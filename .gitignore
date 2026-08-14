@@ -1,0 +1,21 @@
+# Python environments and bytecode
+.venv/
+__pycache__/
+*.py[cod]
+
+# Tool caches and coverage
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+.coverage
+htmlcov/
+
+# Build artifacts
+build/
+dist/
+*.egg-info/
+
+# Local environment values may contain secrets
+.env
+.env.*
+!.env.example

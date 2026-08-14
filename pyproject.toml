@@ -1,0 +1,66 @@
+[project]
+name = "agent-context-platform"
+version = "0.1.0"
+description = "Authoritative context ledger, projections, retrieval, and MCP service"
+readme = "README.md"
+requires-python = ">=3.12,<3.15"
+dependencies = [
+    "fastapi>=0.141.1,<1",
+    "pydantic>=2.12.5,<3",
+    "pydantic-settings>=2.12.0,<3",
+    "uvicorn>=0.40.0,<1",
+]
+
+[build-system]
+requires = ["uv-build>=0.11.28,<0.12.0"]
+build-backend = "uv_build"
+
+[dependency-groups]
+dev = [
+    # Starlette 1.6 prefers HTTPX2; installing legacy HTTPX emits a deprecation warning.
+    "httpx2>=2.10.0,<3",
+    "mypy>=1.19.1,<2",
+    "pytest>=9.0.2,<10",
+    "pytest-cov>=7.0.0,<8",
+    "ruff>=0.14.14,<1",
+]
+
+[tool.pytest.ini_options]
+addopts = [
+    "--strict-config",
+    "--strict-markers",
+    "--cov=agent_context_platform",
+    "--cov-branch",
+    "--cov-report=term-missing",
+    "--cov-fail-under=90",
+]
+testpaths = ["tests"]
+markers = [
+    "unit: isolated tests without external services",
+    "integration: tests that cross process or datastore boundaries",
+    "contract: tests for public API and schema compatibility",
+    "e2e: tests for complete deployed workflows",
+]
+
+[tool.coverage.run]
+branch = true
+source = ["agent_context_platform"]
+
+[tool.coverage.report]
+show_missing = true
+skip_covered = true
+
+[tool.mypy]
+python_version = "3.12"
+strict = true
+warn_unreachable = true
+
+[tool.ruff]
+line-length = 100
+target-version = "py312"
+
+[tool.ruff.lint]
+select = ["E4", "E7", "E9", "F", "I", "B", "UP", "SIM", "RUF"]
+
+[tool.uv]
+required-version = "==0.11.28"
