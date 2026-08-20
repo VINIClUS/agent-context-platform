@@ -46,10 +46,8 @@ def test_create_app_preserves_injected_settings() -> None:
 
 
 def test_create_app_loads_default_settings_from_environment(
-    monkeypatch: pytest.MonkeyPatch,
+    complete_production_environment: None,
 ) -> None:
-    monkeypatch.setenv("AGENT_CONTEXT_ENVIRONMENT", "production")
-
     application = create_app()
 
     assert application.state.settings.environment == "production"

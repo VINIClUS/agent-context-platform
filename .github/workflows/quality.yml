@@ -37,6 +37,49 @@ jobs:
       - name: Install Python
         run: uv python install "${{ matrix.python-version }}"
 
+      - name: Require private SDK token
+        env:
+          SDK_READ_TOKEN: ${{ secrets.AGENT_CONTEXT_SDK_READ_TOKEN }}
+        run: |
+          if [ -z "$SDK_READ_TOKEN" ]; then
+            echo "::error::AGENT_CONTEXT_SDK_READ_TOKEN is required to download the private SDK release"
+            exit 1
+          fi
+
+      - name: Read SDK release metadata
+        run: |
+          uv run --no-project --python "${{ matrix.python-version }}" python <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          metadata = tomllib.loads(Path("pyproject.toml").read_text())["tool"]["agent-context"]["sdk"]
+          variables = {
+              "SDK_REPOSITORY": metadata["repository"],
+              "SDK_VERSION": metadata["version"],
+              "SDK_TAG": metadata["tag"],
+              "SDK_COMMIT": metadata["commit"],
+              "SDK_WHEEL_SHA256": metadata["wheel-sha256"],
+              "SDK_WHEEL": f"agent_context_sdk-{metadata['version']}-py3-none-any.whl",
+          }
+          with Path(os.environ["GITHUB_ENV"]).open("a") as github_env:
+              for name, value in variables.items():
+                  print(f"{name}={value}", file=github_env)
+          PY
+
+      - name: Download private SDK wheel
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_CONTEXT_SDK_READ_TOKEN }}
+        run: |
+          mkdir -p build/sdk
+          gh release download "$SDK_TAG" \
+            --repo "$SDK_REPOSITORY" \
+            --pattern "$SDK_WHEEL" \
+            --dir build/sdk
+
+      - name: Verify private SDK wheel
+        run: echo "$SDK_WHEEL_SHA256  build/sdk/$SDK_WHEEL" | sha256sum --check --strict -
+
       - name: Verify lockfile
         run: uv lock --check --python "${{ matrix.python-version }}"
 
