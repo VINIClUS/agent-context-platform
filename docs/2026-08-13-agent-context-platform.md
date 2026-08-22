@@ -131,7 +131,10 @@ class BlobStore(Protocol):
 ```
 
 - [ ] Write unit tests for deterministic key `sha256/aa/bb/<digest>.zst`, Zstandard round-trip and digest mismatch rejection.
-- [ ] Implement `S3BlobStore` with conditional/idempotent put, metadata digest, server-side head verification and bounded download.
+- [ ] Implement `S3BlobStore` with two write modes: deterministic content-addressed PUT (the
+  Garage default) and `If-None-Match: *` conditional PUT where the S3 implementation supports
+  it. Garage does not provide the conditional-write semantics required by the latter mode;
+  deterministic content-addressed writes remain idempotent through post-PUT verification.
 - [ ] Run the same integration contract against Garage. Keep endpoint/region/path-style options generic so existing MinIO can use it.
 - [ ] Inject a corrupted metadata response and assert `BlobIntegrityError` before any caller can commit an event reference.
 - [ ] Run tests and commit `feat: add verified S3 blob storage`.

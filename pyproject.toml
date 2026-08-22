@@ -15,6 +15,7 @@ dependencies = [
     "pydantic-settings>=2.12.0,<3",
     "sqlalchemy[asyncio]>=2.0.52,<3",
     "uvicorn>=0.40.0,<1",
+    "zstandard>=0.25.0,<1",
 ]
 
 [build-system]
@@ -60,6 +61,10 @@ skip_covered = true
 python_version = "3.12"
 strict = true
 warn_unreachable = true
+
+[[tool.mypy.overrides]]
+module = ["boto3", "botocore.*"]
+ignore_missing_imports = true
 
 [tool.ruff]
 line-length = 100

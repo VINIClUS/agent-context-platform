@@ -219,6 +219,10 @@ This correction is necessary because the [MinIO Community repository was archive
 - Sanitized payloads up to 64 KiB remain inline in PostgreSQL.
 - Larger content is Zstandard-compressed and stored at `sha256/aa/bb/<digest>.zst`.
 - Object identity is the SHA-256 of the sanitized, uncompressed bytes.
+- The default `content_addressed` write mode uses a deterministic PUT and validates the object
+  with HEAD. `if_none_match` uses `If-None-Match: *` only for S3 implementations that support
+  conditional writes. Garage's S3 API does not provide that conditional-write guarantee, so
+  Garage deployments use the default deterministic mode.
 - The platform content service uploads the immutable object, reads metadata back and verifies size/digest before ledger commit.
 - Ledger event, `content_objects`, reference and outbox commit atomically after verification.
 - A failed database transaction may leave a harmless unreferenced object; an orphan sweeper deletes it after 24 hours.

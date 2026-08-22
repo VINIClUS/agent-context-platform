@@ -94,6 +94,12 @@ class S3Settings(BaseModel):
     access_key_id: SecretStr | None = Field(default=None, repr=False)
     secret_access_key: SecretStr | None = Field(default=None, repr=False)
     addressing_style: Literal["path"] = "path"
+    write_mode: Literal["content_addressed", "if_none_match"] = "content_addressed"
+    max_compressed_bytes: int = 67_108_864
+    max_uncompressed_bytes: int = 268_435_456
+    connect_timeout_seconds: float = 5.0
+    read_timeout_seconds: float = 30.0
+    max_attempts: int = 3
 
 
 class MCPSettings(BaseModel):
