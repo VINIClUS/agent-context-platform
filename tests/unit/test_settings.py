@@ -122,6 +122,58 @@ def test_neo4j_rejects_credentials_embedded_in_uri_without_leaking_them() -> Non
     assert uri_secret not in str(error.value)
 
 
+def test_neo4j_timeouts_are_bounded_by_default() -> None:
+    settings = Settings().neo4j
+
+    assert settings.connection_timeout == 5.0
+    assert settings.connection_acquisition_timeout == 10.0
+    assert settings.max_transaction_retry_time == 15.0
+    assert settings.transaction_timeout == 10.0
+    assert settings.schema_timeout == 30.0
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "connection_timeout",
+        "connection_acquisition_timeout",
+        "max_transaction_retry_time",
+        "transaction_timeout",
+        "schema_timeout",
+    ],
+)
+def test_neo4j_rejects_non_positive_timeouts(name: str) -> None:
+    with pytest.raises(ValidationError):
+        Settings(neo4j={name: 0.0})
+
+
+@pytest.mark.parametrize(
+    "name",
+    [
+        "connection_timeout",
+        "connection_acquisition_timeout",
+        "max_transaction_retry_time",
+        "transaction_timeout",
+        "schema_timeout",
+    ],
+)
+def test_neo4j_rejects_unbounded_infinite_timeouts(name: str) -> None:
+    with pytest.raises(ValidationError):
+        Settings(neo4j={name: float("inf")})
+
+
+def test_neo4j_acquisition_timeout_must_exceed_connection_timeout() -> None:
+    with pytest.raises(ValidationError) as error:
+        Settings(
+            neo4j={
+                "connection_timeout": 5.0,
+                "connection_acquisition_timeout": 5.0,
+            }
+        )
+
+    assert "connection_acquisition_timeout must exceed connection_timeout" in str(error.value)
+
+
 def test_secrets_never_appear_in_repr_or_validation_errors() -> None:
     secrets = (
         "postgres-secret",

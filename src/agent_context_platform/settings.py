@@ -74,6 +74,11 @@ class Neo4jSettings(BaseModel):
     username: str | None = Field(default=None, repr=False)
     password: SecretStr | None = Field(default=None, repr=False)
     database: str = "neo4j"
+    connection_timeout: float = Field(default=5.0, gt=0, allow_inf_nan=False)
+    connection_acquisition_timeout: float = Field(default=10.0, gt=0, allow_inf_nan=False)
+    max_transaction_retry_time: float = Field(default=15.0, gt=0, allow_inf_nan=False)
+    transaction_timeout: float = Field(default=10.0, gt=0, allow_inf_nan=False)
+    schema_timeout: float = Field(default=30.0, gt=0, allow_inf_nan=False)
 
     @field_validator("uri")
     @classmethod
@@ -81,6 +86,12 @@ class Neo4jSettings(BaseModel):
         if uri is not None and (uri.username is not None or uri.password is not None):
             raise ValueError("Neo4j URI must not contain credentials")
         return uri
+
+    @model_validator(mode="after")
+    def require_acquisition_timeout_to_exceed_connection_timeout(self) -> Self:
+        if self.connection_acquisition_timeout <= self.connection_timeout:
+            raise ValueError("connection_acquisition_timeout must exceed connection_timeout")
+        return self
 
 
 class S3Settings(BaseModel):
