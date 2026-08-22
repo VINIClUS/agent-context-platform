@@ -69,7 +69,10 @@ class Neo4jStore:
         if (
             self._settings.uri is None
             or self._settings.username is None
+            or not self._settings.username.strip()
             or self._settings.password is None
+            or not self._settings.password.get_secret_value().strip()
+            or not self._settings.database.strip()
         ):
             raise ConfigurationError("Neo4j connection settings are incomplete")
 

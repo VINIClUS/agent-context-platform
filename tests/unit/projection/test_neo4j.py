@@ -110,6 +110,37 @@ def test_health_reports_incomplete_settings_as_configuration_error() -> None:
     assert health.reason == "configuration"
 
 
+@pytest.mark.parametrize(
+    ("name", "value"),
+    [
+        ("username", "   "),
+        ("password", ""),
+        ("database", "\t"),
+    ],
+)
+def test_health_reports_blank_connection_fields_as_configuration_error(
+    monkeypatch: pytest.MonkeyPatch,
+    name: str,
+    value: str,
+) -> None:
+    values = {
+        "uri": "neo4j://graph.example.test",
+        "username": "neo4j-user",
+        "password": "neo4j-secret",
+        "database": "neo4j",
+        name: value,
+    }
+
+    def unexpected_driver_call(*_args: object, **_kwargs: object) -> None:
+        pytest.fail("blank connection settings must not reach the Neo4j driver")
+
+    monkeypatch.setattr(AsyncGraphDatabase, "driver", unexpected_driver_call)
+    health = asyncio.run(Neo4jStore(Neo4jSettings.model_validate(values)).verify_connectivity())
+
+    assert health.status == "error"
+    assert health.reason == "configuration"
+
+
 def test_async_context_closes_an_initialized_driver_once(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
