@@ -60,12 +60,11 @@ def test_schema_versions_are_identified_by_name_and_version_with_typed_document(
     table = SchemaVersionRow.__table__
 
     assert tuple(column.name for column in table.primary_key.columns) == (
-        "schema_name", "schema_version"
+        "schema_name",
+        "schema_version",
     )
     assert isinstance(table.c.schema_document.type, JSONB)
-    assert _check_names(SchemaVersionRow) == {
-        "ck_schema_versions_schema_sha256_lower_hex"
-    }
+    assert _check_names(SchemaVersionRow) == {"ck_schema_versions_schema_sha256_lower_hex"}
 
 
 def test_retention_policy_has_effective_interval_and_unique_revision() -> None:
@@ -73,8 +72,7 @@ def test_retention_policy_has_effective_interval_and_unique_revision() -> None:
 
     assert isinstance(table.c.retention_policy_id.type, UUID)
     assert any(
-        tuple(column.name for column in constraint.columns)
-        == ("resource_class", "effective_from")
+        tuple(column.name for column in constraint.columns) == ("resource_class", "effective_from")
         for constraint in table.constraints
         if isinstance(constraint, UniqueConstraint)
     )

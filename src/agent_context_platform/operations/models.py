@@ -70,9 +70,7 @@ class RetentionPolicyRow(Base):
         {"schema": "operations"},
     )
 
-    retention_policy_id: Mapped[PythonUUID] = mapped_column(
-        UUID(as_uuid=True), primary_key=True
-    )
+    retention_policy_id: Mapped[PythonUUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
     resource_class: Mapped[str] = mapped_column(String(255), nullable=False)
     retention_days: Mapped[int | None] = mapped_column(Integer, nullable=True)
     preserve_metadata: Mapped[bool] = mapped_column(Boolean, nullable=False)

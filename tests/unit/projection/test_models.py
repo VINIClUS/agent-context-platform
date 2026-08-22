@@ -27,9 +27,10 @@ def test_projection_models_are_registered_in_explicit_schema() -> None:
         "projection.dead_letters",
         "projection.ingestion_batches",
     } <= set(Base.metadata.tables)
-    assert {model.__table__.schema for model in (
-        OutboxRow, ProjectionCheckpointRow, DeadLetterRow, IngestionBatchRow
-    )} == {"projection"}
+    assert {
+        model.__table__.schema
+        for model in (OutboxRow, ProjectionCheckpointRow, DeadLetterRow, IngestionBatchRow)
+    } == {"projection"}
 
 
 def test_outbox_has_monotonic_identity_unique_event_and_ordered_claim_index() -> None:
@@ -43,8 +44,7 @@ def test_outbox_has_monotonic_identity_unique_event_and_ordered_claim_index() ->
         if isinstance(constraint, UniqueConstraint)
     )
     assert any(
-        tuple(column.name for column in index.columns)
-        == ("status", "available_at", "outbox_id")
+        tuple(column.name for column in index.columns) == ("status", "available_at", "outbox_id")
         for index in table.indexes
         if isinstance(index, Index)
     )
@@ -60,7 +60,8 @@ def test_projection_checkpoint_has_composite_identity_and_ordered_progress() -> 
     table = ProjectionCheckpointRow.__table__
 
     assert tuple(column.name for column in table.primary_key.columns) == (
-        "projector_name", "projector_version"
+        "projector_name",
+        "projector_version",
     )
     assert _check_names(ProjectionCheckpointRow) >= {
         "ck_projection_checkpoints_non_negative_processed_count",

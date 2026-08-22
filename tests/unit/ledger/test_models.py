@@ -16,9 +16,9 @@ from agent_context_platform.ledger.models import (
 
 def _ddl(model: type[object]) -> str:
     return str(
-        __import__("sqlalchemy").schema.CreateTable(model.__table__).compile(
-            dialect=postgresql.dialect()
-        )
+        __import__("sqlalchemy")
+        .schema.CreateTable(model.__table__)
+        .compile(dialect=postgresql.dialect())
     )
 
 
@@ -40,13 +40,16 @@ def test_ledger_models_are_registered_in_explicit_schema() -> None:
     }
 
     assert expected <= set(Base.metadata.tables)
-    assert {model.__table__.schema for model in (
-        EventStreamRow,
-        EventRow,
-        EventContentRefRow,
-        RedactionReportRow,
-        IntegrityCheckpointRow,
-    )} == {"ledger"}
+    assert {
+        model.__table__.schema
+        for model in (
+            EventStreamRow,
+            EventRow,
+            EventContentRefRow,
+            RedactionReportRow,
+            IntegrityCheckpointRow,
+        )
+    } == {"ledger"}
 
 
 def test_events_preserve_typed_identity_json_and_ordering() -> None:
@@ -54,9 +57,10 @@ def test_events_preserve_typed_identity_json_and_ordering() -> None:
 
     assert tuple(column.name for column in table.primary_key.columns) == ("event_id",)
     assert isinstance(table.c.event_id.type, UUID)
-    assert all(isinstance(table.c[name].type, JSONB) for name in (
-        "producer", "context", "trace", "payload", "redaction"
-    ))
+    assert all(
+        isinstance(table.c[name].type, JSONB)
+        for name in ("producer", "context", "trace", "payload", "redaction")
+    )
     assert {
         tuple(column.name for column in constraint.columns)
         for constraint in table.constraints
@@ -86,9 +90,7 @@ def test_ledger_foreign_keys_never_cascade() -> None:
 def test_content_reference_mirrors_sdk_storage_contract() -> None:
     table = EventContentRefRow.__table__
 
-    assert tuple(column.name for column in table.primary_key.columns) == (
-        "event_id", "content_id"
-    )
+    assert tuple(column.name for column in table.primary_key.columns) == ("event_id", "content_id")
     assert _check_names(EventContentRefRow) >= {
         "ck_event_content_refs_content_sha256_lower_hex",
         "ck_event_content_refs_non_negative_uncompressed_bytes",
@@ -97,7 +99,10 @@ def test_content_reference_mirrors_sdk_storage_contract() -> None:
     }
     assert isinstance(table.c.disposition.type, Enum)
     assert table.c.disposition.type.enums == [
-        "sanitized", "metadata_only", "dropped_redaction_failure", "purged"
+        "sanitized",
+        "metadata_only",
+        "dropped_redaction_failure",
+        "purged",
     ]
     assert table.c.storage.type.enums == ["inline", "object"]
     ddl = _ddl(EventContentRefRow)
@@ -107,9 +112,7 @@ def test_content_reference_mirrors_sdk_storage_contract() -> None:
 def test_redaction_report_is_one_to_one_and_disposition_coherent() -> None:
     table = RedactionReportRow.__table__
 
-    assert tuple(column.name for column in table.primary_key.columns) == (
-        "event_id", "content_id"
-    )
+    assert tuple(column.name for column in table.primary_key.columns) == ("event_id", "content_id")
     assert isinstance(table.c.findings.type, JSONB)
     assert _check_names(RedactionReportRow) >= {
         "ck_redaction_reports_disposition_details",
