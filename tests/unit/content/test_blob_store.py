@@ -113,7 +113,7 @@ def test_put_verified_uses_literal_content_addressed_key_and_zstd_round_trip() -
     assert _run(store.get_verified(stored.object_key, stored.sha256)) == content
 
 
-def test_two_identical_content_addressed_puts_are_safe() -> None:
+def test_two_identical_content_addressed_puts_reuse_the_verified_object() -> None:
     client = FakeS3Client()
     store = _store(client)
 
@@ -121,7 +121,19 @@ def test_two_identical_content_addressed_puts_are_safe() -> None:
     second = _run(store.put_verified(b"same", "application/octet-stream"))
 
     assert second == first
-    assert client.put_attempts == 2
+    assert client.put_attempts == 1
+
+
+def test_content_addressed_put_rejects_conflicting_media_type_without_overwrite() -> None:
+    client = FakeS3Client()
+    store = _store(client)
+    stored = _run(store.put_verified(b"same", "text/plain"))
+
+    with pytest.raises(BlobIntegrityError, match="media type"):
+        _run(store.put_verified(b"same", "application/json"))
+
+    assert client.put_attempts == 1
+    assert client.objects[stored.object_key]["ContentType"] == "text/plain"
 
 
 def test_conditional_put_accepts_existing_object_after_precondition_failure() -> None:
@@ -265,6 +277,17 @@ def test_conditional_put_rejects_a_corrupt_existing_object_after_412() -> None:
     }
 
     with pytest.raises(BlobIntegrityError, match="metadata"):
+        _run(store.put_verified(b"existing", "text/plain"))
+
+
+def test_conditional_put_rejects_corrupt_existing_bytes_after_412() -> None:
+    client = FakeS3Client()
+    store = _store(client, write_mode="if_none_match")
+    stored = _run(store.put_verified(b"existing", "text/plain"))
+    body = client.objects[stored.object_key]["Body"]
+    client.objects[stored.object_key]["Body"] = body[:-1] + bytes([body[-1] ^ 0xFF])
+
+    with pytest.raises(BlobIntegrityError):
         _run(store.put_verified(b"existing", "text/plain"))
 
 

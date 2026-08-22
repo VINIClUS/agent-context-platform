@@ -117,6 +117,17 @@ class S3BlobStore:
         if len(compressed) > self._settings.max_compressed_bytes:
             raise BlobIntegrityError("compressed payload exceeds configured limit")
 
+        expected_metadata = _ObjectMetadata(
+            sha256=digest,
+            compressed_bytes=len(compressed),
+            uncompressed_bytes=len(content),
+            media_type=media_type,
+        )
+        if self._settings.write_mode == "content_addressed" and await self._reuse_existing(
+            object_key, content, expected_metadata
+        ):
+            return self._stored_blob(object_key, expected_metadata)
+
         request: dict[str, Any] = {
             "Bucket": self._settings.bucket_name,
             "Key": object_key,
@@ -125,24 +136,46 @@ class S3BlobStore:
             "ContentType": media_type,
             "ContentEncoding": "zstd",
         }
-        await self._put(request)
-        head = await self._head(object_key)
-        expected_metadata = _ObjectMetadata(
-            sha256=digest,
-            compressed_bytes=len(compressed),
-            uncompressed_bytes=len(content),
-            media_type=media_type,
-        )
-        self._verify_expected_metadata(
-            self._validate_response(head, expected_sha256=digest), expected_metadata
-        )
+        created = await self._put(request)
+        if created:
+            head = await self._head(object_key)
+            self._verify_expected_metadata(
+                self._validate_response(head, expected_sha256=digest), expected_metadata
+            )
+        else:
+            await self._verify_existing(object_key, content, expected_metadata)
+        return self._stored_blob(object_key, expected_metadata)
+
+    @staticmethod
+    def _stored_blob(object_key: str, metadata: _ObjectMetadata) -> StoredBlob:
         return StoredBlob(
-            sha256=expected_metadata.sha256,
+            sha256=metadata.sha256,
             object_key=object_key,
-            compressed_bytes=expected_metadata.compressed_bytes,
-            uncompressed_bytes=expected_metadata.uncompressed_bytes,
-            media_type=expected_metadata.media_type,
+            compressed_bytes=metadata.compressed_bytes,
+            uncompressed_bytes=metadata.uncompressed_bytes,
+            media_type=metadata.media_type,
         )
+
+    async def _reuse_existing(
+        self, object_key: str, content: bytes, expected_metadata: _ObjectMetadata
+    ) -> bool:
+        try:
+            await self._verify_existing(object_key, content, expected_metadata)
+        except BlobNotFoundError:
+            return False
+        return True
+
+    async def _verify_existing(
+        self, object_key: str, content: bytes, expected_metadata: _ObjectMetadata
+    ) -> None:
+        head = await self._head(object_key)
+        self._verify_expected_metadata(
+            self._validate_response(head, expected_sha256=expected_metadata.sha256),
+            expected_metadata,
+        )
+        existing_content = await self.get_verified(object_key, expected_metadata.sha256)
+        if existing_content != content:
+            raise BlobIntegrityError("stored content does not match the requested content")
 
     async def get_verified(self, object_key: str, expected_sha256: str) -> bytes:
         """Download only a canonical object and prove its compressed and raw identities."""
@@ -207,19 +240,19 @@ class S3BlobStore:
         except BlobNotFoundError:
             return
 
-    async def _put(self, request: dict[str, Any]) -> None:
+    async def _put(self, request: dict[str, Any]) -> bool:
         if self._settings.write_mode == "content_addressed":
             await self._call("put_object", **request)
-            return
+            return True
         request["IfNoneMatch"] = "*"
         for attempt in range(self._settings.max_attempts):
             try:
                 await self._call("put_object", **request)
-                return
+                return True
             except BlobStoreError as error:
                 code = _error_code(error)
                 if code in {"412", "PreconditionFailed"}:
-                    return
+                    return False
                 if code not in {"409", "ConditionalRequestConflict"}:
                     raise
                 if attempt + 1 == self._settings.max_attempts:
