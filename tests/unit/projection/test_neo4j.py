@@ -16,11 +16,13 @@ pytestmark = pytest.mark.unit
 class ConnectivityDriver:
     def __init__(self, connectivity_error: Exception | None = None) -> None:
         self.verify_calls = 0
+        self.verify_configs: list[dict[str, Any]] = []
         self.close_calls = 0
         self.connectivity_error = connectivity_error
 
-    async def verify_connectivity(self) -> None:
+    async def verify_connectivity(self, **config: Any) -> None:
         self.verify_calls += 1
+        self.verify_configs.append(config)
         if self.connectivity_error is not None:
             raise self.connectivity_error
 
@@ -69,6 +71,7 @@ def test_store_constructs_driver_lazily_with_bounded_pool_settings(
         )
     ]
     assert driver.verify_calls == 1
+    assert driver.verify_configs == [{"database": "neo4j"}]
 
 
 def test_store_representation_never_exposes_credentials() -> None:

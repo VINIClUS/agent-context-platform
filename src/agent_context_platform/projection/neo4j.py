@@ -87,7 +87,7 @@ class Neo4jStore:
 
     async def verify_connectivity(self) -> Neo4jHealth:
         try:
-            await self._get_driver().verify_connectivity()
+            await self._get_driver().verify_connectivity(database=self._settings.database)
         except AuthError:
             return Neo4jHealth(status="error", reason="authentication")
         except (ConfigurationError, ValueError):

@@ -6,6 +6,8 @@ from dataclasses import dataclass, field
 from time import monotonic
 from typing import LiteralString
 
+from neo4j import Record
+
 from agent_context_platform.projection.neo4j import Neo4jStore, Neo4jTransaction
 
 
@@ -18,6 +20,10 @@ class SchemaStatement:
     label: str
     property_name: str
     parameters: Mapping[str, object] = field(default_factory=dict)
+
+
+class Neo4jSchemaMismatchError(RuntimeError):
+    """The named database schema does not match the projection manifest."""
 
 
 CONSTRAINT_STATEMENTS: tuple[SchemaStatement, ...] = (
@@ -240,7 +246,14 @@ INDEX_STATEMENTS: tuple[SchemaStatement, ...] = (
 SCHEMA_STATEMENTS = CONSTRAINT_STATEMENTS + INDEX_STATEMENTS
 _SCHEMA_INDEX_NAMES = frozenset(statement.name for statement in SCHEMA_STATEMENTS)
 _SHOW_SCHEMA_INDEXES: LiteralString = (
-    "SHOW INDEXES YIELD name, state WHERE name IN $names RETURN name, state"
+    "SHOW INDEXES YIELD name, state, type, entityType, labelsOrTypes, properties, options "
+    "WHERE name IN $names "
+    "RETURN name, state, type, entityType, labelsOrTypes, properties, options"
+)
+_SHOW_SCHEMA_CONSTRAINTS: LiteralString = (
+    "SHOW CONSTRAINTS YIELD name, type, entityType, labelsOrTypes, properties "
+    "WHERE name IN $names "
+    "RETURN name, type, entityType, labelsOrTypes, properties"
 )
 
 
@@ -263,17 +276,89 @@ async def _wait_for_indexes(store: Neo4jStore) -> None:
     deadline = monotonic() + store.schema_timeout
     names = sorted(_SCHEMA_INDEX_NAMES)
 
-    async def read_states(transaction: Neo4jTransaction) -> dict[str, str]:
+    async def read_indexes(transaction: Neo4jTransaction) -> list[Record]:
         result = await transaction.run(_SHOW_SCHEMA_INDEXES, parameters={"names": names})
-        return {str(record["name"]): str(record["state"]) for record in result.records}
+        return result.records
 
     while True:
-        states = await store.execute_read(read_states)
+        records = await store.execute_read(read_indexes)
+        states = {str(record["name"]): str(record["state"]) for record in records}
         if states.keys() == _SCHEMA_INDEX_NAMES and all(
             state == "ONLINE" for state in states.values()
         ):
+            _validate_indexes(records)
+            await _validate_constraints(store)
             return
         remaining = deadline - monotonic()
         if remaining <= 0:
             raise TimeoutError("Neo4j indexes did not become ONLINE within schema timeout")
         await asyncio.sleep(min(0.1, remaining))
+
+
+def _validate_indexes(records: list[Record]) -> None:
+    records_by_name = {str(record["name"]): record for record in records}
+    for statement in SCHEMA_STATEMENTS:
+        record = records_by_name[statement.name]
+        expected_type = "VECTOR" if statement.name == "vx_content_embedding_embedding" else "RANGE"
+        _validate_schema_object(record, statement, expected_type=expected_type)
+        if expected_type == "VECTOR":
+            _validate_vector_config(record, statement)
+
+
+async def _validate_constraints(store: Neo4jStore) -> None:
+    names = sorted(statement.name for statement in CONSTRAINT_STATEMENTS)
+
+    async def read_constraints(transaction: Neo4jTransaction) -> list[Record]:
+        result = await transaction.run(_SHOW_SCHEMA_CONSTRAINTS, parameters={"names": names})
+        return result.records
+
+    records = await store.execute_read(read_constraints)
+    records_by_name = {str(record["name"]): record for record in records}
+    missing = set(names) - records_by_name.keys()
+    if missing:
+        raise Neo4jSchemaMismatchError(
+            f"Neo4j constraints missing from schema: {', '.join(sorted(missing))}"
+        )
+    for statement in CONSTRAINT_STATEMENTS:
+        _validate_schema_object(
+            records_by_name[statement.name],
+            statement,
+            expected_type="UNIQUENESS",
+        )
+
+
+def _validate_schema_object(
+    record: Record,
+    statement: SchemaStatement,
+    *,
+    expected_type: str,
+) -> None:
+    actual = (
+        str(record["type"]),
+        str(record["entityType"]),
+        tuple(str(value) for value in record["labelsOrTypes"]),
+        tuple(str(value) for value in record["properties"]),
+    )
+    expected = (expected_type, "NODE", (statement.label,), (statement.property_name,))
+    if actual != expected:
+        raise Neo4jSchemaMismatchError(
+            f"Neo4j schema object {statement.name} does not match the projection manifest"
+        )
+
+
+def _validate_vector_config(record: Record, statement: SchemaStatement) -> None:
+    options = record["options"]
+    config = options.get("indexConfig") if isinstance(options, Mapping) else None
+    dimensions = config.get("vector.dimensions") if isinstance(config, Mapping) else None
+    similarity = (
+        str(config.get("vector.similarity_function")).lower()
+        if isinstance(config, Mapping)
+        else None
+    )
+    if (
+        dimensions != statement.parameters["dimensions"]
+        or similarity != statement.parameters["similarity"]
+    ):
+        raise Neo4jSchemaMismatchError(
+            f"Neo4j schema object {statement.name} does not match the projection manifest"
+        )

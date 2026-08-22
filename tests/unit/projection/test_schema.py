@@ -12,6 +12,7 @@ from agent_context_platform.projection.schema import (
     CONSTRAINT_STATEMENTS,
     INDEX_STATEMENTS,
     SCHEMA_STATEMENTS,
+    Neo4jSchemaMismatchError,
     ensure_schema,
 )
 
@@ -95,6 +96,9 @@ class RecordedResult:
 class RecordingTransaction:
     def __init__(self, index_names: set[str]) -> None:
         self.index_names = index_names
+        self.index_property_overrides: dict[str, str] = {}
+        self.constraint_property_overrides: dict[str, str] = {}
+        self.vector_dimensions = 384
         self.runs: list[tuple[str, dict[str, object]]] = []
 
     async def run(
@@ -106,7 +110,53 @@ class RecordingTransaction:
         self.runs.append((query, parameters))
         if query.startswith("SHOW INDEXES"):
             return RecordedResult(
-                [{"name": name, "state": "ONLINE"} for name in sorted(self.index_names)]
+                [
+                    {
+                        "name": statement.name,
+                        "state": "ONLINE",
+                        "type": (
+                            "VECTOR"
+                            if statement.name == "vx_content_embedding_embedding"
+                            else "RANGE"
+                        ),
+                        "entityType": "NODE",
+                        "labelsOrTypes": [statement.label],
+                        "properties": [
+                            self.index_property_overrides.get(
+                                statement.name, statement.property_name
+                            )
+                        ],
+                        "options": (
+                            {
+                                "indexConfig": {
+                                    "vector.dimensions": self.vector_dimensions,
+                                    "vector.similarity_function": "cosine",
+                                }
+                            }
+                            if statement.name == "vx_content_embedding_embedding"
+                            else {}
+                        ),
+                    }
+                    for statement in SCHEMA_STATEMENTS
+                    if statement.name in self.index_names
+                ]
+            )
+        if query.startswith("SHOW CONSTRAINTS"):
+            return RecordedResult(
+                [
+                    {
+                        "name": statement.name,
+                        "type": "UNIQUENESS",
+                        "entityType": "NODE",
+                        "labelsOrTypes": [statement.label],
+                        "properties": [
+                            self.constraint_property_overrides.get(
+                                statement.name, statement.property_name
+                            )
+                        ],
+                    }
+                    for statement in CONSTRAINT_STATEMENTS
+                ]
             )
         return RecordedResult([])
 
@@ -133,13 +183,42 @@ def test_ensure_schema_executes_every_statement_and_waits_for_named_indexes() ->
     asyncio.run(ensure_schema(store))  # type: ignore[arg-type]
 
     assert store.write_calls == len(SCHEMA_STATEMENTS)
-    assert store.read_calls == 1
+    assert store.read_calls == 2
     assert store.transaction.runs[: len(SCHEMA_STATEMENTS)] == [
         (statement.query, dict(statement.parameters)) for statement in SCHEMA_STATEMENTS
     ]
-    wait_query, wait_parameters = store.transaction.runs[-1]
+    wait_query, wait_parameters = store.transaction.runs[-2]
     assert wait_query.startswith("SHOW INDEXES")
     assert wait_parameters == {"names": sorted(statement.name for statement in SCHEMA_STATEMENTS)}
+    constraint_query, constraint_parameters = store.transaction.runs[-1]
+    assert constraint_query.startswith("SHOW CONSTRAINTS")
+    assert constraint_parameters == {
+        "names": sorted(statement.name for statement in CONSTRAINT_STATEMENTS)
+    }
+
+
+def test_ensure_schema_rejects_online_index_with_wrong_definition() -> None:
+    store = RecordingStore()
+    store.transaction.index_property_overrides["ix_assertion_valid_from"] = "wrong_property"
+
+    with pytest.raises(Neo4jSchemaMismatchError, match="ix_assertion_valid_from"):
+        asyncio.run(ensure_schema(store))  # type: ignore[arg-type]
+
+
+def test_ensure_schema_rejects_constraint_with_wrong_definition() -> None:
+    store = RecordingStore()
+    store.transaction.constraint_property_overrides["uq_workspace_workspace_id"] = "wrong_id"
+
+    with pytest.raises(Neo4jSchemaMismatchError, match="uq_workspace_workspace_id"):
+        asyncio.run(ensure_schema(store))  # type: ignore[arg-type]
+
+
+def test_ensure_schema_rejects_vector_index_with_wrong_dimensions() -> None:
+    store = RecordingStore()
+    store.transaction.vector_dimensions = 1536
+
+    with pytest.raises(Neo4jSchemaMismatchError, match="vx_content_embedding_embedding"):
+        asyncio.run(ensure_schema(store))  # type: ignore[arg-type]
 
 
 def test_ensure_schema_times_out_when_an_index_never_becomes_online(
