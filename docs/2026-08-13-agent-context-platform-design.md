@@ -242,7 +242,7 @@ This correction is necessary because the [MinIO Community repository was archive
 | Code | `Module`, `File`, `FileRevision`, `Symbol`, `SymbolRevision`, `Dependency` |
 | Agent | `AgentRuntime`, `Session`, `Turn`, `ToolCall` |
 | Results | `TestRun`, `CIRun`, `Artifact`, `Finding` |
-| Knowledge | `Decision`, `Constraint`, `Failure`, `Summary` |
+| Knowledge | `Assertion`, `Decision`, `Constraint`, `Failure`, `Summary` |
 
 ### 9.2 Principal relations
 
@@ -263,9 +263,13 @@ This correction is necessary because the [MinIO Community repository was archive
 - `(:Decision)-[:SUPERSEDES]->(:Decision)`
 - `(:Failure)-[:OBSERVED_IN]->(:Session|TestRun|CIRun)`
 
-### 9.3 Assertion properties
+### 9.3 Assertion nodes
 
-Every derived relation carries:
+Every derived claim is reified as an immutable `Assertion` node. Principal domain relations
+remain the query-facing graph shape, while assertion identity, provenance and bitemporal state
+live on the node so Neo4j Community can enforce uniqueness and index temporal retrieval.
+
+Every assertion carries:
 
 - `assertion_id`;
 - `source_event_id`;
