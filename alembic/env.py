@@ -130,9 +130,7 @@ def run_migrations_online() -> None:
     elif supplied_connection is None:
         asyncio.run(_run_async())
     else:
-        raise TypeError(
-            "Alembic injected connection must be a synchronous SQLAlchemy Connection"
-        )
+        raise TypeError("Alembic injected connection must be a synchronous SQLAlchemy Connection")
 
 
 if context.is_offline_mode():
