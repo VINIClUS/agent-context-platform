@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 
 from sqlalchemy import Connection
-from sqlalchemy.ext.asyncio import AsyncConnection
 from sqlalchemy.schema import SchemaItem
 
 from agent_context_platform.catalog.models import CatalogBase
@@ -115,11 +114,7 @@ def run_migrations_offline() -> None:
         context.run_migrations()
 
 
-async def _run_async(connection: AsyncConnection | None = None) -> None:
-    if connection is not None:
-        await connection.run_sync(_configure)
-        return
-
+async def _run_async() -> None:
     engine = create_engine(Settings())
     try:
         async with engine.connect() as owned_connection:
@@ -132,12 +127,12 @@ def run_migrations_online() -> None:
     supplied_connection = context.config.attributes.get("connection")
     if isinstance(supplied_connection, Connection):
         _configure(supplied_connection)
-    elif isinstance(supplied_connection, AsyncConnection):
-        asyncio.run(_run_async(supplied_connection))
     elif supplied_connection is None:
         asyncio.run(_run_async())
     else:
-        raise TypeError("Alembic connection must be a SQLAlchemy Connection")
+        raise TypeError(
+            "Alembic injected connection must be a synchronous SQLAlchemy Connection"
+        )
 
 
 if context.is_offline_mode():

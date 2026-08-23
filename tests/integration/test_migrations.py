@@ -266,6 +266,7 @@ async def _exercise_migration(dsn: str) -> None:
             await connection.commit()
             await _assert_head(connection)
             await _run_alembic_check(connection)
+            _assert_direct_async_connection_is_rejected(connection)
     finally:
         await engine.dispose()
 
@@ -290,6 +291,14 @@ async def _run_alembic_check(connection: AsyncConnection) -> None:
         command.check(config)
 
     await connection.run_sync(run)
+
+
+def _assert_direct_async_connection_is_rejected(connection: AsyncConnection) -> None:
+    config = Config(PROJECT_ROOT / "alembic.ini")
+    config.attributes["connection"] = connection
+
+    with pytest.raises(TypeError, match="synchronous SQLAlchemy Connection"):
+        command.current(config)
 
 
 async def _assert_prerequisites(connection: AsyncConnection) -> None:
