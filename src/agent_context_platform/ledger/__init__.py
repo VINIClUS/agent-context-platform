@@ -4,10 +4,12 @@ from agent_context_platform.ledger.repository import (
     IdempotencyConflictError,
     LedgerRepository,
     ResolvedEvent,
+    StreamQuarantinedError,
 )
 
 __all__ = [
     "IdempotencyConflictError",
     "LedgerRepository",
     "ResolvedEvent",
+    "StreamQuarantinedError",
 ]

@@ -40,11 +40,13 @@ from agent_context_platform.ledger.models import (
     ContentStorage,
     EventContentRefRow,
     MetadataOnlyReason,
+    StreamStatus,
 )
 from agent_context_platform.ledger.repository import (
     IdempotencyConflictError,
     LedgerRepository,
     ResolvedEvent,
+    StreamQuarantinedError,
     _canonicalize_draft,
     _content_ref_from_row,
     _content_ref_rows_from_sealed,
@@ -440,14 +442,30 @@ def test_outbox_row_defaults_to_pending_and_zero_retries() -> None:
 # --------------------------------------------------------------------------
 
 
+def test_lock_streams_refuses_a_quarantined_stream() -> None:
+    session = AsyncMock(spec=AsyncSession)
+    session.execute.side_effect = [
+        MagicMock(),  # INSERT ... ON CONFLICT DO NOTHING for "stream-q"
+        _one((4, uuid4(), "e" * 64, StreamStatus.QUARANTINED)),  # SELECT ... FOR UPDATE
+    ]
+
+    with pytest.raises(StreamQuarantinedError) as caught:
+        asyncio.run(_lock_streams(session, ["stream-q"]))
+
+    assert caught.value.stream_id == "stream-q"
+    assert session.execute.await_count == 2
+
+
 def test_lock_streams_locks_every_distinct_stream_in_sorted_order() -> None:
     session = AsyncMock(spec=AsyncSession)
     existing_head = uuid4()
     session.execute.side_effect = [
         MagicMock(),  # INSERT ... ON CONFLICT DO NOTHING for "stream-a"
-        _one((0, None, None)),  # SELECT ... FOR UPDATE for "stream-a"
+        _one((0, None, None, StreamStatus.ACTIVE)),  # SELECT ... FOR UPDATE for "stream-a"
         MagicMock(),  # INSERT ... ON CONFLICT DO NOTHING for "stream-b"
-        _one((3, existing_head, "f" * 64)),  # SELECT ... FOR UPDATE for "stream-b"
+        _one(
+            (3, existing_head, "f" * 64, StreamStatus.ACTIVE)
+        ),  # SELECT ... FOR UPDATE for "stream-b"
     ]
 
     result = asyncio.run(_lock_streams(session, ["stream-b", "stream-a", "stream-b"]))
@@ -679,7 +697,7 @@ def test_append_chains_two_new_events_on_the_same_stream() -> None:
     session = AsyncMock(spec=AsyncSession)
     session.execute.side_effect = [
         MagicMock(),  # lock insert
-        _one((0, None, None)),  # lock select
+        _one((0, None, None, StreamStatus.ACTIVE)),  # lock select
         MagicMock(),  # head update
     ]
 
@@ -700,7 +718,7 @@ def test_append_deduplicates_batch_local_repeats_without_a_second_insert() -> No
     session = AsyncMock(spec=AsyncSession)
     session.execute.side_effect = [
         MagicMock(),  # lock insert
-        _one((0, None, None)),  # lock select
+        _one((0, None, None, StreamStatus.ACTIVE)),  # lock select
         MagicMock(),  # head update
     ]
 

@@ -99,6 +99,19 @@ class IdempotencyConflictError(ValueError):
         self.existing_event_id = existing_event_id
 
 
+class StreamQuarantinedError(RuntimeError):
+    """Raised when a batch targets a stream quarantined after failed verification.
+
+    A quarantined stream's head can no longer be trusted, so chaining a new event
+    to it would extend a broken hash chain. The whole batch is refused; the caller
+    is expected to roll back its transaction on this error.
+    """
+
+    def __init__(self, stream_id: str) -> None:
+        super().__init__(f"stream is quarantined: stream_id={stream_id!r}")
+        self.stream_id = stream_id
+
+
 @dataclass(slots=True)
 class _StreamState:
     sequence: int
@@ -356,6 +369,7 @@ async def _lock_streams(
     Locks are always acquired in sorted ``stream_id`` order across the whole
     batch, regardless of the events' original submission order, so that two
     concurrent multi-stream batches can never deadlock against each other.
+    A quarantined stream raises ``StreamQuarantinedError`` once locked.
     """
     state: dict[str, _StreamState] = {}
     for stream_id in sorted(set(stream_ids)):
@@ -374,17 +388,20 @@ async def _lock_streams(
             )
             .on_conflict_do_nothing(index_elements=[EventStreamRow.stream_id])
         )
-        sequence, head_event_id, head_sha256 = (
+        sequence, head_event_id, head_sha256, status = (
             await session.execute(
                 select(
                     EventStreamRow.last_sequence,
                     EventStreamRow.last_event_id,
                     EventStreamRow.last_event_sha256,
+                    EventStreamRow.status,
                 )
                 .where(EventStreamRow.stream_id == stream_id)
                 .with_for_update()
             )
         ).one()
+        if status is StreamStatus.QUARANTINED:
+            raise StreamQuarantinedError(stream_id)
         state[stream_id] = _StreamState(sequence, head_event_id, head_sha256)
     return state
 

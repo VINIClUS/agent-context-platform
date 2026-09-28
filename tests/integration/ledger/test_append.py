@@ -33,15 +33,21 @@ from agent_context_sdk import (  # type: ignore[import-untyped]
 from agent_context_sdk.content.models import ContentDisposition as SdkContentDisposition
 from agent_context_sdk.content.models import ContentStorage as SdkContentStorage
 from agent_context_sdk.events.envelope import new_uuid7
-from sqlalchemy import func, select
+from sqlalchemy import func, select, update
 from sqlalchemy.ext.asyncio import AsyncEngine, async_sessionmaker, create_async_engine
 
 from agent_context_platform.catalog.models import ContentObjectRow
-from agent_context_platform.ledger.models import EventContentRefRow, EventRow, EventStreamRow
+from agent_context_platform.ledger.models import (
+    EventContentRefRow,
+    EventRow,
+    EventStreamRow,
+    StreamStatus,
+)
 from agent_context_platform.ledger.repository import (
     IdempotencyConflictError,
     LedgerRepository,
     ResolvedEvent,
+    StreamQuarantinedError,
 )
 from agent_context_platform.projection.models import OutboxRow
 
@@ -403,5 +409,38 @@ def test_get_by_idempotency_keys_omits_unmatched_pairs(ledger_engine: AsyncEngin
             )
 
         assert set(found) == {("agent-1", key)}
+
+    asyncio.run(exercise())
+
+
+def test_append_refuses_a_quarantined_stream(ledger_engine: AsyncEngine) -> None:
+    async def exercise() -> None:
+        factory = async_sessionmaker(ledger_engine, expire_on_commit=False)
+        stream_id = _unique("stream")
+        first = _draft(stream_id=stream_id, idempotency_key=_unique("key"))
+        async with factory() as session:
+            await LedgerRepository.append(session, [ResolvedEvent(draft=first)])
+            await session.commit()
+
+        async with factory() as session:
+            await session.execute(
+                update(EventStreamRow)
+                .where(EventStreamRow.stream_id == stream_id)
+                .values(status=StreamStatus.QUARANTINED, quarantined_at=_OBSERVED_AT)
+            )
+            await session.commit()
+
+        blocked = _draft(stream_id=stream_id, idempotency_key=_unique("key"))
+        async with factory() as session:
+            with pytest.raises(StreamQuarantinedError) as caught:
+                await LedgerRepository.append(session, [ResolvedEvent(draft=blocked)])
+            await session.rollback()
+        assert caught.value.stream_id == stream_id
+
+        async with factory() as session:
+            stream = await session.get(EventStreamRow, stream_id)
+            assert stream is not None
+            assert stream.last_sequence == 1
+            assert await session.get(EventRow, blocked.event_id) is None
 
     asyncio.run(exercise())
