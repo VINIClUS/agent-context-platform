@@ -223,6 +223,15 @@ def test_secrets_never_appear_in_repr_or_validation_errors() -> None:
 
 
 def test_installed_sdk_matches_the_pinned_public_version() -> None:
+    import tomllib
+    from pathlib import Path
+
     from agent_context_sdk import __version__
 
-    assert __version__ == "0.1.0"
+    pyproject = tomllib.loads(
+        (Path(__file__).resolve().parents[2] / "pyproject.toml").read_text(encoding="utf-8")
+    )
+    pinned = pyproject["tool"]["agent-context"]["sdk"]
+
+    assert __version__ == pinned["version"] == "0.2.0"
+    assert f"agent-context-sdk=={pinned['version']}" in pyproject["project"]["dependencies"]
