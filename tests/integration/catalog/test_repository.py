@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
@@ -29,12 +28,8 @@ pytestmark = pytest.mark.integration
 
 
 @pytest.fixture(scope="module")
-def catalog_engine() -> Iterator[AsyncEngine]:
-    dsn = os.environ.get("AGENT_CONTEXT_TEST_POSTGRES_DSN")
-    if dsn is None:
-        pytest.skip("AGENT_CONTEXT_TEST_POSTGRES_DSN is required for PostgreSQL tests")
-
-    engine = create_async_engine(dsn, poolclass=NullPool)
+def catalog_engine(postgres_dsn: str) -> Iterator[AsyncEngine]:
+    engine = create_async_engine(postgres_dsn, poolclass=NullPool)
 
     async def create_catalog() -> None:
         async with engine.begin() as connection:
