@@ -36,7 +36,7 @@ from datetime import UTC, datetime
 from typing import Any, cast
 from uuid import UUID as PythonUUID
 
-from agent_context_sdk import (  # type: ignore[import-untyped]
+from agent_context_sdk import (  # type: ignore[import-untyped, unused-ignore]
     ContentRefV1,
     EventDraftV1,
     RedactionReportV1,
