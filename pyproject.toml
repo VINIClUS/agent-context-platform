@@ -5,7 +5,7 @@ description = "Authoritative context ledger, projections, retrieval, and MCP ser
 readme = "README.md"
 requires-python = ">=3.12,<3.15"
 dependencies = [
-    "agent-context-sdk==0.1.0",
+    "agent-context-sdk==0.2.0",
     "alembic>=1.19.1,<2",
     "boto3>=1.43.76,<2",
     "fastapi>=0.141.1,<1",
@@ -77,11 +77,11 @@ select = ["E4", "E7", "E9", "F", "I", "B", "UP", "SIM", "RUF"]
 required-version = "==0.11.28"
 
 [tool.uv.sources]
-agent-context-sdk = { path = "build/sdk/agent_context_sdk-0.1.0-py3-none-any.whl" }
+agent-context-sdk = { path = "build/sdk/agent_context_sdk-0.2.0-py3-none-any.whl" }
 
 [tool.agent-context.sdk]
 repository = "VINIClUS/agent-context-sdk"
-version = "0.1.0"
-tag = "v0.1.0"
-commit = "a9179deb97a0402112a5bf1ebf3ba97ec547aa6c"
-wheel-sha256 = "13cf6b39cae0d563e1f8f7ab263674407a81c497aee0f658a92a3a1ff21d3be1"
+version = "0.2.0"
+tag = "v0.2.0"
+commit = "16dc446fffbb22fdc1804edd2aab052e02487210"
+wheel-sha256 = "e431809065c2d7820ad89f529cf5eed9cf98ac007b22f93bc01df9cd754eae62"
