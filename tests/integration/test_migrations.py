@@ -29,6 +29,7 @@ EXPECTED_TABLES = {
         "project_repositories",
         "checkouts",
         "content_objects",
+        "inline_contents",
     },
     "ledger": {
         "event_streams",
@@ -84,6 +85,14 @@ EXPECTED_COLUMNS = {
         "id",
         "created_at",
         "observed_at",
+    },
+    "catalog.inline_contents": {
+        "inline_id",
+        "content_sha256",
+        "media_type",
+        "uncompressed_bytes",
+        "data",
+        "created_at",
     },
     "ledger.event_streams": {
         "stream_id",
@@ -227,8 +236,13 @@ EXPECTED_COLUMNS = {
 
 
 def test_alembic_configuration_exposes_one_initial_head() -> None:
+    # Use `history`, not `heads`, so this keeps checking that the whole
+    # migration chain still resolves to a single head and still traces
+    # back to the original "initial ledger" revision, even as later
+    # revisions (whose own docstrings will not mention "initial ledger")
+    # are appended on top of it.
     result = subprocess.run(
-        [sys.executable, "-m", "alembic", "heads", "--verbose"],
+        [sys.executable, "-m", "alembic", "history", "--verbose"],
         cwd=PROJECT_ROOT,
         check=False,
         capture_output=True,
@@ -415,6 +429,8 @@ async def _assert_constraint_contract(connection: AsyncConnection) -> None:
         "fk_event_streams_last_event_id_events": "a",
         "fk_events_stream_id_event_streams": "a",
         "fk_event_content_refs_event_id_events": "a",
+        "fk_event_content_refs_inline_id_inline_contents": "a",
+        "fk_event_content_refs_object_key_content_objects": "a",
         "fk_redaction_reports_event_id_event_content_refs": "a",
         "fk_outbox_event_id_events": "a",
         "fk_projection_checkpoints_last_outbox_id_outbox": "a",
@@ -492,12 +508,12 @@ async def _assert_role_contract(connection: AsyncConnection) -> None:
             text("SELECT has_schema_privilege('agent_context_api', :schema, 'CREATE')"),
             {"schema": schema},
         )
-    for schema in {"ledger", "projection"}:
+    for schema in {"ledger", "projection", "catalog"}:
         assert await connection.scalar(
             text("SELECT has_schema_privilege('agent_context_projector', :schema, 'USAGE')"),
             {"schema": schema},
         )
-    for schema in {"catalog", "operations"}:
+    for schema in {"operations"}:
         assert not await connection.scalar(
             text("SELECT has_schema_privilege('agent_context_projector', :schema, 'USAGE')"),
             {"schema": schema},
@@ -606,6 +622,12 @@ EXPECTED_CONSTRAINT_NAMES = {
     "ck_content_objects_object_key_not_empty",
     "ck_content_objects_compressed_bytes_nonnegative",
     "ck_content_objects_uncompressed_bytes_nonnegative",
+    "pk_inline_contents",
+    "uq_inline_contents_content_sha256",
+    "ck_inline_contents_content_sha256_format",
+    "ck_inline_contents_inline_id_matches_digest",
+    "ck_inline_contents_uncompressed_bytes_bound",
+    "ck_inline_contents_data_length_matches",
     "pk_event_streams",
     "fk_event_streams_last_event_id_events",
     "ck_event_streams_non_negative_last_sequence",
@@ -624,6 +646,8 @@ EXPECTED_CONSTRAINT_NAMES = {
     "ck_events_previous_hash_matches_sequence",
     "pk_event_content_refs",
     "fk_event_content_refs_event_id_events",
+    "fk_event_content_refs_inline_id_inline_contents",
+    "fk_event_content_refs_object_key_content_objects",
     "ck_event_content_refs_content_sha256_lower_hex",
     "ck_event_content_refs_non_negative_uncompressed_bytes",
     "ck_event_content_refs_storage_form",
@@ -733,6 +757,7 @@ EXPECTED_TABLE_GRANTS = (
         {"SELECT", "INSERT"},
     )
     | _table_grants("agent_context_projector", LEDGER_TABLES, {"SELECT"})
+    | _table_grants("agent_context_projector", {"catalog.inline_contents"}, {"SELECT"})
     | _table_grants("agent_context_projector", {"projection.outbox"}, {"SELECT"})
     | _table_grants(
         "agent_context_projector",

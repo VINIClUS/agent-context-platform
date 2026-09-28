@@ -26,10 +26,15 @@ from agent_context_platform.catalog.repository import (
     normalize_remote,
 )
 
+# Registers InlineContentRow on the shared CatalogBase.metadata so this
+# module's assertions are correct regardless of test collection order
+# (i.e. whether some other module has already imported content.models).
+from agent_context_platform.content.models import InlineContentRow  # noqa: F401
+
 pytestmark = pytest.mark.unit
 
 
-def test_catalog_metadata_defines_the_six_schema_qualified_tables() -> None:
+def test_catalog_metadata_defines_the_schema_qualified_tables() -> None:
     assert set(CatalogBase.metadata.tables) == {
         "catalog.workspaces",
         "catalog.projects",
@@ -37,6 +42,7 @@ def test_catalog_metadata_defines_the_six_schema_qualified_tables() -> None:
         "catalog.project_repositories",
         "catalog.checkouts",
         "catalog.content_objects",
+        "catalog.inline_contents",
     }
 
 
@@ -89,6 +95,10 @@ def test_catalog_constraints_encode_domain_identity_and_content_invariants() -> 
         "ck_content_objects_object_key_not_empty",
         "ck_content_objects_compressed_bytes_nonnegative",
         "ck_content_objects_uncompressed_bytes_nonnegative",
+        "ck_inline_contents_content_sha256_format",
+        "ck_inline_contents_inline_id_matches_digest",
+        "ck_inline_contents_uncompressed_bytes_bound",
+        "ck_inline_contents_data_length_matches",
     }
 
 

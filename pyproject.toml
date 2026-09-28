@@ -66,6 +66,12 @@ warn_unreachable = true
 module = ["boto3", "botocore.*", "agent_context_sdk"]
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+# agent-context-sdk 0.2.0 ships no py.typed marker in its wheel even
+# though its own source is fully annotated; same treatment as boto3 above.
+module = ["agent_context_sdk", "agent_context_sdk.*"]
+ignore_missing_imports = true
+
 [tool.ruff]
 line-length = 100
 target-version = "py312"
