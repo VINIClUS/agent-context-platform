@@ -233,5 +233,5 @@ def test_installed_sdk_matches_the_pinned_public_version() -> None:
     )
     pinned = pyproject["tool"]["agent-context"]["sdk"]
 
-    assert __version__ == pinned["version"] == "0.2.0"
+    assert __version__ == pinned["version"]
     assert f"agent-context-sdk=={pinned['version']}" in pyproject["project"]["dependencies"]
