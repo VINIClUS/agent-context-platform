@@ -66,6 +66,29 @@ uv run --frozen pytest -q
 Pytest registers the `unit`, `integration`, `contract`, and `e2e` markers. The suite enforces 90%
 branch coverage.
 
+## Integration tests
+
+Tests marked `integration` under `tests/integration/` exercise real PostgreSQL, Neo4j, and Garage
+(S3-compatible) services. `scripts/test-services.sh` manages a disposable, isolated stack for them
+via `compose.test.yml`: every service binds to `127.0.0.1` on an ephemeral port, and none of its
+state survives `down`.
+
+```bash
+scripts/test-services.sh up             # start services, wait for health, bootstrap Garage
+eval "$(scripts/test-services.sh env)"  # export AGENT_CONTEXT_TEST_* variables
+uv run --frozen pytest -q               # or: pytest -q -m integration
+scripts/test-services.sh down           # stop services and remove all state
+```
+
+`env` exports `AGENT_CONTEXT_TEST_POSTGRES_DSN`,
+`AGENT_CONTEXT_TEST_NEO4J_{URI,USERNAME,PASSWORD,DATABASE}`, and
+`AGENT_CONTEXT_TEST_S3_{ENDPOINT_URL,REGION_NAME,BUCKET_NAME,ACCESS_KEY_ID,SECRET_ACCESS_KEY}`.
+Without the exported variables, the PostgreSQL, Neo4j, and S3 integration tests skip individually
+instead of failing the run. The `integration` CI job runs the same script before the suite and always
+tears the stack down afterwards. `scripts/test-services.sh status` shows the running containers.
+`AGENT_CONTEXT_TEST_PROJECT` overrides the derived Compose project name, which otherwise comes from
+this checkout's path so concurrent worktrees never collide.
+
 ## Development workflow
 
 Create feature worktrees as siblings of repository checkouts, using an immutable SHA captured from

@@ -6,6 +6,7 @@ import os
 import pytest
 
 from agent_context_platform.projection import Neo4jStore, Neo4jTransaction, ensure_schema
+from agent_context_platform.projection.schema import CONSTRAINT_STATEMENTS, INDEX_STATEMENTS
 from agent_context_platform.settings import Neo4jSettings
 
 pytestmark = pytest.mark.integration
@@ -208,13 +209,30 @@ def test_schema_is_idempotent_and_matches_the_complete_manifest() -> None:
                     "Neo4j integration variables must reference a clean disposable database"
                 )
 
-            await ensure_schema(store)
-            await ensure_schema(store)
+            try:
+                await ensure_schema(store)
+                await ensure_schema(store)
 
-            assert await store.execute_read(read_constraints) == EXPECTED_CONSTRAINTS
-            assert await store.execute_read(read_indexes) == EXPECTED_INDEXES
-            vector_config = await store.execute_read(read_vector_config)
-            assert vector_config["vector.dimensions"] == 384
-            assert str(vector_config["vector.similarity_function"]).lower() == "cosine"
+                assert await store.execute_read(read_constraints) == EXPECTED_CONSTRAINTS
+                assert await store.execute_read(read_indexes) == EXPECTED_INDEXES
+                vector_config = await store.execute_read(read_vector_config)
+                assert vector_config["vector.dimensions"] == 384
+                assert str(vector_config["vector.similarity_function"]).lower() == "cosine"
+            finally:
+                # Community edition has one database, so leave it exactly as
+                # found: drop everything ensure_schema created, regardless
+                # of outcome, so a second run against the same live Neo4j
+                # instance sees the same clean state this test started from.
+                await _drop_schema(store)
 
     asyncio.run(exercise())
+
+
+async def _drop_schema(store: Neo4jStore) -> None:
+    async def drop(transaction: Neo4jTransaction) -> None:
+        for statement in CONSTRAINT_STATEMENTS:
+            await transaction.run(f"DROP CONSTRAINT {statement.name} IF EXISTS", parameters={})
+        for statement in INDEX_STATEMENTS:
+            await transaction.run(f"DROP INDEX {statement.name} IF EXISTS", parameters={})
+
+    await store.execute_write(drop)

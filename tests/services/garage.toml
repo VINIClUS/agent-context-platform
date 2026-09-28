@@ -1,0 +1,21 @@
+# Throwaway single-node Garage configuration for the integration test stack.
+#
+# This file backs the `garage` service in compose.test.yml only. It is not
+# used in production -- see agent-context-infra for the production Garage
+# configuration and secret handling. The rpc_secret below is a fixed,
+# non-sensitive value: the container only ever listens on 127.0.0.1 and is
+# destroyed by `scripts/test-services.sh down` after every test run.
+
+replication_factor = 1
+consistency_mode = "consistent"
+
+metadata_dir = "/var/lib/garage/metadata"
+data_dir = "/var/lib/garage/data"
+db_engine = "sqlite"
+
+rpc_bind_addr = "[::]:3901"
+rpc_secret = "db63019b3092cd267f8b70078ae4103dd91a236a0e147818e2106dbd7ba8559e"
+
+[s3_api]
+s3_region = "garage"
+api_bind_addr = "[::]:3900"

@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import os
 import re
 import subprocess
 import sys
@@ -241,32 +240,37 @@ def test_alembic_configuration_exposes_one_initial_head() -> None:
     assert "initial ledger" in result.stdout.lower()
 
 
-def test_initial_migration_round_trip_and_privileges() -> None:
-    dsn = os.environ.get("AGENT_CONTEXT_TEST_POSTGRES_DSN")
-    if dsn is None:
-        pytest.skip("AGENT_CONTEXT_TEST_POSTGRES_DSN is required for PostgreSQL tests")
-
-    asyncio.run(_exercise_migration(dsn))
+def test_initial_migration_round_trip_and_privileges(postgres_dsn: str) -> None:
+    asyncio.run(_exercise_migration(postgres_dsn))
 
 
 async def _exercise_migration(dsn: str) -> None:
     engine = create_async_engine(dsn, poolclass=NullPool)
     try:
         async with engine.connect() as connection:
-            await _assert_prerequisites(connection)
-            await _run_alembic(connection, command.upgrade, "head")
-            await connection.commit()
-            await _assert_head(connection)
+            try:
+                await _assert_prerequisites(connection)
+                await _run_alembic(connection, command.upgrade, "head")
+                await connection.commit()
+                await _assert_head(connection)
 
-            await _run_alembic(connection, command.downgrade, "base")
-            await connection.commit()
-            await _assert_base(connection)
+                await _run_alembic(connection, command.downgrade, "base")
+                await connection.commit()
+                await _assert_base(connection)
 
-            await _run_alembic(connection, command.upgrade, "head")
-            await connection.commit()
-            await _assert_head(connection)
-            await _run_alembic_check(connection)
-            _assert_direct_async_connection_is_rejected(connection)
+                await _run_alembic(connection, command.upgrade, "head")
+                await connection.commit()
+                await _assert_head(connection)
+                await _run_alembic_check(connection)
+                _assert_direct_async_connection_is_rejected(connection)
+            finally:
+                # Leave the cluster clean regardless of outcome: the two
+                # managed roles are cluster-global and would otherwise
+                # survive this test's own disposable database, breaking a
+                # second run against the same live services.
+                await connection.rollback()
+                await _run_alembic(connection, command.downgrade, "base")
+                await connection.commit()
     finally:
         await engine.dispose()
 

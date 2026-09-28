@@ -1,0 +1,59 @@
+# Ephemeral integration-test services for agent-context-platform.
+#
+# Provisions disposable PostgreSQL, Neo4j, and Garage (S3-compatible)
+# instances for the integration test suite. Every service binds to
+# 127.0.0.1 on an ephemeral host port and keeps no state beyond its own
+# container writable layer, so `docker compose down` (with or without `-v`)
+# always leaves a completely clean slate. There are no named volumes.
+#
+# Manage this stack with scripts/test-services.sh rather than invoking
+# `docker compose` directly -- it derives an isolated project name and
+# bootstraps Garage credentials.
+
+services:
+  postgres:
+    image: postgres:18.4-bookworm@sha256:882236b897e39051d2368c5ccc6cda944904723506b2dfc97f2a8f5bc9afa382
+    environment:
+      POSTGRES_USER: agent_context_test
+      POSTGRES_PASSWORD: agent_context_test
+      POSTGRES_DB: postgres
+    ports:
+      - "127.0.0.1::5432"
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U agent_context_test -d postgres"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 10s
+
+  neo4j:
+    image: neo4j:5.26.29-community-trixie@sha256:f79a46ab4e8d6fd8eeae8dd346a801413d8eed4ddc3c079a42a7e98cc9de9804
+    environment:
+      NEO4J_AUTH: "neo4j/agent-context-test"
+      NEO4J_server_memory_heap_initial__size: "256m"
+      NEO4J_server_memory_heap_max__size: "256m"
+      NEO4J_server_memory_pagecache_size: "128m"
+    ports:
+      - "127.0.0.1::7474"
+      - "127.0.0.1::7687"
+    healthcheck:
+      test: ["CMD-SHELL", "cypher-shell -u neo4j -p agent-context-test -a bolt://localhost:7687 'RETURN 1'"]
+      interval: 5s
+      timeout: 10s
+      retries: 30
+      start_period: 60s
+
+  garage:
+    image: dxflrs/garage:v2.3.0@sha256:866bd13ed2038ba7e7190e840482bc27234c4afaf77be8cfa439ae088c1e4690
+    volumes:
+      - ./tests/services/garage.toml:/etc/garage.toml:ro
+    environment:
+      GARAGE_CONFIG_FILE: /etc/garage.toml
+    ports:
+      - "127.0.0.1::3900"
+    healthcheck:
+      test: ["CMD", "/garage", "status"]
+      interval: 2s
+      timeout: 5s
+      retries: 30
+      start_period: 5s
