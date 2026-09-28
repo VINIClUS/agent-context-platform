@@ -80,8 +80,12 @@ uv run --frozen pytest -q               # or: pytest -q -m integration
 scripts/test-services.sh down           # stop services and remove all state
 ```
 
+`env` exports `AGENT_CONTEXT_TEST_POSTGRES_DSN`,
+`AGENT_CONTEXT_TEST_NEO4J_{URI,USERNAME,PASSWORD,DATABASE}`, and
+`AGENT_CONTEXT_TEST_S3_{ENDPOINT_URL,REGION_NAME,BUCKET_NAME,ACCESS_KEY_ID,SECRET_ACCESS_KEY}`.
 Without the exported variables, the PostgreSQL, Neo4j, and S3 integration tests skip individually
-instead of failing the run. `scripts/test-services.sh status` shows the running containers.
+instead of failing the run. The `integration` CI job runs the same script before the suite and always
+tears the stack down afterwards. `scripts/test-services.sh status` shows the running containers.
 `AGENT_CONTEXT_TEST_PROJECT` overrides the derived Compose project name, which otherwise comes from
 this checkout's path so concurrent worktrees never collide.
 

@@ -33,6 +33,7 @@ readonly POSTGRES_DB="postgres"
 
 readonly NEO4J_USERNAME="neo4j"
 readonly NEO4J_PASSWORD="agent-context-test"
+readonly NEO4J_DATABASE="neo4j"
 
 readonly S3_BUCKET="agent-context-test"
 readonly S3_KEY_NAME="agent-context-test"
@@ -100,6 +101,7 @@ export AGENT_CONTEXT_TEST_POSTGRES_DSN="postgresql+psycopg://${POSTGRES_USER}:${
 export AGENT_CONTEXT_TEST_NEO4J_URI="bolt://127.0.0.1:${neo4j_bolt_port}"
 export AGENT_CONTEXT_TEST_NEO4J_USERNAME="${NEO4J_USERNAME}"
 export AGENT_CONTEXT_TEST_NEO4J_PASSWORD="${NEO4J_PASSWORD}"
+export AGENT_CONTEXT_TEST_NEO4J_DATABASE="${NEO4J_DATABASE}"
 export AGENT_CONTEXT_TEST_S3_ENDPOINT_URL="http://127.0.0.1:${s3_port}"
 export AGENT_CONTEXT_TEST_S3_REGION_NAME="garage"
 export AGENT_CONTEXT_TEST_S3_BUCKET_NAME="${S3_BUCKET}"
