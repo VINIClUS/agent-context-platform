@@ -44,6 +44,13 @@ CONFIG = CodexOtelMapperConfig(
     producer=ProducerV1(producer_id="codex-otel", name="codex-otel-mapper", version="1"),
     stream_id="codex-otel-stream",
 )
+LOG_CONFIG = CodexOtelMapperConfig(
+    hmac_key=b"k" * 32,
+    producer=CONFIG.producer,
+    stream_id="codex-otel-stream",
+    accepted_signal=OtelSignal.LOG,
+)
+FREE_TEXT_CANARY = "CANARY-FREE-TEXT-do-not-store"
 
 
 def _load(name: str) -> CodexOtelRecord:
@@ -56,29 +63,29 @@ def _load(name: str) -> CodexOtelRecord:
 def _record(
     attributes: dict[str, object] | None = None, resource: dict[str, object] | None = None
 ) -> CodexOtelRecord:
-    base = _load("conversation_starts.log.json")
+    base = _load("conversation_starts.trace.json")
     return CodexOtelRecord(
-        signal=OtelSignal.LOG,
+        signal=OtelSignal.TRACE,
         resource=base.resource if resource is None else resource,
         attributes=base.attributes if attributes is None else attributes,
     )
 
 
 def _attrs(**changes: object) -> dict[str, object]:
-    attributes = dict(_load("conversation_starts.log.json").attributes)
+    attributes = dict(_load("conversation_starts.trace.json").attributes)
     attributes.update(changes)
     return {k: v for k, v in attributes.items() if v is not None}
 
 
-def _reason(record: CodexOtelRecord) -> RejectionReason:
+def _reason(record: CodexOtelRecord, config: CodexOtelMapperConfig = CONFIG) -> RejectionReason:
     with pytest.raises(CodexOtelError) as info:
-        map_record(CONFIG, record, observed_at=OBSERVED)
+        map_record(config, record, observed_at=OBSERVED)
     assert str(info.value) == info.value.reason.value
     return info.value.reason
 
 
 def test_conversation_starts_maps_to_a_registered_session_started_event() -> None:
-    draft = map_record(CONFIG, _load("conversation_starts.log.json"), observed_at=OBSERVED)
+    draft = map_record(CONFIG, _load("conversation_starts.trace.json"), observed_at=OBSERVED)
     assert draft is not None
     assert ("agent.session.started", draft.schema_version) in EVENT_PAYLOAD_MODELS
     assert draft.event_type == "agent.session.started"
@@ -92,21 +99,21 @@ def test_conversation_starts_maps_to_a_registered_session_started_event() -> Non
     }
     EVENT_PAYLOAD_MODELS[("agent.session.started", "1.0.0")].model_validate(dict(draft.payload))
     assert draft.context.session_id == CONVERSATION_ID
-    assert draft.occurred_at == datetime(2026, 8, 13, 13, 0, 0, 123000, tzinfo=UTC)
+    assert draft.occurred_at == datetime(2026, 8, 13, 13, 0, 0, 124000, tzinfo=UTC)
     assert draft.observed_at == OBSERVED
     assert draft.redaction.disposition == "metadata_only"
     assert draft.content_claims == ()
 
 
 def test_idempotency_key_is_deterministic_keyed_and_reveals_no_values() -> None:
-    record = _load("conversation_starts.log.json")
+    record = _load("conversation_starts.trace.json")
     first = map_record(CONFIG, record, observed_at=OBSERVED)
     again = map_record(CONFIG, record, observed_at=datetime(2030, 1, 1, tzinfo=UTC))
     assert first is not None and again is not None
     assert first.idempotency_key == again.idempotency_key
     assert first.event_id != again.event_id
     assert CONVERSATION_ID in first.idempotency_key
-    assert "2026-08-13T13:00:00.123Z" in first.idempotency_key
+    assert "2026-08-13T13:00:00.124Z" in first.idempotency_key
     for value in ("gpt-5.5", "workspace-write", "on-request"):
         assert value not in first.idempotency_key
 
@@ -118,7 +125,7 @@ def test_idempotency_key_is_deterministic_keyed_and_reveals_no_values() -> None:
 
     later = map_record(
         CONFIG,
-        _record(_attrs(**{"event.timestamp": "2026-08-13T13:00:00.124Z"})),
+        _record(_attrs(**{"event.timestamp": "2026-08-13T13:00:00.125Z"})),
         observed_at=OBSERVED,
     )
     changed = map_record(CONFIG, _record(_attrs(model="other")), observed_at=OBSERVED)
@@ -132,8 +139,62 @@ def test_the_key_needs_at_least_32_bytes() -> None:
         CodexOtelMapperConfig(hmac_key=b"k" * 31, producer=CONFIG.producer, stream_id="s")
 
 
-def test_only_the_log_signal_is_accepted() -> None:
-    assert _reason(_load("conversation_starts.trace.json")) is RejectionReason.UNSUPPORTED_SIGNAL
+def test_the_default_config_accepts_only_the_trace_signal() -> None:
+    assert CONFIG.accepted_signal is OtelSignal.TRACE
+    assert _reason(_load("conversation_starts.log.json")) is RejectionReason.UNSUPPORTED_SIGNAL
+
+
+def test_the_log_signal_is_accepted_only_when_configured_and_never_both() -> None:
+    log = _load("conversation_starts.log.json")
+    draft = map_record(LOG_CONFIG, log, observed_at=OBSERVED)
+    assert draft is not None
+    assert draft.occurred_at == datetime(2026, 8, 13, 13, 0, 0, 123000, tzinfo=UTC)
+    assert "2026-08-13T13:00:00.123Z" in draft.idempotency_key
+    assert _reason(_load("conversation_starts.trace.json"), LOG_CONFIG) is (
+        RejectionReason.UNSUPPORTED_SIGNAL
+    )
+    dumped = draft.model_dump_json()
+    for canary in ("canary-user@example.invalid", "acct-canary-7f3a"):
+        assert canary not in dumped and canary not in draft.idempotency_key
+
+
+def test_the_accepted_signal_must_be_a_known_signal() -> None:
+    with pytest.raises(ValueError, match="accepted_signal"):
+        CodexOtelMapperConfig(
+            hmac_key=b"k" * 32,
+            producer=CONFIG.producer,
+            stream_id="s",
+            accepted_signal="log",  # type: ignore[arg-type]
+        )
+
+
+def test_free_text_attributes_are_never_read_or_stored() -> None:
+    attributes = _attrs(
+        **{
+            "error.message": FREE_TEXT_CANARY,
+            "provider_name": FREE_TEXT_CANARY,
+            "auth.env_provider_key_name": FREE_TEXT_CANARY,
+            "slug": FREE_TEXT_CANARY,
+            "terminal.type": FREE_TEXT_CANARY,
+            "app.version": FREE_TEXT_CANARY,
+            "reasoning_effort": FREE_TEXT_CANARY,
+            "prompt": FREE_TEXT_CANARY,
+        }
+    )
+    draft = map_record(CONFIG, _record(attributes), observed_at=OBSERVED)
+    assert draft is not None
+    assert FREE_TEXT_CANARY not in draft.model_dump_json()
+    assert FREE_TEXT_CANARY not in draft.idempotency_key
+    baseline = map_record(CONFIG, _record(), observed_at=OBSERVED)
+    assert baseline is not None and baseline.idempotency_key == draft.idempotency_key
+
+    # Even a malformed or oversized value in a never-read attribute cannot leak into an error.
+    bad = _attrs(**{"error.message": FREE_TEXT_CANARY * 1000, "extra": FREE_TEXT_CANARY})
+    assert map_record(CONFIG, _record(bad), observed_at=OBSERVED) is not None
+    failing = _attrs(**{"error.message": FREE_TEXT_CANARY, "conversation.id": None})
+    with pytest.raises(CodexOtelError) as info:
+        map_record(CONFIG, _record(failing), observed_at=OBSERVED)
+    assert FREE_TEXT_CANARY not in str(info.value) + repr(info.value.args)
 
 
 @pytest.mark.parametrize(
@@ -151,7 +212,7 @@ def test_only_the_log_signal_is_accepted() -> None:
 def test_events_without_an_sdk_contract_map_to_nothing(name: str) -> None:
     record = _load(name)
     assert record.attributes["event.name"] in GAP_EVENT_NAMES
-    assert map_record(CONFIG, record, observed_at=OBSERVED) is None
+    assert map_record(LOG_CONFIG, record, observed_at=OBSERVED) is None
 
 
 def test_unknown_codex_events_map_to_nothing() -> None:
@@ -160,7 +221,12 @@ def test_unknown_codex_events_map_to_nothing() -> None:
 
 
 def test_content_and_personal_attributes_never_reach_the_draft() -> None:
-    attributes = _attrs(prompt=CANARIES[0], arguments=CANARIES[1], output=CANARIES[2])
+    attributes = _attrs(
+        prompt=CANARIES[0],
+        arguments=CANARIES[1],
+        output=CANARIES[2],
+        **{"user.email": CANARIES[3], "user.account_id": CANARIES[4]},
+    )
     draft = map_record(CONFIG, _record(attributes), observed_at=OBSERVED)
     assert draft is not None
     dumped = draft.model_dump_json()
@@ -201,9 +267,8 @@ def test_platform_origin_telemetry_is_rejected_to_prevent_loops(service: str) ->
     record = _record(resource={"service.name": service})
     assert _reason(record) is RejectionReason.PLATFORM_ORIGIN
     gap = _load("api_request.log.json")
-    assert _reason(CodexOtelRecord(gap.signal, {"service.name": service}, gap.attributes)) is (
-        RejectionReason.PLATFORM_ORIGIN
-    )
+    gap_record = CodexOtelRecord(gap.signal, {"service.name": service}, gap.attributes)
+    assert _reason(gap_record, LOG_CONFIG) is RejectionReason.PLATFORM_ORIGIN
 
 
 @pytest.mark.parametrize("service", ["otelcol", "codex-cli", "codex_cli_rs2", "", "x" * 500])
@@ -292,6 +357,6 @@ def test_naive_observed_at_is_an_invalid_event() -> None:
 
 def test_mapping_doc_lists_every_gap_event_and_the_tags() -> None:
     doc = MAPPING_DOC.read_text()
-    for name in (*GAP_EVENT_NAMES, "codex.conversation_starts", "SDK-019"):
+    for name in (*GAP_EVENT_NAMES, "codex.conversation_starts", "SDK-019", "CODEX-050"):
         assert name in doc, name
     assert "rust-v0.147.0" in doc and "rust-v0.157.1" in doc

@@ -1,6 +1,6 @@
 {
   "_provenance": "source-derived (hand-built from codex-rs/otel/src/events/session_telemetry.rs and shared.rs at rust-v0.147.0 and rust-v0.157.1); not a captured export; G4 diffs against a real sandbox export",
-  "description": "codex.conversation_starts, trace-safe variant (mcp_server_count instead of mcp_servers; no user.*)",
+  "description": "codex.conversation_starts, trace-safe variant (trace_event!: mcp_server_count instead of mcp_servers; no user.account_id / user.email)",
   "signal": "trace",
   "resource": {
     "service.name": "codex_cli_rs",
@@ -12,6 +12,7 @@
     "auth.env_openai_api_key_present": false,
     "auth.env_codex_api_key_present": false,
     "auth.env_codex_api_key_enabled": false,
+    "auth.env_provider_key_present": false,
     "auth.env_refresh_token_url_override_present": false,
     "reasoning_effort": "medium",
     "reasoning_summary": "auto",
@@ -26,6 +27,7 @@
     "originator": "codex_cli_rs",
     "terminal.type": "xterm",
     "model": "gpt-5.5",
-    "slug": "gpt-5.5"
+    "slug": "gpt-5.5",
+    "auth_mode": "chatgpt"
   }
 }

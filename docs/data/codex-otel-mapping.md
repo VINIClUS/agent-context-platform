@@ -20,10 +20,18 @@ sandbox export.
 
 ## Input contract
 
-- **Signal.** Only the OTLP *log* signal is mapped. Codex emits most events twice (`log_event!`
-  and `trace_event!`) with different attribute sets and independently computed `event.timestamp`
-  values (`shared.rs`), so consuming both would break idempotency. Trace-safe records are
-  rejected with `unsupported_signal`.
+- **Signal (CODEX-050).** Exactly one OTLP signal is consumed, chosen by the mapper config field
+  `accepted_signal` (default `trace`); the other is rejected with `unsupported_signal`, so a
+  deployment never consumes both. Codex emits most events twice (`log_event!` and `trace_event!`,
+  `shared.rs`) with independently computed `event.timestamp` values, so consuming both would
+  break idempotency. Decision CODEX-050: Codex OTel **logs are disabled** (`exporter = "none"`)
+  because log records carry tool `arguments` verbatim, tool `output` and
+  `user.email`/`user.account_id`; only trace-safe records (the `codex_otel.trace_safe` target,
+  `targets.rs`) and metrics are exported, to a loopback collector. The mapper therefore defaults
+  to `trace`; `accepted_signal=log` exists for tests and for a deliberately log-only deployment.
+  Log-only fields (`arguments`, `output`, `user.email`, `user.account_id`, `mcp_servers`,
+  `prompt`, `agent_name`) are never exported under the CODEX-050 config and are never read
+  under either signal.
 - **Loop prevention.** `service.name` (the Codex `originator`, or an explicit override:
   `otel_init.rs`) must be in the explicit allowlist `codex_cli_rs` (`DEFAULT_ORIGINATOR`,
   `default_client.rs`) or `codex_exec` (`set_default_originator`, `exec/src/lib.rs`). Names that
@@ -39,7 +47,12 @@ sandbox export.
   `CodexOtelError` carries only a fixed reason code, never an attribute value.
 - **Never read.** `prompt`, `arguments`, `output`, `error.message`, `user.email`,
   `user.account_id`, `auth.request_id`, `auth.cf_ray`, `auth.agent_id`, `auth.task_id`: content or
-  personal/identifying data (`log_event!` in `shared.rs`; `tool_result.rs`;
+  personal/identifying data. `error.message` is **free text that is also present on the trace
+  signal** (`record_api_request` `common` block and `sse_event` `trace_event!` in
+  `session_telemetry.rs`), so the trace signal is not free-text-free: the mapper reads
+  only the explicit allowlist below and a test seeds canaries in `error.message` and other
+  free-text attributes. Config-derived strings (`provider_name`, `auth.env_provider_key_name`,
+  `slug`, `terminal.type`, `app.version`, `reasoning_effort`) are likewise never read (`log_event!` in `shared.rs`; `tool_result.rs`;
   `session_telemetry.rs`). Codex gates prompt logging behind `log_user_prompt`; even when
   enabled the text stays out. Mapped events carry no content claims.
 - **Idempotency.** The key is
@@ -56,7 +69,7 @@ sandbox export.
 | Codex event | SDK event | Payload field | Source attribute | Notes | Codex file:tag |
 | --- | --- | --- | --- | --- | --- |
 | `codex.conversation_starts` | `agent.session.started` | `source` | (constant `codex_otel`) | | |
-| | | `session_id` | `conversation.id` | required; `[A-Za-z0-9._:-]{1,128}` | `events/shared.rs` (`log_event!`) @ both tags |
+| | | `session_id` | `conversation.id` | required; `[A-Za-z0-9._:-]{1,128}` | `events/shared.rs` (`trace_event!`, `log_event!`) @ both tags |
 | | | `model` | `model` | blank becomes null | `events/shared.rs` @ both tags |
 | | | `permission_mode` | `approval_policy` | closed set `untrusted`, `on-request`, `granular`, `never`; else null | `session_telemetry.rs::conversation_starts` @ both tags; `protocol.rs::AskForApproval` |
 | | | `sandbox_mode` | `sandbox_policy` | closed set `danger-full-access`, `read-only`, `external-sandbox`, `workspace-write`; else null (strum `Display` prints the variant only, never `writable_roots`) | `session_telemetry.rs::conversation_starts` @ both tags; `protocol.rs::SandboxPolicy` |
@@ -67,6 +80,34 @@ Present in both tags with identical names (checked by diff of `session_telemetry
 mapped from this event: `provider_name`, `reasoning_effort`, `reasoning_summary`,
 `context_window`, `auto_compact_token_limit`, `auth.*` presence flags, `mcp_servers` (log) /
 `mcp_server_count` (trace): no v0.3.2 field.
+
+### `codex.conversation_starts` attributes per signal
+
+Emitted by `session_telemetry.rs::conversation_starts` via `log_and_trace_event!` (`common`,
+`log`, `trace` blocks) with the per-signal macro suffixes from `shared.rs`; identical at
+`rust-v0.147.0` and `rust-v0.157.1`. "Read" means the mapper reads it; everything else is ignored.
+
+| Attribute | Log | Trace-safe | Read by mapper | Source (file:tag) |
+| --- | --- | --- | --- | --- |
+| `event.name` | yes | yes | yes (selects the event) | `session_telemetry.rs` `common` @ both tags |
+| `event.timestamp` | yes | yes | yes (`occurred_at`, key) | `shared.rs` `log_event!`/`trace_event!` @ both tags |
+| `conversation.id` | yes | yes | yes (`session_id`, key) | `shared.rs` @ both tags |
+| `model` | yes | yes | yes | `shared.rs` @ both tags |
+| `approval_policy` | yes | yes | yes (closed set) | `session_telemetry.rs` `common` @ both tags |
+| `sandbox_policy` | yes | yes | yes (closed set) | `session_telemetry.rs` `common` @ both tags |
+| `provider_name`, `reasoning_effort`, `reasoning_summary`, `context_window`, `auto_compact_token_limit`, `auth.env_*` (presence flags, `provider_key_name`) | yes | yes | no | `session_telemetry.rs` `common` @ both tags |
+| `slug`, `app.version`, `originator`, `terminal.type`, `auth_mode` | yes | yes | no | `shared.rs` @ both tags |
+| `mcp_servers` (server names, joined) | yes | no | no | `session_telemetry.rs` `log` block @ both tags |
+| `mcp_server_count` | no | yes | no | `session_telemetry.rs` `trace` block @ both tags |
+| `user.email`, `user.account_id` | yes | no | never | `shared.rs` `log_event!` only @ both tags |
+
+For the other events the trace-safe variant is the log variant minus `user.email` /
+`user.account_id` (`shared.rs`) and any `log:`-only block; `common:` attributes reach both
+signals. That includes free text and identifiers: `error.message` and `auth.request_id`,
+`auth.cf_ray`, `auth.error`, `auth.agent_id`, `auth.task_id` on `codex.api_request`
+(`record_api_request` `common` block) and `error.message` on `codex.sse_event` failures
+(`trace_event!` and `see_event_completed_failed`) @ both tags. These events are unmapped, and the
+mapper never reads these attributes.
 
 ## Recognised but unmapped: field-level gap table (input to SDK-019)
 
