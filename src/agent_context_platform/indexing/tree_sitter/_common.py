@@ -125,8 +125,9 @@ class Budget:
 
     Work limits (design numbers, see ``python.py``): ``MAX_NODES_PER_FILE`` bounds one file
     deterministically; ``CPU_SOFT_LIMIT`` (5 s from the start of the request) is a backstop on
-    CPU time, checked before each file's parse, inside the parse (progress callback, about
-    every 64 KiB) and every 2048 walked nodes. Worst case under the runner's ``RLIMIT_CPU`` of
+    CPU time, checked before each file's parse, inside the parse (a read callback that
+    reports end of input once spent, 4 KiB chunks; measured on 3.12 with 1 MiB of hostile
+    ``def (`` lines the parse ends within ~0.1 s of the deadline) and every 2048 walked nodes. Worst case under the runner's ``RLIMIT_CPU`` of
     10 s: interpreter and grammar start-up (~0.7 s, before the clock starts) + 5 s backstop +
     one check granularity (<0.1 s) + parent-side validation and JSON dump (~1.5 s for a 8 MiB
     output) = under 7.5 s. A file over budget degrades to no symbols; the rest continues.

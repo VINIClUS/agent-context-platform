@@ -471,9 +471,9 @@ def test_more_than_eight_callable_candidates_still_yield_no_edge() -> None:
 
 
 def test_a_batch_of_garbage_files_degrades_the_tail_not_the_process() -> None:
-    """5 x 1 MB of parser-hostile bytes (the 8 MiB request bound caps the batch at 5): no nonzero_exit."""
-    garbage = (b"def (\n" * 200_000)[:MAX_SOURCE_BYTES]  # never finishes parsing
-    files = [source(f"pkg/g{n}.py", garbage) for n in range(5)]
+    """6 x 1 MB of parser-hostile bytes: the CPU backstop degrades files, never nonzero_exit."""
+    garbage = (b"def (\n" * 200_000)[:1_000_000]  # never finishes parsing
+    files = [source(f"pkg/g{n}.py", garbage) for n in range(6)]
     files.append(source("pkg/ok.py", "def a():\n    pass\n"))
     started = time.monotonic()
     module = python_adapter().parse(request(*files))
@@ -515,3 +515,15 @@ def test_the_real_adapter_runs_confined_and_cannot_read_a_sibling_file(tmp_path:
         {},
     )
     assert json.loads(raw)["probe"][f"read:{sibling}"] == "EACCES"
+
+
+def test_a_hostile_parse_is_cut_inside_the_parse_by_the_cpu_backstop(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    """Error recovery on this input is quadratic (seconds for 1 MB): the read callback ends it."""
+    monkeypatch.setattr(_common.Budget, "CPU_SOFT_LIMIT", 0.5)
+    hostile = (b"def (\n" * 200_000)[:1_000_000]
+    started = time.process_time()
+    module = in_process(request(source("pkg/h.py", hostile)))
+    assert time.process_time() - started < 3
+    assert module.files[0].symbols == ()

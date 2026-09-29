@@ -109,6 +109,7 @@ _PROPERTY_NAMES: Final = frozenset({"property", "cached_property"})
 _PROPERTY_ATTRIBUTES: Final = frozenset({"setter", "getter", "deleter", "cached_property"})
 _CALLABLE_KINDS: Final = frozenset({"function", "method", "class"})
 
+_READ_CHUNK: Final = 4096
 _PARSER: Final = Parser(Language(tree_sitter_python.language()))
 
 
@@ -597,19 +598,28 @@ def _relations(
     return tuple(out)
 
 
-def _bounded_parse(content: bytes, budget: Budget) -> Tree:
-    """Parse under the CPU backstop: checked before, and during (progress callback)."""
+def _bounded_parse(content: bytes, budget: Budget, chunk: int = _READ_CHUNK) -> Tree:
+    """Parse under the CPU backstop: checked before the parse and on every chunk it reads.
+
+    py-tree-sitter's ``progress_callback`` is not used: it crashes the interpreter on the
+    cp312 and cp313 wheels (0.25.2 and 0.26.0). Instead the parser reads the source through a
+    read callback in small chunks; once the backstop is spent the callback reports end of
+    input (and keeps doing so), the parse unwinds, and the file degrades. Error recovery is
+    superlinear on hostile input, so the bound has to act inside the parse.
+    """
     budget.check()
+    stopped = False
 
     def read(offset: int, _point: object) -> bytes:
-        return content[offset : offset + 65536]
+        nonlocal stopped
+        if not stopped and budget.out_of_time():
+            stopped = True
+        return b"" if stopped else content[offset : offset + chunk]
 
-    try:
-        return _PARSER.parse(
-            read, encoding="utf8", progress_callback=lambda *_: budget.out_of_time()
-        )
-    except ValueError:  # the callback cancelled the parse
-        raise WorkBudgetExceeded from None
+    tree = _PARSER.parse(read, encoding="utf8")
+    if stopped:
+        raise WorkBudgetExceeded
+    return tree
 
 
 def _parse_file(source: SourceFile, budget: Budget, output: list[int]) -> ParsedFile:
