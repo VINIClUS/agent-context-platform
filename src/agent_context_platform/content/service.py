@@ -222,16 +222,16 @@ def _parse_json_strict(text_value: str) -> JsonValue:
     """Parse ``text_value`` as JSON, rejecting anything not safe to process further.
 
     ``json.loads`` uses CPython's C-accelerated scanner here, which recurses
-    in C, not Python, to walk nested arrays/objects. Since CPython 3.12 the
-    guard against runaway C recursion is sized from the actual C stack
-    available, not a fixed frame count -- so on a platform or thread with
-    enough stack, ``json.loads`` can fully parse input many callers would
-    consider pathologically deep instead of raising ``RecursionError`` (this
-    was reproduced with pytest passing locally while CI's Python 3.14 job,
-    matching platform and interpreter patch version, failed on the exact
-    same 50,000-deep fixture). The explicit, iterative ``_exceeds_max_json_depth``
-    check below is what makes rejection deterministic across every platform:
-    it runs whether or not ``json.loads`` itself happened to raise.
+    in C, not Python, to walk nested arrays/objects, guarded against runaway
+    C recursion by a check whose trip point is not a portable constant: it
+    was observed to vary by available C stack, not just by interpreter
+    version. 50,000 levels of nesting raised ``RecursionError`` during
+    parsing on every environment this suite ran on except one -- a CI job
+    running the identical CPython 3.14.6 patch release as a local run that
+    rejected the same input (reproduced locally with ``ulimit -s
+    unlimited``). The explicit, iterative ``_exceeds_max_json_depth`` check
+    below is what makes rejection deterministic across every platform: it
+    runs whether or not ``json.loads`` itself happened to raise.
     """
     try:
         parsed = json.loads(

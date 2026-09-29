@@ -269,12 +269,12 @@ def test_parse_json_strict_accepts_json_at_the_max_depth() -> None:
     """The boundary itself is not rejected -- only content deeper than it.
 
     Regression test for a CI-only failure: ``json.loads``'s C scanner
-    recurses in C, and CPython 3.12+ sizes its C-recursion guard from the
-    actual C stack available, not a fixed frame count. 50,000-deep input
-    (the fixture above) raised ``RecursionError`` during parsing on every
-    platform this suite has run on so far except one -- a GitHub Actions
-    Python 3.14 runner with more stack headroom than this repo's local dev
-    environment, despite both running the identical 3.14.6 patch release.
+    recurses in C, guarded against runaway C recursion by a check whose trip
+    point was observed to vary by available C stack, not just by
+    interpreter version. 50,000-deep input (the fixture above) raised
+    ``RecursionError`` during parsing on every environment this suite ran on
+    except one -- a GitHub Actions Python 3.14 runner, running the identical
+    3.14.6 patch release as a local run that rejected the same input.
     ``_exceeds_max_json_depth`` is what makes rejection deterministic
     regardless: it runs whether or not ``json.loads`` itself raised.
     """
