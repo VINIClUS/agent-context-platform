@@ -75,6 +75,8 @@ class OrphanSweeper:
         *,
         min_age: timedelta = timedelta(hours=24),
     ) -> None:
+        if min_age < timedelta(0):
+            raise ValueError(f"min_age must be >= 0, got {min_age}")
         self._client = client
         self._bucket_name = bucket_name
         self._session_factory = session_factory

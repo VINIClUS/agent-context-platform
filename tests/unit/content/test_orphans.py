@@ -257,3 +257,15 @@ def test_run_retains_objects_still_referenced_in_the_catalog() -> None:
         assert client.deleted == []
 
     _run(exercise())
+
+
+def test_constructor_rejects_a_negative_min_age() -> None:
+    """A negative grace period would put the cutoff in the future."""
+    with pytest.raises(ValueError, match="min_age"):
+        OrphanSweeper(
+            FakeS3Client([]), "bucket", FakeSessionFactory(set(), []), min_age=-timedelta(seconds=1)
+        )
+
+
+def test_constructor_allows_a_zero_min_age() -> None:
+    OrphanSweeper(FakeS3Client([]), "bucket", FakeSessionFactory(set(), []), min_age=timedelta(0))

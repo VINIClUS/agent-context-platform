@@ -285,6 +285,38 @@ def test_inline_ref_claiming_another_digest_violates_the_digest_binding(
     _run(exercise())
 
 
+def test_content_object_row_must_have_the_key_derived_from_its_digest(
+    content_session_factory: async_sessionmaker[AsyncSession],
+) -> None:
+    """A ``content_objects`` row cannot pair a key with another digest.
+
+    Together with ``object_key_matches_digest`` on the refs, this makes the
+    object FK imply digest equality: sweeper lookups by the key's digest find
+    exactly the row a ref points at.
+    """
+
+    async def exercise() -> None:
+        digest_a = hashlib.sha256(f"a-{time.time_ns()}".encode()).hexdigest()
+        digest_b = hashlib.sha256(f"b-{time.time_ns()}".encode()).hexdigest()
+        async with content_session_factory() as session:
+            with pytest.raises(IntegrityError) as exc_info:
+                async with session.begin():
+                    await session.execute(
+                        text(
+                            "INSERT INTO catalog.content_objects (content_sha256, object_key, "
+                            "media_type, compressed_bytes, uncompressed_bytes) "
+                            "VALUES (:digest, :key, 'text/plain', 1, 1)"
+                        ),
+                        {"digest": digest_b, "key": _key(digest_a)},
+                    )
+            assert (
+                exc_info.value.orig.diag.constraint_name
+                == "ck_content_objects_object_key_matches_digest"
+            )
+
+    _run(exercise())
+
+
 @pytest.mark.parametrize(
     "size",
     [pytest.param(256, id="inline"), pytest.param(INLINE_MAX_BYTES + 256, id="object")],

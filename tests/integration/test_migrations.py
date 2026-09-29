@@ -297,7 +297,12 @@ _LEGACY_DIGEST = hashlib.sha256(b"legacy-content-that-was-never-stored").hexdige
 
 @pytest.mark.parametrize(
     ("storage", "expected_counts"),
-    [("inline", "inline=1, object=0"), ("object", "inline=0, object=1")],
+    [
+        ("inline", "inline=1, object=0, object_digest=0"),
+        ("object", "inline=0, object=1, object_digest=0"),
+        # The key resolves to a row, but that row carries a different digest.
+        ("object_digest", "inline=0, object=0, object_digest=1"),
+    ],
 )
 def test_content_persistence_upgrade_refuses_legacy_refs_without_stored_content(
     postgres_dsn: str, storage: str, expected_counts: str
@@ -339,6 +344,7 @@ async def _exercise_legacy_refs(dsn: str, storage: str, expected_counts: str) ->
                 )
 
                 await connection.execute(text("DELETE FROM ledger.event_content_refs"))
+                await connection.execute(text("DELETE FROM catalog.content_objects"))
                 await connection.commit()
                 await _run_alembic(connection, command.upgrade, "head")
                 await connection.commit()
@@ -376,6 +382,16 @@ async def _seed_legacy_ref(connection: AsyncConnection, storage: str) -> None:
         {"event_id": event_id, "stream_id": stream_id, "digest": digest},
     )
     object_key = f"sha256/{_LEGACY_DIGEST[:2]}/{_LEGACY_DIGEST[2:4]}/{_LEGACY_DIGEST}.zst"
+    if storage == "object_digest":
+        await connection.execute(
+            text(
+                "INSERT INTO catalog.content_objects (content_sha256, object_key, media_type, "
+                "compressed_bytes, uncompressed_bytes) "
+                "VALUES (:other, :object_key, 'text/plain', 5, 10)"
+            ),
+            {"other": hashlib.sha256(b"a-different-digest").hexdigest(), "object_key": object_key},
+        )
+        storage = "object"
     await connection.execute(
         text(
             "INSERT INTO ledger.event_content_refs (event_id, content_id, content_sha256, "
@@ -725,6 +741,7 @@ EXPECTED_CONSTRAINT_NAMES = {
     "uq_content_objects_object_key",
     "ck_content_objects_content_sha256_format",
     "ck_content_objects_object_key_not_empty",
+    "ck_content_objects_object_key_matches_digest",
     "ck_content_objects_compressed_bytes_nonnegative",
     "ck_content_objects_uncompressed_bytes_nonnegative",
     "pk_inline_contents",

@@ -17,6 +17,20 @@ counts. The transaction rolls back and the database is left untouched. Operator
 remediation: resolve those events first (purge or quarantine them, or re-ingest
 their content through ``ContentService`` so the rows exist), then re-run.
 
+Refs to objects must also agree on the digest, not just the key. A legacy
+``content_objects`` row may carry the referenced ``object_key`` under a different
+digest; ``OrphanSweeper`` looks rows up by the digest embedded in the key, would
+find none, and could delete an object a committed ref still needs. The
+precondition therefore also counts refs whose digest differs from their object
+row's, and ``content_objects`` rows whose key is not the canonical key for their
+own digest. Enforcement afterwards is a CHECK on ``catalog.content_objects``
+(``ck_content_objects_object_key_matches_digest``, the same key format as
+``object_key_matches_digest`` on the refs) rather than a composite FK: the refs'
+CHECK ties ref key to ref digest, this CHECK ties object key to object digest,
+and the existing key FK joins the two, so ref digest = object digest follows
+transitively. A composite ``(object_key, content_sha256)`` FK would add a
+redundant unique index for no extra guarantee.
+
 The inline digest binding (``ck_event_content_refs_inline_id_matches_digest``)
 is added with the same revision: ``inline_contents`` already enforces
 ``inline_id = content_sha256``, so requiring the same equality on the ref
@@ -41,10 +55,15 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 INLINE_MAX_BYTES = 65_536
+OBJECT_KEY_MATCHES = (
+    "object_key = 'sha256/' || substr(content_sha256, 1, 2) || '/' || "
+    "substr(content_sha256, 3, 2) || '/' || content_sha256 || '.zst'"
+)
 
 
 def _refuse_legacy_refs_without_stored_content() -> None:
     op.execute("LOCK TABLE ledger.event_content_refs IN SHARE ROW EXCLUSIVE MODE")
+    op.execute("LOCK TABLE catalog.content_objects IN SHARE ROW EXCLUSIVE MODE")
     connection = op.get_bind()
     inline_refs = connection.scalar(
         sa.text("SELECT count(*) FROM ledger.event_content_refs WHERE storage = 'inline'")
@@ -56,11 +75,23 @@ def _refuse_legacy_refs_without_stored_content() -> None:
             "WHERE o.object_key = r.object_key)"
         )
     )
-    if inline_refs or unbacked_object_refs:
+    mismatched_object_refs = connection.scalar(
+        sa.text(
+            "SELECT count(*) FROM ledger.event_content_refs r "
+            "JOIN catalog.content_objects o ON o.object_key = r.object_key "
+            "WHERE r.storage = 'object' AND r.content_sha256 <> o.content_sha256"
+        )
+    )
+    noncanonical_objects = connection.scalar(
+        sa.text(f"SELECT count(*) FROM catalog.content_objects WHERE NOT ({OBJECT_KEY_MATCHES})")
+    )
+    if inline_refs or unbacked_object_refs or mismatched_object_refs or noncanonical_objects:
         raise RuntimeError(
             "cannot add content foreign keys: ledger.event_content_refs holds legacy refs "
             f"whose content was never stored (inline={inline_refs}, "
-            f"object={unbacked_object_refs}). Their bytes cannot be backfilled. "
+            f"object={unbacked_object_refs}, object_digest={mismatched_object_refs}, "
+            f"content_objects_key={noncanonical_objects}). Their bytes cannot be backfilled "
+            "and object rows must carry the digest their key encodes. "
             "Remediation: purge or quarantine those events, or re-ingest their content "
             "through the content service, then re-run this migration."
         )
@@ -122,6 +153,12 @@ def upgrade() -> None:
     )
 
     op.create_check_constraint(
+        "ck_content_objects_object_key_matches_digest",
+        "content_objects",
+        OBJECT_KEY_MATCHES,
+        schema="catalog",
+    )
+    op.create_check_constraint(
         "ck_event_content_refs_inline_id_matches_digest",
         "event_content_refs",
         "storage <> 'inline' OR inline_id = content_sha256",
@@ -143,6 +180,12 @@ def downgrade() -> None:
     op.execute("REVOKE SELECT, INSERT ON catalog.inline_contents FROM agent_context_api")
     op.execute("REVOKE USAGE ON SCHEMA catalog FROM agent_context_projector")
 
+    op.drop_constraint(
+        "ck_content_objects_object_key_matches_digest",
+        "content_objects",
+        schema="catalog",
+        type_="check",
+    )
     op.drop_constraint(
         "ck_event_content_refs_inline_id_matches_digest",
         "event_content_refs",

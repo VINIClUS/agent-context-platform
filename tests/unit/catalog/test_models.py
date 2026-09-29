@@ -93,6 +93,7 @@ def test_catalog_constraints_encode_domain_identity_and_content_invariants() -> 
     assert checks == {
         "ck_content_objects_content_sha256_format",
         "ck_content_objects_object_key_not_empty",
+        "ck_content_objects_object_key_matches_digest",
         "ck_content_objects_compressed_bytes_nonnegative",
         "ck_content_objects_uncompressed_bytes_nonnegative",
         "ck_inline_contents_content_sha256_format",
