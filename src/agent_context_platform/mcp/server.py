@@ -13,13 +13,13 @@ from mcp_types import METHOD_NOT_FOUND
 from starlette.applications import Starlette
 from starlette.types import ASGIApp
 
-from agent_context_platform.mcp.protocol_guard import ProtocolGuard
+from agent_context_platform.mcp.protocol_guard import AccessGate, ProtocolGuard
 from agent_context_platform.settings import MCPSettings
 
 MCP_PATH: Final = "/mcp"
 SERVER_NAME: Final = "agent-context-platform"
 SERVER_VERSION: Final = "0.1.0"
-# Lists change only on deploy; private until auth scopes (PLATFORM-045) decide visibility.
+# Lists change only on deploy; private: every method needs the memory:read scope (PLATFORM-045).
 LIST_CACHE_HINT: Final = CacheHint(ttl_ms=60_000, scope="private")
 
 _ALWAYS_SERVED: Final = frozenset({"server/discover"})
@@ -86,8 +86,13 @@ class MCPMount:
             yield
 
 
-def build_mcp_mount(server: MCPServer[Any], settings: MCPSettings) -> MCPMount:
-    """Wrap ``server`` as a stateless Streamable HTTP app behind the protocol guard."""
+def build_mcp_mount(
+    server: MCPServer[Any], settings: MCPSettings, *, access_gate: AccessGate
+) -> MCPMount:
+    """Wrap ``server`` as a stateless Streamable HTTP app behind the protocol guard.
+
+    ``access_gate`` is required so the route can never be mounted unauthenticated.
+    """
     sdk_app = server.streamable_http_app(
         streamable_http_path=MCP_PATH,
         json_response=True,
@@ -101,5 +106,6 @@ def build_mcp_mount(server: MCPServer[Any], settings: MCPSettings) -> MCPMount:
         allowed_hosts=settings.allowed_hosts,
         allowed_origins=settings.allowed_origins,
         max_body_bytes=settings.max_request_body_bytes,
+        access_gate=access_gate,
     )
     return MCPMount(guarded, sdk_app)

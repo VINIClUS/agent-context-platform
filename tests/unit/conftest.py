@@ -13,7 +13,7 @@ PRODUCTION_ENV = {
     "AGENT_CONTEXT_S3__ENDPOINT_URL": "https://objects.example.test",
     "AGENT_CONTEXT_S3__ACCESS_KEY_ID": "garage-access-key",
     "AGENT_CONTEXT_S3__SECRET_ACCESS_KEY": "garage-secret-key",
-    "AGENT_CONTEXT_MCP__BEARER_TOKEN_VERIFIER": "mcp-secret-verifier",
+    "AGENT_CONTEXT_MCP__TOKEN_HMAC_KEY": "mcp-secret-hmac-key-0123456789abcdef",
 }
 
 

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping
-from typing import Any, Final
+from typing import Any, Final, Protocol
 
 from mcp.shared.inbound import (
     ERROR_CODE_HTTP_STATUS,
@@ -80,10 +80,18 @@ def _error_body(
     return {"jsonrpc": "2.0", "id": request_id, "error": error}
 
 
+class AccessGate(Protocol):
+    """Authentication and authorisation step run after the Host and Origin checks."""
+
+    async def admit(self, scope: Scope, send: Send) -> Send | None:
+        """Return the ``send`` to continue with, or ``None`` once it has answered a rejection."""
+        ...
+
+
 class ProtocolGuard:
     """Pure ASGI guard that runs before the MCP application.
 
-    Enforces, in order: Host allowlist, Origin check, POST-only, the
+    Enforces, in order: Host allowlist, Origin check, the access gate (401/403/429), POST-only, the
     ``2026-07-28`` protocol version header, and a streamed request-size limit.
     Rejections carry fixed content-free bodies and never log request data.
     The version check also keeps the SDK's handshake-era transport unreachable,
@@ -97,8 +105,10 @@ class ProtocolGuard:
         allowed_hosts: Iterable[str],
         allowed_origins: Iterable[str],
         max_body_bytes: int,
+        access_gate: AccessGate,
     ) -> None:
         self._app = app
+        self._access_gate = access_gate
         self._allowed_hosts = tuple(allowed_hosts)
         self._allowed_origins = tuple(allowed_origins)
         self._max_body_bytes = max_body_bytes
@@ -124,6 +134,11 @@ class ProtocolGuard:
         ):
             await _respond(send, 403, _error_body(INVALID_REQUEST, "Invalid Origin"))
             return
+        # Authenticate before reading any body, so an unauthenticated client costs nothing.
+        gated_send = await self._access_gate.admit(scope, send)
+        if gated_send is None:
+            return
+        send = gated_send
         if scope["method"] != "POST":
             await _respond(send, 405, None, [(b"allow", b"POST")])
             return

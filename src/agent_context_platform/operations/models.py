@@ -4,8 +4,8 @@ from datetime import datetime
 from typing import Any
 from uuid import UUID as PythonUUID
 
-from sqlalchemy import Boolean, CheckConstraint, DateTime, Integer, String, UniqueConstraint
-from sqlalchemy.dialects.postgresql import JSONB, UUID
+from sqlalchemy import Boolean, CheckConstraint, DateTime, Integer, String, Text, UniqueConstraint
+from sqlalchemy.dialects.postgresql import ARRAY, JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
 from agent_context_platform.db import Base
@@ -38,6 +38,43 @@ class RegisteredProducerRow(Base):
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     updated_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     last_used_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
+
+
+class McpTokenRow(Base):
+    """A pre-provisioned read-only MCP bearer: prefix, Argon2id verifier, principal, scopes.
+
+    A separate table and a mandatory ``mcp_`` prefix keep MCP and ingestion credentials
+    mutually unusable. Rows are inserted by an operator; the API role only reads them.
+    """
+
+    __tablename__ = "mcp_tokens"
+    __table_args__ = (
+        UniqueConstraint("token_prefix"),
+        CheckConstraint("token_prefix LIKE 'mcp\\_%'", name="mcp_prefix"),
+        CheckConstraint(
+            "token_verifier LIKE '$argon2id$v=19$%'",
+            name="argon2id_verifier",
+        ),
+        CheckConstraint(
+            "cardinality(scopes) > 0 AND scopes <@ ARRAY['memory:read']::text[]",
+            name="memory_read_scopes",
+        ),
+        CheckConstraint("expires_at > created_at", name="expiry_after_creation"),
+        CheckConstraint(
+            "revoked_at IS NULL OR revoked_at >= created_at",
+            name="revocation_after_creation",
+        ),
+        {"schema": "operations"},
+    )
+
+    token_id: Mapped[PythonUUID] = mapped_column(UUID(as_uuid=True), primary_key=True)
+    token_prefix: Mapped[str] = mapped_column(String(64), nullable=False)
+    token_verifier: Mapped[str] = mapped_column(String(512), nullable=False)
+    principal: Mapped[str] = mapped_column(String(255), nullable=False)
+    scopes: Mapped[list[str]] = mapped_column(ARRAY(Text), nullable=False)
+    created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    expires_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
+    revoked_at: Mapped[datetime | None] = mapped_column(DateTime(timezone=True), nullable=True)
 
 
 class SchemaVersionRow(Base):

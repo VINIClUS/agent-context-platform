@@ -45,7 +45,7 @@ def test_incomplete_production_settings_report_only_missing_names() -> None:
         "s3.endpoint_url",
         "s3.access_key_id",
         "s3.secret_access_key",
-        "mcp.bearer_token_verifier",
+        "mcp.token_hmac_key",
     ):
         assert missing_name in message
     assert "input_value" not in message
@@ -73,7 +73,7 @@ def test_production_treats_blank_credentials_as_missing() -> None:
                 "access_key_id": "",
                 "secret_access_key": "   ",
             },
-            mcp={"bearer_token_verifier": ""},
+            mcp={"token_hmac_key": ""},
         )
 
     message = str(error.value)
@@ -82,7 +82,7 @@ def test_production_treats_blank_credentials_as_missing() -> None:
         "neo4j.password",
         "s3.access_key_id",
         "s3.secret_access_key",
-        "mcp.bearer_token_verifier",
+        "mcp.token_hmac_key",
     ):
         assert missing_name in message
     assert "input_value" not in message
@@ -180,7 +180,7 @@ def test_secrets_never_appear_in_repr_or_validation_errors() -> None:
         "neo4j-secret",
         "garage-access-key",
         "garage-secret-key",
-        "mcp-secret-verifier",
+        "mcp-secret-hmac-key-0123456789abcdef",
     )
     settings = Settings(
         postgresql={"dsn": "postgresql+psycopg://platform:postgres-secret@postgres/agent_context"},
@@ -194,7 +194,7 @@ def test_secrets_never_appear_in_repr_or_validation_errors() -> None:
             "access_key_id": "garage-access-key",
             "secret_access_key": "garage-secret-key",
         },
-        mcp={"bearer_token_verifier": "mcp-secret-verifier"},
+        mcp={"token_hmac_key": "mcp-secret-hmac-key-0123456789abcdef"},
     )
 
     representation = repr(settings)
@@ -215,7 +215,7 @@ def test_secrets_never_appear_in_repr_or_validation_errors() -> None:
                 "access_key_id": "garage-access-key",
                 "secret_access_key": "garage-secret-key",
             },
-            mcp={"bearer_token_verifier": "mcp-secret-verifier"},
+            mcp={"token_hmac_key": "mcp-secret-hmac-key-0123456789abcdef"},
         )
 
     error_message = str(error.value)
@@ -303,3 +303,25 @@ def test_ingestion_settings_reject_non_positive_values(field: str) -> None:
 
     with pytest.raises(ValidationError):
         IngestionSettings(**{field: 0})
+
+
+def test_mcp_token_hmac_key_must_be_long_and_never_leak() -> None:
+    with pytest.raises(ValidationError) as error:
+        Settings(mcp={"token_hmac_key": "short-key"})
+
+    assert "at least 32 characters" in str(error.value)
+    assert "short-key" not in str(error.value)
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"principal_cache_ttl_seconds": 0},
+        {"principal_cache_ttl_seconds": 301},
+        {"rate_limit_per_second": 0},
+        {"rate_limit_burst": 0},
+    ],
+)
+def test_mcp_cache_and_rate_limit_are_bounded(override: dict[str, float]) -> None:
+    with pytest.raises(ValidationError):
+        Settings(mcp=override)
