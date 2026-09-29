@@ -415,7 +415,8 @@ class ParsedModule(BaseModel):
 
     model_config = _MODEL
 
-    protocol_version: Literal[1, 2] = PROTOCOL_VERSION
+    # Answers default to 1: an adapter that emits ``references`` or ``diagnostics`` must say 2.
+    protocol_version: Literal[1, 2] = 1
     files: tuple[ParsedFile, ...]
 
 
