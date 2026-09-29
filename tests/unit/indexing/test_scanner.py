@@ -62,7 +62,7 @@ def test_clean_repository_lists_tracked_files_with_content_digests(repo: RepoBui
     assert result.workspace.branch == "main"
     assert not result.workspace.detached
     assert not result.workspace.is_dirty
-    assert result.workspace.dirty_patch_sha256 is None
+    assert result.workspace.dirty_state_sha256 is None
     assert not result.truncated
     assert result.root == repo.root.resolve()
 
@@ -78,7 +78,7 @@ def test_untracked_files_are_listed_and_ignored_files_are_not(repo: RepoBuilder)
     assert result.untracked[0].content_sha256 == sha(b"todo\n")
     assert result.workspace.untracked_paths == ("notes/todo.txt",)
     assert result.workspace.is_dirty
-    assert result.workspace.dirty_patch_sha256 is not None
+    assert result.workspace.dirty_state_sha256 is not None
     everything = {item.path for item in result.files} | {item.path for item in result.untracked}
     assert "debug.log" not in everything
     assert "build/out.o" not in everything
@@ -113,7 +113,7 @@ def test_dirty_state_tracks_modified_deleted_and_staged_files(repo: RepoBuilder)
     assert files["staged.txt"].change == "A."  # type: ignore[attr-defined]
     assert dirty.workspace.modified_paths == ("README.md", "data.bin", "staged.txt")
     assert dirty.workspace.is_dirty
-    assert dirty.workspace.dirty_patch_sha256 not in (None, clean.workspace.dirty_patch_sha256)
+    assert dirty.workspace.dirty_state_sha256 not in (None, clean.workspace.dirty_state_sha256)
     assert dirty.scan_sha256 != clean.scan_sha256
 
 
@@ -125,7 +125,7 @@ def test_dirty_digest_follows_worktree_content(repo: RepoBuilder) -> None:
     (repo.root / "README.md").write_text("second edit\n")
     second = scan_repository(repo.root)
 
-    assert second.workspace.dirty_patch_sha256 != first.workspace.dirty_patch_sha256
+    assert second.workspace.dirty_state_sha256 != first.workspace.dirty_state_sha256
 
 
 def test_digest_binds_paths_to_contents(repo: RepoBuilder) -> None:
@@ -142,7 +142,7 @@ def test_digest_binds_paths_to_contents(repo: RepoBuilder) -> None:
         f.content_sha256 for f in after.files if f.path in ("a.txt", "b.txt")
     )
     assert after.scan_sha256 != before.scan_sha256
-    assert after.workspace.dirty_patch_sha256 is not None
+    assert after.workspace.dirty_state_sha256 is not None
 
 
 def test_identical_repositories_scan_identically(make_repo: MakeRepo) -> None:
@@ -157,7 +157,7 @@ def test_identical_repositories_scan_identically(make_repo: MakeRepo) -> None:
     two = scan_repository(second.root)
 
     assert one.scan_sha256 == two.scan_sha256
-    assert one.workspace.dirty_patch_sha256 == two.workspace.dirty_patch_sha256
+    assert one.workspace.dirty_state_sha256 == two.workspace.dirty_state_sha256
     assert [item.path for item in one.untracked] == ["a-untracked.txt", "z-untracked.txt"]
 
 
@@ -270,7 +270,7 @@ def test_committed_gitlink_bump_changes_dirty_digest(repo: RepoBuilder) -> None:
     removed = scan_repository(repo.root)
 
     assert bumped.workspace.modified_paths == ("sub",)
-    assert bumped.workspace.dirty_patch_sha256 != removed.workspace.dirty_patch_sha256
+    assert bumped.workspace.dirty_state_sha256 != removed.workspace.dirty_state_sha256
     assert removed.workspace.modified_paths == ("sub",)
 
 
@@ -413,7 +413,7 @@ def test_truncation_changes_dirty_digest(repo: RepoBuilder) -> None:
     limited = scan_repository(repo.root, ScanLimits(max_files=4))
     full = scan_repository(repo.root)
 
-    assert limited.workspace.dirty_patch_sha256 != full.workspace.dirty_patch_sha256
+    assert limited.workspace.dirty_state_sha256 != full.workspace.dirty_state_sha256
     assert limited.workspace.untracked_paths == full.workspace.untracked_paths
 
 
@@ -868,3 +868,89 @@ def test_file_content_never_reaches_logs_reprs_or_errors(
     assert CANARY not in rendered
     assert sha(f"token = {CANARY}\n".encode()) in repr(result)
     assert any(record.name == scanner.__name__ for record in caplog.records)
+
+
+def test_discarded_growing_read_is_charged_to_the_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    chunks = [b"x" * 30, b"x" * 30, b""]
+
+    class Info:
+        st_mode = 0o100644
+        st_size = 10
+        st_dev = 1
+        st_ino = 2
+
+    monkeypatch.setattr(scanner.os, "stat", lambda *a, **k: Info())
+    monkeypatch.setattr(scanner.os, "open", lambda *a, **k: 99)
+    monkeypatch.setattr(scanner.os, "fstat", lambda fd: Info())
+    monkeypatch.setattr(scanner.os, "close", lambda fd: None)
+    monkeypatch.setattr(scanner.os, "read", lambda fd, size: chunks.pop(0))
+
+    seen = scanner._observe_leaf(3, "f", file_cap=50, budget=1000)
+
+    assert seen.skipped is SkipReason.TOO_LARGE
+    assert seen.consumed == 60
+
+
+def test_growing_file_bytes_count_toward_total(
+    repo: RepoBuilder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo.write("grow.txt", b"x" * 10)
+    real = scanner._observe
+
+    def grown(root_fd: int, path: str, *, file_cap: int, budget: int) -> scanner._Observed:
+        if path == "grow.txt":
+            return scanner._Observed(
+                FileKind.FILE, 9_000, None, None, None, SkipReason.TOO_LARGE, consumed=9_000
+            )
+        return real(root_fd, path, file_cap=file_cap, budget=budget)
+
+    monkeypatch.setattr(scanner, "_observe", grown)
+
+    result = scanner.scan_repository(repo.root, ScanLimits(max_total_bytes=10_000))
+
+    assert result.bytes_read >= 9_000
+
+
+def test_rejected_status_entries_keep_workspace_dirty(repo: RepoBuilder) -> None:
+    repo.write("back\\slash.txt", "one\n")
+    repo.commit("backslash")
+    clean = scan_repository(repo.root)
+    assert not clean.workspace.is_dirty
+    repo.write("back\\slash.txt", "changed and longer\n")
+
+    dirty = scan_repository(repo.root)
+
+    assert dirty.workspace.is_dirty
+    assert dirty.workspace.dirty_state_sha256 is not None
+    assert "slash" not in repr(dirty.workspace)
+    assert dirty.workspace.modified_paths == ()
+
+
+def test_only_rejected_untracked_path_is_dirty(repo: RepoBuilder) -> None:
+    (repo.root / os.fsdecode(b"bad-\xff-name")).write_text("x\n")
+
+    result = scan_repository(repo.root)
+
+    assert result.workspace.is_dirty
+    assert result.workspace.dirty_state_sha256 is not None
+
+
+def test_omitted_tracked_paths_are_bound_into_scan_digest(
+    repo: RepoBuilder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    limits = ScanLimits(max_files=2)
+    before = scan_repository(repo.root, limits)
+    real = scanner._parse_index
+
+    def other_oid_for_omitted(raw: bytes, rejections: list[scanner.Rejection]) -> object:
+        entries = real(raw, rejections)
+        entries["src/app.py"] = scanner._IndexEntry("100644", "e" * 40, False)
+        return entries
+
+    monkeypatch.setattr(scanner, "_parse_index", other_oid_for_omitted)
+    after = scan_repository(repo.root, limits)
+
+    assert before.workspace == after.workspace
+    assert [f.path for f in before.files] == [f.path for f in after.files]
+    assert before.omitted_files == after.omitted_files == 2
+    assert before.scan_sha256 != after.scan_sha256

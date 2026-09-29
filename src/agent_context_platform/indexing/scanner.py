@@ -37,6 +37,9 @@ command that could touch worktree content:
   ``escapes_repository`` record. Submodules are gitlinks: their OIDs are
   recorded and nothing is recursed into.
 
+A repository owned by another user fails closed as ``not_a_repository``:
+git's ``safe.directory`` is deliberately unavailable (no global config).
+
 Bounds: each command has a timeout and a stdout cap (exceeding it is an
 error, not a truncation; stderr is discarded). File count, per-file bytes and
 total bytes are capped after sorting paths canonically, and any cap that bites
@@ -58,7 +61,7 @@ import subprocess
 import tempfile
 import time
 from collections.abc import Mapping, Sequence
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
 from typing import Literal
@@ -207,17 +210,18 @@ class UntrackedFile:
 class WorkspaceState:
     """HEAD identity and uncommitted state.
 
-    ``dirty_patch_sha256`` is a digest over path-bound change records (status
+    ``dirty_state_sha256`` is a digest over path-bound change records (status
     codes, modes, base/index OIDs and the worktree content digests) for every
-    modified tracked path, staged submodule change and untracked file. It is
-    ``None`` for a clean workspace.
+    modified tracked path, staged submodule change and untracked file, plus an
+    opaque count for changes whose path was rejected. It is a state digest,
+    not a patch hash, and ``None`` for a clean workspace.
     """
 
     head_commit: str | None
     branch: str | None
     detached: bool
     is_dirty: bool
-    dirty_patch_sha256: str | None
+    dirty_state_sha256: str | None
     modified_paths: tuple[str, ...]
     untracked_paths: tuple[str, ...]
 
@@ -763,7 +767,7 @@ def _clean_oid(value: str) -> str | None:
 
 
 def _parse_status(
-    raw: bytes, rejections: list[Rejection]
+    raw: bytes, rejections: list[Rejection], rejected_changes: list[str] | None = None
 ) -> tuple[dict[str, _Change], list[tuple[str, bool]]]:
     """Return tracked changes by path and untracked ``(path, is_directory)`` pairs."""
     changes: dict[str, _Change] = {}
@@ -780,6 +784,8 @@ def _parse_status(
             path = _safe_path(path_raw.rstrip(b"/") if is_directory else path_raw)
             if path is None:
                 rejections.append(_reject(path_raw))
+                if rejected_changes is not None:
+                    rejected_changes.append("?")
             else:
                 untracked.append((path, is_directory))
         elif marker == b"!":
@@ -799,6 +805,8 @@ def _parse_status(
             path = _safe_path(fields[path_index].encode("utf-8", errors="surrogateescape"))
             if path is None:
                 rejections.append(_reject(fields[path_index].encode("utf-8", "surrogateescape")))
+                if rejected_changes is not None:
+                    rejected_changes.append(f"{marker.decode()}{fields[1]}")
                 continue
             changes[path] = _Change(
                 xy=fields[1],
@@ -845,6 +853,8 @@ class _Observed:
     is_binary: bool | None
     link_target: str | None
     skipped: SkipReason | None
+    # Bytes actually read from the file, even when the digest was discarded.
+    consumed: int = 0
 
 
 def _skipped(
@@ -955,14 +965,16 @@ def _observe_leaf(parent: int, name: str, *, file_cap: int, budget: int) -> _Obs
             total += len(chunk)
             if total > cap:
                 # Grew while being read: report it as over the cap, never truncate.
-                over = _over_cap(total, file_cap, budget, FileKind.FILE)
-                return over if over is not None else _skipped(SkipReason.TOO_LARGE, FileKind.FILE)
+                over = _over_cap(total, file_cap, budget, FileKind.FILE) or _skipped(
+                    SkipReason.TOO_LARGE, FileKind.FILE
+                )
+                return replace(over, consumed=total)
             if len(sniff) < _BINARY_SNIFF_BYTES:
                 sniff += chunk[: _BINARY_SNIFF_BYTES - len(sniff)]
             digest.update(chunk)
     finally:
         os.close(fd)
-    return _Observed(FileKind.FILE, total, digest.hexdigest(), b"\x00" in sniff, None, None)
+    return _Observed(FileKind.FILE, total, digest.hexdigest(), b"\x00" in sniff, None, None, total)
 
 
 # --- orchestration ------------------------------------------------------------------
@@ -985,7 +997,8 @@ def _scan(root: Path, limits: ScanLimits) -> RepositoryScan:
         rejections: list[Rejection] = []
         index = _parse_index(output.index, rejections)
         head_links = _parse_head_gitlinks(output.head_tree)
-        changes, untracked_raw = _parse_status(output.status, rejections)
+        rejected_changes: list[str] = []
+        changes, untracked_raw = _parse_status(output.status, rejections, rejected_changes)
 
         bytes_read = 0
         processed = 0
@@ -999,9 +1012,9 @@ def _scan(root: Path, limits: ScanLimits) -> RepositoryScan:
                 file_cap=limits.max_file_bytes,
                 budget=max(limits.max_total_bytes - bytes_read, 0),
             )
-            if seen.skipped is None:
-                bytes_read += seen.size or 0
-            elif seen.skipped is SkipReason.TOO_LARGE:
+            # Charge what was actually read, even if the digest was discarded.
+            bytes_read += (seen.size or 0) if seen.skipped is None else seen.consumed
+            if seen.skipped is SkipReason.TOO_LARGE:
                 reasons.add(TruncationReason.MAX_FILE_BYTES)
             elif seen.skipped is SkipReason.BUDGET_EXHAUSTED:
                 reasons.add(TruncationReason.MAX_TOTAL_BYTES)
@@ -1127,7 +1140,12 @@ def _scan(root: Path, limits: ScanLimits) -> RepositoryScan:
     modified_paths = tuple(
         sorted({*changes, *(record[0] for record in gitlink_changes)}, key=_sort_key)
     )
-    is_dirty = bool(change_records or gitlink_changes or untracked_records)
+    # Changes at rejected paths stay dirty; only marker, status code and a
+    # count are recorded, never the raw path.
+    rejected_records = sorted(
+        [code, rejected_changes.count(code)] for code in set(rejected_changes)
+    )
+    is_dirty = bool(change_records or gitlink_changes or untracked_records or rejected_records)
     dirty_digest: str | None = None
     if is_dirty:
         payload: bytes = canonical_json_bytes(
@@ -1138,6 +1156,7 @@ def _scan(root: Path, limits: ScanLimits) -> RepositoryScan:
                 "untracked": untracked_records,
                 "truncated": truncated,
                 "omitted_files": omitted,
+                "rejected_changes": rejected_records,
             }
         )
         dirty_digest = sha256_hex(_DIRTY_DOMAIN + payload)
@@ -1147,7 +1166,7 @@ def _scan(root: Path, limits: ScanLimits) -> RepositoryScan:
         branch=head.branch,
         detached=head.detached,
         is_dirty=is_dirty,
-        dirty_patch_sha256=dirty_digest,
+        dirty_state_sha256=dirty_digest,
         modified_paths=modified_paths,
         untracked_paths=tuple(item.path for item in untracked) + tuple(omitted_untracked),
     )
@@ -1174,6 +1193,12 @@ def _scan(root: Path, limits: ScanLimits) -> RepositoryScan:
             "truncated": truncated,
             "truncation_reasons": [reason.value for reason in ordered_reasons],
             "omitted_files": omitted,
+            # Index-bound (path, OID) pairs for tracked entries past max_files.
+            "omitted_tracked_sha256": sha256_hex(
+                canonical_json_bytes(
+                    [[path, index[path].oid] for path in sorted(omitted_tracked, key=_sort_key)]
+                )
+            ),
         }
     )
     result = RepositoryScan(
