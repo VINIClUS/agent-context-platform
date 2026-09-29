@@ -64,6 +64,7 @@ from tree_sitter import Language, Node, Parser, Tree
 
 from agent_context_platform.indexing.tree_sitter._common import (
     Budget,
+    WorkBudgetExceeded,
     cut_signature,
     digest,
     frame,
@@ -182,12 +183,16 @@ class _Walk:
         return True
 
 
-def _text(node: Node) -> bytes:
-    """Source text of a node that is small by construction (a leaf token or a checked name)."""
-    return node.text or b""
+def _text(content: bytes, node: Node) -> bytes:
+    """Source text of a node that is small by construction (a leaf token or a checked name).
+
+    Sliced from the source: a tree parsed through a read callback keeps no copy of it, and
+    ``Node.text`` on such a tree is far slower than a slice.
+    """
+    return content[node.start_byte : node.end_byte]
 
 
-def _name_bytes(node: Node) -> bytes | None:
+def _name_bytes(content: bytes, node: Node) -> bytes | None:
     """Text of an identifier-like node, read only when its byte length is name-sized.
 
     ``Node.text`` copies the whole subtree, so it is never called on a node whose size the
@@ -195,7 +200,7 @@ def _name_bytes(node: Node) -> bytes | None:
     """
     if node.end_byte - node.start_byte > MAX_NAME_BYTES:
         return None
-    return node.text or b""
+    return _text(content, node)
 
 
 def _qualified(parent: _Sym, simple: str) -> str:
@@ -227,29 +232,29 @@ def _is_docstring(walk: _Walk, node: Node) -> bool:
     return not any(child.type == "interpolation" for child in string.children)
 
 
-def _leaf_token(node: Node) -> bytes:
+def _leaf_token(content: bytes, node: Node) -> bytes:
     if node.type == "string_start":
         # Prefix letters (b, f, r, u) change meaning; the quote style does not.
-        prefix = _text(node).translate(None, b"'\"").lower()
+        prefix = _text(content, node).translate(None, b"'\"").lower()
         return frame(b"s:" + prefix)
     if node.type == "string_content":
         # Python reads any newline sequence in a literal as \n: LF/CRLF conversion is no edit.
-        text = _text(node).replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        text = _text(content, node).replace(b"\r\n", b"\n").replace(b"\r", b"\n")
         return frame(b"n:string_content=" + text)
     if node.is_named:
-        return frame(b"n:" + node.type.encode() + b"=" + _text(node))
+        return frame(b"n:" + node.type.encode() + b"=" + _text(content, node))
     return frame(b"a:" + node.type.encode())
 
 
-def _is_property_decorator(decorator: Node) -> bool:
+def _is_property_decorator(content: bytes, decorator: Node) -> bool:
     target = decorator.named_child(0)
     if target is None:
         return False
     if target.type == "identifier":
-        return _name_bytes(target) in {n.encode() for n in _PROPERTY_NAMES}
+        return _name_bytes(content, target) in {n.encode() for n in _PROPERTY_NAMES}
     if target.type == "attribute":
         attribute = target.child_by_field_name("attribute")
-        return attribute is not None and _name_bytes(attribute) in {
+        return attribute is not None and _name_bytes(content, attribute) in {
             n.encode() for n in _PROPERTY_ATTRIBUTES
         }
     return False
@@ -276,7 +281,7 @@ def _enter_definition(walk: _Walk, node: Node) -> None:
     sym: _Sym | None = None
     if parent_scope is not None and body is not None and name_node is not None:
         entry.body_id = body.id
-        raw = _name_bytes(name_node)
+        raw = _name_bytes(walk.content, name_node)
         simple = (
             identifier_bytes(raw, walk.content, name_node.start_byte, name_node.end_byte)
             if raw is not None
@@ -306,7 +311,7 @@ def _enter_definition(walk: _Walk, node: Node) -> None:
     if sym is not None and node.type == "class_definition":
         bases = node.child_by_field_name("superclasses")
         for base in bases.named_children if bases is not None else ():
-            raw = _name_bytes(base) if base.type == "identifier" else None
+            raw = _name_bytes(walk.content, base) if base.type == "identifier" else None
             if raw is not None:
                 walk.sites.append(
                     _Site(sym, "base", raw.decode("utf-8", "replace"), *base.byte_range)
@@ -369,7 +374,7 @@ def _enter_statement(walk: _Walk, node: Node) -> None:
     end_of_signature = value.start_byte if value is not None else node.end_byte
     signature = cut_signature(walk.content[node.start_byte : end_of_signature])
     for target in found:
-        raw = _name_bytes(target)
+        raw = _name_bytes(walk.content, target)
         simple = (
             identifier_bytes(raw, walk.content, target.start_byte, target.end_byte)
             if raw is not None
@@ -401,7 +406,7 @@ def _enter_call(walk: _Walk, node: Node) -> None:
     if scope is None or function is None or len(walk.sites) >= _MAX_CALL_SITES:
         return
     if function.type == "identifier":
-        raw = _name_bytes(function)
+        raw = _name_bytes(walk.content, function)
         if raw is not None:
             walk.sites.append(
                 _Site(scope, "name", raw.decode("utf-8", "replace"), *function.byte_range)
@@ -412,9 +417,12 @@ def _enter_call(walk: _Walk, node: Node) -> None:
         # ``owner`` may be the whole nested prefix of a chain: test its type and size first.
         if owner is None or attribute is None or owner.type != "identifier":
             return
-        if owner.end_byte - owner.start_byte not in (3, 4) or _text(owner) not in (b"self", b"cls"):
+        if owner.end_byte - owner.start_byte not in (3, 4) or _text(walk.content, owner) not in (
+            b"self",
+            b"cls",
+        ):
             return
-        raw = _name_bytes(attribute)
+        raw = _name_bytes(walk.content, attribute)
         if raw is not None:
             walk.sites.append(
                 _Site(scope, "member", raw.decode("utf-8", "replace"), *attribute.byte_range)
@@ -440,7 +448,9 @@ def _enter(walk: _Walk, node: Node) -> bool:
         walk.decorated[node.id] = (node.start_byte, len(walk.tokens))
         walk.property_decorator = False
     elif kind == "decorator":
-        walk.property_decorator = walk.property_decorator or _is_property_decorator(node)
+        walk.property_decorator = walk.property_decorator or _is_property_decorator(
+            walk.content, node
+        )
     elif kind in _DEFINITIONS:
         _enter_definition(walk, node)
     elif kind in ("expression_statement", "type_alias_statement"):
@@ -448,7 +458,7 @@ def _enter(walk: _Walk, node: Node) -> bool:
     elif kind == "call":
         _enter_call(walk, node)
     if node.child_count == 0:
-        walk.tokens.append(_leaf_token(node))
+        walk.tokens.append(_leaf_token(walk.content, node))
         return False
     walk.tokens.append(frame(b"(" + kind.encode()))
     return True
@@ -538,10 +548,9 @@ def _resolve(
     while scope is not None:
         # Names of an enclosing class body are not visible from its methods.
         if scope.kind != "class" or first:
-            here = members.get((id(scope), site.name), [])
-            if len(here) > _MAX_CANDIDATES:
+            found = [s for s in members.get((id(scope), site.name), []) if s.kind in kinds]
+            if len(found) > _MAX_CANDIDATES:
                 return []
-            found = [s for s in here if s.kind in kinds]
             if found:
                 return found
         first = False
@@ -588,6 +597,21 @@ def _relations(
     return tuple(out)
 
 
+def _bounded_parse(content: bytes, budget: Budget) -> Tree:
+    """Parse under the CPU backstop: checked before, and during (progress callback)."""
+    budget.check()
+
+    def read(offset: int, _point: object) -> bytes:
+        return content[offset : offset + 65536]
+
+    try:
+        return _PARSER.parse(
+            read, encoding="utf8", progress_callback=lambda *_: budget.out_of_time()
+        )
+    except ValueError:  # the callback cancelled the parse
+        raise WorkBudgetExceeded from None
+
+
 def _parse_file(source: SourceFile, budget: Budget, output: list[int]) -> ParsedFile:
     content = source.content()
     empty = ParsedFile(
@@ -601,7 +625,7 @@ def _parse_file(source: SourceFile, budget: Budget, output: list[int]) -> Parsed
     if name and not walk.add(root):
         return empty
     walk.scopes.append(root)
-    _traverse(_PARSER.parse(content), walk)
+    _traverse(_bounded_parse(content, budget), walk)
     if name:
         root.semantic = digest(_SEMANTIC_DOMAIN, walk.tokens)
         root.signature_digest = digest(_SIGNATURE_DOMAIN, ())

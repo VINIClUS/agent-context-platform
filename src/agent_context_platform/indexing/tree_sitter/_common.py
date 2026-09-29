@@ -124,9 +124,12 @@ class Budget:
     """What one request may cost: name bytes, output size, syntax nodes and CPU time.
 
     Work limits (design numbers, see ``python.py``): ``MAX_NODES_PER_FILE`` bounds one file
-    deterministically; ``CPU_SOFT_LIMIT`` (5 s from the start of the request) is a backstop on CPU time, kept well
-    under the runner's ``RLIMIT_CPU`` (10 s) so validation and serialisation still fit. A
-    file over budget degrades to no symbols; the rest of the batch continues.
+    deterministically; ``CPU_SOFT_LIMIT`` (5 s from the start of the request) is a backstop on
+    CPU time, checked before each file's parse, inside the parse (progress callback, about
+    every 64 KiB) and every 2048 walked nodes. Worst case under the runner's ``RLIMIT_CPU`` of
+    10 s: interpreter and grammar start-up (~0.7 s, before the clock starts) + 5 s backstop +
+    one check granularity (<0.1 s) + parent-side validation and JSON dump (~1.5 s for a 8 MiB
+    output) = under 7.5 s. A file over budget degrades to no symbols; the rest continues.
     """
 
     MAX_NODES_PER_FILE: Final = 600_000
@@ -143,12 +146,20 @@ class Budget:
         self._names = 0
         self._nodes = 0
 
+    def out_of_time(self) -> bool:
+        return time.process_time() > self._cpu_deadline
+
+    def check(self) -> None:
+        """Raise when the request's CPU backstop is already spent."""
+        if self.out_of_time():
+            raise WorkBudgetExceeded
+
     def node(self) -> None:
         """Count one syntax node; raise when the file (or the process CPU) is over budget."""
         self._nodes += 1
         if self._nodes > self.max_nodes:
             raise WorkBudgetExceeded
-        if self._nodes % 2048 == 0 and time.process_time() > self._cpu_deadline:
+        if self._nodes % 2048 == 0 and self.out_of_time():
             raise WorkBudgetExceeded
 
     @staticmethod

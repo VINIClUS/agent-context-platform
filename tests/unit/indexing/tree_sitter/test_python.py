@@ -3,13 +3,15 @@
 from __future__ import annotations
 
 import json
+import os
+import sys
 import time
 from importlib import metadata
 from pathlib import Path
 
 import pytest
 
-from agent_context_platform.indexing.tree_sitter import _common, python
+from agent_context_platform.indexing.tree_sitter import _common, landlock, python, runner
 from agent_context_platform.indexing.tree_sitter._common import normalize_module
 from agent_context_platform.indexing.tree_sitter.base import (
     MAX_SOURCE_BYTES,
@@ -29,6 +31,7 @@ from agent_context_platform.indexing.tree_sitter.python import (
     parse_python,
     python_adapter,
 )
+from agent_context_platform.indexing.tree_sitter.runner import Limits
 
 pytestmark = pytest.mark.unit
 
@@ -450,3 +453,65 @@ def test_outer_revision_still_changes_when_an_inner_body_changes() -> None:
     code = "def outer():\n    def inner():\n        return 1\n    return inner\n"
     assert digests(code, "outer")[1] != digests(code.replace("return 1", "return 2"), "outer")[1]
     assert digests(code, "outer")[0] == digests(code.replace("return 1", "return 2"), "outer")[0]
+
+
+def test_nine_variable_assignments_do_not_suppress_the_edge_to_a_function() -> None:
+    code = "".join("x = 1\n" for _ in range(9)) + "def x():\n    pass\n\n\ndef caller():\n    x()\n"
+    module = in_process(request(source("pkg/mod.py", code)))
+    (parsed,) = module.files
+    names = {s.ref: s.qualified_name for s in parsed.symbols}
+    edges = {(names[r.source_ref], names[r.target_ref]) for r in parsed.relations}
+    assert ("pkg.mod.caller", "pkg.mod.x") in edges
+
+
+def test_more_than_eight_callable_candidates_still_yield_no_edge() -> None:
+    code = "".join("def x():\n    pass\n" for _ in range(9)) + "def caller():\n    x()\n"
+    (parsed,) = in_process(request(source("pkg/mod.py", code))).files
+    assert parsed.relations == ()
+
+
+def test_a_batch_of_garbage_files_degrades_the_tail_not_the_process() -> None:
+    """5 x 1 MB of parser-hostile bytes (the 8 MiB request bound caps the batch at 5): no nonzero_exit."""
+    garbage = (b"def (\n" * 200_000)[:MAX_SOURCE_BYTES]  # never finishes parsing
+    files = [source(f"pkg/g{n}.py", garbage) for n in range(5)]
+    files.append(source("pkg/ok.py", "def a():\n    pass\n"))
+    started = time.monotonic()
+    module = python_adapter().parse(request(*files))
+    assert time.monotonic() - started < 19
+    assert [item.path for item in module.files] == [f.path for f in files]
+    assert module.files[-1].symbols == ()  # the tail was degraded, and the batch returned
+
+
+def test_the_cpu_backstop_is_checked_before_and_during_a_parse(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_common.Budget, "CPU_SOFT_LIMIT", -1.0)
+    module = in_process(request(source("pkg/a.py", "def a():\n    pass\n")))
+    assert module.files[0].symbols == ()
+
+
+@pytest.mark.skipif(landlock.abi_version() < 1, reason="kernel lacks Landlock")
+def test_the_real_adapter_runs_confined_and_cannot_read_a_sibling_file(tmp_path: Path) -> None:
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    sibling = tmp_path / "sibling.txt"
+    sibling.write_text("secret sibling")
+    limits = Limits(checkout_roots=(str(checkout),), wall_seconds=15.0)
+    assert landlock.abi_version() >= 1
+    module = python_adapter(limits=limits).parse(fixture_request())
+    assert normalize_module(module) == json.loads((FIXTURES / "expected.json").read_text())
+    assert any(item.symbols for item in module.files)
+    # Its read set (interpreter, site-packages, its own package) has no room for the sibling.
+    command = [sys.executable, "-m", python.__name__]
+    rules = landlock.read_set(command)
+    real = os.path.realpath(sibling)
+    assert not any(real == r or real.startswith(r.rstrip("/") + "/") for r in rules.read)
+    # And a child under the same limits and interpreter is refused the file (EACCES).
+    fake = str(Path(__file__).with_name("fake_adapter.py"))
+    raw = runner._run(
+        [sys.executable, fake, "read_other_file", str(sibling)],
+        fixture_request().model_dump_json().encode(),
+        limits,
+        {},
+    )
+    assert json.loads(raw)["probe"][f"read:{sibling}"] == "EACCES"
