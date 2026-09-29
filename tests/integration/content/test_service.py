@@ -248,6 +248,43 @@ def test_ref_insert_without_attach_violates_the_storage_fk(
     _run(exercise())
 
 
+def test_inline_ref_claiming_another_digest_violates_the_digest_binding(
+    content_session_factory: async_sessionmaker[AsyncSession],
+    content_service: ContentService,
+    insert_minimal_event: Any,
+    insert_content_ref: Any,
+) -> None:
+    """An inline ref may not claim digest A while ``inline_id`` points at B's row.
+
+    The inline FK alone only proves that *some* inline row exists; this is
+    the inline counterpart of ``object_key_matches_digest``.
+    """
+
+    async def exercise() -> None:
+        nonce = time.time_ns()
+        stored = _item("bound-b", _sized_payload(size=256, nonce=nonce))
+        claimed = _item("bound-a", _sized_payload(size=256, nonce=nonce + 1))
+        prepared = await content_service.prepare([stored])
+        [ref_b] = prepared.resolve([stored.claim])
+        async with content_session_factory() as session, session.begin():
+            await content_service.attach(session, prepared)
+
+        forged = ref_b.model_copy(update={"content_sha256": claimed.claim.content_sha256})
+        assert forged.inline_id == ref_b.content_sha256 != forged.content_sha256
+
+        async with content_session_factory() as session:
+            event = await insert_minimal_event(session)
+            with pytest.raises(IntegrityError) as exc_info:
+                async with session.begin():
+                    await insert_content_ref(session, event.event_id, forged)
+            assert (
+                exc_info.value.orig.diag.constraint_name
+                == "ck_event_content_refs_inline_id_matches_digest"
+            )
+
+    _run(exercise())
+
+
 @pytest.mark.parametrize(
     "size",
     [pytest.param(256, id="inline"), pytest.param(INLINE_MAX_BYTES + 256, id="object")],

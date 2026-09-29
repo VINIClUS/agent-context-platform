@@ -145,6 +145,10 @@ class EventContentRefRow(Base):
             name="storage_form",
         ),
         CheckConstraint(
+            "storage <> 'inline' OR inline_id = content_sha256",
+            name="inline_id_matches_digest",
+        ),
+        CheckConstraint(
             "storage <> 'object' OR object_key = "
             "'sha256/' || substr(content_sha256, 1, 2) || '/' || "
             "substr(content_sha256, 3, 2) || '/' || content_sha256 || '.zst'",

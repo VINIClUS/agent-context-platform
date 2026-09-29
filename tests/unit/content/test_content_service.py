@@ -384,6 +384,34 @@ def test_prepare_rejects_content_requiring_redaction() -> None:
     _run(exercise())
 
 
+@pytest.mark.parametrize("mismatch", ["digest", "length"])
+def test_prepare_rejects_bytes_that_do_not_match_the_claim(mismatch: str) -> None:
+    """``model_construct`` skips validation, so prepare() must re-check the claim itself."""
+
+    async def exercise() -> None:
+        data = canonical_json_bytes({"real": "content-bytes"})
+        other = canonical_json_bytes({"claimed": "some-other-bytes"})
+        claim = _claim("forged", data if mismatch == "length" else other)
+        if mismatch == "length":
+            claim = claim.model_copy(update={"uncompressed_bytes": len(data) + 1})
+        item = SanitizedContentItemV1.model_construct(
+            claim=claim,
+            sanitized_bytes_base64=base64.b64encode(data).decode("ascii"),
+            redaction_report=_sanitized_report(),
+        )
+        store = FakeBlobStore()
+        service = ContentService(store, _POLICY)
+
+        with pytest.raises(ContentResolutionError) as failure:
+            await service.prepare([item])
+
+        assert "real" not in str(failure.value)
+        assert "content-bytes" not in str(failure.value)
+        assert store.put_calls == []
+
+    _run(exercise())
+
+
 def test_prepare_rejects_content_when_policy_raises_redaction_error() -> None:
     async def exercise() -> None:
         strict_policy = RedactionPolicyV1(max_depth=1)

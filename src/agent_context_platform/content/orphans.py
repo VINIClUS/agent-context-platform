@@ -21,7 +21,7 @@ from __future__ import annotations
 
 import asyncio
 import re
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Callable
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
 from typing import Any
@@ -142,7 +142,7 @@ class OrphanSweeper:
             )
             if exists is not None:
                 return False
-            await asyncio.to_thread(
+            await _run_delete_to_completion(
                 self._client.delete_object, Bucket=self._bucket_name, Key=object_key
             )
             return True
@@ -162,3 +162,26 @@ class OrphanSweeper:
             if not response.get("IsTruncated"):
                 return
             continuation_token = response.get("NextContinuationToken")
+
+
+async def _run_delete_to_completion(delete: Callable[..., Any], **kwargs: Any) -> None:
+    """Run ``delete`` in a thread; on cancellation, wait for it to finish first.
+
+    Cancelling ``asyncio.to_thread`` abandons the wait but cannot stop the
+    thread, so a plain cancellation would let the caller's transaction exit
+    (releasing the per-digest advisory lock) while the delete is still about
+    to run. Shielding the future and waiting it out keeps the lock held until
+    the delete has really returned; the cancellation is re-raised afterwards.
+    """
+    delete_future = asyncio.ensure_future(asyncio.to_thread(delete, **kwargs))
+    try:
+        await asyncio.shield(delete_future)
+    except asyncio.CancelledError:
+        while not delete_future.done():
+            try:
+                await asyncio.wait([delete_future])
+            except asyncio.CancelledError:
+                continue
+        if not delete_future.cancelled():
+            delete_future.exception()  # mark retrieved; cancellation takes precedence
+        raise

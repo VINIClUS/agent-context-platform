@@ -407,6 +407,72 @@ def test_attach_holds_the_lock_and_blocks_the_sweeper(
     _run(exercise())
 
 
+def test_cancelled_sweep_keeps_the_lock_until_the_delete_returns(
+    content_session_factory: async_sessionmaker[AsyncSession],
+    content_service: ContentService,
+    s3_client: Any,
+    s3_settings: Any,
+) -> None:
+    """Cancelling a sweep cannot stop ``delete_object``'s worker thread.
+
+    If the sweep's transaction exited on cancellation, the advisory lock would
+    be released while the thread was still about to delete: a concurrent
+    ``attach()`` could re-verify the still-present object, commit a reference,
+    and then have it orphaned by the delete. The sweep must hold the lock until
+    the delete has actually returned, and only then propagate the cancellation.
+    """
+
+    async def exercise() -> None:
+        data = _sized_payload(size=INLINE_MAX_BYTES + 1, nonce=time.time_ns())
+        item = _item("race-sweep-cancelled", data)
+        prepared = await content_service.prepare([item])
+        [ref] = prepared.resolve([item.claim])
+        assert ref.object_key is not None
+
+        gated_client = _GatedDeleteClient(s3_client, blocked_key=ref.object_key)
+        sweeper = OrphanSweeper(
+            gated_client, s3_settings.bucket_name, content_session_factory, min_age=timedelta(0)
+        )
+
+        session_b = content_session_factory()
+        sweep_task = asyncio.create_task(sweeper._sweep_one(ref.content_sha256, ref.object_key))
+        attach_task: asyncio.Task[None] | None = None
+        try:
+            await asyncio.wait_for(_wait_until_true(gated_client.entered.is_set), timeout=30)
+
+            sweep_task.cancel()
+            await asyncio.sleep(0.5)
+            # The thread is still blocked inside delete_object, so the sweep
+            # must not have finished (and released its lock) yet.
+            assert not sweep_task.done()
+
+            await asyncio.wait_for(session_b.begin(), timeout=30)
+            attach_task = asyncio.create_task(content_service.attach(session_b, prepared))
+            await asyncio.wait_for(
+                _wait_for_blocked_advisory_lock(content_session_factory), timeout=30
+            )
+            assert not attach_task.done()
+
+            gated_client.release.set()
+            with pytest.raises(asyncio.CancelledError):
+                await asyncio.wait_for(sweep_task, timeout=30)
+
+            # The delete completed before the lock was released, so attach()
+            # sees the object gone rather than committing a dangling reference.
+            with pytest.raises(BlobNotFoundError):
+                await asyncio.wait_for(attach_task, timeout=30)
+        finally:
+            gated_client.release.set()
+            if attach_task is not None and not attach_task.done():
+                attach_task.cancel()
+            if not sweep_task.done():
+                sweep_task.cancel()
+            await session_b.rollback()
+            await session_b.close()
+
+    _run(exercise())
+
+
 def test_sweep_holds_the_lock_and_blocks_attach(
     content_session_factory: async_sessionmaker[AsyncSession],
     content_service: ContentService,

@@ -66,6 +66,7 @@ from __future__ import annotations
 
 import base64
 import binascii
+import hashlib
 import json
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
@@ -403,6 +404,15 @@ class ContentService:
                 data = base64.b64decode(item.sanitized_bytes_base64, validate=True)
             except (binascii.Error, ValueError):
                 raise InvalidContentEncodingError("content base64 could not be decoded") from None
+
+            # Pydantic validates the claim's shape, not its relation to the
+            # bytes, and model_construct() skips even that: recompute both
+            # so bytes can never be stored under a digest they do not have.
+            if (
+                hashlib.sha256(data).hexdigest() != item.claim.content_sha256
+                or len(data) != item.claim.uncompressed_bytes
+            ):
+                raise ContentResolutionError("content bytes do not match their claim")
 
             self._recheck_redaction(item.claim.media_type, data)
             validated.append((item, data))
