@@ -3,7 +3,9 @@
 ``LedgerRepository.append`` is the only way new events enter the ledger. It
 allocates per-stream sequence numbers under row-level locks (acquired in
 sorted ``stream_id`` order, so concurrent multi-stream batches never
-deadlock against each other), seals each event through the SDK's
+deadlock against each other), then takes one advisory lock per idempotency
+key in sorted lock-key order (so batches on disjoint streams that reuse
+keys never deadlock on the unique index), seals each event through the SDK's
 ``seal_event`` (hash-chained against the stream's previous head), and is
 idempotent on ``(producer_id, idempotency_key)``: replaying the exact same
 draft -- whether resubmitted with the same ``event_id`` (e.g. concurrent
@@ -30,10 +32,11 @@ differ from Python's code-point order.
 
 from __future__ import annotations
 
+import hashlib
 from collections.abc import Iterable, Mapping, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
-from typing import Any, cast
+from typing import Any, Final, cast
 from uuid import UUID as PythonUUID
 
 from agent_context_sdk import (  # type: ignore[import-untyped, unused-ignore]
@@ -43,7 +46,7 @@ from agent_context_sdk import (  # type: ignore[import-untyped, unused-ignore]
     StoredEventV1,
     seal_event,
 )
-from sqlalchemy import func, select, tuple_, update
+from sqlalchemy import func, select, text, tuple_, update
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -62,6 +65,11 @@ from agent_context_platform.projection.models import OutboxRow, OutboxStatus
 
 _IDEMPOTENCY_CONSTRAINT = "uq_events_producer_id"
 _EVENT_PK_CONSTRAINT = "pk_events"
+
+#: Fixed namespace for the per-idempotency-key advisory locks ``append``
+#: takes. Arbitrary but stable: API replicas running different versions
+#: during a rollout must derive the same lock for the same key.
+_IDEMPOTENCY_LOCK_NAMESPACE: Final[int] = 0x4944_454D  # b"IDEM"
 
 
 @dataclass(frozen=True, slots=True)
@@ -406,6 +414,36 @@ async def _lock_streams(
     return state
 
 
+def _idempotency_lock_key(producer_id: str, idempotency_key: str) -> int:
+    """Derive the second ``int4`` of a key's ``pg_advisory_xact_lock`` pair.
+
+    A collision only makes two keys share one lock, which adds waiting but
+    never hides a conflict: the unique constraint still decides.
+    """
+    digest = hashlib.sha256(f"{producer_id}\0{idempotency_key}".encode()).digest()
+    return int.from_bytes(digest[:4], byteorder="big", signed=True)
+
+
+async def _lock_idempotency_keys(session: AsyncSession, keys: Iterable[tuple[str, str]]) -> None:
+    """Take an exclusive transaction-scoped lock per ``(producer_id, key)``.
+
+    Stream locks cannot serialize batches on disjoint streams that reuse the
+    same keys: each could insert one key and then wait on the other's
+    uncommitted unique-index entry for the next, which PostgreSQL breaks by
+    aborting one transaction as a deadlock. Holding every key's lock before
+    the first insert turns that into an ordinary wait, after which the
+    loser's insert meets the committed row and resolves as a replay or an
+    ``IdempotencyConflictError``. Locks are taken in ascending lock-key
+    order (not key order), so hash collisions cannot create a lock cycle,
+    and always after ``_lock_streams``.
+    """
+    for lock_key in sorted({_idempotency_lock_key(*key) for key in keys}):
+        await session.execute(
+            text("SELECT pg_advisory_xact_lock(:namespace, :lock_key)"),
+            {"namespace": _IDEMPOTENCY_LOCK_NAMESPACE, "lock_key": lock_key},
+        )
+
+
 async def _recover_existing(
     session: AsyncSession, draft: EventDraftV1, *, event_id: PythonUUID | None = None
 ) -> StoredEventV1:
@@ -553,6 +591,13 @@ class LedgerRepository:
 
         stream_ids = {resolved.draft.stream_id for resolved in resolved_events}
         stream_state = await _lock_streams(session, stream_ids)
+        await _lock_idempotency_keys(
+            session,
+            (
+                (resolved.draft.producer.producer_id, resolved.draft.idempotency_key)
+                for resolved in resolved_events
+            ),
+        )
 
         touched_streams: set[str] = set()
         results: list[StoredEventV1 | None] = [None] * len(resolved_events)

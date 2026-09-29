@@ -53,7 +53,9 @@ from agent_context_platform.ledger.repository import (
     _draft_identity,
     _event_row_from_sealed,
     _existing_draft_identity,
+    _idempotency_lock_key,
     _insert_or_recover,
+    _lock_idempotency_keys,
     _lock_streams,
     _outbox_row,
     _plan_batch,
@@ -477,6 +479,30 @@ def test_lock_streams_locks_every_distinct_stream_in_sorted_order() -> None:
     assert session.execute.await_count == 4
 
 
+def test_idempotency_lock_key_is_a_stable_signed_int4() -> None:
+    # Pinned values: API replicas on different versions during a rollout
+    # must derive the same lock for the same key.
+    assert _idempotency_lock_key("agent-1", "k1") == -1529213843
+    assert _idempotency_lock_key("agent-1", "k2") == 1840744207
+    assert _idempotency_lock_key("agent-2", "k1") != _idempotency_lock_key("agent-1", "k1")
+
+
+def test_lock_idempotency_keys_locks_each_distinct_key_once_in_lock_key_order() -> None:
+    session = AsyncMock(spec=AsyncSession)
+    keys = [("agent-1", "dup"), ("agent-1", "k1"), ("agent-1", "dup")]
+
+    asyncio.run(_lock_idempotency_keys(session, keys))
+
+    # "dup" sorts before "k1" as a string, but its lock key is larger.
+    calls = session.execute.await_args_list
+    assert [call.args[1] for call in calls] == [
+        {"namespace": 0x4944_454D, "lock_key": _idempotency_lock_key("agent-1", "k1")},
+        {"namespace": 0x4944_454D, "lock_key": _idempotency_lock_key("agent-1", "dup")},
+    ]
+    assert _idempotency_lock_key("agent-1", "k1") < _idempotency_lock_key("agent-1", "dup")
+    assert all("pg_advisory_xact_lock" in str(call.args[0]) for call in calls)
+
+
 def test_update_stream_head_issues_one_update(monkeypatch: pytest.MonkeyPatch) -> None:
     session = AsyncMock(spec=AsyncSession)
     state = _StreamState(sequence=2, head_event_id=uuid4(), head_sha256="a" * 64)
@@ -698,6 +724,8 @@ def test_append_chains_two_new_events_on_the_same_stream() -> None:
     session.execute.side_effect = [
         MagicMock(),  # lock insert
         _one((0, None, None, StreamStatus.ACTIVE)),  # lock select
+        MagicMock(),  # idempotency lock for "k1"
+        MagicMock(),  # idempotency lock for "k2"
         MagicMock(),  # head update
     ]
 
@@ -707,7 +735,7 @@ def test_append_chains_two_new_events_on_the_same_stream() -> None:
     assert results[0].stream_sequence == 1
     assert results[1].stream_sequence == 2
     assert results[1].integrity.previous_event_sha256 == results[0].integrity.event_sha256
-    assert session.execute.await_count == 3
+    assert session.execute.await_count == 5
 
 
 def test_append_deduplicates_batch_local_repeats_without_a_second_insert() -> None:
@@ -719,6 +747,7 @@ def test_append_deduplicates_batch_local_repeats_without_a_second_insert() -> No
     session.execute.side_effect = [
         MagicMock(),  # lock insert
         _one((0, None, None, StreamStatus.ACTIVE)),  # lock select
+        MagicMock(),  # one idempotency lock for the repeated "dup"
         MagicMock(),  # head update
     ]
 
@@ -726,7 +755,7 @@ def test_append_deduplicates_batch_local_repeats_without_a_second_insert() -> No
 
     assert results[0].event_id == results[1].event_id
     assert session.add.call_count == 2  # one event row + one outbox row, not two
-    assert session.execute.await_count == 3
+    assert session.execute.await_count == 4
 
 
 # --------------------------------------------------------------------------
