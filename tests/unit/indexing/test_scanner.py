@@ -3,6 +3,7 @@ from __future__ import annotations
 import hashlib
 import logging
 import os
+import shutil
 import subprocess
 import traceback
 from collections.abc import Callable
@@ -1062,7 +1063,7 @@ def test_growing_file_with_little_budget_left_never_exceeds_total(
 
     def tracking_open(path: str, flags: int, *args: object, **kwargs: object) -> int:
         fd = real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
-        if kwargs.get("dir_fd") is not None and flags & os.O_NONBLOCK:
+        if path == "grow.txt" and flags & os.O_NONBLOCK:
             worktree_fds.add(fd)
         return fd
 
@@ -1227,3 +1228,125 @@ def test_skipped_symlink_is_charged_up_to_the_budget(tmp_path: Path) -> None:
     assert over_file.skipped is SkipReason.TOO_LARGE and over_file.consumed == 80
     assert over_budget.skipped is SkipReason.BUDGET_EXHAUSTED and over_budget.consumed == 50
     assert ok.skipped is None and ok.consumed == 80
+
+
+def test_symlinked_index_is_refused_and_leaks_nothing(
+    repo: RepoBuilder, make_repo: MakeRepo
+) -> None:
+    victim = make_repo("victim-index")
+    victim.write("victim-secret-path.txt", "victim tree\n")
+    victim.commit("victim")
+    index = repo.root / ".git" / "index"
+    index.unlink()
+    index.symlink_to(victim.root / ".git" / "index")
+
+    with pytest.raises(ScanError) as caught:
+        scan_repository(repo.root)
+
+    assert caught.value.reason is ScanFailure.ROOT_MISMATCH
+    assert "victim-secret-path" not in repr(caught.value)
+
+
+def test_symlinked_linked_worktree_index_is_refused(
+    repo: RepoBuilder, make_repo: MakeRepo, tmp_path: Path
+) -> None:
+    victim = make_repo("victim-linked-index")
+    victim.write("victim-secret-path.txt", "victim tree\n")
+    victim.commit("victim")
+    linked, admin = _linked(repo, tmp_path, "linked-index")
+    (admin / "index").unlink()
+    (admin / "index").symlink_to(victim.root / ".git" / "index")
+
+    assert failure_of(linked) is ScanFailure.ROOT_MISMATCH
+
+
+def test_scan_uses_a_private_index_copy(repo: RepoBuilder, monkeypatch: pytest.MonkeyPatch) -> None:
+    seen: list[str] = []
+    real = scanner._run_git
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        seen.append(kwargs["env"].get("GIT_INDEX_FILE", ""))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(scanner, "_run_git", spy)
+
+    scan_repository(repo.root)
+
+    private = [value for value in seen if value]
+    assert private
+    assert all(str(repo.root) not in value for value in private)
+
+
+def test_oversized_index_is_refused(repo: RepoBuilder, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(scanner, "_INDEX_COPY_CAP", 16)
+
+    assert failure_of(repo.root) is ScanFailure.UNSUPPORTED_REPOSITORY
+
+
+def test_alternates_to_a_foreign_object_store_are_refused(
+    repo: RepoBuilder, make_repo: MakeRepo
+) -> None:
+    victim = make_repo("victim-alt")
+    victim.write("victim-secret-path.txt", "victim tree\n")
+    victim.commit("victim")
+    info = repo.root / ".git" / "objects" / "info"
+    info.mkdir(exist_ok=True)
+    (info / "alternates").write_text(f"{victim.root / '.git' / 'objects'}\n")
+
+    assert failure_of(repo.root) is ScanFailure.UNSUPPORTED_REPOSITORY
+
+
+def test_symlinked_objects_directory_is_refused(
+    repo: RepoBuilder, make_repo: MakeRepo, tmp_path: Path
+) -> None:
+    moved = tmp_path / "moved-objects"
+    (repo.root / ".git" / "objects").rename(moved)
+    (repo.root / ".git" / "objects").symlink_to(moved)
+
+    assert failure_of(repo.root) in {ScanFailure.ROOT_MISMATCH, *FAIL_CLOSED}
+
+
+@pytest.mark.parametrize("name", ["packed-refs", "shallow", "config"])
+def test_symlinked_ref_and_config_files_are_refused(
+    repo: RepoBuilder, tmp_path: Path, name: str
+) -> None:
+    target = repo.root / ".git" / name
+    copy = tmp_path / f"elsewhere-{name}"
+    copy.write_bytes(target.read_bytes() if target.exists() else b"")
+    target.unlink(missing_ok=True)
+    target.symlink_to(copy)
+
+    assert failure_of(repo.root) in {ScanFailure.ROOT_MISMATCH, *FAIL_CLOSED}
+
+
+def test_symlinked_info_directory_is_not_honoured(repo: RepoBuilder, tmp_path: Path) -> None:
+    elsewhere = tmp_path / "foreign-info"
+    elsewhere.mkdir()
+    (elsewhere / "exclude").write_text("*\n")
+    info = repo.root / ".git" / "info"
+    shutil.rmtree(info)
+    info.symlink_to(elsewhere)
+
+    assert failure_of(repo.root) in {ScanFailure.UNSUPPORTED_REPOSITORY, *FAIL_CLOSED}
+
+
+def test_symlink_read_is_skipped_once_budget_is_zero(tmp_path: Path) -> None:
+    root = tmp_path / "w"
+    root.mkdir()
+    os.symlink("t" * 80, root / "l")
+    calls: list[str] = []
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    real = os.readlink
+    try:
+        with pytest.MonkeyPatch.context() as patch:
+            patch.setattr(
+                scanner.os, "readlink", lambda *a, **k: calls.append("x") or real(*a, **k)
+            )
+            empty = scanner._observe_leaf(fd, "l", file_cap=1000, budget=0)
+            some = scanner._observe_leaf(fd, "l", file_cap=1000, budget=1000)
+    finally:
+        os.close(fd)
+
+    assert empty.skipped is SkipReason.BUDGET_EXHAUSTED and empty.consumed == 0
+    assert calls == ["x"]  # only the call with budget left
+    assert some.skipped is None

@@ -90,6 +90,8 @@ _BINARY_SNIFF_BYTES = 8_000
 _METADATA_OUTPUT_CAP = 65_536
 _INFO_COPY_CAP = 1_048_576
 _METADATA_FILE_CAP = 4096
+# An index entry is at least ~62 bytes plus its path, so 256 MiB holds millions.
+_INDEX_COPY_CAP = 256 * 1024 * 1024
 _SCAN_DOMAIN = b"agent-context-platform:scan:v1\0"
 _DIRTY_DOMAIN = b"agent-context-platform:dirty:v1\0"
 _GITLINK_MODE = "160000"
@@ -448,22 +450,58 @@ def _bootstrap(root: Path, limits: ScanLimits) -> _Repo:
     )
 
 
-def _read_metadata(path: Path, cap: int = _METADATA_FILE_CAP) -> bytes | None:
-    """Read one repository metadata file: no symlink, regular file, bounded.
+def _open_below(base: Path, parts: Sequence[str]) -> int | None:
+    """Open ``base/parts...`` as a regular file without following any symlink.
 
-    Returns ``None`` when the file is absent. Anything else unusual (a symlink,
-    a non-regular file, more than ``cap`` bytes) fails closed without revealing
-    content. At most ``cap + 1`` bytes are ever read.
+    ``base`` is an already validated directory (it is resolved once); every
+    component below it is opened with ``O_NOFOLLOW`` relative to its parent,
+    so nothing under it can redirect the read to another repository. Returns
+    ``None`` when a component is absent, otherwise a file descriptor. Anything
+    else unusual (a symlink, a non-directory parent, a non-regular file) raises
+    ``ROOT_MISMATCH`` without revealing content.
     """
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
     try:
-        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-    except FileNotFoundError:
-        return None
+        current = os.open(base.resolve(), dir_flags)
     except OSError:
         raise ScanError(ScanFailure.ROOT_MISMATCH) from None
     try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise ScanError(ScanFailure.ROOT_MISMATCH)
+        for name in parts[:-1]:
+            try:
+                nxt = os.open(name, dir_flags, dir_fd=current)
+            except FileNotFoundError:
+                return None
+            except OSError:
+                raise ScanError(ScanFailure.ROOT_MISMATCH) from None
+            os.close(current)
+            current = nxt
+        try:
+            fd = os.open(
+                parts[-1],
+                os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC,
+                dir_fd=current,
+            )
+        except FileNotFoundError:
+            return None
+        except OSError:
+            raise ScanError(ScanFailure.ROOT_MISMATCH) from None
+    finally:
+        os.close(current)
+    if not stat.S_ISREG(os.fstat(fd).st_mode):
+        os.close(fd)
+        raise ScanError(ScanFailure.ROOT_MISMATCH)
+    return fd
+
+
+def _read_below(base: Path, parts: Sequence[str], cap: int = _METADATA_FILE_CAP) -> bytes | None:
+    """Read a small metadata file below ``base``: no symlinks, bounded, content-free errors.
+
+    At most ``cap + 1`` bytes are ever read; more than ``cap`` fails closed.
+    """
+    fd = _open_below(base, parts)
+    if fd is None:
+        return None
+    try:
         data = b""
         while len(data) <= cap:
             try:
@@ -478,6 +516,80 @@ def _read_metadata(path: Path, cap: int = _METADATA_FILE_CAP) -> bytes | None:
     if len(data) > cap:
         raise ScanError(ScanFailure.ROOT_MISMATCH)
     return data
+
+
+def _read_metadata(path: Path, cap: int = _METADATA_FILE_CAP) -> bytes | None:
+    """Read one file directly inside a validated directory (see ``_read_below``)."""
+    return _read_below(path.parent, (path.name,), cap)
+
+
+def _copy_bounded(base: Path, parts: Sequence[str], destination: Path, cap: int) -> bool:
+    """Stream ``base/parts`` into ``destination`` (no symlinks, at most ``cap`` bytes)."""
+    fd = _open_below(base, parts)
+    if fd is None:
+        return False
+    copied = 0
+    try:
+        with destination.open("wb") as out:
+            while True:
+                try:
+                    chunk = os.read(fd, min(_CHUNK_SIZE, cap + 1 - copied))
+                except OSError:
+                    raise ScanError(ScanFailure.ROOT_MISMATCH) from None
+                if not chunk:
+                    break
+                copied += len(chunk)
+                if copied > cap:
+                    raise ScanError(ScanFailure.UNSUPPORTED_REPOSITORY)
+                out.write(chunk)
+    finally:
+        os.close(fd)
+    return True
+
+
+def _validate_repository_files(repo: _Repo, head_ref: str | None) -> None:
+    """Refuse a repository whose files git would read from somewhere else.
+
+    Every path handed to git, by environment variable or through git's own
+    lookups, must be a regular file or real directory directly inside the
+    accepted git dir or common dir, or be copied through the no-follow reader.
+    """
+    # ``objects`` itself must be a real directory in the common dir.
+    try:
+        parent = os.open(repo.common_dir.resolve(), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
+    except OSError:
+        raise ScanError(ScanFailure.ROOT_MISMATCH) from None
+    try:
+        os.close(
+            os.open(
+                "objects",
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=parent,
+            )
+        )
+    except OSError:
+        raise ScanError(ScanFailure.ROOT_MISMATCH) from None
+    finally:
+        os.close(parent)
+    for name in ("alternates", "http-alternates"):
+        data = _read_below(repo.common_dir, ("objects", "info", name))
+        if data is not None and data.strip():
+            # Alternates would let git read another object store.
+            raise ScanError(ScanFailure.UNSUPPORTED_REPOSITORY)
+    for base, name in (
+        (repo.git_dir, "index"),
+        (repo.git_dir, "config.worktree"),
+        (repo.common_dir, "config"),
+        (repo.common_dir, "packed-refs"),
+        (repo.common_dir, "shallow"),
+    ):
+        descriptor = _open_below(base, (name,))
+        if descriptor is not None:
+            os.close(descriptor)
+    if head_ref is not None and head_ref.startswith("refs/"):
+        descriptor = _open_below(repo.common_dir, head_ref.split("/"))
+        if descriptor is not None:
+            os.close(descriptor)
 
 
 def _dir_identity(path: Path) -> tuple[int, int] | None:
@@ -578,6 +690,7 @@ class _Head:
     oid: str | None
     branch: str | None
     detached: bool
+    ref: str | None = None
 
 
 def _read_head(repo: _Repo, limits: ScanLimits) -> _Head:
@@ -614,7 +727,7 @@ def _read_head(repo: _Repo, limits: ScanLimits) -> _Head:
         raise ScanError(ScanFailure.UNSUPPORTED_REPOSITORY)
     if ref is None:
         return _Head(oid=oid, branch=None, detached=True)
-    return _Head(oid=oid, branch=ref.removeprefix("refs/heads/"), detached=False)
+    return _Head(oid=oid, branch=ref.removeprefix("refs/heads/"), detached=False, ref=ref)
 
 
 # Keys copied from repository config into the private view. None can name a
@@ -693,9 +806,9 @@ def _safe_config(repo: _Repo, limits: ScanLimits) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _copy_info_file(source: Path, destination: Path) -> None:
+def _copy_info_file(common_dir: Path, name: str, destination: Path) -> None:
     try:
-        data = _read_metadata(source, _INFO_COPY_CAP)
+        data = _read_below(common_dir, ("info", name), _INFO_COPY_CAP)
     except ScanError:
         raise ScanError(ScanFailure.UNSUPPORTED_REPOSITORY) from None
     if data is None:
@@ -725,12 +838,15 @@ def _run_in_private_view(repo: _Repo, head: _Head, limits: ScanLimits) -> _GitOu
         (private / "HEAD").write_text(head_text, encoding="ascii")
         (private / "config").write_text(config_text, encoding="utf-8")
         for name in ("exclude", "attributes"):
-            _copy_info_file(repo.common_dir / "info" / name, private / "info" / name)
+            _copy_info_file(repo.common_dir, name, private / "info" / name)
+        # git reads and may lock the index it is given, and follows a symlinked
+        # one: hand it a private copy taken through the no-follow reader.
+        _copy_bounded(repo.git_dir, ("index",), private / "index", _INDEX_COPY_CAP)
 
         env = _base_env(repo.git, repo.root)
         env["GIT_DIR"] = str(private)
         env["GIT_WORK_TREE"] = str(repo.root)
-        env["GIT_INDEX_FILE"] = str(repo.git_dir / "index")
+        env["GIT_INDEX_FILE"] = str(private / "index")
         env["GIT_OBJECT_DIRECTORY"] = str(repo.common_dir / "objects")
 
         def run(args: Sequence[str]) -> bytes:
@@ -1031,6 +1147,9 @@ def _observe_leaf(
     except OSError:
         return _skipped(SkipReason.UNREADABLE)
     if stat.S_ISLNK(info.st_mode):
+        if budget <= 0:
+            # Nothing left to charge: do not read the target at all.
+            return _skipped(SkipReason.BUDGET_EXHAUSTED, FileKind.SYMLINK)
         try:
             target = os.readlink(os.fsencode(name), dir_fd=parent)
         except OSError:
@@ -1124,7 +1243,9 @@ def _scan(root: Path, limits: ScanLimits) -> RepositoryScan:
     repo = _bootstrap(root, limits)
     root_fd = _open_pinned_root(root, repo.root_identity)
     try:
+        _validate_repository_files(repo, None)
         head = _read_head(repo, limits)
+        _validate_repository_files(repo, head.ref)
         output = _run_in_private_view(repo, head, limits)
         rejections: list[Rejection] = []
         index = _parse_index(output.index, rejections)
