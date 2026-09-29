@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import dataclasses
 import io
 import json
 import os
@@ -22,8 +23,10 @@ from pydantic import ValidationError
 
 from agent_context_platform.indexing.tree_sitter import base, runner
 from agent_context_platform.indexing.tree_sitter.base import (
+    ParsedDiagnostic,
     ParsedFile,
     ParsedModule,
+    ParsedReference,
     ParsedSymbol,
     ParseRequest,
     SourceFile,
@@ -35,6 +38,8 @@ from agent_context_platform.indexing.tree_sitter.base import (
     validate_module,
 )
 from agent_context_platform.indexing.tree_sitter.runner import Limits, SandboxedAdapter
+
+from .conftest import PACKAGE_READ_PATHS
 
 pytestmark = pytest.mark.unit
 
@@ -79,7 +84,9 @@ def second(**over: Any) -> dict[str, Any]:
     return data
 
 
-def module(symbols: list[dict[str, Any]] | None = None, **file_over: Any) -> ParsedModule:
+def module(
+    symbols: list[dict[str, Any]] | None = None, version: int = 2, **file_over: Any
+) -> ParsedModule:
     parsed: dict[str, Any] = {
         "path": "pkg/mod.py",
         "language": "python",
@@ -88,7 +95,9 @@ def module(symbols: list[dict[str, Any]] | None = None, **file_over: Any) -> Par
         "relations": [],
     }
     parsed.update(file_over)
-    return ParsedModule.model_validate_json(json.dumps({"protocol_version": 1, "files": [parsed]}))
+    return ParsedModule.model_validate_json(
+        json.dumps({"protocol_version": version, "files": [parsed]})
+    )
 
 
 def refused(code: StructuralErrorCode, candidate: ParsedModule, req: ParseRequest | None = None):
@@ -290,6 +299,9 @@ def test_parser_fingerprint_is_canonical() -> None:
 def adapter(mode: str, arg: str = "", **kwargs: Any) -> SandboxedAdapter:
     command = [sys.executable, FAKE, mode, *([arg] if arg else [])]
     limits = kwargs.pop("limits", Limits(wall_seconds=3.0, cpu_seconds=2))
+    limits = dataclasses.replace(
+        limits, extra_read_paths=(*PACKAGE_READ_PATHS, *limits.extra_read_paths)
+    )
     env = {"FAKE_FINGERPRINT": FINGERPRINT, **kwargs.pop("env", {})}
     return SandboxedAdapter(
         command,
@@ -325,6 +337,9 @@ def test_well_behaved_adapter_round_trips() -> None:
         ("range", StructuralErrorCode.RANGE_OUT_OF_BOUNDS),
         ("foreign_path", StructuralErrorCode.PATH_MISMATCH),
         ("dangling", StructuralErrorCode.DANGLING_RELATION),
+        ("references_exfil", StructuralErrorCode.TEXT_NOT_IN_SOURCE),
+        ("protocol_v1", StructuralErrorCode.SCHEMA_VIOLATION),
+        ("diagnostics_free_text", StructuralErrorCode.SCHEMA_VIOLATION),
         ("wrong_evidence", StructuralErrorCode.SCHEMA_VIOLATION),
         ("extra_field", StructuralErrorCode.SCHEMA_VIOLATION),
         ("duplicate", StructuralErrorCode.DUPLICATE_SYMBOL),
@@ -785,7 +800,15 @@ def test_non_linux_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_every_output_field_is_classified() -> None:
-    for model in (ParsedModule, ParsedFile, ParsedSymbol, StructuralRelation):
+    models = (
+        ParsedModule,
+        ParsedFile,
+        ParsedSymbol,
+        StructuralRelation,
+        ParsedReference,
+        ParsedDiagnostic,
+    )
+    for model in models:
         assert set(model.model_fields) == set(base.FIELD_CONFINEMENT[model.__name__]), model
     rehashed = {
         name
@@ -798,7 +821,7 @@ def test_every_output_field_is_classified() -> None:
 
 def test_free_form_string_fields_are_token_confined_or_rehashed() -> None:
     """A future free-form field must be classified, and only those classes may be free text."""
-    allowed = {"token", "enum", "range", "parent", "derived", "rehashed", "structure"}
+    allowed = {"token", "numeric", "enum", "range", "parent", "derived", "rehashed", "structure"}
     for fields in base.FIELD_CONFINEMENT.values():
         assert set(fields.values()) <= allowed
 
@@ -902,7 +925,7 @@ def test_go_receiver_declared_in_another_file_is_accepted() -> None:
         ParsedModule.model_validate_json(
             json.dumps(
                 {
-                    "protocol_version": 1,
+                    "protocol_version": 2,
                     "files": [
                         json.loads(candidate.files[0].model_dump_json()),
                         {
@@ -1019,3 +1042,534 @@ def test_disambiguator_groups_by_name_and_kind_so_a_variable_does_not_shift_a_fu
 
 def test_the_same_declaration_under_different_refs_is_rejected() -> None:
     refused(StructuralErrorCode.DUPLICATE_SYMBOL, module([symbol(), symbol(ref="2")]))
+
+
+# --- unresolved references and diagnostics -----------------------------------------------
+
+# SOURCE: ``def a():`` is bytes 0..8, ``return 1`` is 13..21 (``return`` 13..19, ``a`` at 4).
+IMPORT_SOURCE = b"import os.path\nfrom ..pkg import x\n\ndef f():\n    a.b(1)\n"
+
+
+def ref(start: int, end: int, name: str, **over: Any) -> dict[str, Any]:
+    data: dict[str, Any] = {
+        "source": None,
+        "kind": "call",
+        "target_name": name,
+        "relative_level": 0,
+        "start_byte": start,
+        "end_byte": end,
+        "evidence_kind": "tree_sitter",
+        "confidence": "heuristic",
+    }
+    data.update(over)
+    return data
+
+
+def imp(start: int, end: int, name: str, **over: Any) -> dict[str, Any]:
+    return ref(start, end, name, kind="import", confidence="syntactic", **over)
+
+
+def validated(candidate: ParsedModule, req: ParseRequest | None = None) -> ParsedFile:
+    checked = validate_module(req or request(), candidate, expected_fingerprint=FINGERPRINT)
+    return checked.files[0]
+
+
+def test_valid_references_of_each_kind_and_relative_imports() -> None:
+    content = IMPORT_SOURCE
+    req = request(content)
+    call_at = content.index(b"a.b")
+    func_start = content.index(b"def f")
+    func = symbol(
+        qualified_name="pkg.mod.f",
+        start_byte=func_start,
+        end_byte=len(content),
+        signature="def f()",
+    )
+    references = [
+        imp(7, 14, "os.path"),  # the dotted-name node of ``import os.path``
+        imp(22, 25, "pkg", relative_level=2),  # ``from ..pkg import x``: range on ``pkg``
+        imp(33, 34, "x", relative_level=2),
+        ref(call_at, call_at + 3, "a.b", source="1"),
+        ref(call_at, call_at + 1, "a", source="1"),
+        ref(func_start, func_start + 3, "def", kind="inherit", confidence="syntactic", source="1"),
+    ]
+    got = validated(module([func], references=references), req)
+    assert [item.source for item in got.references] == [None, None, None, "0", "0", "0"]
+    assert {item.kind for item in got.references} == {"import", "call", "inherit"}
+    assert got.references[1].relative_level == 2
+    assert got.references[1].target_name == "pkg"
+    assert got.diagnostics == ()
+
+
+def test_reference_source_is_remapped_to_a_symbol_index() -> None:
+    swapped = module([second(ref="7"), symbol(ref="3")], references=[ref(4, 5, "a", source="3")])
+    got = validated(swapped)
+    assert got.references[0].source == "1"
+
+
+@pytest.mark.parametrize(
+    ("reference", "code"),
+    [
+        (ref(4, 5, "b"), StructuralErrorCode.TEXT_NOT_IN_SOURCE),  # not a token in the range
+        (ref(4, 5, "a.return"), StructuralErrorCode.TEXT_NOT_IN_SOURCE),  # one segment outside
+        (ref(0, 3, "de"), StructuralErrorCode.TEXT_NOT_IN_SOURCE),  # prefix of a token
+        (ref(4, 5, "a b"), StructuralErrorCode.TEXT_NOT_IN_SOURCE),
+        (ref(4, 5, "a-b"), StructuralErrorCode.TEXT_NOT_IN_SOURCE),
+        (ref(4, 5, "a..a"), StructuralErrorCode.TEXT_NOT_IN_SOURCE),
+        (ref(4, len(SOURCE) + 1, "a"), StructuralErrorCode.RANGE_OUT_OF_BOUNDS),
+        (ref(4, 5, "a", source="9"), StructuralErrorCode.DANGLING_RELATION),
+        (
+            ref(13, 19, "return", source="1"),  # symbol 1 is bytes 0..8
+            StructuralErrorCode.RANGE_OUT_OF_BOUNDS,
+        ),
+        (ref(4, 12, "a", source="1"), StructuralErrorCode.RANGE_OUT_OF_BOUNDS),
+    ],
+)
+def test_references_are_confined_to_the_occurrence(
+    reference: dict[str, Any], code: StructuralErrorCode
+) -> None:
+    refused(code, module(references=[reference]))
+
+
+WORDS = b"alpha.beta.gamma.delta"
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["delta.alpha", "beta.alpha", "gamma.beta.alpha", "alpha.gamma", "alpha.alpha", "delta"],
+)
+def test_reference_names_out_of_order_or_partial_are_refused(name: str) -> None:
+    req = request(WORDS)
+    refused(
+        StructuralErrorCode.TEXT_NOT_IN_SOURCE,
+        module([], references=[ref(0, len(WORDS), name)]),
+        req,
+    )
+    assert validated(module([], references=[ref(0, len(WORDS), "alpha.beta.gamma.delta")]), req)
+
+
+def test_a_whole_file_range_only_yields_the_one_name_of_its_tokens() -> None:
+    """511 references over whole-file ranges cannot each say something different."""
+    req = request(WORDS)
+    for name in ("alpha.beta", "alpha.gamma.beta", "beta.alpha.gamma.delta"):
+        refused(
+            StructuralErrorCode.TEXT_NOT_IN_SOURCE,
+            module([], references=[imp(0, len(WORDS), name)]),
+            req,
+        )
+    # A statement is not a name: its keywords are tokens of the range.
+    refused(
+        StructuralErrorCode.TEXT_NOT_IN_SOURCE,
+        module([], references=[imp(0, 14, "os.path")]),
+        request(b"import os.path\n"),
+    )
+
+
+@pytest.mark.parametrize("name", ["a/b", "a#b", "a::b", "a.b/c", ".a.b", "a.b.", "a..b"])
+def test_reference_separators_other_than_a_dot_are_refused(name: str) -> None:
+    req = request(b"a b c/d")
+    refused(StructuralErrorCode.TEXT_NOT_IN_SOURCE, module([], references=[ref(0, 3, name)]), req)
+    slashed = request(b"a/b#c::d")
+    refused(
+        StructuralErrorCode.TEXT_NOT_IN_SOURCE,
+        module([], references=[ref(0, 8, name)]),
+        slashed,
+    )
+
+
+def test_a_range_that_cuts_a_token_is_refused() -> None:
+    req = request(b"alpha beta")
+    refused(StructuralErrorCode.TEXT_NOT_IN_SOURCE, module([], references=[ref(1, 5, "lpha")]), req)
+    refused(StructuralErrorCode.TEXT_NOT_IN_SOURCE, module([], references=[ref(0, 4, "alph")]), req)
+    assert validated(module([], references=[ref(0, 5, "alpha")]), req)
+
+
+def test_a_target_from_elsewhere_in_the_file_is_not_enough() -> None:
+    """``return`` is a token of the file, but not of the occurrence range that is claimed."""
+    refused(StructuralErrorCode.TEXT_NOT_IN_SOURCE, module(references=[ref(4, 5, "return")]))
+    assert validated(module(references=[ref(13, 19, "return")])).references
+
+
+def test_duplicate_references_are_refused() -> None:
+    refused(
+        StructuralErrorCode.DUPLICATE_REFERENCE,
+        module(references=[ref(4, 5, "a"), ref(4, 5, "a", source="1")]),
+    )
+    # A different kind, level or range is a different occurrence.
+    assert validated(
+        module(references=[ref(4, 5, "a"), imp(4, 5, "a"), imp(4, 5, "a", relative_level=1)])
+    )
+    assert validated(module(references=[ref(4, 5, "a"), ref(4, 6, "a")]))
+
+
+def test_reference_caps(monkeypatch: pytest.MonkeyPatch) -> None:
+    two = [ref(4, 5, "a", source="1"), ref(4, 6, "a", source="1")]
+    monkeypatch.setattr(base, "MAX_REFERENCES_PER_SYMBOL", 1)
+    refused(StructuralErrorCode.COUNT_EXCEEDED, module(references=two))
+    monkeypatch.setattr(base, "MAX_REFERENCES_PER_SYMBOL", 64)
+    monkeypatch.setattr(base, "MAX_MODULE_REFERENCES", 1)
+    refused(StructuralErrorCode.COUNT_EXCEEDED, module(references=[ref(4, 5, "a"), imp(4, 5, "a")]))
+    assert validated(module(references=two))
+    monkeypatch.setattr(base, "MAX_REFERENCES_PER_FILE", 1)
+    refused(StructuralErrorCode.COUNT_EXCEEDED, module(references=two))
+
+
+def test_reference_names_count_against_the_name_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(base, "MAX_NAME_TOTAL_BYTES", len("pkg.mod.a"))
+    refused(StructuralErrorCode.COUNT_EXCEEDED, module(references=[ref(4, 5, "a")]))
+    monkeypatch.setattr(base, "MAX_NAME_TOTAL_BYTES", len("pkg.mod.a") + 1)
+    assert validated(module(references=[ref(4, 5, "a")]))
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"kind": "type_ref"},
+        {"kind": "Call"},
+        {"confidence": "certain"},
+        {"confidence": "syntactic"},  # a call is never syntactic
+        {"relative_level": -1},
+        {"relative_level": base.MAX_RELATIVE_LEVEL + 1},
+        {"relative_level": "1"},
+        {"evidence_kind": "scip"},
+        {"target_name": ""},
+        {"target_name": "a\nb"},
+        {"target_name": "x" * (base.MAX_NAME_BYTES + 1)},
+        {"start_byte": 5, "end_byte": 5},
+        {"start_byte": -1},
+        {"source": "abc"},
+        {"extra": 1},
+    ],
+)
+def test_reference_rejects(override: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        ParsedReference.model_validate(ref(4, 5, "a", **override))
+
+
+def test_import_is_syntactic_and_call_is_heuristic() -> None:
+    with pytest.raises(ValidationError):
+        ParsedReference.model_validate(ref(4, 5, "a", kind="import"))
+    assert ParsedReference.model_validate(imp(4, 5, "a", relative_level=16)).relative_level == 16
+
+
+def test_reference_errors_do_not_echo_input() -> None:
+    with pytest.raises(ValidationError) as caught:
+        ParsedReference.model_validate(ref(4, 5, "SECRET-\x00-TEXT"))
+    assert "SECRET" not in str(caught.value)
+
+
+def test_valid_diagnostics() -> None:
+    codes = ("work_budget_exceeded", "syntax_recovered", "symbols_dropped", "references_capped")
+    got = validated(module(diagnostics=[{"code": code, "count": 3} for code in codes]))
+    assert [item.code for item in got.diagnostics] == list(codes)
+    degraded = module(
+        [],
+        diagnostics=[
+            {"code": "file_degraded", "count": 1},
+            {"code": "work_budget_exceeded", "count": 1},
+        ],
+    )
+    assert validated(degraded).symbols == ()
+    bounded = {"code": "syntax_recovered", "count": base.MAX_DIAGNOSTIC_COUNT}
+    assert (
+        validated(module(diagnostics=[bounded])).diagnostics[0].count == base.MAX_DIAGNOSTIC_COUNT
+    )
+
+
+@pytest.mark.parametrize(
+    "diagnostics",
+    [
+        [{"code": "boom", "count": 1}],
+        [{"code": "Syntax_Recovered", "count": 1}],
+        [{"code": "syntax_recovered", "count": 0}],
+        [{"code": "syntax_recovered", "count": -1}],
+        [{"code": "syntax_recovered", "count": base.MAX_DIAGNOSTIC_COUNT + 1}],
+        [{"code": "syntax_recovered", "count": "1"}],
+        [{"code": "syntax_recovered"}],
+        [{"code": "syntax_recovered", "count": 1, "message": "hunter2"}],
+        [{"count": 1, "code": "syntax_recovered", "detail": "/etc/passwd"}],
+        [{"code": "syntax_recovered", "count": 1}] * 2,
+        ["syntax_recovered"],
+        [{"code": "file_degraded", "count": 1}],  # no reason
+        [
+            {"code": "file_degraded", "count": 1},
+            {"code": "syntax_recovered", "count": 1},
+        ],  # still carries a symbol
+    ],
+)
+def test_diagnostics_refused(diagnostics: list[Any]) -> None:
+    with pytest.raises(ValidationError):
+        module(diagnostics=diagnostics)
+
+
+def test_degraded_file_carries_no_relations_or_references() -> None:
+    degraded = [{"code": "file_degraded", "count": 1}, {"code": "symbols_dropped", "count": 1}]
+    with pytest.raises(ValidationError):
+        module([], references=[ref(4, 5, "a")], diagnostics=degraded)
+
+
+def test_diagnostics_are_bounded_by_the_code_set() -> None:
+    assert len(base.DIAGNOSTIC_CODES) == 5
+    with pytest.raises(ValidationError):
+        ParsedFile.model_validate(
+            {
+                **module().files[0].model_dump(),
+                "diagnostics": [{"code": "syntax_recovered", "count": 1}] * 6,
+            }
+        )
+
+
+def test_a_go_receiver_still_passes_and_a_long_range_bound_name_does_not() -> None:
+    go = b"func (t T) m() {}"
+    receiver = symbol(
+        qualified_name="T.m", start_byte=0, end_byte=len(go), signature="func (t T) m() {}"
+    )
+    assert validated(module([receiver]), request(go))
+    words = [f"w{n}".encode() for n in range(91)]
+    text = b" ".join(words)
+    name = ".".join(word.decode() for word in words)  # 90 non-final segments, all range tokens
+    long = symbol(qualified_name=name, start_byte=0, end_byte=len(text), signature="")
+    refused(StructuralErrorCode.TEXT_NOT_IN_SOURCE, module([long]), request(text))
+    two = symbol(qualified_name="w1.w2.w3", start_byte=0, end_byte=len(text), signature="")
+    refused(StructuralErrorCode.TEXT_NOT_IN_SOURCE, module([two]), request(text))
+    # Path components and other emitted symbols are structure, so they stay unlimited.
+    paths = request(text, path="w1/w2/w3/mod.py")
+    ok = symbol(qualified_name="w1.w2.w3.w4", start_byte=0, end_byte=len(text), signature="")
+    assert validated(module([ok], path="w1/w2/w3/mod.py"), paths)
+
+
+def test_diagnostic_counts_saturate_at_one_thousand() -> None:
+    assert base.MAX_DIAGNOSTIC_COUNT == 1000
+
+
+def test_protocol_one_and_unknown_versions_are_refused_everywhere() -> None:
+    assert request().protocol_version == base.PROTOCOL_VERSION == 2
+    assert module().protocol_version == 2
+    for version in (0, 1, 3):
+        with pytest.raises(ValidationError):
+            module(version=version)
+        with pytest.raises(ValidationError):
+            ParseRequest.model_validate(
+                {"protocol_version": version, "files": [request().files[0].model_dump()]}
+            )
+    assert not hasattr(adapter("ok"), "_protocol_version")
+    with pytest.raises(TypeError):
+        adapter("ok", protocol_version=1)
+
+
+def test_sandboxed_adapter_round_trips_references_and_diagnostics() -> None:
+    assert isinstance(adapter("ok").parse(request()), ParsedModule)
+    result = adapter("references_ok").parse(request())
+    assert isinstance(result, ParsedModule)
+    file = result.files[0]
+    assert [item.source for item in file.references] == ["0", None]
+    assert file.references[1].relative_level == 2
+    assert [item.code for item in file.diagnostics] == ["syntax_recovered"]
+    degraded = adapter("degraded_ok").parse(request())
+    assert isinstance(degraded, ParsedModule)
+    assert degraded.files[0].symbols == ()
+    assert {item.code for item in degraded.files[0].diagnostics} == {
+        "file_degraded",
+        "work_budget_exceeded",
+    }
+
+
+def test_serve_speaks_protocol_two_only() -> None:
+    good = io.BytesIO(request().model_dump_json().encode())
+    stdout = io.BytesIO()
+    assert runner.serve(lambda _req: module(), good, stdout) == 0
+    assert json.loads(stdout.getvalue())["protocol_version"] == 2
+    v1 = json.loads(request().model_dump_json())
+    v1["protocol_version"] = 1
+    stdout = io.BytesIO()
+    assert runner.serve(lambda _req: module(), io.BytesIO(json.dumps(v1).encode()), stdout) == 3
+    assert stdout.getvalue() == b""
+
+
+def test_a_protocol_one_answer_is_refused() -> None:
+    assert outcome("protocol_v1") is StructuralErrorCode.SCHEMA_VIOLATION
+
+
+# --- qualified references ---------------------------------------------------------------
+
+FROM = b"from ..pkg import x\nfrom a.b import c\n"
+
+
+def qref(start: int, end: int, name: str, qs: int, qe: int, qualifier: str, **over: Any) -> Any:
+    return imp(
+        start,
+        end,
+        name,
+        qualifier=qualifier,
+        qualifier_start_byte=qs,
+        qualifier_end_byte=qe,
+        **over,
+    )
+
+
+def test_a_qualified_relative_import_carries_pkg_x_at_level_two() -> None:
+    at = FROM.index(b"pkg")
+    x = FROM.index(b" x") + 1
+    got = validated(
+        module([], references=[qref(x, x + 1, "x", at, at + 3, "pkg", relative_level=2)]),
+        request(FROM),
+    ).references[0]
+    assert (got.qualifier, got.target_name, got.relative_level) == ("pkg", "x", 2)
+
+
+def test_a_qualified_import_from_a_dotted_module() -> None:
+    ab = FROM.index(b"a.b")
+    c = FROM.index(b" c") + 1
+    got = validated(
+        module([], references=[qref(c, c + 1, "c", ab, ab + 3, "a.b")]), request(FROM)
+    ).references[0]
+    assert (got.qualifier, got.target_name) == ("a.b", "c")
+
+
+def test_a_qualifier_range_may_sit_on_a_string_literal() -> None:
+    ts = b'import { x } from "./pkg";'
+    at = ts.index(b"./pkg")
+    x = ts.index(b"x")
+    got = validated(
+        module([], references=[qref(x, x + 1, "x", at, at + 5, "pkg", relative_level=1)]),
+        request(ts),
+    ).references[0]
+    assert got.qualifier == "pkg"
+
+
+@pytest.mark.parametrize(
+    "qualifier",
+    [
+        ("pkg", 0, 4),  # the range holds ``from``
+        ("b.a", FROM.index(b"a.b"), FROM.index(b"a.b") + 3),  # out of order
+        ("a.b.c", FROM.index(b"a.b"), FROM.index(b"a.b") + 3),  # more than the range says
+        ("a", FROM.index(b"a.b"), FROM.index(b"a.b") + 3),  # fewer
+        ("a/b", FROM.index(b"a.b"), FROM.index(b"a.b") + 3),
+        ("a#b", FROM.index(b"a.b"), FROM.index(b"a.b") + 3),
+        ("a::b", FROM.index(b"a.b"), FROM.index(b"a.b") + 3),
+        ("ab", FROM.index(b"a.b"), FROM.index(b"a.b") + 3),
+        ("pkg", FROM.index(b"pkg") + 1, FROM.index(b"pkg") + 3),  # cuts the token
+    ],
+)
+def test_a_qualifier_that_is_not_its_range_is_refused(qualifier: tuple[str, int, int]) -> None:
+    name, start, end = qualifier
+    x = FROM.index(b" x") + 1
+    refused(
+        StructuralErrorCode.TEXT_NOT_IN_SOURCE,
+        module([], references=[qref(x, x + 1, "x", start, end, name)]),
+        request(FROM),
+    )
+
+
+def test_a_qualifier_outside_the_source_symbol_or_the_file_is_refused() -> None:
+    # symbol 1 is bytes 0..8 of SOURCE (``def a():``); ``return`` lies outside it.
+    outside = qref(4, 5, "a", 13, 19, "return", source="1")
+    refused(StructuralErrorCode.RANGE_OUT_OF_BOUNDS, module(references=[outside]))
+    beyond = qref(4, 5, "a", 4, len(SOURCE) + 1, "a")
+    refused(StructuralErrorCode.RANGE_OUT_OF_BOUNDS, module(references=[beyond]))
+    assert validated(module(references=[qref(4, 5, "a", 4, 5, "a", source="1")]))
+
+
+def test_qualified_reference_shape_and_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    for over in (
+        {"qualifier": None, "qualifier_start_byte": 4, "qualifier_end_byte": 5},
+        {"qualifier": "a", "qualifier_start_byte": None, "qualifier_end_byte": None},
+        {"qualifier": "a", "qualifier_start_byte": 5, "qualifier_end_byte": 5},
+        {"qualifier": "a", "qualifier_start_byte": -1, "qualifier_end_byte": 5},
+        {"qualifier": "a\nb", "qualifier_start_byte": 4, "qualifier_end_byte": 5},
+        {"qualifier": "", "qualifier_start_byte": 4, "qualifier_end_byte": 5},
+    ):
+        with pytest.raises(ValidationError):
+            ParsedReference.model_validate(ref(4, 5, "a", **over))
+    # ``pkg.mod.a`` (9) + name ``a`` (1) + qualifier ``a`` (1)
+    monkeypatch.setattr(base, "MAX_NAME_TOTAL_BYTES", 10)
+    refused(StructuralErrorCode.COUNT_EXCEEDED, module(references=[qref(4, 5, "a", 4, 5, "a")]))
+    monkeypatch.setattr(base, "MAX_NAME_TOTAL_BYTES", 11)
+    assert validated(module(references=[qref(4, 5, "a", 4, 5, "a")]))
+
+
+def test_duplicates_are_keyed_by_the_qualifier_too() -> None:
+    plain = imp(4, 5, "a")
+    refused(
+        StructuralErrorCode.DUPLICATE_REFERENCE,
+        module(references=[qref(4, 5, "a", 4, 5, "a"), qref(4, 5, "a", 4, 5, "a")]),
+    )
+    assert validated(module(references=[plain, qref(4, 5, "a", 4, 5, "a")]))
+    assert validated(module(references=[qref(4, 5, "a", 4, 5, "a"), qref(4, 5, "a", 4, 6, "a")]))
+
+
+# --- separators between the tokens of a name -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("source", "separator"),
+    [(b"a.b", "dot"), (b"a . b", "spaced"), (b"a\t.\n b", "whitespace")],
+)
+def test_a_dot_with_optional_ascii_whitespace_separates_names(
+    source: bytes, separator: str
+) -> None:
+    del separator
+    got = validated(module([], references=[ref(0, len(source), "a.b")]), request(source))
+    assert got.references[0].target_name == "a.b"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [b"a / b", b"a b", b"a#b", b"a::b", b"a/b", b"a..b", b"a . . b", b"a , b", b"a.\x00b", b"a.-b"],
+)
+def test_other_separators_between_tokens_are_refused(source: bytes) -> None:
+    refused(
+        StructuralErrorCode.TEXT_NOT_IN_SOURCE,
+        module([], references=[ref(0, len(source), "a.b")]),
+        request(source),
+    )
+    refused(
+        StructuralErrorCode.TEXT_NOT_IN_SOURCE,
+        module([], references=[qref(0, 1, "a", 0, len(source), "a.b")]),
+        request(source),
+    )
+
+
+def test_a_string_literal_qualifier_may_use_slash_separators() -> None:
+    ts = b'import { x } from "./pkg/mod";'
+    at = ts.index(b"./pkg/mod")
+    end = at + len(b"./pkg/mod")
+    x = ts.index(b"x")
+    got = validated(
+        module([], references=[qref(x, x + 1, "x", at, end, "pkg.mod", relative_level=1)]),
+        request(ts),
+    ).references[0]
+    assert (got.qualifier, got.relative_level) == ("pkg.mod", 1)
+    single = b"import { x } from './pkg/mod';"
+    assert validated(
+        module([], references=[qref(x, x + 1, "x", at, end, "pkg.mod", relative_level=1)]),
+        request(single),
+    )
+
+
+@pytest.mark.parametrize(
+    "ts",
+    [
+        b"import { x } from ./pkg/mod;",  # no quotes
+        b"import { x } from \"./pkg/mod';",  # mismatched quotes
+        b"import { x } from `./pkg/mod';",
+        b'import { x } from "a"./pkg/mod;',  # only one side is a quote
+    ],
+)
+def test_a_slash_needs_a_real_string_literal_range(ts: bytes) -> None:
+    at = ts.index(b"./pkg/mod")
+    end = at + len(b"./pkg/mod")
+    x = ts.index(b"x")
+    candidate = module([], references=[qref(x, x + 1, "x", at, end, "pkg.mod", relative_level=1)])
+    refused(StructuralErrorCode.TEXT_NOT_IN_SOURCE, candidate, request(ts))
+
+
+def test_a_slash_is_never_a_separator_in_a_name_or_outside_a_literal_qualifier() -> None:
+    ts = b'import { x } from "pkg/mod";'
+    at = ts.index(b"pkg/mod")
+    # the name range, even inside a string literal
+    refused(
+        StructuralErrorCode.TEXT_NOT_IN_SOURCE,
+        module([], references=[ref(at, at + 7, "pkg.mod")]),
+        request(ts),
+    )

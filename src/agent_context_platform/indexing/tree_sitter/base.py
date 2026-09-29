@@ -10,6 +10,9 @@ Wire protocol: one bounded JSON document each way (``ParseRequest`` on stdin,
 ``ParsedModule`` on stdout). Both sides validate with pydantic models that are
 frozen, strict and ``extra="forbid"``, with ``hide_input_in_errors`` so that a
 validation failure never echoes source text into logs.
+Only protocol 2 exists (``references`` and ``diagnostics`` are part of it): every adapter
+ships in-tree with the runner, so there is no negotiation. Requests and answers with any other
+``protocol_version`` fail validation (``schema_violation``).
 
 Trust rules enforced by ``validate_module`` (fail closed, typed content-free
 errors, never the offending value):
@@ -22,6 +25,9 @@ errors, never the offending value):
 - relation endpoints are refs of that file's symbols;
 - every assertion says ``evidence_kind="tree_sitter"`` (design 9.3), no default;
 - counts are bounded;
+- ``references`` (unresolved import/call/inherit candidates, protocol 2) and ``diagnostics``
+  (closed-enum degradation codes with bounded counts, no free text) are validated below.
+  ``references`` and ``diagnostics`` default to empty;
 - every free-text field is confined to the parsed file itself, so an adapter that read
   some other file (``/etc/passwd``, a ``.env``) cannot exfiltrate it through the output.
   Read isolation is not something the container gives (the adapter shares the indexer's
@@ -60,9 +66,46 @@ errors, never the offending value):
     ``FIELD_CONFINEMENT`` classifies every output field; a test fails when a new field
     is not classified.
 
+  * ``ParsedReference.target_name`` is a function of its range (a new free-text channel, so
+    airtight): it EQUALS the identifier tokens found in ``[start_byte, end_byte]``, in source
+    order, joined by ``.``. Between two consecutive tokens the source bytes must be exactly one
+    ``.``, optionally surrounded by ASCII whitespace (``a . b``); ``a / b``, ``a b``, ``a#b``,
+    ``a::b`` are refused, as is a token cut by either range end. The one exception is a
+    qualifier whose range is the CONTENT of a string literal (the bytes right outside the range
+    are the same quote character, ``"``, ``'`` or backtick, and that quote is not inside the
+    range): there ``/`` also separates, so TS ``from "./pkg/mod"`` with the range on ``./pkg/mod``
+    gives the qualifier ``pkg.mod`` (the ``./`` is the adapter's ``relative_level``). The adapter therefore points the range at the name
+    node itself (``os.path`` inside ``import os.path``; ``pkg`` inside ``from ..pkg import x``
+    with ``relative_level=2``), never at the whole statement: a statement's own keywords would
+    be part of the name. A target that spans two places (``pkg.x`` of ``from ..pkg import x``)
+    uses the optional ``qualifier`` with its own range, checked exactly like the name range;
+    the effective target is ``qualifier + "." + target_name`` and ``relative_level`` applies to
+    the qualifier. Both names are charged to the name budget; The range lies inside the file and, when ``source`` is set, inside
+    that symbol's range. ``source`` is
+    remapped to a symbol index (None is module level), ``kind`` and ``confidence`` are closed
+    enums (``syntactic`` for import/inherit, ``heuristic`` for call: the target is a name, not a
+    resolved symbol), ``relative_level`` is an integer 0..``MAX_RELATIVE_LEVEL``. References are
+    capped per file (``MAX_REFERENCES_PER_FILE``, the total that binds symbols and module level
+    together), per symbol and at module level, duplicates are refused and the name bytes count
+    against ``MAX_NAME_TOTAL_BYTES``;
+  * ``ParsedFile.diagnostics`` is at most one ``ParsedDiagnostic`` per closed-enum code with a
+    bounded count. ``file_degraded`` needs a reason code and no symbols, relations or references,
+    so a degraded file is never mistaken for an empty one. Counts saturate at
+    ``MAX_DIAGNOSTIC_COUNT`` (1000);
+  * of the non-final ``qualified_name`` segments, at most ``MAX_RANGE_BOUND_PREFIX`` (one, for
+    Go receivers) may rest only on "a token inside the symbol's own range"; the others must be
+    path components or names of emitted symbols;
+
   Residual channel (inherent to structural output): an adapter can still choose *which*
-  symbols, relations and ordering to emit, about one bit per candidate token or edge, at most about ``log2(tokens in file)`` bits per symbol and only ever about
-  this file's own content. That leaks nothing beyond the file it was asked to parse.
+  symbols, relations, references and ordering to emit, and only ever about this file's own
+  content. Measured bounds, with T identifier tokens in the file: a symbol name carries at most
+  ``log2(T)`` bits for its final segment plus ``log2(T)`` for the one range-bound segment; a
+  reference carries only its ranges, since the names are functions of them: at most
+  ``2*log2(T)`` bits (which token span), ``4*log2(T)`` with a qualifier, plus 5 bits of level.
+  A 256-token file with 511 module-level references therefore carries at most about
+  511 * 32 bits = 2 KB with qualifiers (1 KB without; it was 50 KB while names were free token
+  orderings), and a whole-file range yields exactly one name. That leaks nothing beyond
+  the file it was asked to parse.
 
 Adapter output carries no source text beyond qualified names, ``kind``s,
 ``disambiguator``s and signatures. A signature is bounded to
@@ -96,7 +139,7 @@ from pydantic import (
 
 from agent_context_platform.indexing.identity import canonical_path
 
-PROTOCOL_VERSION: Final = 1
+PROTOCOL_VERSION: Final = 2
 EVIDENCE_KIND: Final = "tree_sitter"
 
 # Same default as scanner.ScanLimits.max_file_bytes: the scanner never yields larger files.
@@ -115,6 +158,16 @@ _DIGEST = r"^[0-9a-f]{64}$"
 _DISAMBIGUATOR = r"^[0-9]{0,6}$"
 _REF = r"^[0-9]{1,6}$"
 MAX_RELATIONS_PER_SYMBOL: Final = 64
+MAX_REFERENCES_PER_FILE: Final = 50_000
+MAX_REFERENCES_PER_SYMBOL: Final = 64
+# Imports pile up at module level, which is one source of its own.
+MAX_MODULE_REFERENCES: Final = 4096
+MAX_RELATIVE_LEVEL: Final = 16
+# Adapters saturate a count at this value; a larger one is refused.
+MAX_DIAGNOSTIC_COUNT: Final = 1000
+# Non-final qualified-name segments that may be bound only by "a token inside the symbol's own
+# range" (Go receivers). Path components and other emitted symbols are bound to structure.
+MAX_RANGE_BOUND_PREFIX: Final = 1
 
 
 class StructuralErrorCode(StrEnum):
@@ -139,6 +192,7 @@ class StructuralErrorCode(StrEnum):
     DUPLICATE_SYMBOL = "duplicate_symbol"
     COUNT_EXCEEDED = "count_exceeded"
     TEXT_NOT_IN_SOURCE = "text_not_in_source"
+    DUPLICATE_REFERENCE = "duplicate_reference"
 
 
 class StructuralError(Exception):
@@ -188,6 +242,22 @@ type SymbolKind = Literal[
     "property",
 ]
 type RelationKind = Literal["calls", "imports", "inherits", "references", "contains"]
+type ReferenceKind = Literal["import", "call", "inherit"]
+type ReferenceConfidence = Literal["syntactic", "heuristic"]
+type DiagnosticCode = Literal[
+    "work_budget_exceeded",
+    "syntax_recovered",
+    "symbols_dropped",
+    "references_capped",
+    "file_degraded",
+]
+DIAGNOSTIC_CODES: Final = (
+    "work_budget_exceeded",
+    "syntax_recovered",
+    "symbols_dropped",
+    "references_capped",
+    "file_degraded",
+)
 type Ref = Annotated[str, StringConstraints(pattern=_REF)]
 type Language = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_+\-]{0,31}$")]
 type RepoPath = Annotated[
@@ -231,7 +301,7 @@ class ParseRequest(BaseModel):
 
     model_config = _MODEL
 
-    protocol_version: Literal[1] = PROTOCOL_VERSION
+    protocol_version: Literal[2] = PROTOCOL_VERSION
     files: tuple[SourceFile, ...] = Field(min_length=1, max_length=MAX_INPUT_FILES)
 
     @model_validator(mode="after")
@@ -286,6 +356,61 @@ class StructuralRelation(BaseModel):
         return self
 
 
+class ParsedReference(BaseModel):
+    """An unresolved structural reference: a name the syntax mentions, never a resolved symbol.
+
+    Cross-file resolution (PLATFORM-037) consumes these; nothing here says what the name is.
+    """
+
+    model_config = _MODEL
+
+    source: Ref | None = None
+    kind: ReferenceKind
+    target_name: Annotated[
+        Text, StringConstraints(min_length=1), AfterValidator(lambda v: _bounded(v, MAX_NAME_BYTES))
+    ]
+    relative_level: Annotated[int, Field(ge=0, le=MAX_RELATIVE_LEVEL)] = 0
+    start_byte: Annotated[int, Field(ge=0)]
+    end_byte: Annotated[int, Field(ge=0)]
+    # Optional second name with its own range: the effective target is
+    # ``qualifier + "." + target_name`` and ``relative_level`` applies to the qualifier
+    # (``from ..pkg import x``: qualifier ``pkg`` at its range, name ``x`` at its own).
+    qualifier: (
+        Annotated[
+            Text,
+            StringConstraints(min_length=1),
+            AfterValidator(lambda v: _bounded(v, MAX_NAME_BYTES)),
+        ]
+        | None
+    ) = None
+    qualifier_start_byte: Annotated[int, Field(ge=0)] | None = None
+    qualifier_end_byte: Annotated[int, Field(ge=0)] | None = None
+    evidence_kind: Literal["tree_sitter"]
+    confidence: ReferenceConfidence
+
+    @model_validator(mode="after")
+    def _consistent(self) -> Self:
+        if self.start_byte >= self.end_byte:
+            raise ValueError("empty or inverted byte range")
+        if (self.confidence == "heuristic") != (self.kind == "call"):
+            raise ValueError("confidence does not match the reference kind")
+        parts = (self.qualifier, self.qualifier_start_byte, self.qualifier_end_byte)
+        if any(part is None for part in parts) != all(part is None for part in parts):
+            raise ValueError("a qualifier needs its name and both range ends")
+        if self.qualifier is not None and self.qualifier_start_byte >= self.qualifier_end_byte:  # type: ignore[operator]
+            raise ValueError("empty or inverted byte range")
+        return self
+
+
+class ParsedDiagnostic(BaseModel):
+    """A content-free degradation report: a closed-enum code and how many times it happened."""
+
+    model_config = _MODEL
+
+    code: DiagnosticCode
+    count: Annotated[int, Field(ge=1, le=MAX_DIAGNOSTIC_COUNT)]
+
+
 class ParsedFile(BaseModel):
     """Normalized structure of one input file, tagged with the parser fingerprint."""
 
@@ -296,6 +421,19 @@ class ParsedFile(BaseModel):
     parser_fingerprint: Digest
     symbols: tuple[ParsedSymbol, ...]
     relations: tuple[StructuralRelation, ...] = ()
+    references: tuple[ParsedReference, ...] = ()
+    diagnostics: tuple[ParsedDiagnostic, ...] = Field(default=(), max_length=len(DIAGNOSTIC_CODES))
+
+    @model_validator(mode="after")
+    def _diagnostics_consistent(self) -> Self:
+        codes = [item.code for item in self.diagnostics]
+        if len(set(codes)) != len(codes):
+            raise ValueError("duplicate diagnostic code")
+        if "file_degraded" in codes and (
+            len(codes) < 2 or self.symbols or self.relations or self.references
+        ):
+            raise ValueError("a degraded file needs a reason and carries no structure")
+        return self
 
 
 class ParsedModule(BaseModel):
@@ -303,7 +441,7 @@ class ParsedModule(BaseModel):
 
     model_config = _MODEL
 
-    protocol_version: Literal[1] = PROTOCOL_VERSION
+    protocol_version: Literal[2] = PROTOCOL_VERSION
     files: tuple[ParsedFile, ...]
 
 
@@ -330,6 +468,8 @@ FIELD_CONFINEMENT: Final[Mapping[str, Mapping[str, Confinement]]] = {
         "parser_fingerprint": "parent",  # must equal the host-computed fingerprint
         "symbols": "structure",
         "relations": "structure",
+        "references": "structure",
+        "diagnostics": "structure",
     },
     "ParsedSymbol": {
         "ref": "derived",
@@ -352,6 +492,20 @@ FIELD_CONFINEMENT: Final[Mapping[str, Mapping[str, Confinement]]] = {
         "end_byte": "range",
         "evidence_kind": "enum",
     },
+    "ParsedReference": {
+        "source": "derived",  # remapped to a symbol index, None is module level
+        "kind": "enum",
+        "target_name": "token",  # every segment is an identifier token inside the range
+        "relative_level": "numeric",
+        "start_byte": "range",
+        "end_byte": "range",
+        "qualifier": "token",  # equals the identifier tokens of its own range
+        "qualifier_start_byte": "range",
+        "qualifier_end_byte": "range",
+        "evidence_kind": "enum",
+        "confidence": "enum",
+    },
+    "ParsedDiagnostic": {"code": "enum", "count": "numeric"},
 }
 OPAQUE_FIELDS: Final = ("signature_digest", "semantic_fingerprint")
 _REHASH_DOMAIN: Final = b"agent-context/tree-sitter/opaque/v1"
@@ -447,12 +601,19 @@ def _finish(
         )
         for item in parsed.relations
     )
-    return parsed.model_copy(update={"symbols": symbols, "relations": relations})
+    references = tuple(
+        item.model_copy(update={"source": None if item.source is None else str(index[item.source])})
+        for item in parsed.references
+    )
+    return parsed.model_copy(
+        update={"symbols": symbols, "relations": relations, "references": references}
+    )
 
 
 _SEPARATORS = re.compile(r"::|[./#]")
 _IDENT = re.compile(rb"[A-Za-z_$\x80-\xff][A-Za-z0-9_$\x80-\xff]*")
 _WHITESPACE = re.compile(rb"[ \t\r\n\f\v]+")
+_ASCII_SPACE = b" \t\r\n\f\v"
 
 
 def _path_parts(path: str) -> set[bytes]:
@@ -464,8 +625,16 @@ class _SourceText:
 
     def __init__(self, path: str, content: bytes) -> None:
         self._tokens: dict[bytes, list[int]] = {}
+        # Every identifier token in source order, for the reference-name check.
+        self._starts: list[int] = []
+        self._ends: list[int] = []
+        self._words: list[bytes] = []
         for match in _IDENT.finditer(content):
             self._tokens.setdefault(match.group(), []).append(match.start())
+            self._starts.append(match.start())
+            self._ends.append(match.end())
+            self._words.append(match.group())
+        self._content = content
         self._path_parts = _path_parts(path)
         self.name_bytes = 0
         # Whitespace-collapsed text, with the original offset of every collapsed byte.
@@ -490,11 +659,52 @@ class _SourceText:
         index = bisect_left(starts, start)
         return index < len(starts) and starts[index] + len(token) <= end
 
-    def final_ok(self, qualified_name: str, kind: str, start: int, end: int) -> bool:
-        """Every segment is an identifier and the final one is a token of the symbol's range."""
-        self.name_bytes += len(qualified_name.encode())
+    def charge(self, name: str) -> None:
+        """Count name bytes against the per-file budget."""
+        self.name_bytes += len(name.encode())
         if self.name_bytes > MAX_NAME_TOTAL_BYTES:
             raise StructuralError(StructuralErrorCode.COUNT_EXCEEDED)
+
+    def _string_content(self, start: int, end: int) -> bool:
+        """The range is exactly what sits between two identical quote bytes."""
+        if start == 0 or end >= len(self._content):
+            return False
+        quote = self._content[start - 1 : start]
+        return (
+            quote in (b'"', b"'", b"`")
+            and self._content[end : end + 1] == quote
+            and quote not in self._content[start:end]
+        )
+
+    def path_ok(self, target_name: str, start: int, end: int, *, qualifier: bool = False) -> bool:
+        """The name equals the range's identifier tokens, in order, joined by ``.``.
+
+        Consecutive tokens are separated by exactly ``.`` (ASCII whitespace around it allowed),
+        or also ``/`` for a qualifier that is the content of a string literal.
+        """
+        self.charge(target_name)
+        index = bisect_left(self._starts, start)
+        first = index
+        if index and self._ends[index - 1] > start:
+            return False  # a token is cut by the start of the range
+        for wanted in target_name.encode().split(b"."):
+            if index >= len(self._starts) or self._ends[index] > end:
+                return False
+            if self._words[index] != wanted:
+                return False
+            index += 1
+        # Another token in range, or one cut by the end of the range, is not the name.
+        if index < len(self._starts) and self._starts[index] < end:
+            return False
+        separators = (b".", b"/") if qualifier and self._string_content(start, end) else (b".",)
+        return all(
+            self._content[self._ends[n - 1] : self._starts[n]].strip(_ASCII_SPACE) in separators
+            for n in range(first + 1, index)
+        )
+
+    def final_ok(self, qualified_name: str, kind: str, start: int, end: int) -> bool:
+        """Every segment is an identifier and the final one is a token of the symbol's range."""
+        self.charge(qualified_name)
         segments = [segment.encode() for segment in _SEPARATORS.split(qualified_name)]
         if not all(_IDENT.fullmatch(raw) for raw in segments):
             return False
@@ -506,12 +716,16 @@ class _SourceText:
     def prefix_ok(
         self, qualified_name: str, start: int, end: int, finals: set[bytes], paths: set[bytes]
     ) -> bool:
-        """Non-final segments: a path component, another symbol's name, or a token in range."""
+        """Non-final segments: a path component, another symbol's name, or (a few) range tokens."""
         segments = [segment.encode() for segment in _SEPARATORS.split(qualified_name)]
-        return all(
-            raw in paths or raw in finals or self._token_within(raw, start, end)
-            for raw in segments[:-1]
-        )
+        range_bound = 0
+        for raw in segments[:-1]:
+            if raw in paths or raw in finals:
+                continue
+            if not self._token_within(raw, start, end):
+                return False
+            range_bound += 1
+        return range_bound <= MAX_RANGE_BOUND_PREFIX
 
     def signature_ok(self, signature: str, start: int, end: int) -> bool:
         needle = _WHITESPACE.sub(b" ", signature.encode()).strip()
@@ -524,10 +738,14 @@ class _SourceText:
 
 def _validate_file(parsed: ParsedFile, content: bytes) -> _SourceText:
     size = len(content)
-    if len(parsed.symbols) > MAX_SYMBOLS_PER_FILE or len(parsed.relations) > MAX_RELATIONS_PER_FILE:
+    if (
+        len(parsed.symbols) > MAX_SYMBOLS_PER_FILE
+        or len(parsed.relations) > MAX_RELATIONS_PER_FILE
+        or len(parsed.references) > MAX_REFERENCES_PER_FILE
+    ):
         raise StructuralError(StructuralErrorCode.COUNT_EXCEEDED)
     text = _SourceText(parsed.path, content)
-    refs: set[str] = set()
+    refs: dict[str, tuple[int, int]] = {}
     declarations: set[tuple[str, str, int, int]] = set()
     for symbol in parsed.symbols:
         if symbol.language != parsed.language:
@@ -541,7 +759,7 @@ def _validate_file(parsed: ParsedFile, content: bytes) -> _SourceText:
         declaration = (symbol.qualified_name, symbol.kind, symbol.start_byte, symbol.end_byte)
         if symbol.ref in refs or declaration in declarations:
             raise StructuralError(StructuralErrorCode.DUPLICATE_SYMBOL)
-        refs.add(symbol.ref)
+        refs[symbol.ref] = (symbol.start_byte, symbol.end_byte)
         declarations.add(declaration)
     per_source: dict[str, int] = {}
     for relation in parsed.relations:
@@ -552,4 +770,51 @@ def _validate_file(parsed: ParsedFile, content: bytes) -> _SourceText:
             raise StructuralError(StructuralErrorCode.RANGE_OUT_OF_BOUNDS)
         if relation.source_ref not in refs or relation.target_ref not in refs:
             raise StructuralError(StructuralErrorCode.DANGLING_RELATION)
+    _validate_references(parsed, size, refs, text)
     return text
+
+
+def _validate_references(
+    parsed: ParsedFile, size: int, refs: dict[str, tuple[int, int]], text: _SourceText
+) -> None:
+    per_source: dict[str | None, int] = {}
+    seen: set[tuple[str, str, int, int, int, str | None, int | None, int | None]] = set()
+    for reference in parsed.references:
+        limit = MAX_MODULE_REFERENCES if reference.source is None else MAX_REFERENCES_PER_SYMBOL
+        per_source[reference.source] = per_source.get(reference.source, 0) + 1
+        if per_source[reference.source] > limit:
+            raise StructuralError(StructuralErrorCode.COUNT_EXCEEDED)
+        low, high = 0, size
+        if reference.source is not None:
+            if reference.source not in refs:
+                raise StructuralError(StructuralErrorCode.DANGLING_RELATION)
+            low, high = refs[reference.source]
+        if reference.end_byte > high or reference.start_byte < low:
+            raise StructuralError(StructuralErrorCode.RANGE_OUT_OF_BOUNDS)
+        if reference.qualifier is not None and (
+            reference.qualifier_end_byte > high  # type: ignore[operator]
+            or reference.qualifier_start_byte < low  # type: ignore[operator]
+        ):
+            raise StructuralError(StructuralErrorCode.RANGE_OUT_OF_BOUNDS)
+        key = (
+            reference.kind,
+            reference.target_name,
+            reference.relative_level,
+            reference.start_byte,
+            reference.end_byte,
+            reference.qualifier,
+            reference.qualifier_start_byte,
+            reference.qualifier_end_byte,
+        )
+        if key in seen:
+            raise StructuralError(StructuralErrorCode.DUPLICATE_REFERENCE)
+        seen.add(key)
+        if not text.path_ok(reference.target_name, reference.start_byte, reference.end_byte):
+            raise StructuralError(StructuralErrorCode.TEXT_NOT_IN_SOURCE)
+        if reference.qualifier is not None and not text.path_ok(
+            reference.qualifier,
+            reference.qualifier_start_byte,  # type: ignore[arg-type]
+            reference.qualifier_end_byte,  # type: ignore[arg-type]
+            qualifier=True,
+        ):
+            raise StructuralError(StructuralErrorCode.TEXT_NOT_IN_SOURCE)

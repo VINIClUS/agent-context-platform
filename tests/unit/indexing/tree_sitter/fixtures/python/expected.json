@@ -39,7 +39,9 @@
      "signature": "VERSION =",
      "signature_digest": "c1c28e0dcd3ae056644b84359cba4d3a211cc7b155492a41ac1621bea99a6824"
     }
-   ]
+   ],
+   "references": [],
+   "diagnostics": []
   },
   {
    "language": "python",
@@ -424,7 +426,9 @@
      "signature": "async def fetch_all() -> list[Account]:",
      "signature_digest": "a4854ad9a994beeef5ce5da550a5611107300d1c05c8fd9c8d574ddbdc36a373"
     }
-   ]
+   ],
+   "references": [],
+   "diagnostics": []
   },
   {
    "language": "python",
@@ -465,8 +469,10 @@
      "signature": "def run() -> None:",
      "signature_digest": "83bb44cd7df4b06b4ae630405078c9d8438a798e9d870fc13bfff70d61b028f6"
     }
-   ]
+   ],
+   "references": [],
+   "diagnostics": []
   }
  ],
- "protocol_version": 1
+ "protocol_version": 2
 }

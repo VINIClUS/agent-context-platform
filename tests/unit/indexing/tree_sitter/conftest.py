@@ -3,13 +3,19 @@
 from __future__ import annotations
 
 from collections.abc import Sequence
+from pathlib import Path
 
 import pytest
 
+import agent_context_platform
 from agent_context_platform.indexing.tree_sitter import landlock, runner
 from agent_context_platform.indexing.tree_sitter.runner import Limits
 
 ABI = landlock.abi_version()
+# The fake adapter parses stdin with the real ``ParseRequest``; under Landlock it may read the
+# platform package (and the directory holding it, which Python lists) and nothing else more.
+_PACKAGE = Path(agent_context_platform.__file__).resolve().parent
+PACKAGE_READ_PATHS = (str(_PACKAGE), str(_PACKAGE.parent))
 
 
 @pytest.fixture(autouse=True)

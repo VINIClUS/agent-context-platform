@@ -5,7 +5,6 @@ Standalone on purpose: it runs inside the sandbox as an untrusted child.
 
 from __future__ import annotations
 
-import base64
 import errno
 import hashlib
 import json
@@ -37,6 +36,21 @@ def symbol(ref: str, name: str, start: int, end: int, **over: object) -> dict[st
         "signature_digest": digest("sig" + name),
         "semantic_fingerprint": digest("body" + name),
         "evidence_kind": "tree_sitter",
+    }
+    base.update(over)
+    return base
+
+
+def reference(start: int, end: int, name: str, **over: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "source": None,
+        "kind": "call",
+        "target_name": name,
+        "relative_level": 0,
+        "start_byte": start,
+        "end_byte": end,
+        "evidence_kind": "tree_sitter",
+        "confidence": "heuristic",
     }
     base.update(over)
     return base
@@ -116,27 +130,51 @@ def main() -> int:
     if MODE == "no_read_hang":
         time.sleep(600)
     if MODE == "ignore_stdin":
-        emit({"protocol_version": 1, "files": []})
+        emit({"protocol_version": 2, "files": []})
         return 0
-    request = json.loads(sys.stdin.read())
+    raw = sys.stdin.read()
     if MODE == "read_other_file":
         # Prints {attempt: errno name or "ok"}; ARG is the os.pathsep-joined list to open.
+        # Raw on purpose: the probe must not need the platform package to be readable.
         emit({"probe": probe(ARG.split(os.pathsep))})
         return 0
-    file = request["files"][0]
-    size = len(base64.b64decode(file["content_b64"]))
+    # The REAL request model, so the tests exercise the real validation. The package is
+    # readable only through ``Limits.extra_read_paths`` (see conftest.PACKAGE_READ_PATHS).
+    from agent_context_platform.indexing.tree_sitter.base import ParseRequest
+
+    request = ParseRequest.model_validate_json(raw)
+    file = request.files[0]
+    size = len(file.content())
     fingerprint = os.environ.get("FAKE_FINGERPRINT", "")
     good = symbol("1", "pkg.a", 0, min(size, 8), signature="def a()")
     parsed: dict[str, object] = {
-        "path": file["path"],
-        "language": file["language"],
+        "path": file.path,
+        "language": file.language,
         "parser_fingerprint": fingerprint,
         "symbols": [good],
         "relations": [],
     }
-    document: dict[str, object] = {"protocol_version": 1, "files": [parsed]}
+    document: dict[str, object] = {"protocol_version": 2, "files": [parsed]}
     if MODE == "ok":
         pass
+    elif MODE == "references_ok":
+        parsed["references"] = [
+            reference(4, 5, "a", source="1"),
+            reference(13, 19, "return", kind="import", confidence="syntactic", relative_level=2),
+        ]
+        parsed["diagnostics"] = [{"code": "syntax_recovered", "count": 1}]
+    elif MODE == "references_exfil":
+        parsed["references"] = [reference(4, 5, "AWS_SECRET_KEY")]
+    elif MODE == "protocol_v1":
+        document["protocol_version"] = 1
+    elif MODE == "degraded_ok":
+        parsed["symbols"] = []
+        parsed["diagnostics"] = [
+            {"code": "file_degraded", "count": 1},
+            {"code": "work_budget_exceeded", "count": 1},
+        ]
+    elif MODE == "diagnostics_free_text":
+        parsed["diagnostics"] = [{"code": "syntax_recovered", "count": 1, "detail": "secret"}]
     elif MODE == "range":
         parsed["symbols"] = [symbol("1", "pkg.a", 0, size + 1)]
     elif MODE == "foreign_path":

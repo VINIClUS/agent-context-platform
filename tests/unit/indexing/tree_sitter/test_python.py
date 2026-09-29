@@ -527,3 +527,85 @@ def test_a_hostile_parse_is_cut_inside_the_parse_by_the_cpu_backstop(
     module = in_process(request(source("pkg/h.py", hostile)))
     assert time.process_time() - started < 3
     assert module.files[0].symbols == ()
+
+
+# --- references and diagnostics through the shared helpers ----------------------------------
+
+
+def _with_references(source: SourceFile, budget: object, output: list[int]) -> ParsedFile:
+    refs = [
+        {
+            "source": None,
+            "kind": kind,
+            "target_name": name,
+            "relative_level": 0,
+            "start_byte": start,
+            "end_byte": start + len(name),
+            "evidence_kind": "tree_sitter",
+            "confidence": "heuristic" if kind == "call" else "syntactic",
+        }
+        for kind, name, start in (("call", "os", 13), ("import", "sys", 4), ("call", "a", 0))
+    ]
+    return ParsedFile.model_validate_json(
+        json.dumps(
+            {
+                "path": source.path,
+                "language": source.language,
+                "parser_fingerprint": FINGERPRINT,
+                "symbols": [],
+                "references": refs,
+                "diagnostics": [{"code": "syntax_recovered", "count": 2}],
+            }
+        )
+    )
+
+
+REFERENCE_SOURCE = b"a = sys; y = os.x\n"
+
+
+def _reference_request() -> ParseRequest:
+    return ParseRequest(files=(SourceFile.from_bytes("pkg/m.py", "python", REFERENCE_SOURCE),))
+
+
+def test_safe_module_carries_references_and_diagnostics_through() -> None:
+    module = _common.safe_module(_reference_request(), FINGERPRINT, _with_references)
+    file = module.files[0]
+    assert module.protocol_version == 2
+    assert [item.target_name for item in file.references] == ["os", "sys", "a"]
+    assert [(item.code, item.count) for item in file.diagnostics] == [("syntax_recovered", 2)]
+
+
+def test_normalize_module_sorts_references_and_diagnostics_deterministically() -> None:
+    module = _common.safe_module(_reference_request(), FINGERPRINT, _with_references)
+    view = normalize_module(module)["files"][0]
+    assert [item["target"] for item in view["references"]] == sorted(
+        item["target"] for item in view["references"]
+    ) or [item["range"] for item in view["references"]] == sorted(
+        item["range"] for item in view["references"]
+    )
+    reordered = module.model_copy(
+        update={
+            "files": (
+                module.files[0].model_copy(update={"references": module.files[0].references[::-1]}),
+            )
+        }
+    )
+    assert normalize_module(reordered) == normalize_module(module)
+    dropped = module.files[0].model_copy(update={"references": module.files[0].references[:2]})
+    assert normalize_module(module.model_copy(update={"files": (dropped,)})) != normalize_module(
+        module
+    )
+    changed = module.files[0].model_copy(update={"diagnostics": ()})
+    assert normalize_module(module.model_copy(update={"files": (changed,)})) != normalize_module(
+        module
+    )
+
+
+def test_output_over_budget_sheds_references_and_says_so(monkeypatch: pytest.MonkeyPatch) -> None:
+    full = _common.safe_module(_reference_request(), FINGERPRINT, _with_references).files[0]
+    lean = full.model_copy(update={"references": ()})
+    monkeypatch.setattr(_common, "OUTPUT_BUDGET", len(lean.model_dump_json()) + 60)
+    shed = _common.safe_module(_reference_request(), FINGERPRINT, _with_references).files[0]
+    assert shed.references == ()
+    assert {item.code for item in shed.diagnostics} == {"syntax_recovered", "references_capped"}
+    assert [item.count for item in shed.diagnostics if item.code == "references_capped"] == [3]
