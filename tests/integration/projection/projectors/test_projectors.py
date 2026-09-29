@@ -21,6 +21,7 @@ from agent_context_platform.projection.runtime import Projector
 
 from ..conftest import neo4j_integration_settings
 from .conftest import (
+    SHA,
     TRANSACTION_ATTEMPTS,
     build_event,
     digest,
@@ -29,7 +30,7 @@ from .conftest import (
     project_event,
     wipe_projected_graph,
 )
-from .fixtures import CALL, CALL_CONTEXT, IDS, TURN_CONTEXT, session_events
+from .fixtures import CALL, CALL_CONTEXT, CONTEXT, IDS, TURN_CONTEXT, session_events
 
 pytestmark = pytest.mark.integration
 
@@ -103,6 +104,37 @@ def test_any_delivery_order_and_duplicates_give_the_same_digest() -> None:
         }
         for name, delivery in deliveries.items():
             assert digest(await state_after(store, delivery)) == expected, name
+
+    with_graph(body)
+
+
+def test_conflicting_snapshot_events_resolve_the_same_way_in_any_order() -> None:
+    def snapshot(number: int, files: list[str], paths: list[str]) -> StoredEventV1:
+        return build_event(
+            number,
+            "git.workspace_snapshot.captured",
+            {
+                "snapshot_id": "snap_1",
+                "repository_id": "repo_1",
+                "checkout_id": "co_1",
+                "base_commit": None,
+                "dirty_patch_sha256": SHA,
+                "modified_content_sha256": files,
+                "untracked_paths": paths,
+            },
+            context=CONTEXT,
+        )
+
+    async def body(store: Neo4jStore) -> None:
+        events = [snapshot(20, ["a" * 64, "b" * 64], ["a.md", "z.md"]), snapshot(21, [], ["m.md"])]
+        expected = digest(await state_after(store, events))
+        for delivery in (list(reversed(events)), events * 2, list(reversed(events)) * 2):
+            assert digest(await state_after(store, delivery)) == expected
+        node = next(
+            n for n in (await graph_state(store))["nodes"] if n["id"] == "WorkspaceSnapshot:snap_1"
+        )
+        assert node["props"]["untracked_paths"] == ["m.md"]
+        assert node["props"]["modified_content_sha256"] == []
 
     with_graph(body)
 

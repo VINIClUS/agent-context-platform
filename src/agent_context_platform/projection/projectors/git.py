@@ -27,7 +27,6 @@ from agent_context_platform.projection.neo4j import Neo4jTransaction
 from agent_context_platform.projection.projectors import (
     assert_link,
     event_order,
-    fill_once,
     lock_event_nodes,
     min_non_null,
     newest_wins,
@@ -64,7 +63,7 @@ _SNAPSHOT: Final = (
     node_statement("WorkspaceSnapshot", "snapshot_id")
     + min_non_null("repository_id", "checkout_id", "base_commit", "dirty_patch_sha256")
     + " "
-    + fill_once("modified_content_sha256", "untracked_paths")
+    + newest_wins("collections", "modified_content_sha256", "untracked_paths")
 )
 
 _CHECKOUT_IN_REPOSITORY: Final = relationship_statement(
@@ -179,12 +178,13 @@ async def _snapshot_captured(tx: Neo4jTransaction, event: StoredEventV1) -> None
         _SNAPSHOT,
         parameters={
             "node_id": snapshot,
+            "order": event_order(event),
             "repository_id": payload.repository_id,
             "checkout_id": payload.checkout_id,
             "base_commit": payload.base_commit,
             "dirty_patch_sha256": payload.dirty_patch_sha256,
-            "modified_content_sha256": list(payload.modified_content_sha256),
-            "untracked_paths": list(payload.untracked_paths),
+            "modified_content_sha256": sorted(payload.modified_content_sha256),
+            "untracked_paths": sorted(payload.untracked_paths),
         },
     )
     await assert_link(tx, _HAS_SNAPSHOT, event, payload.checkout_id, snapshot)

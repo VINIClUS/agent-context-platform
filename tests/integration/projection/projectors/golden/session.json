@@ -119,6 +119,7 @@
       "props": {
         "base_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
         "checkout_id": "co_1",
+        "collections_order": "2026-08-13T13:00:12.000000|0198a4b1-98c0-7c28-ae3f-00000000000c",
         "dirty_patch_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
         "modified_content_sha256": [
           "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
