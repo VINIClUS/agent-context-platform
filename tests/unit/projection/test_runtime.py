@@ -187,11 +187,6 @@ def test_retry_delay_grows_exponentially(retry_count: int, expected_seconds: flo
     assert delay == timedelta(seconds=expected_seconds)
 
 
-def test_as_utc_rejects_a_naive_timestamp() -> None:
-    with pytest.raises(ValueError, match="timezone-aware"):
-        runtime._as_utc(datetime(2026, 1, 1))
-
-
 # --- run_once orchestration ---------------------------------------------------
 
 
@@ -736,3 +731,81 @@ def test_load_event_reconstructs_content_refs_when_present() -> None:
     assert ref.content_id == "artifact-1"
     assert ref.storage.value == "inline"
     assert ref.disposition.value == "sanitized"
+
+
+def test_load_event_orders_content_refs_by_code_point_not_sql_collation() -> None:
+    from agent_context_sdk import (
+        ContentClaimV1,
+        ContentRefV1,
+        EventDraftV1,
+        seal_event,
+        verify_event,
+    )
+
+    sealed_shape = build_stored_event()
+    claims = (
+        ContentClaimV1(
+            content_id="B-ref",
+            content_sha256="b" * 64,
+            media_type="text/plain",
+            uncompressed_bytes=3,
+        ),
+        ContentClaimV1(
+            content_id="a-ref",
+            content_sha256="a" * 64,
+            media_type="text/plain",
+            uncompressed_bytes=3,
+        ),
+    )
+    draft = EventDraftV1.model_validate(
+        {
+            **sealed_shape.model_dump(
+                mode="json",
+                include={
+                    "event_type",
+                    "stream_id",
+                    "occurred_at",
+                    "observed_at",
+                    "producer",
+                    "payload",
+                    "redaction",
+                    "idempotency_key",
+                },
+            ),
+            "content_claims": [claim.model_dump(mode="json") for claim in claims],
+        }
+    )
+    refs = [
+        ContentRefV1(
+            **claim.model_dump(),
+            disposition="sanitized",
+            storage="inline",
+            inline_id=f"inline-{claim.content_id}",
+        )
+        for claim in claims
+    ]
+    # Sealed in canonical code-point order ("B-ref" < "a-ref"), as the ledger does.
+    sealed = seal_event(draft, refs, 1, None)
+    rows = [
+        EventContentRefRow(
+            event_id=sealed.event_id,
+            content_id=ref.content_id,
+            content_sha256=ref.content_sha256,
+            media_type=ref.media_type,
+            uncompressed_bytes=ref.uncompressed_bytes,
+            disposition=ContentDisposition.SANITIZED,
+            storage=ContentStorage.INLINE,
+            inline_id=ref.inline_id,
+            object_key=None,
+            encoding=None,
+        )
+        for ref in reversed(sealed.content_refs)  # a case-insensitive collation's order
+    ]
+    session = FakeSession(
+        get_results=[_event_row_from(sealed)], scalars_results=[FakeScalarResult(rows)]
+    )
+
+    reconstructed = asyncio.run(runtime._load_event(session, sealed.event_id))  # type: ignore[arg-type]
+
+    assert [ref.content_id for ref in reconstructed.content_refs] == ["B-ref", "a-ref"]
+    assert verify_event(reconstructed)

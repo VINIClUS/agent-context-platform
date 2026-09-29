@@ -13,7 +13,9 @@ from sqlalchemy import and_, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from agent_context_platform.ledger.models import EventContentRefRow, EventRow
+# Module import (not `from ... import`): ledger.repository imports projection.models,
+# so binding the attribute at call time keeps either import order cycle-free.
+import agent_context_platform.ledger.repository as ledger_repository
 from agent_context_platform.projection.checkpoints import CheckpointRepository
 from agent_context_platform.projection.models import (
     DeadLetterRow,
@@ -96,67 +98,19 @@ class ClaimedOutboxRow:
     lease_expires_at: datetime
 
 
-def _as_utc(value: datetime) -> datetime:
-    if value.tzinfo is None or value.utcoffset() is None:
-        raise ValueError("timestamp must be timezone-aware")
-    return value.astimezone(UTC)
-
-
 async def _load_event(session: AsyncSession, event_id: UUID) -> StoredEventV1:
-    """Reconstruct the SDK's canonical `StoredEventV1` from ledger rows.
+    """Reconstruct the SDK's canonical `StoredEventV1` through the ledger.
 
-    Uses the real SDK contract model rather than a hand-rolled projection
-    dataclass, so downstream projectors observe exactly the same shape a
-    producer sealed and the ledger stored.
+    Delegates to `LedgerRepository.get_event`, the ledger's single
+    reconstruction path, which orders content refs exactly as the event was
+    sealed (Python code-point order by `content_id`) instead of trusting SQL
+    collation. Projectors therefore observe the same shape a producer sealed
+    and the ledger stored.
     """
-    event_row = await session.get(EventRow, event_id)
-    if event_row is None:
+    event = await ledger_repository.LedgerRepository.get_event(session, event_id)
+    if event is None:
         raise OrphanedOutboxRowError(f"ledger event missing for outbox claim: {event_id}")
-
-    content_ref_rows = (
-        await session.scalars(
-            select(EventContentRefRow)
-            .where(EventContentRefRow.event_id == event_id)
-            .order_by(EventContentRefRow.content_id)
-        )
-    ).all()
-
-    return StoredEventV1.model_validate(
-        {
-            "event_id": event_row.event_id,
-            "event_type": event_row.event_type,
-            "schema_version": event_row.schema_version,
-            "stream_id": event_row.stream_id,
-            "stream_sequence": event_row.stream_sequence,
-            "occurred_at": _as_utc(event_row.occurred_at),
-            "observed_at": _as_utc(event_row.observed_at),
-            "producer": event_row.producer,
-            "context": event_row.context,
-            "trace": event_row.trace,
-            "payload": event_row.payload,
-            "redaction": event_row.redaction,
-            "idempotency_key": event_row.idempotency_key,
-            "content_refs": [
-                {
-                    "content_id": ref.content_id,
-                    "content_sha256": ref.content_sha256,
-                    "media_type": ref.media_type,
-                    "uncompressed_bytes": ref.uncompressed_bytes,
-                    "disposition": ref.disposition.value,
-                    "storage": ref.storage.value,
-                    "inline_id": ref.inline_id,
-                    "object_key": ref.object_key,
-                    "encoding": ref.encoding,
-                }
-                for ref in content_ref_rows
-            ],
-            "integrity": {
-                "payload_sha256": event_row.payload_sha256,
-                "previous_event_sha256": event_row.previous_event_sha256,
-                "event_sha256": event_row.event_sha256,
-            },
-        }
-    )
+    return event
 
 
 class ProjectionRunner:
