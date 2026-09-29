@@ -132,6 +132,25 @@ class MCPSettings(BaseModel):
     max_request_body_bytes: int = Field(default=1_048_576, gt=0)
 
 
+class IngestionSettings(BaseModel):
+    """Batch ingestion limits and the Argon2id cost used for the unknown-prefix dummy hash.
+
+    Stored verifiers carry their own parameters, so the cost settings only shape the
+    dummy verifier that keeps unknown-prefix requests as slow as real ones.
+    """
+
+    model_config = _SECTION_CONFIG
+
+    # Counted while streaming; Content-Length is never trusted. Sized for 500 events
+    # plus base64 content items (base64 inflates raw bytes by 4/3).
+    max_request_body_bytes: int = Field(default=33_554_432, gt=0)
+    argon2_time_cost: int = Field(default=3, gt=0)
+    argon2_memory_cost_kib: int = Field(default=65_536, gt=0)
+    argon2_parallelism: int = Field(default=4, gt=0)
+    # Bounds concurrent Argon2 verifications (each holds memory_cost KiB).
+    argon2_max_concurrency: int = Field(default=4, gt=0)
+
+
 class Settings(BaseSettings):
     """Single process boundary for the Agent Context environment namespace."""
 
@@ -150,6 +169,7 @@ class Settings(BaseSettings):
     neo4j: Neo4jSettings = Field(default_factory=Neo4jSettings)
     s3: S3Settings = Field(default_factory=S3Settings)
     mcp: MCPSettings = Field(default_factory=MCPSettings)
+    ingestion: IngestionSettings = Field(default_factory=IngestionSettings)
 
     @model_validator(mode="after")
     def require_complete_production_settings(self) -> Self:
