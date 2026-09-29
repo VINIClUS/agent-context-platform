@@ -597,5 +597,6 @@ async def test_mcp_route_stays_mounted_and_gets_a_request_id(harness: Harness) -
     async with harness.client() as client:
         response = await client.get("/mcp", headers={"x-request-id": "mcp-req-1"})
 
-    assert response.status_code == 405
+    # Mounted and authenticated first: a tokenless request is 401 (405 needs a valid token).
+    assert response.status_code == 401
     assert response.headers["x-request-id"] == "mcp-req-1"

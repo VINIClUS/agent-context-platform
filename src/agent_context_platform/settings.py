@@ -118,7 +118,15 @@ class MCPSettings(BaseModel):
 
     model_config = _SECTION_CONFIG
 
-    bearer_token_verifier: SecretStr | None = Field(default=None, repr=False)
+    # Server key for the principal cache's HMAC(token) keys. Required in production;
+    # other environments fall back to a random per-process key (the cache is in-memory).
+    token_hmac_key: SecretStr | None = Field(default=None, repr=False)
+    # Upper bound on how long a revocation can go unnoticed on one replica.
+    principal_cache_ttl_seconds: float = Field(default=30.0, gt=0, le=300, allow_inf_nan=False)
+    principal_cache_max_entries: int = Field(default=1024, gt=0)
+    # Per-principal, per-replica token bucket.
+    rate_limit_per_second: float = Field(default=5.0, gt=0, allow_inf_nan=False)
+    rate_limit_burst: int = Field(default=20, gt=0)
     stateless_http: Literal[True] = True
     # A trailing ":*" accepts any 1-5 digit port. A Host or Origin with no port does
     # not match a ":*" entry, so list it explicitly if needed. Origin is only checked
@@ -130,6 +138,14 @@ class MCPSettings(BaseModel):
         default=("http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"), strict=False
     )
     max_request_body_bytes: int = Field(default=1_048_576, gt=0)
+
+    @field_validator("token_hmac_key")
+    @classmethod
+    def require_long_hmac_key(cls, key: SecretStr | None) -> SecretStr | None:
+        # Blank is reported as missing in production; a short non-blank key is never valid.
+        if key is not None and 0 < len(key.get_secret_value().strip()) < 32:
+            raise ValueError("MCP token HMAC key must be at least 32 characters")
+        return key
 
 
 class IngestionSettings(BaseModel):
@@ -189,10 +205,8 @@ class Settings(BaseSettings):
             if self.s3.secret_access_key is None
             else self.s3.secret_access_key.get_secret_value()
         )
-        bearer_token_verifier = (
-            None
-            if self.mcp.bearer_token_verifier is None
-            else self.mcp.bearer_token_verifier.get_secret_value()
+        token_hmac_key = (
+            None if self.mcp.token_hmac_key is None else self.mcp.token_hmac_key.get_secret_value()
         )
         missing = [
             name
@@ -207,7 +221,7 @@ class Settings(BaseSettings):
                 ("s3.bucket_name", self.s3.bucket_name),
                 ("s3.access_key_id", s3_access_key_id),
                 ("s3.secret_access_key", s3_secret_access_key),
-                ("mcp.bearer_token_verifier", bearer_token_verifier),
+                ("mcp.token_hmac_key", token_hmac_key),
             )
             if value is None or (isinstance(value, str) and not value.strip())
         ]

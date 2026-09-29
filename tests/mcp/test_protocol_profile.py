@@ -12,7 +12,10 @@ from mcp_helpers import (
     CAPABILITIES_META_KEY,
     PROTOCOL_VERSION,
     SERVER_INFO_META_KEY,
+    TOKEN,
     VERSION_META_KEY,
+    AuthHarness,
+    OpenGate,
     mcp_client,
     mcp_headers,
     rpc_body,
@@ -369,6 +372,7 @@ async def test_understated_content_length_cannot_bypass_limit() -> None:
         allowed_hosts=("h",),
         allowed_origins=(),
         max_body_bytes=150,
+        access_gate=OpenGate(),
     )
     scope = {
         "type": "http",
@@ -403,6 +407,7 @@ async def test_client_disconnect_while_reading_body_is_silent() -> None:
         allowed_hosts=("h",),
         allowed_origins=(),
         max_body_bytes=10,
+        access_gate=OpenGate(),
     )
     scope = {
         "type": "http",
@@ -422,7 +427,9 @@ async def test_non_http_scopes_pass_through() -> None:
     async def downstream(scope: Any, _receive: Any, _send: Any) -> None:
         seen.append(scope["type"])
 
-    guard = ProtocolGuard(downstream, allowed_hosts=(), allowed_origins=(), max_body_bytes=1)
+    guard = ProtocolGuard(
+        downstream, allowed_hosts=(), allowed_origins=(), max_body_bytes=1, access_gate=OpenGate()
+    )
     await guard({"type": "lifespan"}, None, None)  # type: ignore[arg-type]
 
     assert seen == ["lifespan"]
@@ -549,7 +556,13 @@ async def test_missing_host_header_is_rejected() -> None:
     async def downstream(*_args: Any) -> None:
         raise AssertionError("request without Host reached the MCP app")
 
-    guard = ProtocolGuard(downstream, allowed_hosts=("h",), allowed_origins=(), max_body_bytes=1)
+    guard = ProtocolGuard(
+        downstream,
+        allowed_hosts=("h",),
+        allowed_origins=(),
+        max_body_bytes=1,
+        access_gate=OpenGate(),
+    )
     await guard({"type": "http", "method": "POST", "headers": []}, None, send)  # type: ignore[arg-type]
 
     assert sent[0]["status"] == 421
@@ -561,12 +574,15 @@ def test_application_mounts_mcp_at_exact_path_and_keeps_health() -> None:
     from agent_context_platform.app import create_app
     from agent_context_platform.settings import Settings
 
+    harness = AuthHarness()
+    harness.add()
     with TestClient(
-        create_app(Settings(environment="test")), base_url="http://127.0.0.1:8000"
+        create_app(Settings(environment="test"), mcp_auth=harness.runtime()),
+        base_url="http://127.0.0.1:8000",
     ) as c:
         discovered = c.post(
             "/mcp",
-            headers=mcp_headers("server/discover"),
+            headers=mcp_headers("server/discover", authorization=f"Bearer {TOKEN}"),
             json=rpc_body("server/discover"),
             follow_redirects=False,
         )
@@ -661,6 +677,7 @@ async def test_duplicate_host_or_origin_is_rejected(name: str, status: int) -> N
         allowed_hosts=("h",),
         allowed_origins=("https://ok.test",),
         max_body_bytes=10,
+        access_gate=OpenGate(),
     )
     headers = [(b"host", b"h"), (b"origin", b"https://ok.test")]
     value = b"h" if name == "host" else b"https://ok.test"

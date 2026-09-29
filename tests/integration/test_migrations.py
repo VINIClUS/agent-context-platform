@@ -48,6 +48,7 @@ EXPECTED_TABLES = {
     },
     "operations": {
         "registered_producers",
+        "mcp_tokens",
         "schema_versions",
         "retention_policies",
     },
@@ -217,6 +218,16 @@ EXPECTED_COLUMNS = {
         "updated_at",
         "last_used_at",
     },
+    "operations.mcp_tokens": {
+        "token_id",
+        "token_prefix",
+        "token_verifier",
+        "principal",
+        "scopes",
+        "created_at",
+        "expires_at",
+        "revoked_at",
+    },
     "operations.schema_versions": {
         "schema_name",
         "schema_version",
@@ -292,7 +303,46 @@ async def _exercise_migration(dsn: str) -> None:
 
 
 _PRE_CONTENT_REVISION = "20260823_0001"
+_CONTENT_REVISION = "20260928_0001"
+_MCP_TOKENS_REVISION = "20260929_0001"
 _LEGACY_DIGEST = hashlib.sha256(b"legacy-content-that-was-never-stored").hexdigest()
+
+
+def test_mcp_tokens_revision_steps_down_cleanly(postgres_dsn: str) -> None:
+    """The one auth-token revision adds and removes only ``operations.mcp_tokens`` and its grant."""
+    asyncio.run(_exercise_mcp_tokens_step(postgres_dsn))
+
+
+async def _exercise_mcp_tokens_step(dsn: str) -> None:
+    engine = create_async_engine(dsn, poolclass=NullPool)
+    try:
+        async with engine.connect() as connection:
+            try:
+                await _run_alembic(connection, command.upgrade, _MCP_TOKENS_REVISION)
+                await connection.commit()
+                assert await connection.scalar(text("SELECT to_regclass('operations.mcp_tokens')"))
+                assert await connection.scalar(
+                    text(
+                        "SELECT has_table_privilege("
+                        "'agent_context_api', 'operations.mcp_tokens', 'SELECT')"
+                    )
+                )
+
+                await _run_alembic(connection, command.downgrade, _CONTENT_REVISION)
+                await connection.commit()
+                assert (
+                    await connection.scalar(text("SELECT to_regclass('operations.mcp_tokens')"))
+                    is None
+                )
+                assert await connection.scalar(
+                    text("SELECT to_regclass('catalog.inline_contents')")
+                )
+            finally:
+                await connection.rollback()
+                await _run_alembic(connection, command.downgrade, "base")
+                await connection.commit()
+    finally:
+        await engine.dispose()
 
 
 @pytest.mark.parametrize(
@@ -346,10 +396,10 @@ async def _exercise_legacy_refs(dsn: str, storage: str, expected_counts: str) ->
                 await connection.execute(text("DELETE FROM ledger.event_content_refs"))
                 await connection.execute(text("DELETE FROM catalog.content_objects"))
                 await connection.commit()
-                await _run_alembic(connection, command.upgrade, "head")
+                await _run_alembic(connection, command.upgrade, _CONTENT_REVISION)
                 await connection.commit()
                 assert await connection.scalar(text("SELECT version_num FROM alembic_version")) == (
-                    "20260928_0001"
+                    _CONTENT_REVISION
                 )
             finally:
                 await connection.rollback()
@@ -825,6 +875,13 @@ EXPECTED_CONSTRAINT_NAMES = {
     "ck_registered_producers_expiry_after_creation",
     "ck_registered_producers_revocation_after_creation",
     "ck_registered_producers_timestamp_order",
+    "pk_mcp_tokens",
+    "uq_mcp_tokens_token_prefix",
+    "ck_mcp_tokens_mcp_prefix",
+    "ck_mcp_tokens_argon2id_verifier",
+    "ck_mcp_tokens_memory_read_scopes",
+    "ck_mcp_tokens_expiry_after_creation",
+    "ck_mcp_tokens_revocation_after_creation",
     "pk_schema_versions",
     "ck_schema_versions_schema_sha256_lower_hex",
     "pk_retention_policies",

@@ -3,7 +3,7 @@ from __future__ import annotations
 import json
 import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping
-from typing import Any, Final
+from typing import Any, Final, Protocol
 
 from mcp.shared.inbound import (
     ERROR_CODE_HTTP_STATUS,
@@ -59,12 +59,23 @@ async def _respond(
     await send({"type": "http.response.body", "body": payload})
 
 
-def _request_id(body: bytes) -> str | int | None:
-    """Best-effort JSON-RPC id so a rejection can be correlated by the client."""
+def _decode(body: bytes) -> Any:
     try:
-        decoded = json.loads(body)
+        return json.loads(body)
     except (ValueError, RecursionError):
         return None
+
+
+def _request_method(decoded: Any) -> str:
+    """The JSON-RPC ``method`` from the body, or a fixed token; never caller-chosen text."""
+    method = decoded.get("method") if isinstance(decoded, dict) else None
+    if isinstance(method, str) and _METHOD_PATTERN.fullmatch(method):
+        return method
+    return INVALID_METHOD
+
+
+def _request_id(decoded: Any) -> str | int | None:
+    """Best-effort JSON-RPC id so a rejection can be correlated by the client."""
     request_id = decoded.get("id") if isinstance(decoded, dict) else None
     if isinstance(request_id, bool) or not isinstance(request_id, str | int):
         return None
@@ -80,10 +91,33 @@ def _error_body(
     return {"jsonrpc": "2.0", "id": request_id, "error": error}
 
 
+METHOD_SCOPE_KEY: Final = "agent_context.mcp_method"
+INVALID_METHOD: Final = "invalid"
+_METHOD_PATTERN: Final = re.compile(r"[A-Za-z0-9_./-]{1,64}", re.ASCII)
+
+
+class AdmittedRequest(Protocol):
+    """A request the access gate let through; ``finish`` records its audit exactly once."""
+
+    send: Send
+
+    def finish(self, outcome: str | None) -> None:
+        """Called once the request ends; ``outcome`` is ``None`` after a normal completion."""
+        ...
+
+
+class AccessGate(Protocol):
+    """Authentication and authorisation step run after the Host and Origin checks."""
+
+    async def admit(self, scope: Scope, send: Send) -> AdmittedRequest | None:
+        """Return the admitted request, or ``None`` once the gate has answered a rejection."""
+        ...
+
+
 class ProtocolGuard:
     """Pure ASGI guard that runs before the MCP application.
 
-    Enforces, in order: Host allowlist, Origin check, POST-only, the
+    Enforces, in order: Host allowlist, Origin check, the access gate (401/403/429), POST-only, the
     ``2026-07-28`` protocol version header, and a streamed request-size limit.
     Rejections carry fixed content-free bodies and never log request data.
     The version check also keeps the SDK's handshake-era transport unreachable,
@@ -97,8 +131,10 @@ class ProtocolGuard:
         allowed_hosts: Iterable[str],
         allowed_origins: Iterable[str],
         max_body_bytes: int,
+        access_gate: AccessGate,
     ) -> None:
         self._app = app
+        self._access_gate = access_gate
         self._allowed_hosts = tuple(allowed_hosts)
         self._allowed_origins = tuple(allowed_origins)
         self._max_body_bytes = max_body_bytes
@@ -124,24 +160,43 @@ class ProtocolGuard:
         ):
             await _respond(send, 403, _error_body(INVALID_REQUEST, "Invalid Origin"))
             return
+        # Authenticate before reading any body, so an unauthenticated client costs nothing.
+        admitted = await self._access_gate.admit(scope, send)
+        if admitted is None:
+            return
+        outcome: str | None = "error"
+        try:
+            outcome = await self._serve(scope, receive, admitted.send, headers)
+        finally:
+            # Exactly one audit per admitted request, even on disconnect or an exception.
+            admitted.finish(outcome)
+
+    async def _serve(
+        self, scope: Scope, receive: Receive, send: Send, headers: Mapping[str, str]
+    ) -> str | None:
+        """Run the checks after admission; returns a fixed outcome label, ``None`` if normal."""
         if scope["method"] != "POST":
             await _respond(send, 405, None, [(b"allow", b"POST")])
-            return
+            return None
 
         declared = headers.get("content-length")
         if declared is not None and (
             not declared.isascii() or not declared.isdigit() or int(declared) > self._max_body_bytes
         ):
             await _respond(send, _BODY_LIMIT_STATUS, _error_body(INVALID_REQUEST, "Too large"))
-            return
+            return None
 
         try:
             body = await self._read_limited_body(receive)
         except _BodyTooLargeError:
             await _respond(send, _BODY_LIMIT_STATUS, _error_body(INVALID_REQUEST, "Too large"))
-            return
+            return None
         except _ClientDisconnectedError:
-            return
+            return "disconnect"
+
+        # Parsed once here; the audit reads this validated value, never the caller's header.
+        decoded = _decode(body)
+        scope[METHOD_SCOPE_KEY] = _request_method(decoded)
 
         rejection = unsupported_protocol_version_rejection(
             headers.get(MCP_PROTOCOL_VERSION_HEADER, "")
@@ -151,9 +206,11 @@ class ProtocolGuard:
             await _respond(
                 send,
                 status,
-                _error_body(rejection.code, rejection.message, rejection.data, _request_id(body)),
+                _error_body(
+                    rejection.code, rejection.message, rejection.data, _request_id(decoded)
+                ),
             )
-            return
+            return None
 
         # Only W3C trace context is imported; client-supplied baggage is dropped entirely
         # (empty allowlist) so attacker-controlled values never become ambient.
@@ -162,6 +219,7 @@ class ProtocolGuard:
             await self._app(scope, self._replay(body, receive), send)
         finally:
             otel_context.detach(token)
+        return None
 
     @staticmethod
     def _is_duplicated(scope: Scope, name: bytes) -> bool:

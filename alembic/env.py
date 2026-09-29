@@ -35,6 +35,7 @@ MANAGED_TABLES = {
     "projection.ingestion_batches",
     "projection.dead_letters",
     "operations.registered_producers",
+    "operations.mcp_tokens",
     "operations.schema_versions",
     "operations.retention_policies",
 }
