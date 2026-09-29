@@ -67,7 +67,15 @@ class OpenGate:
     """An access gate that admits everything, for tests of the guard's other checks."""
 
     async def admit(self, scope: Any, send: Any) -> Any:
-        return send
+        return _OpenRequest(send)
+
+
+class _OpenRequest:
+    def __init__(self, send: Any) -> None:
+        self.send = send
+
+    def finish(self, outcome: str | None) -> None:
+        pass
 
 
 class Clock:

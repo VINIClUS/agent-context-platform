@@ -24,7 +24,6 @@ import hmac
 import json
 import logging
 import os
-import re
 import secrets
 import sys
 import time
@@ -41,6 +40,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.types import Message, Scope, Send
 
+from agent_context_platform.mcp.protocol_guard import METHOD_SCOPE_KEY, AdmittedRequest
 from agent_context_platform.operations.models import McpTokenRow
 from agent_context_platform.security.bearer import (
     Argon2Verifier,
@@ -61,7 +61,7 @@ MCP_TOKEN_PREFIX: Final = "mcp_"
 PRINCIPAL_SCOPE_KEY: Final = "agent_context.mcp_principal"
 DSN_ENVIRONMENT_VARIABLE: Final = "AGENT_CONTEXT_POSTGRESQL__DSN"
 
-_METHOD_PATTERN: Final = re.compile(r"[A-Za-z0-9_./-]{1,64}", re.ASCII)
+UNREAD_METHOD: Final = "unread"
 _OVERLOAD_RETRY_AFTER_SECONDS: Final = 1
 _UNAVAILABLE_RETRY_AFTER_SECONDS: Final = 5
 _DEFAULT_HASHER: Final = PasswordHasher()
@@ -170,28 +170,51 @@ class PrincipalCache:
 
 
 class TokenBucketLimiter:
-    """Per-principal in-memory token bucket; state is per replica, not shared."""
+    """Per-principal in-memory token bucket; state is per replica, not shared.
+
+    Buckets that have refilled to full are indistinguishable from a new one, so they are
+    evicted: at most once per refill horizon, and always when ``max_buckets`` is reached.
+    If every bucket is still in use at the cap, the oldest is dropped (its owner regains a
+    full burst, a bounded leniency in exchange for bounded memory).
+    """
 
     def __init__(
         self,
         *,
         rate_per_second: float,
         burst: int,
+        max_buckets: int = 4096,
         clock: Callable[[], float] = time.monotonic,
     ) -> None:
         self._rate = rate_per_second
         self._burst = float(burst)
+        self._horizon = self._burst / rate_per_second
+        self._max_buckets = max_buckets
         self._clock = clock
         self._buckets: dict[str, tuple[float, float]] = {}
+        self._last_sweep = clock()
 
     def acquire(self, principal: str) -> None:
         now = self._clock()
-        tokens, updated = self._buckets.get(principal, (self._burst, now))
+        if now - self._last_sweep >= self._horizon or (
+            len(self._buckets) >= self._max_buckets and principal not in self._buckets
+        ):
+            self._sweep(now)
+        tokens, updated = self._buckets.pop(principal, (self._burst, now))
         tokens = min(self._burst, tokens + (now - updated) * self._rate)
         if tokens < 1.0:
             self._buckets[principal] = (tokens, now)
             raise RateLimitedError(max(1, ceil((1.0 - tokens) / self._rate)))
         self._buckets[principal] = (tokens - 1.0, now)
+
+    def _sweep(self, now: float) -> None:
+        self._last_sweep = now
+        for name, (tokens, updated) in list(self._buckets.items()):
+            if tokens + (now - updated) * self._rate >= self._burst:
+                del self._buckets[name]
+        while len(self._buckets) >= self._max_buckets:
+            # Insertion order is least recently used: acquire re-inserts on every access.
+            del self._buckets[next(iter(self._buckets))]
 
 
 class McpAuthenticator:
@@ -271,15 +294,11 @@ class McpAccessGate:
         self._scope = scope
         self._holder = holder
 
-    async def admit(self, scope: Scope, send: Send) -> Send | None:
-        """Return the ``send`` to continue with, or ``None`` after answering a rejection."""
+    async def admit(self, scope: Scope, send: Send) -> AdmittedRequest | None:
+        """Return the admitted request, or ``None`` after answering a rejection."""
         started = time.perf_counter()
         headers = _header_values(scope)
-        method = _audit_method(headers)
-        principal: McpPrincipal | None = None
-
-        def audit(status: int, error_code: str | None = None) -> None:
-            _audit(principal, method, status, started, error_code)
+        audit = _Audit(scope, started)
 
         authorizations = headers.get("authorization", [])
         try:
@@ -291,41 +310,74 @@ class McpAccessGate:
             runtime = self._holder.runtime
             if runtime is None:
                 await _reject(send, 503, "auth_unavailable", retry_after=5)
-                audit(503, "auth_unavailable")
+                audit.record(503, "auth_unavailable")
                 return None
-            principal = await runtime.authenticator.authenticate(authorizations[0])
-            if self._scope not in principal.scopes:
+            audit.principal = await runtime.authenticator.authenticate(authorizations[0])
+            if self._scope not in audit.principal.scopes:
                 raise InsufficientScopeError
-            runtime.limiter.acquire(principal.principal)
+            runtime.limiter.acquire(audit.principal.principal)
         except AuthOverloadedError as error:
             await _reject(send, error.status_code, error.code, retry_after=1)
-            audit(error.status_code, error.code)
+            audit.record(error.status_code, error.code)
             return None
         except AuthError as error:
             challenge = error.status_code == 401
             await _reject(send, error.status_code, error.code, challenge=challenge)
-            audit(error.status_code, error.code)
+            audit.record(error.status_code, error.code)
             return None
         except RateLimitedError as error:
             await _respond(
                 send, 429, None, [(b"retry-after", str(error.retry_after_seconds).encode())]
             )
-            audit(429, "rate_limited")
+            audit.record(429, "rate_limited")
             return None
         except SQLAlchemyError:
             # Never log the exception: driver errors can embed statement parameters.
             await _reject(send, 503, "auth_unavailable", retry_after=5)
-            audit(503, "auth_unavailable")
+            audit.record(503, "auth_unavailable")
             return None
 
-        scope[PRINCIPAL_SCOPE_KEY] = principal
+        scope[PRINCIPAL_SCOPE_KEY] = audit.principal
 
         async def audited_send(message: Message) -> None:
             if message["type"] == "http.response.start":
-                audit(int(message["status"]))
+                audit.record(int(message["status"]))
             await send(message)
 
-        return audited_send
+        return _Admitted(audited_send, audit)
+
+
+class _Audit:
+    """One audit line per request: the first ``record`` wins, later ones are no-ops."""
+
+    def __init__(self, scope: Scope, started: float) -> None:
+        self.principal: McpPrincipal | None = None
+        self._scope = scope
+        self._started = started
+        self._done = False
+
+    def record(self, status: int | str, error_code: str | None = None) -> None:
+        if self._done:
+            return
+        self._done = True
+        # Set by the protocol guard from the validated body; rejections that happen before the
+        # body is read have no method to report.
+        method = self._scope.get(METHOD_SCOPE_KEY, UNREAD_METHOD)
+        _audit(self.principal, method, status, self._started, error_code)
+
+
+class _Admitted:
+    def __init__(self, send: Send, audit: _Audit) -> None:
+        self.send = send
+        self._audit = audit
+
+    def finish(self, outcome: str | None) -> None:
+        # A response that started was already audited with its status; anything else
+        # (disconnect, exception before a response) gets a fixed label instead.
+        if outcome is not None:
+            self._audit.record(outcome, outcome)
+        else:
+            self._audit.record("error", "no_response")
 
 
 def require_scope(scope: str, holder: McpAuthHolder) -> McpAccessGate:
@@ -340,18 +392,10 @@ def _header_values(scope: Scope) -> dict[str, list[str]]:
     return values
 
 
-def _audit_method(headers: Mapping[str, list[str]]) -> str:
-    """The ``mcp-method`` header only when it looks like a method name; never the body."""
-    values = headers.get("mcp-method", [])
-    if len(values) == 1 and _METHOD_PATTERN.fullmatch(values[0]):
-        return values[0]
-    return "unknown"
-
-
 def _audit(
     principal: McpPrincipal | None,
     method: str,
-    status: int,
+    status: int | str,
     started: float,
     error_code: str | None,
 ) -> None:
@@ -359,7 +403,7 @@ def _audit(
     principal_name = "-" if principal is None else principal.principal
     token_id = "-" if principal is None else str(principal.token_id)
     logger.info(
-        "mcp_request principal=%s token_id=%s method=%s status=%d latency_ms=%s",
+        "mcp_request principal=%s token_id=%s method=%s status=%s latency_ms=%s",
         principal_name,
         token_id,
         method,

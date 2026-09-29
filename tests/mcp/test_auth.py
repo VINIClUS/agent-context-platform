@@ -16,6 +16,7 @@ from mcp_helpers import (
     SECRET,
     TOKEN,
     AuthHarness,
+    Clock,
     mcp_client,
     mcp_headers,
     rpc_body,
@@ -330,18 +331,128 @@ async def test_logs_carry_audit_metadata_but_never_secrets_or_content(
             assert not any(secret in value for secret in haystack), (log.name, value)
 
 
-async def test_unusual_method_header_is_logged_as_unknown(
+async def test_audited_method_comes_from_the_body_not_the_header(
     harness: AuthHarness, caplog: pytest.LogCaptureFixture
 ) -> None:
     caplog.set_level(logging.INFO)
     async with mcp_client(runtime=harness.runtime()) as client:
+        # The header claims server/discover; the body is a different request.
         await client.post(
             "/mcp",
-            headers=mcp_headers("x y", **{}),
+            headers=mcp_headers("server/discover"),
+            json=rpc_body("tools/call", {"name": "search"}),
+        )
+        await client.post(
+            "/mcp",
+            headers=mcp_headers(f"{CANARY} spoof"),
             json=rpc_body("server/discover"),
         )
+        for raw in (b"not json", b'{"method": "bad method!"}', b'{"method": 7}', b"{}"):
+            await client.post("/mcp", headers=mcp_headers("server/discover"), content=raw)
 
-    assert [r.method for r in caplog.records if hasattr(r, "method")] == ["unknown"]  # type: ignore[attr-defined]
+    methods = [r.method for r in caplog.records if hasattr(r, "method")]  # type: ignore[attr-defined]
+    assert methods == ["tools/call", "server/discover", "invalid", "invalid", "invalid", "invalid"]
+    assert all(CANARY not in str(vars(r)) for r in caplog.records)
+
+
+async def test_rejections_before_the_body_is_read_audit_a_fixed_method(
+    harness: AuthHarness, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    async with mcp_client(runtime=harness.runtime(), token=None) as client:
+        await client.post("/mcp", headers=mcp_headers(CANARY), json=rpc_body("tools/call"))
+
+    (record,) = [r for r in caplog.records if hasattr(r, "method")]
+    assert record.method == "unread"  # type: ignore[attr-defined]
+    assert record.status == 401  # type: ignore[attr-defined]
+
+
+def _audit_records(caplog: pytest.LogCaptureFixture) -> list[Any]:
+    return [r for r in caplog.records if r.name == "agent_context_platform.mcp.auth"]
+
+
+async def test_client_disconnect_during_body_read_is_audited_once(
+    harness: AuthHarness, caplog: pytest.LogCaptureFixture
+) -> None:
+    from agent_context_platform.mcp.protocol_guard import ProtocolGuard
+
+    caplog.set_level(logging.INFO)
+
+    async def downstream(*_args: Any) -> None:
+        raise AssertionError("disconnected request reached the MCP app")
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.disconnect"}
+
+    async def send(_message: dict[str, Any]) -> None:
+        raise AssertionError("nothing may be sent to a disconnected client")
+
+    guard = ProtocolGuard(
+        downstream,  # type: ignore[arg-type]
+        allowed_hosts=("h",),
+        allowed_origins=(),
+        max_body_bytes=10,
+        access_gate=require_scope("memory:read", McpAuthHolder(harness.runtime())),
+    )
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "headers": [(b"host", b"h"), (b"authorization", f"Bearer {TOKEN}".encode())],
+    }
+    await guard(scope, receive, send)  # type: ignore[arg-type]
+
+    (record,) = _audit_records(caplog)
+    assert (record.status, record.principal) == ("disconnect", "codex-reader")
+
+
+async def test_exception_before_a_response_is_audited_once_and_propagates(
+    harness: AuthHarness, caplog: pytest.LogCaptureFixture
+) -> None:
+    from agent_context_platform.mcp.protocol_guard import ProtocolGuard
+
+    caplog.set_level(logging.INFO)
+
+    async def downstream(*_args: Any) -> None:
+        raise RuntimeError(CANARY)
+
+    async def receive() -> dict[str, Any]:
+        return {"type": "http.request", "body": b"{}", "more_body": False}
+
+    async def send(_message: dict[str, Any]) -> None:
+        raise AssertionError("no response is expected")
+
+    guard = ProtocolGuard(
+        downstream,  # type: ignore[arg-type]
+        allowed_hosts=("h",),
+        allowed_origins=(),
+        max_body_bytes=10,
+        access_gate=require_scope("memory:read", McpAuthHolder(harness.runtime())),
+    )
+    scope = {
+        "type": "http",
+        "method": "POST",
+        "headers": [
+            (b"host", b"h"),
+            (b"authorization", f"Bearer {TOKEN}".encode()),
+            (b"mcp-protocol-version", b"2026-07-28"),
+        ],
+    }
+    with pytest.raises(RuntimeError):
+        await guard(scope, receive, send)  # type: ignore[arg-type]
+
+    (record,) = _audit_records(caplog)
+    assert record.status == "error"
+    assert CANARY not in str(vars(record))
+
+
+async def test_response_and_completion_are_audited_once(
+    harness: AuthHarness, caplog: pytest.LogCaptureFixture
+) -> None:
+    caplog.set_level(logging.INFO)
+    async with mcp_client(runtime=harness.runtime()) as client:
+        await discover(client)
+
+    assert [r.status for r in _audit_records(caplog)] == [200]
 
 
 async def test_principal_is_exposed_on_the_asgi_scope(harness: AuthHarness) -> None:
@@ -357,9 +468,10 @@ async def test_principal_is_exposed_on_the_asgi_scope(harness: AuthHarness) -> N
     async def send(message: dict[str, Any]) -> None:
         sent.append(message)
 
-    gated = await gate.admit(scope, send)  # type: ignore[arg-type]
-    assert gated is not None
-    await app(scope, None, gated)
+    admitted = await gate.admit(scope, send)  # type: ignore[arg-type]
+    assert admitted is not None
+    await app(scope, None, admitted.send)
+    admitted.finish(None)
     assert seen[0].principal == "codex-reader"
     assert seen[0].scopes == frozenset({"memory:read"})
 
@@ -452,3 +564,24 @@ async def test_concurrent_requests_share_one_bounded_verifier(harness: AuthHarne
     assert [r.status_code for r in responses] == [200] * 4
     assert isinstance(harness.verifier, Argon2Verifier)
     assert isinstance(runtime, McpAuthRuntime)
+
+
+def test_limiter_evicts_idle_buckets_and_is_hard_capped() -> None:
+    clock = Clock()
+    limiter = mcp_auth.TokenBucketLimiter(
+        rate_per_second=1, burst=2, max_buckets=3, clock=clock.monotonic
+    )
+    for name in ("a", "b", "c"):
+        limiter.acquire(name)
+    assert len(limiter._buckets) == 3
+
+    # Past the refill horizon every bucket is full again, so a sweep drops them all.
+    clock.advance(10)
+    limiter.acquire("d")
+    assert set(limiter._buckets) == {"d"}
+
+    # Busy principals fill the cap: the least recently used is dropped, the cap holds.
+    for name in ("e", "f", "g", "h"):
+        limiter.acquire(name)
+        assert len(limiter._buckets) <= 3
+    assert "d" not in limiter._buckets and "h" in limiter._buckets

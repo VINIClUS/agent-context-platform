@@ -40,9 +40,10 @@ A token is `mcp_<id>.<secret>`. The non-secret prefix (`mcp_` plus random charac
 `memory:read`, enforced by a CHECK), `created_at`, `expires_at` and `revoked_at`. Only the verifier is
 stored; the secret exists once, at mint time.
 
-Ingestion and MCP credentials are mutually unusable: separate tables, a mandatory `mcp_` prefix on this
-plane (a producer token is refused before any database access), and a producer table that never holds
-an `mcp_` token. Presenting an `events:ingest` token to `/mcp`, or a `memory:read` token to
+Ingestion and MCP credentials are mutually unusable: they live in separate tables, and this plane
+requires an `mcp_` prefix (a token without it is refused before any database access), so a producer
+token is never even looked up here and an MCP token is looked up only in a table that holds no producer
+registrations. Presenting an `events:ingest` token to `/mcp`, or a `memory:read` token to
 `/v1/ingestion/batches`, fails with 401.
 
 The API role `agent_context_api` has `SELECT` only on `operations.mcp_tokens`. It cannot mint, extend
@@ -63,14 +64,14 @@ or un-revoke a token.
 ### Rate limit
 
 Each principal has an in-memory token bucket (`rate_limit_per_second`, `rate_limit_burst`). It is per
-replica: with N replicas a principal's effective ceiling is N times the configured rate. An empty
+replica: with N replicas a principal's effective ceiling is N times the configured rate. Idle (fully refilled) buckets are evicted and the table is capped, so memory stays bounded. An empty
 bucket answers 429 with `Retry-After` and no body.
 
 ### Audit
 
 Each request emits one structured log line (`agent_context_platform.mcp.auth`) with `principal`,
-`token_id`, `method` (from the `mcp-method` header, `unknown` if it is not a plain method name),
-`status` and `latency_ms`. Tokens, request bodies, tool arguments and driver errors are never logged.
+`token_id`, `method` (the JSON-RPC method the protocol guard validated from the body, never the `Mcp-Method` header; `invalid` when absent or malformed, `unread` when the request was rejected before the body was read),
+`status` and `latency_ms`. Every admitted request is audited exactly once; a client disconnect or an internal error before a response is logged with the fixed status `disconnect` or `error`. Tokens, request bodies, tool arguments and driver errors are never logged.
 
 ## Settings
 
