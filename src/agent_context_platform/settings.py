@@ -120,6 +120,16 @@ class MCPSettings(BaseModel):
 
     bearer_token_verifier: SecretStr | None = Field(default=None, repr=False)
     stateless_http: Literal[True] = True
+    # A trailing ":*" accepts any 1-5 digit port. A Host or Origin with no port does
+    # not match a ":*" entry, so list it explicitly if needed. Origin is only checked
+    # when present; a duplicated Host or Origin header is rejected.
+    allowed_hosts: tuple[str, ...] = Field(
+        default=("127.0.0.1:*", "localhost:*", "[::1]:*"), strict=False
+    )
+    allowed_origins: tuple[str, ...] = Field(
+        default=("http://127.0.0.1:*", "http://localhost:*", "http://[::1]:*"), strict=False
+    )
+    max_request_body_bytes: int = Field(default=1_048_576, gt=0)
 
 
 class Settings(BaseSettings):
