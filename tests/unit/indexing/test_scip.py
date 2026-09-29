@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import time
+import tracemalloc
 import uuid
 from pathlib import Path
 
@@ -13,6 +14,7 @@ from agent_context_platform.indexing.scip import (
     ScipImportError,
     ScipLimits,
     SemanticIndex,
+    SourceRange,
     evidence_outranks,
     import_scip,
     is_valid_symbol,
@@ -320,7 +322,7 @@ def test_malformed_bytes_fail_closed_with_content_free_error(name: str) -> None:
 
     assert caught.value.reason == "malformed"
     assert caught.value.__cause__ is None
-    assert caught.value.__suppress_context__ is True
+    assert caught.value.__context__ is None or caught.value.__suppress_context__
     assert str(caught.value) == "malformed"
 
 
@@ -515,3 +517,122 @@ def test_empty_source_text_has_no_valid_range() -> None:
     absent = document(text="")
     add(absent, [0, 0, 0])
     assert codes(run(build(absent))) == []
+
+
+def _index_with(*fields: bytes) -> bytes:
+    metadata = scip_pb2.Metadata()
+    metadata.tool_info.name = "unit"
+    return (
+        b"\x0a"
+        + bytes([len(metadata.SerializeToString())])
+        + metadata.SerializeToString()
+        + b"".join(fields)
+    )
+
+
+def _peak_refusal(data: bytes, reason: str) -> tuple[float, int]:
+    tracemalloc.start()
+    started = time.perf_counter()
+    try:
+        with pytest.raises(ScipImportError) as caught:
+            import_scip(data, REPO, COMMIT)
+        elapsed = time.perf_counter() - started
+        _, peak = tracemalloc.get_traced_memory()
+    finally:
+        tracemalloc.stop()
+    assert caught.value.reason == reason
+    return elapsed, peak
+
+
+def test_ten_million_empty_documents_are_refused_without_materializing() -> None:
+    data = _index_with(b"\x12\x00" * 10_000_000)
+    elapsed, peak = _peak_refusal(data, "too_many_documents")
+
+    assert elapsed < 10.0
+    assert peak < 20 * 1024 * 1024
+
+
+def test_millions_of_empty_occurrences_are_refused_without_materializing() -> None:
+    document_bytes = b"\x0a\x01a" + b"\x12\x00" * 3_000_000
+    data = _index_with(b"\x12" + _length(document_bytes) + document_bytes)
+    elapsed, peak = _peak_refusal(data, "too_many_occurrences")
+
+    assert elapsed < 10.0
+    assert peak < 20 * 1024 * 1024
+
+
+def test_total_occurrences_and_symbols_across_documents_are_capped() -> None:
+    body = b"\x0a\x01a" + b"\x12\x00" * 600
+    data = _index_with((b"\x12" + _length(body) + body) * 2)
+    with pytest.raises(ScipImportError) as caught:
+        import_scip(data, REPO, COMMIT, limits=ScipLimits(max_total_occurrences=1_000))
+    assert caught.value.reason == "too_many_occurrences"
+
+    symbols = b"\x0a\x01a" + b"\x1a\x00" * 600
+    data = _index_with((b"\x12" + _length(symbols) + symbols) * 2)
+    with pytest.raises(ScipImportError) as caught:
+        import_scip(data, REPO, COMMIT, limits=ScipLimits(max_total_symbols=1_000))
+    assert caught.value.reason == "too_many_symbols"
+
+
+def test_nested_repeats_and_truncation_are_refused() -> None:
+    occurrence = b"\x32\x00" * 1_500  # diagnostics
+    document_bytes = b"\x12" + _length(occurrence) + occurrence
+    data = _index_with(b"\x12" + _length(document_bytes) + document_bytes)
+    _peak_refusal(data, "too_many_repeated_items")
+    _peak_refusal(_index_with(b"\x12\x05ab"), "malformed")  # length overruns the buffer
+    _peak_refusal(_index_with(b"\x1b"), "malformed")  # group wire type
+    _peak_refusal(_index_with(b"\x80"), "malformed")  # truncated varint
+
+
+def _length(data: bytes) -> bytes:
+    out = bytearray()
+    size = len(data)
+    while size >= 0x80:
+        out.append(size & 0x7F | 0x80)
+        size >>= 7
+    out.append(size)
+    return bytes(out)
+
+
+def test_long_line_ranges_use_cached_widths() -> None:
+    doc = document(text="x" * 2_000_000 + "\n")
+    doc.position_encoding = scip_pb2.UTF8CodeUnitOffsetFromLineStart
+    for column in range(10_000):
+        add(doc, [0, column, column + 1])
+    started = time.perf_counter()
+    result = run(build(doc))
+
+    assert len(result.documents[0].occurrences) == 10_000
+    assert time.perf_counter() - started < 10.0
+
+
+def test_enclosing_range_must_contain_the_occurrence() -> None:
+    doc = document(text="0123456789\nabcdefghij\n")
+    doc.position_encoding = scip_pb2.UTF32CodeUnitOffsetFromLineStart
+    contained = add(doc, [0, 2, 4])
+    contained.enclosing_range.extend([0, 0, 1, 5])
+    disjoint = add(doc, [0, 2, 4])
+    disjoint.enclosing_range.extend([1, 0, 1, 3])
+    partial = add(doc, [0, 2, 4])
+    partial.enclosing_range.extend([0, 3, 0, 9])
+    outside = add(doc, [0, 2, 4])
+    outside.enclosing_range.extend([0, 0, 9, 1])
+    garbled = add(doc, [0, 2, 4])
+    garbled.enclosing_range.extend([0, 0])
+    typed = add(doc, [0, 2, 4])
+    typed.multi_line_enclosing_range.end_line = 1
+    typed.multi_line_enclosing_range.end_character = 2
+    result = run(build(doc))
+
+    kept = [o.enclosing_range for o in result.documents[0].occurrences]
+    assert kept[0] == SourceRange(0, 0, 1, 5)
+    assert kept[1:5] == [None, None, None, None]
+    assert kept[5] == SourceRange(0, 0, 1, 2)
+    assert [(d.code, d.occurrence_index) for d in result.diagnostics] == [
+        ("invalid_range", 1),
+        ("invalid_range", 2),
+        ("out_of_document_range", 3),
+        ("invalid_range", 4),
+    ]
+    assert len(result.documents[0].occurrences) == 6

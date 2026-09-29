@@ -10,8 +10,10 @@ The bytes are untrusted. The importer
 
 - bounds the total size before parsing, then the document, occurrence, symbol,
   relationship, tool-argument and symbol-length counts, and fails closed with a
-  typed, content-free ``ScipImportError`` (parsing a Protobuf message is not
-  streaming, so ``max_index_bytes`` is the memory bound);
+  typed, content-free ``ScipImportError``. A linear wire-format pre-scan counts
+  and caps documents, external symbols, occurrences and symbols before any of
+  them is parsed, and each ``Document`` is then parsed on its own, so a flood of
+  tiny messages is refused without being materialized (see ``ScipLimits``);
 - never fabricates an edge: an invalid range (negative, start after end, wrong
   arity, outside the document when the text is known), an empty or malformed
   symbol, or a document with an unsafe path is discarded and reported as an
@@ -35,11 +37,11 @@ from __future__ import annotations
 import hashlib
 import re
 import uuid
-from collections.abc import Mapping
+from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import Final, Literal
 
-from google.protobuf.message import DecodeError
+from google.protobuf.message import DecodeError, Message
 
 from agent_context_platform.indexing.identity import (
     EvidenceKind,
@@ -76,6 +78,7 @@ type ImportErrorReason = Literal[
     "too_many_occurrences",
     "too_many_symbols",
     "too_many_relationships",
+    "too_many_repeated_items",
     "symbol_too_long",
 ]
 type DiagnosticCode = Literal[
@@ -102,10 +105,18 @@ class ScipImportError(Exception):
 class ScipLimits:
     """Upper bounds applied to untrusted index bytes."""
 
-    max_index_bytes: int = 128 * 1024 * 1024
+    # Worst-case memory. A Python protobuf message costs on the order of 0.5 KB while an
+    # empty one is 2 bytes on the wire (a 250x expansion), so no count of messages is
+    # ever materialized before the wire pre-scan has bounded it. What stays alive is one
+    # Document at a time plus the result: roughly 1 KB per kept occurrence or symbol, so
+    # the totals below bound the result near 2 GB and the byte cap bounds pre-scan input.
+    max_index_bytes: int = 64 * 1024 * 1024
     max_documents: int = 100_000
-    max_occurrences_per_document: int = 1_000_000
-    max_symbols_per_document: int = 200_000
+    max_occurrences_per_document: int = 500_000
+    max_symbols_per_document: int = 100_000
+    max_total_occurrences: int = 2_000_000
+    max_total_symbols: int = 1_000_000
+    max_repeated_items_per_message: int = 1_000
     max_external_symbols: int = 500_000
     max_relationships_per_symbol: int = 10_000
     max_symbol_length: int = 4096
@@ -271,21 +282,38 @@ def import_scip(
         raise ValueError("commit must be a lowercase 40 or 64 character hex object id")
     if len(index_bytes) > limits.max_index_bytes:
         raise ScipImportError("index_too_large")
+    # Pre-scan the wire format and cap every repeated message count before any message
+    # is materialized; a full ParseFromString would build them all first.
     index = scip_pb2.Index()
-    try:
-        index.ParseFromString(index_bytes)
-    except DecodeError:
-        raise ScipImportError("malformed") from None
+    document_slices: list[tuple[int, int]] = []
+    external_slices: list[tuple[int, int]] = []
+    for number, start, stop in _walk(index_bytes, 0, len(index_bytes)):
+        if number == 1:
+            _merge_metadata(index, index_bytes[start:stop], limits)
+        elif number == 2:
+            document_slices.append((start, stop))
+            if len(document_slices) > limits.max_documents:
+                raise ScipImportError("too_many_documents")
+        elif number == 3:
+            external_slices.append((start, stop))
+            if len(external_slices) > limits.max_external_symbols:
+                raise ScipImportError("too_many_external_symbols")
     run = _run(index, commit, toolchain, limits)
-    if len(index.documents) > limits.max_documents:
-        raise ScipImportError("too_many_documents")
-    if len(index.external_symbols) > limits.max_external_symbols:
-        raise ScipImportError("too_many_external_symbols")
 
     importer = _Importer(repository_id, limits, file_logical_ids or {}, sources or {})
     documents: list[SemanticDocument] = []
     seen: set[str] = set()
-    for document in index.documents:
+    total_occurrences = total_symbols = 0
+    for start, stop in document_slices:
+        chunk = index_bytes[start:stop]
+        occurrence_count, symbol_count = _prescan_document(chunk, limits)
+        total_occurrences += occurrence_count
+        total_symbols += symbol_count
+        if total_occurrences > limits.max_total_occurrences:
+            raise ScipImportError("too_many_occurrences")
+        if total_symbols > limits.max_total_symbols:
+            raise ScipImportError("too_many_symbols")
+        document = _parse(scip_pb2.Document, chunk)
         path = document.relative_path
         if len(path.encode("utf-8")) > _MAX_PATH_BYTES or not is_safe_repo_path(path):
             importer.diagnose("unsafe_path", None)
@@ -295,10 +323,12 @@ def import_scip(
             continue
         seen.add(path)
         documents.append(importer.document(document))
+    external_infos = (
+        _parse_symbol_information(index_bytes[start:stop], limits)
+        for start, stop in external_slices
+    )
     external = tuple(
-        symbol
-        for info in index.external_symbols
-        if (symbol := importer.symbol(info, None, "", None)) is not None
+        symbol for info in external_infos if (symbol := importer.symbol(info, None, "", None))
     )
     return SemanticIndex(
         repository_id=repository_id,
@@ -308,6 +338,129 @@ def import_scip(
         external_symbols=external,
         diagnostics=tuple(importer.diagnostics),
     )
+
+
+def _varint(data: bytes, position: int, end: int) -> tuple[int, int]:
+    value = 0
+    for shift in range(0, 70, 7):
+        if position >= end:
+            raise ScipImportError("malformed")
+        byte = data[position]
+        position += 1
+        value |= (byte & 0x7F) << shift
+        if not byte & 0x80:
+            return value, position
+    raise ScipImportError("malformed")
+
+
+def _walk(data: bytes, start: int, end: int) -> Iterator[tuple[int, int, int]]:
+    """Yield ``(field number, payload start, payload stop)`` of each length-delimited field.
+
+    A linear walk of the top-level wire format of ``data[start:end]`` that skips the
+    other wire types and allocates nothing per field. Groups, a field number of zero
+    and any overrun raise ``ScipImportError("malformed")``.
+    """
+    position = start
+    while position < end:
+        key, position = _varint(data, position, end)
+        number, wire_type = key >> 3, key & 7
+        if number == 0:
+            raise ScipImportError("malformed")
+        if wire_type == 0:
+            _, position = _varint(data, position, end)
+        elif wire_type == 1:
+            position += 8
+        elif wire_type == 5:
+            position += 4
+        elif wire_type == 2:
+            length, position = _varint(data, position, end)
+            if position + length > end:
+                raise ScipImportError("malformed")
+            yield number, position, position + length
+            position += length
+        else:
+            raise ScipImportError("malformed")
+        if position > end:
+            raise ScipImportError("malformed")
+
+
+def _parse[T: Message](message_type: type[T], data: bytes) -> T:
+    try:
+        return message_type.FromString(data)
+    except DecodeError:
+        raise ScipImportError("malformed") from None
+
+
+def _count_children(data: bytes, field: int, cap: int, reason: ImportErrorReason) -> int:
+    count = 0
+    for number, _, _ in _walk(data, 0, len(data)):
+        if number == field:
+            count += 1
+            if count > cap:
+                raise ScipImportError(reason)
+    return count
+
+
+def _merge_metadata(index: scip_pb2.Index, data: bytes, limits: ScipLimits) -> None:
+    for number, start, stop in _walk(data, 0, len(data)):
+        if number == 2:  # tool_info
+            _count_children(data[start:stop], 3, limits.max_tool_arguments, "tool_info_too_large")
+    index.metadata.SetInParent()
+    try:
+        index.metadata.MergeFromString(data)
+    except DecodeError:
+        raise ScipImportError("malformed") from None
+
+
+def _prescan_document(data: bytes, limits: ScipLimits) -> tuple[int, int]:
+    """Count a document's occurrences and symbols, bounding nested repeats, before parsing."""
+    occurrences = symbols = 0
+    nested = limits.max_repeated_items_per_message
+    occurrence_caps, symbol_caps = _occurrence_caps(limits), _symbol_caps(limits)
+    for number, start, stop in _walk(data, 0, len(data)):
+        if number == 2:
+            occurrences += 1
+            if occurrences > limits.max_occurrences_per_document:
+                raise ScipImportError("too_many_occurrences")
+            # A message with more than ``nested`` children is at least 2 * nested bytes.
+            if stop - start > 2 * nested:
+                _bound_repeats(data[start:stop], occurrence_caps)
+        elif number == 3:
+            symbols += 1
+            if symbols > limits.max_symbols_per_document:
+                raise ScipImportError("too_many_symbols")
+            if stop - start > 2 * min(nested, limits.max_relationships_per_symbol):
+                _bound_repeats(data[start:stop], symbol_caps)
+    return occurrences, symbols
+
+
+def _bound_repeats(data: bytes, caps: Mapping[int, tuple[int, ImportErrorReason]]) -> None:
+    """Refuse a message whose listed repeated fields exceed their ``(cap, reason)``."""
+    counts: dict[int, int] = {}
+    for number, _, _ in _walk(data, 0, len(data)):
+        if number in caps:
+            counts[number] = counts.get(number, 0) + 1
+            if counts[number] > caps[number][0]:
+                raise ScipImportError(caps[number][1])
+
+
+def _occurrence_caps(limits: ScipLimits) -> dict[int, tuple[int, ImportErrorReason]]:
+    cap = limits.max_repeated_items_per_message
+    # override_documentation (4) and diagnostics (6)
+    return {4: (cap, "too_many_repeated_items"), 6: (cap, "too_many_repeated_items")}
+
+
+def _symbol_caps(limits: ScipLimits) -> dict[int, tuple[int, ImportErrorReason]]:
+    # documentation (3) and relationships (4)
+    return {
+        3: (limits.max_repeated_items_per_message, "too_many_repeated_items"),
+        4: (limits.max_relationships_per_symbol, "too_many_relationships"),
+    }
+
+
+def _parse_symbol_information(data: bytes, limits: ScipLimits) -> scip_pb2.SymbolInformation:
+    _bound_repeats(data, _symbol_caps(limits))
+    return _parse(scip_pb2.SymbolInformation, data)
 
 
 def _run(index: scip_pb2.Index, commit: str, toolchain: str | None, limits: ScipLimits) -> IndexRun:
@@ -414,8 +567,15 @@ class _Importer:
             self.diagnose("out_of_document_range", path, position)
             return None
         enclosing = _enclosing_range(occurrence)
-        if enclosing is not None and not bounds.contains(enclosing):
-            enclosing = None
+        if _has_enclosing(occurrence):
+            # The enclosing range must be valid, inside the document and contain the
+            # occurrence; otherwise only it is dropped, the occurrence stays.
+            if enclosing is None or not _encloses(enclosing, located):
+                self.diagnose("invalid_range", path, position)
+                enclosing = None
+            elif not bounds.contains(enclosing):
+                self.diagnose("out_of_document_range", path, position)
+                enclosing = None
         if occurrence.symbol_roles < 0:
             self.diagnose("invalid_roles", path, position)
             return None
@@ -660,6 +820,20 @@ def _enclosing_range(occurrence: scip_pb2.Occurrence) -> SourceRange | None:
     return _legacy(occurrence.enclosing_range) if occurrence.enclosing_range else None
 
 
+def _has_enclosing(occurrence: scip_pb2.Occurrence) -> bool:
+    return bool(occurrence.WhichOneof("typed_enclosing_range") or occurrence.enclosing_range)
+
+
+def _encloses(outer: SourceRange, inner: SourceRange) -> bool:
+    return (outer.start_line, outer.start_character) <= (
+        inner.start_line,
+        inner.start_character,
+    ) and (
+        outer.end_line,
+        outer.end_character,
+    ) >= (inner.end_line, inner.end_character)
+
+
 def _legacy(values: object) -> SourceRange | None:
     numbers = list(values)  # type: ignore[call-overload]
     if len(numbers) == 3:
@@ -694,7 +868,7 @@ class _Bounds:
             else []
         )
         self._encoding = encoding
-        self._widths: dict[int, int] = {}
+        self._widths: dict[int, int | None] = {}
 
     def contains(self, located: SourceRange) -> bool:
         if self._lines is None:
@@ -712,6 +886,11 @@ class _Bounds:
 
     def _width(self, line: int) -> int | None:
         """Line length in the position encoding, or None when the encoding is unspecified."""
+        if line not in self._widths:
+            self._widths[line] = self._measure(line)
+        return self._widths[line]
+
+    def _measure(self, line: int) -> int | None:
         assert self._lines is not None
         text = self._lines[line]
         if self._encoding == scip_pb2.UTF8CodeUnitOffsetFromLineStart:
