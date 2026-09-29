@@ -107,7 +107,7 @@ def main() -> int:
     elif MODE == "extra_field":
         good["source_text"] = "secret"
     elif MODE == "duplicate":
-        parsed["symbols"] = [symbol("1", "pkg.a", 0, 8), symbol("2", "pkg.a", 0, 8)]
+        parsed["symbols"] = [symbol("1", "pkg.a", 0, 8), symbol("1", "pkg.a", 0, 8)]
     elif MODE == "bad_language":
         parsed["language"] = "go"
     elif MODE == "bad_json":

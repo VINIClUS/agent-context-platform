@@ -29,15 +29,22 @@ errors, never the offending value):
 
   * ``qualified_name`` is a path of identifier tokens split on ``.``, ``::``, ``/``,
     ``#``. The final segment must be an identifier token located inside the symbol's own
-    ``[start_byte, end_byte)`` (for ``kind="module"`` a component of the file path also
-    qualifies); every other segment is an identifier token occurring in the file, or a
-    path component, and at least two characters long. Tokens only, no substrings. Names
-    that are not made of identifiers (``<lambda>``) are refused: adapters name them
-    from real tokens. All names of a file together are bounded (``MAX_NAME_TOTAL_BYTES``);
+    ``[start_byte, end_byte]`` (for ``kind="module"`` a component of the file path also
+    qualifies). Every other segment is bound structurally, with no length rule: a
+    component of a path of the request, the exact final segment of a symbol emitted in
+    the same module output (enclosing classes, namespaces, packages), or an identifier
+    token inside this symbol's own range (Go receivers). Names that are not made of
+    identifiers (``<lambda>``) are refused. All names of a file together are bounded
+    (``MAX_NAME_TOTAL_BYTES``);
   * ``signature`` (whitespace runs collapsed) is a contiguous run of the
     whitespace-collapsed text inside the symbol's own byte range;
-  * ``ref`` and ``disambiguator`` are numeric (at most 6 digits); ``kind`` and the
-    relation ``kind`` are closed enums; ``language`` must equal the input's.
+  * ``ref`` and ``disambiguator`` never come from the adapter: ``ref`` is rewritten to the
+    symbol's index in the file (relations are remapped, at most
+    ``MAX_RELATIONS_PER_SYMBOL`` per source), and ``disambiguator`` is derived as the
+    0..n-1 ordinal among symbols with the same qualified name, ordered by
+    ``(start_byte, end_byte, kind)``. The adapter's values (numeric, at most 6 digits) are
+    ignored beyond uniqueness of refs. ``kind`` and the relation ``kind`` are closed
+    enums; ``language`` must equal the input's.
 
   * opaque values (``OPAQUE_FIELDS``: ``signature_digest``, ``semantic_fingerprint``) are
     hashes the parser makes up, so nothing ties them to the file and 32 bytes per symbol
@@ -48,8 +55,8 @@ errors, never the offending value):
     ``FIELD_CONFINEMENT`` classifies every output field; a test fails when a new field
     is not classified.
 
-  Residual channel: an adapter can still choose *which* tokens, symbols and ordering
-  to emit, at most about ``log2(tokens in file)`` bits per symbol and only ever about
+  Residual channel (inherent to structural output): an adapter can still choose *which*
+  symbols, relations and ordering to emit, about one bit per candidate token or edge, at most about ``log2(tokens in file)`` bits per symbol and only ever about
   this file's own content. That leaks nothing beyond the file it was asked to parse.
 
 Adapter output carries no source text beyond qualified names, ``kind``s,
@@ -102,6 +109,7 @@ MAX_NAME_TOTAL_BYTES: Final = 256 * 1024
 _DIGEST = r"^[0-9a-f]{64}$"
 _DISAMBIGUATOR = r"^[0-9]{0,6}$"
 _REF = r"^[0-9]{1,6}$"
+MAX_RELATIONS_PER_SYMBOL: Final = 64
 
 
 class StructuralErrorCode(StrEnum):
@@ -297,7 +305,9 @@ class StructuralAdapter(Protocol):
 
 # How every field of the adapter output is kept from carrying foreign data. A test requires
 # every model field to be listed here, so a new field cannot slip in unclassified.
-type Confinement = Literal["token", "numeric", "enum", "range", "parent", "rehashed", "structure"]
+type Confinement = Literal[
+    "token", "numeric", "enum", "range", "parent", "derived", "rehashed", "structure"
+]
 FIELD_CONFINEMENT: Final[Mapping[str, Mapping[str, Confinement]]] = {
     "ParsedModule": {"protocol_version": "enum", "files": "structure"},
     "ParsedFile": {
@@ -308,11 +318,11 @@ FIELD_CONFINEMENT: Final[Mapping[str, Mapping[str, Confinement]]] = {
         "relations": "structure",
     },
     "ParsedSymbol": {
-        "ref": "numeric",
+        "ref": "derived",
         "language": "parent",
         "qualified_name": "token",
         "kind": "enum",
-        "disambiguator": "numeric",
+        "disambiguator": "derived",  # parent-derived ordinal
         "start_byte": "range",
         "end_byte": "range",
         "signature": "token",  # a contiguous run of the symbol's own source text
@@ -321,8 +331,8 @@ FIELD_CONFINEMENT: Final[Mapping[str, Mapping[str, Confinement]]] = {
         "evidence_kind": "enum",
     },
     "StructuralRelation": {
-        "source_ref": "numeric",
-        "target_ref": "numeric",
+        "source_ref": "derived",  # remapped to a symbol index
+        "target_ref": "derived",
         "kind": "enum",
         "start_byte": "range",
         "end_byte": "range",
@@ -352,7 +362,7 @@ def validate_module(
     """Check ``module`` against ``request``; return it with opaque values re-hashed, or raise."""
     sources = {item.path: item for item in request.files}
     seen: set[str] = set()
-    rehashed: list[ParsedFile] = []
+    texts: dict[str, _SourceText] = {}
     for parsed in module.files:
         source = sources.get(parsed.path)
         if source is None or parsed.path in seen:
@@ -362,22 +372,77 @@ def validate_module(
             raise StructuralError(StructuralErrorCode.LANGUAGE_MISMATCH)
         if parsed.parser_fingerprint != expected_fingerprint:
             raise StructuralError(StructuralErrorCode.FINGERPRINT_MISMATCH)
-        _validate_file(parsed, source.content())
-        symbols = tuple(
-            item.model_copy(
-                update={name: rehash_opaque(name, getattr(item, name)) for name in OPAQUE_FIELDS}
-            )
-            for item in parsed.symbols
-        )
-        rehashed.append(parsed.model_copy(update={"symbols": symbols}))
+        texts[parsed.path] = _validate_file(parsed, source.content())
     if seen != set(sources):
         raise StructuralError(StructuralErrorCode.PATH_MISMATCH)
-    return module.model_copy(update={"files": tuple(rehashed)})
+    # Non-final name segments may name a symbol of any file of this module output.
+    finals = {
+        _SEPARATORS.split(item.qualified_name)[-1].encode()
+        for parsed in module.files
+        for item in parsed.symbols
+    }
+    paths = {part for path in sources for part in _path_parts(path)}
+    return module.model_copy(
+        update={
+            "files": tuple(
+                _finish(parsed, texts[parsed.path], finals, paths) for parsed in module.files
+            )
+        }
+    )
+
+
+def _finish(
+    parsed: ParsedFile, text: _SourceText, finals: set[bytes], paths: set[bytes]
+) -> ParsedFile:
+    """Bind non-final name segments, then rebuild with parent-derived and re-hashed values."""
+    for item in parsed.symbols:
+        if not text.prefix_ok(item.qualified_name, item.start_byte, item.end_byte, finals, paths):
+            raise StructuralError(StructuralErrorCode.TEXT_NOT_IN_SOURCE)
+    index = {item.ref: number for number, item in enumerate(parsed.symbols)}
+    order = sorted(
+        range(len(parsed.symbols)),
+        key=lambda n: (
+            parsed.symbols[n].start_byte,
+            parsed.symbols[n].end_byte,
+            parsed.symbols[n].kind,
+            n,
+        ),
+    )
+    ordinals: dict[str, int] = {}
+    disambiguators = [""] * len(parsed.symbols)
+    for number in order:
+        name = parsed.symbols[number].qualified_name
+        disambiguators[number] = str(ordinals.get(name, 0))
+        ordinals[name] = ordinals.get(name, 0) + 1
+    symbols = tuple(
+        item.model_copy(
+            update={
+                "ref": str(number),
+                "disambiguator": disambiguators[number],
+                **{name: rehash_opaque(name, getattr(item, name)) for name in OPAQUE_FIELDS},
+            }
+        )
+        for number, item in enumerate(parsed.symbols)
+    )
+    relations = tuple(
+        item.model_copy(
+            update={
+                "source_ref": str(index[item.source_ref]),
+                "target_ref": str(index[item.target_ref]),
+            }
+        )
+        for item in parsed.relations
+    )
+    return parsed.model_copy(update={"symbols": symbols, "relations": relations})
 
 
 _SEPARATORS = re.compile(r"::|[./#]")
 _IDENT = re.compile(rb"[A-Za-z_$\x80-\xff][A-Za-z0-9_$\x80-\xff]*")
 _WHITESPACE = re.compile(rb"[ \t\r\n\f\v]+")
+
+
+def _path_parts(path: str) -> set[bytes]:
+    return {part.encode() for piece in path.split("/") for part in (piece, *piece.split("."))}
 
 
 class _SourceText:
@@ -387,9 +452,7 @@ class _SourceText:
         self._tokens: dict[bytes, list[int]] = {}
         for match in _IDENT.finditer(content):
             self._tokens.setdefault(match.group(), []).append(match.start())
-        self._path_parts = {
-            part.encode() for piece in path.split("/") for part in (piece, *piece.split("."))
-        }
+        self._path_parts = _path_parts(path)
         self.name_bytes = 0
         # Whitespace-collapsed text, with the original offset of every collapsed byte.
         pieces: list[bytes] = []
@@ -413,23 +476,28 @@ class _SourceText:
         index = bisect_left(starts, start)
         return index < len(starts) and starts[index] + len(token) <= end
 
-    def name_ok(self, qualified_name: str, kind: str, start: int, end: int) -> bool:
+    def final_ok(self, qualified_name: str, kind: str, start: int, end: int) -> bool:
+        """Every segment is an identifier and the final one is a token of the symbol's range."""
         self.name_bytes += len(qualified_name.encode())
         if self.name_bytes > MAX_NAME_TOTAL_BYTES:
             raise StructuralError(StructuralErrorCode.COUNT_EXCEEDED)
         segments = [segment.encode() for segment in _SEPARATORS.split(qualified_name)]
-        for position, raw in enumerate(segments):
-            if not _IDENT.fullmatch(raw):
-                return False
-            if position < len(segments) - 1:
-                if len(raw) < 2 or not (raw in self._tokens or raw in self._path_parts):
-                    return False
-            elif not (
-                self._token_within(raw, start, end)
-                or (kind == "module" and len(raw) >= 2 and raw in self._path_parts)
-            ):
-                return False
-        return True
+        if not all(_IDENT.fullmatch(raw) for raw in segments):
+            return False
+        last = segments[-1]
+        return self._token_within(last, start, end) or (
+            kind == "module" and last in self._path_parts
+        )
+
+    def prefix_ok(
+        self, qualified_name: str, start: int, end: int, finals: set[bytes], paths: set[bytes]
+    ) -> bool:
+        """Non-final segments: a path component, another symbol's name, or a token in range."""
+        segments = [segment.encode() for segment in _SEPARATORS.split(qualified_name)]
+        return all(
+            raw in paths or raw in finals or self._token_within(raw, start, end)
+            for raw in segments[:-1]
+        )
 
     def signature_ok(self, signature: str, start: int, end: int) -> bool:
         needle = _WHITESPACE.sub(b" ", signature.encode()).strip()
@@ -440,29 +508,31 @@ class _SourceText:
         return self._collapsed.find(needle, low, high) != -1
 
 
-def _validate_file(parsed: ParsedFile, content: bytes) -> None:
+def _validate_file(parsed: ParsedFile, content: bytes) -> _SourceText:
     size = len(content)
     if len(parsed.symbols) > MAX_SYMBOLS_PER_FILE or len(parsed.relations) > MAX_RELATIONS_PER_FILE:
         raise StructuralError(StructuralErrorCode.COUNT_EXCEEDED)
     text = _SourceText(parsed.path, content)
     refs: set[str] = set()
-    keys: set[tuple[str, str, str]] = set()
     for symbol in parsed.symbols:
         if symbol.language != parsed.language:
             raise StructuralError(StructuralErrorCode.LANGUAGE_MISMATCH)
         if symbol.end_byte > size:
             raise StructuralError(StructuralErrorCode.RANGE_OUT_OF_BOUNDS)
-        if not text.name_ok(
+        if not text.final_ok(
             symbol.qualified_name, symbol.kind, symbol.start_byte, symbol.end_byte
         ) or not text.signature_ok(symbol.signature, symbol.start_byte, symbol.end_byte):
             raise StructuralError(StructuralErrorCode.TEXT_NOT_IN_SOURCE)
-        key = (symbol.qualified_name, symbol.kind, symbol.disambiguator)
-        if symbol.ref in refs or key in keys:
+        if symbol.ref in refs:
             raise StructuralError(StructuralErrorCode.DUPLICATE_SYMBOL)
         refs.add(symbol.ref)
-        keys.add(key)
+    per_source: dict[str, int] = {}
     for relation in parsed.relations:
+        per_source[relation.source_ref] = per_source.get(relation.source_ref, 0) + 1
+        if per_source[relation.source_ref] > MAX_RELATIONS_PER_SYMBOL:
+            raise StructuralError(StructuralErrorCode.COUNT_EXCEEDED)
         if relation.end_byte > size:
             raise StructuralError(StructuralErrorCode.RANGE_OUT_OF_BOUNDS)
         if relation.source_ref not in refs or relation.target_ref not in refs:
             raise StructuralError(StructuralErrorCode.DANGLING_RELATION)
+    return text

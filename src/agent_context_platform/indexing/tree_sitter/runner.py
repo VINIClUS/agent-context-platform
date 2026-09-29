@@ -58,16 +58,17 @@ Known limits (be honest about them):
   only children of the runner that are not live supervisors: live ones must carry the
   ``AGENT_CONTEXT_SANDBOX_RUN`` key in their environment with ANY token (a finished run's
   token is dead), zombies must be session leaders or in a session no live supervisor owns.
-  Concurrent runs' supervisors, and so their descendants, are excluded.
+  Concurrent runs' supervisors, and so their descendants, are excluded; sweep, spawn and
+  registration of a supervisor share one lock, so no live supervisor is ever unregistered
+  while a sweep runs.
   Side effects and residuals: orphans of any other code in the worker process also
   re-parent to it (subreaper is process-wide), and a zombie sweep can in theory reap a
   foreign ``start_new_session`` child that exited during the run, so the worker should not
-  run such children concurrently. A descendant that scrubs its environment (``execve``
-  with an empty one) after killing the supervisor is not recognized while alive; the
-  container ``pids_limit`` and restart bound that.
-- Concurrent runs share the UID, so an adapter of one run could signal the process of
-  another. INFRA-040 (follow-up) serializes adapter runs per indexer container or gives
-  each job its own PID namespace; until then run one adapter at a time per container.
+  run such children concurrently.
+- Won't fix here: same-UID signalling between concurrent runs, and a live orphan that
+  scrubbed its environment (``execve`` with an empty one) after killing the supervisor.
+  Both are contained by the INFRA-040 per-job PID namespace (a per-job container with
+  ``--init`` and ``pids_limit``, so every descendant dies with the job).
 - Read isolation is NOT provided by the container: the adapter shares the indexer's
   filesystem view and could read any file the UID can (a ``.env``, ``/etc/passwd``).
   Confinement is by output validation (``base.validate_module`` only accepts text that
@@ -297,7 +298,6 @@ def _run(command: Sequence[str], payload: bytes, limits: Limits, env: dict[str, 
     if not sys.platform.startswith("linux"):
         raise StructuralError(StructuralErrorCode.SPAWN_FAILED)  # subreaper is Linux-only
     _ensure_subreaper()
-    _sweep_orphans()
     env = {**env, _RUN_KEY: uuid.uuid4().hex}
     workdir = _make_workdir()
     try:
@@ -311,20 +311,21 @@ def _run(command: Sequence[str], payload: bytes, limits: Limits, env: dict[str, 
             json.dumps(limits.rlimits()),
             *command,
         ]
-        try:
-            process = subprocess.Popen(
-                argv,
-                stdin=subprocess.PIPE,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
-                cwd=workdir,
-                env=env,
-                close_fds=True,
-                start_new_session=True,
-            )
-        except OSError:
-            raise StructuralError(StructuralErrorCode.SPAWN_FAILED) from None
-        with _LIVE_LOCK:
+        with _LIVE_LOCK:  # sweep, spawn and registration are atomic against other sweeps
+            _sweep_orphans()
+            try:
+                process = subprocess.Popen(
+                    argv,
+                    stdin=subprocess.PIPE,
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    cwd=workdir,
+                    env=env,
+                    close_fds=True,
+                    start_new_session=True,
+                )
+            except OSError:
+                raise StructuralError(StructuralErrorCode.SPAWN_FAILED) from None
             _LIVE_SUPERVISORS.add(process.pid)
         try:
             deadline = time.monotonic() + limits.wall_seconds
@@ -372,7 +373,8 @@ def _reap(process: subprocess.Popen[bytes]) -> None:
             with contextlib.suppress(OSError):
                 stream.close()
     try:
-        _sweep_orphans(process.pid)
+        with _LIVE_LOCK:
+            _sweep_orphans(process.pid)
     finally:
         process.wait()
         with _LIVE_LOCK:
@@ -380,7 +382,7 @@ def _reap(process: subprocess.Popen[bytes]) -> None:
 
 
 _LIVE_SUPERVISORS: set[int] = set()
-_LIVE_LOCK = threading.Lock()
+_LIVE_LOCK = threading.RLock()  # spawn + registration + every sweep run under it
 _SUBREAPER_LOCK = threading.Lock()
 _subreaper_set = False
 _ORPHAN_SWEEP_SECONDS: Final = 3.0

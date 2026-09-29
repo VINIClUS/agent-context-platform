@@ -251,13 +251,10 @@ def test_dangling_relation_endpoints() -> None:
 
 
 def test_duplicate_symbols_are_refused() -> None:
-    refused(StructuralErrorCode.DUPLICATE_SYMBOL, module([symbol(), symbol(ref="2")]))
     refused(
         StructuralErrorCode.DUPLICATE_SYMBOL,
         module([symbol(), second(ref="1")]),
     )
-    distinct = module([symbol(), symbol(ref="2", disambiguator="2")])
-    assert validate_module(request(), distinct, expected_fingerprint=FINGERPRINT)
 
 
 def test_count_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -571,6 +568,14 @@ def test_realistic_python_and_typescript_names_and_signatures_pass() -> None:
         "lib/store.ts",
         [
             symbol(
+                ref="3",
+                qualified_name="store::Store",
+                kind="class",
+                start_byte=0,
+                end_byte=len(TS_SOURCE) - 1,
+                signature="export class Store<T>",
+            ),
+            symbol(
                 qualified_name="store::Store#get",
                 start_byte=start,
                 end_byte=TS_SOURCE.index(b"{\n    return"),
@@ -629,7 +634,8 @@ def test_total_name_bytes_are_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
         "h.u.n.t.e.r.2",  # one-character segments spelling out foreign data
         "pkg.mod.a.",  # empty segment
         "pkg.mod.2",  # not an identifier
-        "p.mod.a",  # non-final segment shorter than two characters
+        "p.mod.a",  # non-final segment that is a token nowhere it may be
+        "h.u.n.t.e.r",  # spelling attack: single tokens from elsewhere in the file
         "pkg.mod.return",  # final token exists in the file, but outside the symbol's range
         "<lambda>",
     ],
@@ -792,7 +798,7 @@ def test_every_output_field_is_classified() -> None:
 
 def test_free_form_string_fields_are_token_confined_or_rehashed() -> None:
     """A future free-form field must be classified, and only those classes may be free text."""
-    allowed = {"token", "numeric", "enum", "range", "parent", "rehashed", "structure"}
+    allowed = {"token", "enum", "range", "parent", "derived", "rehashed", "structure"}
     for fields in base.FIELD_CONFINEMENT.values():
         assert set(fields.values()) <= allowed
 
@@ -823,3 +829,162 @@ def test_rehash_is_deterministic_and_injective_on_the_child_value() -> None:
 
     assert digest_of("1" * 64) == digest_of("1" * 64)
     assert digest_of("1" * 64) != digest_of("2" * 64)
+
+
+# --- structural name binding, derived numerics, race --------------------------------------
+
+SRC_A = b"class A:\n    def run(self):\n        pass\n\nx = 1\nmod = 2\nhunter = 3\n"
+
+
+def _names(content: bytes, path: str, symbols: list[dict[str, Any]]) -> StructuralErrorCode | None:
+    try:
+        confined(content, path, symbols)
+    except StructuralError as error:
+        return error.code
+    return None
+
+
+def test_single_character_enclosing_segments_are_accepted() -> None:
+    run = SRC_A.index(b"def run")
+    cls = symbol(
+        qualified_name="A", kind="class", start_byte=0, end_byte=len(SRC_A), signature="class A"
+    )
+    method = symbol(
+        ref="2",
+        qualified_name="A.run",
+        start_byte=run,
+        end_byte=SRC_A.index(b"pass") + 4,
+        signature="def run(self)",
+    )
+    assert _names(SRC_A, "pkg/mod.py", [cls, method]) is None
+
+
+def test_single_character_module_path_segments_are_accepted() -> None:
+    f = SRC_A.index(b"class")
+    assert (
+        _names(
+            SRC_A,
+            "x/mod.py",
+            [
+                symbol(
+                    qualified_name="x.mod.A",
+                    start_byte=f,
+                    end_byte=len(SRC_A),
+                    signature="class A:",
+                )
+            ],
+        )
+        is None
+    )
+
+
+def test_go_receiver_declared_in_another_file_is_accepted() -> None:
+    go = b"func (t *T) m() {}\n"
+    candidate = module(
+        [
+            symbol(
+                qualified_name="T.m",
+                start_byte=0,
+                end_byte=len(go),
+                signature="func (t *T) m() {}",
+                language="go",
+            )
+        ],
+        path="a.go",
+        language="go",
+    )
+    other = SourceFile(
+        path="b.go", language="go", content_b64=base64.b64encode(b"type T struct{}\n").decode()
+    )
+    first = SourceFile(path="a.go", language="go", content_b64=base64.b64encode(go).decode())
+    checked = validate_module(
+        ParseRequest(files=(first, other)),
+        ParsedModule.model_validate_json(
+            json.dumps(
+                {
+                    "protocol_version": 1,
+                    "files": [
+                        json.loads(candidate.files[0].model_dump_json()),
+                        {
+                            "path": "b.go",
+                            "language": "go",
+                            "parser_fingerprint": FINGERPRINT,
+                            "symbols": [],
+                            "relations": [],
+                        },
+                    ],
+                }
+            )
+        ),
+        expected_fingerprint=FINGERPRINT,
+    )
+    assert checked.files[0].symbols[0].qualified_name == "T.m"
+
+
+def test_spelling_out_a_word_from_tokens_elsewhere_is_refused() -> None:
+    src = b"def h(): pass\nu = n = t = e = r = 1\n"
+    bad = symbol(qualified_name="h.u.n.t.e.r", start_byte=0, end_byte=13, signature="def h(): pass")
+    assert _names(src, "pkg/mod.py", [bad]) is StructuralErrorCode.TEXT_NOT_IN_SOURCE
+
+
+def test_disambiguator_is_derived_by_the_parent() -> None:
+    late = second(ref="9", start_byte=12, disambiguator="7", signature="return 1")
+    early = second(ref="4", start_byte=9, disambiguator="999", signature="return 1")
+    out = validate_module(request(), module([late, early]), expected_fingerprint=FINGERPRINT)
+    got = out.files[0].symbols
+    # Ordinals follow (start, end, kind), not the adapter's order or its own values.
+    assert [(x.start_byte, x.disambiguator) for x in got] == [(12, "1"), (9, "0")]
+    assert [x.ref for x in got] == ["0", "1"]
+    lone = validate_module(
+        request(), module([symbol(disambiguator="123456")]), expected_fingerprint=FINGERPRINT
+    )
+    assert lone.files[0].symbols[0].disambiguator == "0"
+
+
+def test_relations_are_remapped_and_capped(monkeypatch: pytest.MonkeyPatch) -> None:
+    rel = {
+        "source_ref": "2",
+        "target_ref": "1",
+        "kind": "calls",
+        "start_byte": 9,
+        "end_byte": 10,
+        "evidence_kind": "tree_sitter",
+    }
+    out = validate_module(
+        request(), module([symbol(), second()], relations=[rel]), expected_fingerprint=FINGERPRINT
+    )
+    assert (out.files[0].relations[0].source_ref, out.files[0].relations[0].target_ref) == (
+        "1",
+        "0",
+    )
+    monkeypatch.setattr(base, "MAX_RELATIONS_PER_SYMBOL", 1)
+    refused(StructuralErrorCode.COUNT_EXCEEDED, module([symbol(), second()], relations=[rel, rel]))
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="subreaper is Linux-only")
+def test_a_concurrent_run_does_not_sweep_a_supervisor_being_registered(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import threading
+
+    real = subprocess.Popen
+    spawned = threading.Event()
+    first = [True]
+
+    def slow(*args: Any, **kwargs: Any) -> Any:
+        process = real(*args, **kwargs)
+        if first[0]:
+            first[0] = False
+            spawned.set()
+            time.sleep(0.5)  # descheduled between Popen and registration
+        return process
+
+    monkeypatch.setattr(runner.subprocess, "Popen", slow)
+    results: list[Any] = []
+    thread = threading.Thread(target=lambda: results.append(outcome("ok")))
+    thread.start()
+    assert spawned.wait(5)
+    other = outcome("ok")
+    thread.join()
+    assert isinstance(other, ParsedModule)
+    assert isinstance(results[0], ParsedModule)
