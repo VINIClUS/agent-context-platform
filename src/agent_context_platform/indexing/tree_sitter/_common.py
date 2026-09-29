@@ -13,10 +13,11 @@ limits), ``safe_module`` (per-file degradation) and ``normalize_module`` (golden
 from __future__ import annotations
 
 import hashlib
+import json
 import re
 import struct
 import time
-from collections.abc import Callable, Iterable
+from collections.abc import Callable, Iterable, Iterator
 from typing import Any, Final
 
 from pydantic import ValidationError
@@ -25,8 +26,10 @@ from agent_context_platform.indexing.tree_sitter.base import (
     MAX_NAME_BYTES,
     MAX_NAME_TOTAL_BYTES,
     MAX_OUTPUT_BYTES,
+    ParsedDiagnostic,
     ParsedFile,
     ParsedModule,
+    ParsedReference,
     ParseRequest,
     SourceFile,
     StructuralError,
@@ -195,8 +198,11 @@ def safe_module(
     Passing ``validate_module`` per file implies passing it for the batch, so one
     pathological file cannot take down the others. Only the validation errors
     (``ValidationError``, ``StructuralError``) and ``WorkBudgetExceeded`` are caught, so an
-    adapter bug (any other exception) still fails loudly. The wire contract has no
-    diagnostics channel: a degraded file is indistinguishable from an empty one (P032C).
+    adapter bug (any other exception) still fails loudly. ``references`` and ``diagnostics``
+    of a valid file pass through untouched. Only when the whole answer would exceed the output
+    bound are they shed, references first and never silently: ``references_capped`` says so.
+    A file that degrades to *no symbols* is still indistinguishable from an empty one until the
+    adapters emit ``file_degraded`` (PLATFORM-033b).
     """
     budget = Budget()
     output = [0]
@@ -222,14 +228,45 @@ def safe_module(
             output[0] = mark
             parsed = empty
         # The runner refuses the whole answer above MAX_OUTPUT_BYTES: measure the real JSON,
-        # then shed relations, then symbols, of this file only.
-        for reduced in (parsed, parsed.model_copy(update={"relations": ()}), empty):
+        # then shed references (reported), then relations, then symbols, of this file only.
+        for reduced in _reductions(parsed, empty):
             size = len(reduced.model_dump_json())
             if total + size <= OUTPUT_BUDGET:
                 break
         total += size
         files.append(reduced)
     return ParsedModule(files=tuple(files))
+
+
+def _reductions(parsed: ParsedFile, empty: ParsedFile) -> Iterator[ParsedFile]:
+    """The file as is, then without references (reported), then without relations, then empty."""
+    yield parsed
+    shed = parsed
+    if parsed.references:
+        kept = [item for item in parsed.diagnostics if item.code != "references_capped"]
+        kept.append(
+            ParsedDiagnostic(code="references_capped", count=min(len(parsed.references), 1000))
+        )
+        shed = parsed.model_copy(update={"references": (), "diagnostics": tuple(kept)})
+        yield shed
+    yield shed.model_copy(update={"relations": ()})
+    yield empty
+
+
+def _reference_view(item: ParsedReference, by_ref: dict[str, str]) -> dict[str, Any]:
+    return {
+        "source": None if item.source is None else by_ref[item.source],
+        "kind": item.kind,
+        "target": item.target_name,
+        "relative_level": item.relative_level,
+        "range": [item.start_byte, item.end_byte],
+        "qualifier": item.qualifier,
+        "qualifier_range": (
+            None if item.qualifier is None else [item.qualifier_start_byte, item.qualifier_end_byte]
+        ),
+        "evidence_kind": item.evidence_kind,
+        "confidence": item.confidence,
+    }
 
 
 def normalize_module(module: ParsedModule) -> dict[str, Any]:
@@ -269,6 +306,16 @@ def normalize_module(module: ParsedModule) -> dict[str, Any]:
                     }
                     for rel in parsed.relations
                 ],
+                # Sorted, so the golden and parity tests catch a missing, reordered or
+                # corrupted entry regardless of the order the adapter walked the tree.
+                "references": sorted(
+                    (_reference_view(item, by_ref) for item in parsed.references),
+                    key=lambda view: json.dumps(view, sort_keys=True),
+                ),
+                "diagnostics": sorted(
+                    ({"code": item.code, "count": item.count} for item in parsed.diagnostics),
+                    key=lambda view: view["code"],
+                ),
             }
         )
     return {"protocol_version": module.protocol_version, "files": files}

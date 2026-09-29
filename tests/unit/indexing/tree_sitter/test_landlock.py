@@ -298,7 +298,7 @@ def module_adapter(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> tuple[Pat
         "    sys.exit(9)\n"
         "request = json.loads(sys.stdin.read())\n"
         "file = request['files'][0]\n"
-        "sys.stdout.write(json.dumps({'protocol_version': 1, 'files': [{\n"
+        "sys.stdout.write(json.dumps({'protocol_version': 2, 'files': [{\n"
         "    'path': file['path'], 'language': file['language'],\n"
         "    'parser_fingerprint': os.environ['FAKE_FINGERPRINT'],\n"
         "    'symbols': [], 'relations': []}]}))\n"

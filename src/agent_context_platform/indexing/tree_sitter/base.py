@@ -10,9 +10,9 @@ Wire protocol: one bounded JSON document each way (``ParseRequest`` on stdin,
 ``ParsedModule`` on stdout). Both sides validate with pydantic models that are
 frozen, strict and ``extra="forbid"``, with ``hide_input_in_errors`` so that a
 validation failure never echoes source text into logs.
-Protocol versions 1 and 2 are both spoken. ``SandboxedAdapter`` declares the version it speaks
-(default 2), the request carries it, ``serve`` accepts both, and a response may not claim a
-higher version than the adapter declared. Version 1 has no ``references`` or ``diagnostics``.
+Only protocol 2 exists (``references`` and ``diagnostics`` are part of it): every adapter
+ships in-tree with the runner, so there is no negotiation. Requests and answers with any other
+``protocol_version`` fail validation (``schema_violation``).
 
 Trust rules enforced by ``validate_module`` (fail closed, typed content-free
 errors, never the offending value):
@@ -27,8 +27,7 @@ errors, never the offending value):
 - counts are bounded;
 - ``references`` (unresolved import/call/inherit candidates, protocol 2) and ``diagnostics``
   (closed-enum degradation codes with bounded counts, no free text) are validated below.
-  Protocol 1 adapters emit neither (both default to empty) and still validate; a protocol 1
-  document that carries them is refused;
+  ``references`` and ``diagnostics`` default to empty;
 - every free-text field is confined to the parsed file itself, so an adapter that read
   some other file (``/etc/passwd``, a ``.env``) cannot exfiltrate it through the output.
   Read isolation is not something the container gives (the adapter shares the indexer's
@@ -69,17 +68,19 @@ errors, never the offending value):
 
   * ``ParsedReference.target_name`` is a function of its range (a new free-text channel, so
     airtight): it EQUALS the identifier tokens found in ``[start_byte, end_byte]``, in source
-    order, joined by ``.`` (only ``.`` separates; ``/``, ``#`` and ``::`` are refused, a token
-    cut by either range end is refused). The adapter therefore points the range at the name
+    order, joined by ``.``. Between two consecutive tokens the source bytes must be exactly one
+    ``.``, optionally surrounded by ASCII whitespace (``a . b``); ``a / b``, ``a b``, ``a#b``,
+    ``a::b`` are refused, as is a token cut by either range end. The one exception is a
+    qualifier whose range is the CONTENT of a string literal (the bytes right outside the range
+    are the same quote character, ``"``, ``'`` or backtick, and that quote is not inside the
+    range): there ``/`` also separates, so TS ``from "./pkg/mod"`` with the range on ``./pkg/mod``
+    gives the qualifier ``pkg.mod`` (the ``./`` is the adapter's ``relative_level``). The adapter therefore points the range at the name
     node itself (``os.path`` inside ``import os.path``; ``pkg`` inside ``from ..pkg import x``
     with ``relative_level=2``), never at the whole statement: a statement's own keywords would
     be part of the name. A target that spans two places (``pkg.x`` of ``from ..pkg import x``)
     uses the optional ``qualifier`` with its own range, checked exactly like the name range;
     the effective target is ``qualifier + "." + target_name`` and ``relative_level`` applies to
-    the qualifier. The rule is by tokens only, with no lexical context: the qualifier range may
-    sit on a string literal's contents (TS ``from "./pkg"``: the range on ``./pkg`` has the one
-    identifier token ``pkg``, the ``./`` is the adapter's ``relative_level=1``) because a range
-    can only ever yield the tokens it covers. Both names are charged to the name budget; The range lies inside the file and, when ``source`` is set, inside
+    the qualifier. Both names are charged to the name budget; The range lies inside the file and, when ``source`` is set, inside
     that symbol's range. ``source`` is
     remapped to a symbol index (None is module level), ``kind`` and ``confidence`` are closed
     enums (``syntactic`` for import/inherit, ``heuristic`` for call: the target is a name, not a
@@ -300,7 +301,7 @@ class ParseRequest(BaseModel):
 
     model_config = _MODEL
 
-    protocol_version: Literal[1, 2] = PROTOCOL_VERSION
+    protocol_version: Literal[2] = PROTOCOL_VERSION
     files: tuple[SourceFile, ...] = Field(min_length=1, max_length=MAX_INPUT_FILES)
 
     @model_validator(mode="after")
@@ -440,8 +441,7 @@ class ParsedModule(BaseModel):
 
     model_config = _MODEL
 
-    # Answers default to 1: an adapter that emits ``references`` or ``diagnostics`` must say 2.
-    protocol_version: Literal[1, 2] = 1
+    protocol_version: Literal[2] = PROTOCOL_VERSION
     files: tuple[ParsedFile, ...]
 
 
@@ -528,10 +528,6 @@ def validate_module(
     request: ParseRequest, module: ParsedModule, *, expected_fingerprint: str
 ) -> ParsedModule:
     """Check ``module`` against ``request``; return it with opaque values re-hashed, or raise."""
-    if module.protocol_version < 2 and any(
-        parsed.references or parsed.diagnostics for parsed in module.files
-    ):
-        raise StructuralError(StructuralErrorCode.SCHEMA_VIOLATION)
     sources = {item.path: item for item in request.files}
     seen: set[str] = set()
     texts: dict[str, _SourceText] = {}
@@ -617,6 +613,7 @@ def _finish(
 _SEPARATORS = re.compile(r"::|[./#]")
 _IDENT = re.compile(rb"[A-Za-z_$\x80-\xff][A-Za-z0-9_$\x80-\xff]*")
 _WHITESPACE = re.compile(rb"[ \t\r\n\f\v]+")
+_ASCII_SPACE = b" \t\r\n\f\v"
 
 
 def _path_parts(path: str) -> set[bytes]:
@@ -637,6 +634,7 @@ class _SourceText:
             self._starts.append(match.start())
             self._ends.append(match.end())
             self._words.append(match.group())
+        self._content = content
         self._path_parts = _path_parts(path)
         self.name_bytes = 0
         # Whitespace-collapsed text, with the original offset of every collapsed byte.
@@ -667,10 +665,26 @@ class _SourceText:
         if self.name_bytes > MAX_NAME_TOTAL_BYTES:
             raise StructuralError(StructuralErrorCode.COUNT_EXCEEDED)
 
-    def path_ok(self, target_name: str, start: int, end: int) -> bool:
-        """The name equals the range's identifier tokens, in order, joined by ``.``."""
+    def _string_content(self, start: int, end: int) -> bool:
+        """The range is exactly what sits between two identical quote bytes."""
+        if start == 0 or end >= len(self._content):
+            return False
+        quote = self._content[start - 1 : start]
+        return (
+            quote in (b'"', b"'", b"`")
+            and self._content[end : end + 1] == quote
+            and quote not in self._content[start:end]
+        )
+
+    def path_ok(self, target_name: str, start: int, end: int, *, qualifier: bool = False) -> bool:
+        """The name equals the range's identifier tokens, in order, joined by ``.``.
+
+        Consecutive tokens are separated by exactly ``.`` (ASCII whitespace around it allowed),
+        or also ``/`` for a qualifier that is the content of a string literal.
+        """
         self.charge(target_name)
         index = bisect_left(self._starts, start)
+        first = index
         if index and self._ends[index - 1] > start:
             return False  # a token is cut by the start of the range
         for wanted in target_name.encode().split(b"."):
@@ -680,7 +694,13 @@ class _SourceText:
                 return False
             index += 1
         # Another token in range, or one cut by the end of the range, is not the name.
-        return index >= len(self._starts) or self._starts[index] >= end
+        if index < len(self._starts) and self._starts[index] < end:
+            return False
+        separators = (b".", b"/") if qualifier and self._string_content(start, end) else (b".",)
+        return all(
+            self._content[self._ends[n - 1] : self._starts[n]].strip(_ASCII_SPACE) in separators
+            for n in range(first + 1, index)
+        )
 
     def final_ok(self, qualified_name: str, kind: str, start: int, end: int) -> bool:
         """Every segment is an identifier and the final one is a token of the symbol's range."""
@@ -795,5 +815,6 @@ def _validate_references(
             reference.qualifier,
             reference.qualifier_start_byte,  # type: ignore[arg-type]
             reference.qualifier_end_byte,  # type: ignore[arg-type]
+            qualifier=True,
         ):
             raise StructuralError(StructuralErrorCode.TEXT_NOT_IN_SOURCE)

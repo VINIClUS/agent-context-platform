@@ -338,7 +338,7 @@ def test_well_behaved_adapter_round_trips() -> None:
         ("foreign_path", StructuralErrorCode.PATH_MISMATCH),
         ("dangling", StructuralErrorCode.DANGLING_RELATION),
         ("references_exfil", StructuralErrorCode.TEXT_NOT_IN_SOURCE),
-        ("references_v1", StructuralErrorCode.SCHEMA_VIOLATION),
+        ("protocol_v1", StructuralErrorCode.SCHEMA_VIOLATION),
         ("diagnostics_free_text", StructuralErrorCode.SCHEMA_VIOLATION),
         ("wrong_evidence", StructuralErrorCode.SCHEMA_VIOLATION),
         ("extra_field", StructuralErrorCode.SCHEMA_VIOLATION),
@@ -925,7 +925,7 @@ def test_go_receiver_declared_in_another_file_is_accepted() -> None:
         ParsedModule.model_validate_json(
             json.dumps(
                 {
-                    "protocol_version": 1,
+                    "protocol_version": 2,
                     "files": [
                         json.loads(candidate.files[0].model_dump_json()),
                         {
@@ -1131,7 +1131,7 @@ def test_references_are_confined_to_the_occurrence(
     refused(code, module(references=[reference]))
 
 
-WORDS = b"alpha beta gamma delta"
+WORDS = b"alpha.beta.gamma.delta"
 
 
 @pytest.mark.parametrize(
@@ -1342,18 +1342,19 @@ def test_diagnostic_counts_saturate_at_one_thousand() -> None:
     assert base.MAX_DIAGNOSTIC_COUNT == 1000
 
 
-def test_protocol_one_still_validates_and_cannot_carry_new_fields() -> None:
-    old = module(version=1)
-    assert old.protocol_version == 1
-    assert validated(old).references == ()
-    refused(StructuralErrorCode.SCHEMA_VIOLATION, module(version=1, references=[ref(4, 5, "a")]))
-    refused(
-        StructuralErrorCode.SCHEMA_VIOLATION,
-        module(version=1, diagnostics=[{"code": "syntax_recovered", "count": 1}]),
-    )
+def test_protocol_one_and_unknown_versions_are_refused_everywhere() -> None:
     assert request().protocol_version == base.PROTOCOL_VERSION == 2
-    with pytest.raises(ValidationError):
-        ParsedModule.model_validate({"protocol_version": 3, "files": []})
+    assert module().protocol_version == 2
+    for version in (0, 1, 3):
+        with pytest.raises(ValidationError):
+            module(version=version)
+        with pytest.raises(ValidationError):
+            ParseRequest.model_validate(
+                {"protocol_version": version, "files": [request().files[0].model_dump()]}
+            )
+    assert not hasattr(adapter("ok"), "_protocol_version")
+    with pytest.raises(TypeError):
+        adapter("ok", protocol_version=1)
 
 
 def test_sandboxed_adapter_round_trips_references_and_diagnostics() -> None:
@@ -1373,26 +1374,20 @@ def test_sandboxed_adapter_round_trips_references_and_diagnostics() -> None:
     }
 
 
-def test_request_carries_the_declared_version_and_serve_accepts_both() -> None:
-    v1 = adapter("ok", protocol_version=1).parse(request())
-    assert isinstance(v1, ParsedModule)
-    assert v1.protocol_version == 1  # the fake echoes the version of the request it parsed
-    v2 = adapter("ok").parse(request())
-    assert isinstance(v2, ParsedModule)
-    assert v2.protocol_version == 2
-    for version in (1, 2):
-        stdin = io.BytesIO(
-            request().model_copy(update={"protocol_version": version}).model_dump_json().encode()
-        )
-        stdout = io.BytesIO()
-        assert runner.serve(lambda _req, v=version: module(version=v), stdin, stdout) == 0
-        assert json.loads(stdout.getvalue())["protocol_version"] == version
+def test_serve_speaks_protocol_two_only() -> None:
+    good = io.BytesIO(request().model_dump_json().encode())
+    stdout = io.BytesIO()
+    assert runner.serve(lambda _req: module(), good, stdout) == 0
+    assert json.loads(stdout.getvalue())["protocol_version"] == 2
+    v1 = json.loads(request().model_dump_json())
+    v1["protocol_version"] = 1
+    stdout = io.BytesIO()
+    assert runner.serve(lambda _req: module(), io.BytesIO(json.dumps(v1).encode()), stdout) == 3
+    assert stdout.getvalue() == b""
 
 
-def test_a_response_above_the_declared_version_is_refused() -> None:
-    result = outcome("references_ok", protocol_version=1)
-    assert result is StructuralErrorCode.SCHEMA_VIOLATION
-    assert outcome("references_v1", protocol_version=1) is StructuralErrorCode.SCHEMA_VIOLATION
+def test_a_protocol_one_answer_is_refused() -> None:
+    assert outcome("protocol_v1") is StructuralErrorCode.SCHEMA_VIOLATION
 
 
 # --- qualified references ---------------------------------------------------------------
@@ -1501,3 +1496,80 @@ def test_duplicates_are_keyed_by_the_qualifier_too() -> None:
     )
     assert validated(module(references=[plain, qref(4, 5, "a", 4, 5, "a")]))
     assert validated(module(references=[qref(4, 5, "a", 4, 5, "a"), qref(4, 5, "a", 4, 6, "a")]))
+
+
+# --- separators between the tokens of a name -------------------------------------------
+
+
+@pytest.mark.parametrize(
+    ("source", "separator"),
+    [(b"a.b", "dot"), (b"a . b", "spaced"), (b"a\t.\n b", "whitespace")],
+)
+def test_a_dot_with_optional_ascii_whitespace_separates_names(
+    source: bytes, separator: str
+) -> None:
+    del separator
+    got = validated(module([], references=[ref(0, len(source), "a.b")]), request(source))
+    assert got.references[0].target_name == "a.b"
+
+
+@pytest.mark.parametrize(
+    "source",
+    [b"a / b", b"a b", b"a#b", b"a::b", b"a/b", b"a..b", b"a . . b", b"a , b", b"a.\x00b", b"a.-b"],
+)
+def test_other_separators_between_tokens_are_refused(source: bytes) -> None:
+    refused(
+        StructuralErrorCode.TEXT_NOT_IN_SOURCE,
+        module([], references=[ref(0, len(source), "a.b")]),
+        request(source),
+    )
+    refused(
+        StructuralErrorCode.TEXT_NOT_IN_SOURCE,
+        module([], references=[qref(0, 1, "a", 0, len(source), "a.b")]),
+        request(source),
+    )
+
+
+def test_a_string_literal_qualifier_may_use_slash_separators() -> None:
+    ts = b'import { x } from "./pkg/mod";'
+    at = ts.index(b"./pkg/mod")
+    end = at + len(b"./pkg/mod")
+    x = ts.index(b"x")
+    got = validated(
+        module([], references=[qref(x, x + 1, "x", at, end, "pkg.mod", relative_level=1)]),
+        request(ts),
+    ).references[0]
+    assert (got.qualifier, got.relative_level) == ("pkg.mod", 1)
+    single = b"import { x } from './pkg/mod';"
+    assert validated(
+        module([], references=[qref(x, x + 1, "x", at, end, "pkg.mod", relative_level=1)]),
+        request(single),
+    )
+
+
+@pytest.mark.parametrize(
+    "ts",
+    [
+        b"import { x } from ./pkg/mod;",  # no quotes
+        b"import { x } from \"./pkg/mod';",  # mismatched quotes
+        b"import { x } from `./pkg/mod';",
+        b'import { x } from "a"./pkg/mod;',  # only one side is a quote
+    ],
+)
+def test_a_slash_needs_a_real_string_literal_range(ts: bytes) -> None:
+    at = ts.index(b"./pkg/mod")
+    end = at + len(b"./pkg/mod")
+    x = ts.index(b"x")
+    candidate = module([], references=[qref(x, x + 1, "x", at, end, "pkg.mod", relative_level=1)])
+    refused(StructuralErrorCode.TEXT_NOT_IN_SOURCE, candidate, request(ts))
+
+
+def test_a_slash_is_never_a_separator_in_a_name_or_outside_a_literal_qualifier() -> None:
+    ts = b'import { x } from "pkg/mod";'
+    at = ts.index(b"pkg/mod")
+    # the name range, even inside a string literal
+    refused(
+        StructuralErrorCode.TEXT_NOT_IN_SOURCE,
+        module([], references=[ref(at, at + 7, "pkg.mod")]),
+        request(ts),
+    )

@@ -130,7 +130,7 @@ def main() -> int:
     if MODE == "no_read_hang":
         time.sleep(600)
     if MODE == "ignore_stdin":
-        emit({"protocol_version": 1, "files": []})
+        emit({"protocol_version": 2, "files": []})
         return 0
     raw = sys.stdin.read()
     if MODE == "read_other_file":
@@ -154,31 +154,26 @@ def main() -> int:
         "symbols": [good],
         "relations": [],
     }
-    document: dict[str, object] = {"protocol_version": request.protocol_version, "files": [parsed]}
+    document: dict[str, object] = {"protocol_version": 2, "files": [parsed]}
     if MODE == "ok":
         pass
     elif MODE == "references_ok":
-        document["protocol_version"] = 2
         parsed["references"] = [
             reference(4, 5, "a", source="1"),
             reference(13, 19, "return", kind="import", confidence="syntactic", relative_level=2),
         ]
         parsed["diagnostics"] = [{"code": "syntax_recovered", "count": 1}]
     elif MODE == "references_exfil":
-        document["protocol_version"] = 2
         parsed["references"] = [reference(4, 5, "AWS_SECRET_KEY")]
-    elif MODE == "references_v1":
+    elif MODE == "protocol_v1":
         document["protocol_version"] = 1
-        parsed["references"] = [reference(4, 5, "a")]
     elif MODE == "degraded_ok":
-        document["protocol_version"] = 2
         parsed["symbols"] = []
         parsed["diagnostics"] = [
             {"code": "file_degraded", "count": 1},
             {"code": "work_budget_exceeded", "count": 1},
         ]
     elif MODE == "diagnostics_free_text":
-        document["protocol_version"] = 2
         parsed["diagnostics"] = [{"code": "syntax_recovered", "count": 1, "detail": "secret"}]
     elif MODE == "range":
         parsed["symbols"] = [symbol("1", "pkg.a", 0, size + 1)]
