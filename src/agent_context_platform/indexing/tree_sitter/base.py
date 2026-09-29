@@ -25,7 +25,12 @@ errors, never the offending value):
 - every free-text field is confined to the parsed file itself, so an adapter that read
   some other file (``/etc/passwd``, a ``.env``) cannot exfiltrate it through the output.
   Read isolation is not something the container gives (the adapter shares the indexer's
-  filesystem view); this is the confinement:
+  filesystem view). It is enforced by Landlock (``landlock.py``): the adapter process can read
+  only its own interpreter, site-packages and system libraries, never the checkout, other
+  checkouts, ``.env`` files, ``/etc`` secrets or ``$HOME`` (the source arrives on stdin), and
+  the runner refuses to run adapters when the kernel cannot enforce it. What remains readable
+  is the input file itself, so the residual channel is structural output about that file,
+  which the output confinement below bounds:
 
   * ``qualified_name`` is a path of identifier tokens split on ``.``, ``::``, ``/``,
     ``#``. The final segment must be an identifier token located inside the symbol's own
@@ -118,6 +123,8 @@ class StructuralErrorCode(StrEnum):
     INVALID_REQUEST = "invalid_request"
     INPUT_TOO_LARGE = "input_too_large"
     SPAWN_FAILED = "spawn_failed"
+    SANDBOX_UNAVAILABLE = "sandbox_unavailable"
+    UNSAFE_READ_SET = "unsafe_read_set"
     TIMEOUT = "timeout"
     OUTPUT_TOO_LARGE = "output_too_large"
     STDERR_TOO_LARGE = "stderr_too_large"
@@ -140,6 +147,13 @@ class StructuralError(Exception):
     def __init__(self, code: StructuralErrorCode) -> None:
         super().__init__(code.value)
         self.code = code
+
+
+class SandboxUnavailable(StructuralError):
+    """The runner cannot confine the adapter (no Landlock), so it refuses to run it."""
+
+    def __init__(self) -> None:
+        super().__init__(StructuralErrorCode.SANDBOX_UNAVAILABLE)
 
 
 def _no_controls(value: str) -> str:

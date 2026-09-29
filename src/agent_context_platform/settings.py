@@ -188,6 +188,12 @@ class Settings(BaseSettings):
     s3: S3Settings = Field(default_factory=S3Settings)
     mcp: MCPSettings = Field(default_factory=MCPSettings)
     ingestion: IngestionSettings = Field(default_factory=IngestionSettings)
+    # Structural indexer (PLATFORM-032b). Adapters are confined with Landlock and the runner
+    # refuses to run them when the kernel cannot enforce it; this is the dev-only escape hatch
+    # (AGENT_CONTEXT_INDEXER_ALLOW_UNCONFINED_ADAPTERS). Never enable it in production.
+    indexer_allow_unconfined_adapters: bool = False
+    # Directories being indexed; no path readable by an adapter may equal, contain or lie in one.
+    indexer_checkout_roots: tuple[str, ...] = Field(default=(), strict=False)
 
     @model_validator(mode="after")
     def require_complete_production_settings(self) -> Self:
