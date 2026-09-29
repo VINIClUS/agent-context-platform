@@ -34,8 +34,17 @@ the body; the fingerprint covers the whole definition including nested definitio
 Syntax errors. tree-sitter recovers, so the walk never fails. A definition or assignment
 that *contains* an ERROR or MISSING node (not counting nested definitions, which decide for
 themselves) is skipped together with everything nested inside it, because nested names are
-qualified through it. Enclosing an error is not overlapping it: a class whose method is
-broken is kept, the method is dropped. The module symbol is always emitted.
+qualified through it. Precisely: an error inside a method's own tokens drops only that method
+(the class and its other members are kept), but an ERROR node sitting directly in a class body,
+between members, belongs to the class and drops the whole class with its members. Enclosing an
+error is not overlapping it. The module symbol is always emitted. Dropped symbols release
+their name/output/slot budget, so malformed declarations never starve valid ones.
+
+Work limits (``_common.Budget``): at most ``MAX_NODES_PER_FILE`` (600k) syntax nodes per file (about 3 s of CPU) and a
+5 s CPU backstop per request (the runner's RLIMIT_CPU is 10 s); a file over budget degrades to no
+symbols while the rest of the batch continues. Call resolution is memoized, a name with more
+than 8 same-scope definitions yields no edge, and resolution stops for a source at its
+relation cap.
 
 Robustness: the walk is an iterative cursor loop (no recursion on nesting), byte offsets
 are those of the raw input (CRLF and any BOM untouched), names must be valid UTF-8 whole
@@ -54,7 +63,7 @@ import tree_sitter_python
 from tree_sitter import Language, Node, Parser, Tree
 
 from agent_context_platform.indexing.tree_sitter._common import (
-    NameBudget,
+    Budget,
     cut_signature,
     digest,
     frame,
@@ -64,6 +73,7 @@ from agent_context_platform.indexing.tree_sitter._common import (
 )
 from agent_context_platform.indexing.tree_sitter.base import (
     EVIDENCE_KIND,
+    MAX_NAME_BYTES,
     MAX_RELATIONS_PER_FILE,
     MAX_RELATIONS_PER_SYMBOL,
     MAX_SYMBOLS_PER_FILE,
@@ -91,6 +101,7 @@ _SEMANTIC_DOMAIN: Final = b"agent-context/python/semantic/v1"
 _SIGNATURE_DOMAIN: Final = b"agent-context/python/signature/v1"
 _CLOSE: Final = frame(b")")
 _MAX_CALL_SITES: Final = 200_000
+_MAX_CANDIDATES: Final = 8
 _DEFINITIONS: Final = frozenset({"function_definition", "class_definition"})
 _SKIPPED: Final = frozenset({"comment", "line_continuation", "string_end", ",", ";"})
 _PROPERTY_NAMES: Final = frozenset({"property", "cached_property"})
@@ -140,7 +151,7 @@ class _Site:
 @dataclass(eq=False)
 class _Walk:
     content: bytes
-    budget: NameBudget
+    budget: Budget
     output: list[int]
     root: _Sym
     syms: list[_Sym] = field(default_factory=list)
@@ -149,13 +160,22 @@ class _Walk:
     frames: list[_Frame] = field(default_factory=list)
     scopes: list[_Sym | None] = field(default_factory=list)
     decorated: dict[int, tuple[int, int]] = field(default_factory=dict)
+    # Ancestors as (type, id), kept by the walk itself: ``Node.parent`` is not O(1).
+    ancestors: list[tuple[str, int]] = field(default_factory=list)
+    first_child: dict[int, int] = field(default_factory=dict)
+    seen: set[tuple[str, str, int, int]] = field(default_factory=set)
+    property_decorator: bool = False
 
     def add(self, sym: _Sym, parent: _Frame | None = None) -> bool:
         """Register a symbol if limits allow; the caller drops its subtree otherwise."""
         if len(self.syms) >= MAX_SYMBOLS_PER_FILE:
             return False
+        key = (sym.qualified, sym.kind, sym.start, sym.end)
+        if key in self.seen:  # ``a = a = 1``, ``a, a = v``: one construct, one symbol
+            return False
         if not self.budget.take(sym.qualified, sym.signature, self.output):
             return False
+        self.seen.add(key)
         self.syms.append(sym)
         if parent is not None:
             parent.syms.append(sym)
@@ -163,6 +183,18 @@ class _Walk:
 
 
 def _text(node: Node) -> bytes:
+    """Source text of a node that is small by construction (a leaf token or a checked name)."""
+    return node.text or b""
+
+
+def _name_bytes(node: Node) -> bytes | None:
+    """Text of an identifier-like node, read only when its byte length is name-sized.
+
+    ``Node.text`` copies the whole subtree, so it is never called on a node whose size the
+    input controls (a call chain ``a.f().f()...`` nests its whole prefix in each link).
+    """
+    if node.end_byte - node.start_byte > MAX_NAME_BYTES:
+        return None
     return node.text or b""
 
 
@@ -178,26 +210,21 @@ def _first_identifier(node: Node) -> Node | None:
     return current
 
 
-def _is_docstring(node: Node) -> bool:
+def _is_docstring(walk: _Walk, node: Node) -> bool:
     """A lone plain string as the first statement of a module, class or function body."""
-    if node.named_child_count != 1:
+    if node.named_child_count != 1 or not walk.ancestors:
+        return False
+    parent_type, parent_id = walk.ancestors[-1]
+    if parent_type != "module" and not (
+        parent_type == "block" and len(walk.ancestors) > 1 and walk.ancestors[-2][0] in _DEFINITIONS
+    ):
+        return False
+    if walk.first_child.get(parent_id) != node.id:
         return False
     string = node.named_child(0)
     if string is None or string.type != "string":
         return False
-    if any(child.type == "interpolation" for child in string.children):
-        return False
-    parent = node.parent
-    if parent is None:
-        return False
-    if parent.type != "module":
-        grand = parent.parent
-        if parent.type != "block" or grand is None or grand.type not in _DEFINITIONS:
-            return False
-    before = node.prev_named_sibling
-    while before is not None and before.type == "comment":
-        before = before.prev_named_sibling
-    return before is None
+    return not any(child.type == "interpolation" for child in string.children)
 
 
 def _leaf_token(node: Node) -> bytes:
@@ -205,30 +232,26 @@ def _leaf_token(node: Node) -> bytes:
         # Prefix letters (b, f, r, u) change meaning; the quote style does not.
         prefix = _text(node).translate(None, b"'\"").lower()
         return frame(b"s:" + prefix)
+    if node.type == "string_content":
+        # Python reads any newline sequence in a literal as \n: LF/CRLF conversion is no edit.
+        text = _text(node).replace(b"\r\n", b"\n").replace(b"\r", b"\n")
+        return frame(b"n:string_content=" + text)
     if node.is_named:
         return frame(b"n:" + node.type.encode() + b"=" + _text(node))
     return frame(b"a:" + node.type.encode())
 
 
-def _property_decorated(node: Node) -> bool:
-    parent = node.parent
-    if parent is None or parent.type != "decorated_definition":
+def _is_property_decorator(decorator: Node) -> bool:
+    target = decorator.named_child(0)
+    if target is None:
         return False
-    for decorator in parent.children:
-        if decorator.type != "decorator":
-            continue
-        target = decorator.named_child(0)
-        if target is None:
-            continue
-        if target.type == "identifier" and _text(target).decode("utf-8", "replace") in (
-            _PROPERTY_NAMES
-        ):
-            return True
-        attribute = target.child_by_field_name("attribute") if target.type == "attribute" else None
-        if attribute is not None and _text(attribute).decode("utf-8", "replace") in (
-            _PROPERTY_ATTRIBUTES
-        ):
-            return True
+    if target.type == "identifier":
+        return _name_bytes(target) in {n.encode() for n in _PROPERTY_NAMES}
+    if target.type == "attribute":
+        attribute = target.child_by_field_name("attribute")
+        return attribute is not None and _name_bytes(attribute) in {
+            n.encode() for n in _PROPERTY_ATTRIBUTES
+        }
     return False
 
 
@@ -242,9 +265,9 @@ def _header_end(body: Node) -> int:
 
 def _enter_definition(walk: _Walk, node: Node) -> None:
     parent_scope = walk.scopes[-1]
-    parent_node = node.parent
-    if parent_node is not None and parent_node.type == "decorated_definition":
-        start, tok_start = walk.decorated[parent_node.id]
+    decorated = bool(walk.ancestors) and walk.ancestors[-1][0] == "decorated_definition"
+    if decorated:
+        start, tok_start = walk.decorated[walk.ancestors[-1][1]]
     else:
         start, tok_start = node.start_byte, len(walk.tokens)
     entry = _Frame(node.id, True, tok_start, len(walk.syms))
@@ -253,15 +276,18 @@ def _enter_definition(walk: _Walk, node: Node) -> None:
     sym: _Sym | None = None
     if parent_scope is not None and body is not None and name_node is not None:
         entry.body_id = body.id
-        simple = identifier_bytes(
-            _text(name_node), walk.content, name_node.start_byte, name_node.end_byte
+        raw = _name_bytes(name_node)
+        simple = (
+            identifier_bytes(raw, walk.content, name_node.start_byte, name_node.end_byte)
+            if raw is not None
+            else None
         )
         if simple is not None:
             kind: SymbolKind
             if node.type == "class_definition":
                 kind = "class"
             elif parent_scope.kind == "class":
-                kind = "property" if _property_decorated(node) else "method"
+                kind = "property" if decorated and walk.property_decorator else "method"
             else:
                 kind = "function"
             candidate = _Sym(
@@ -280,9 +306,10 @@ def _enter_definition(walk: _Walk, node: Node) -> None:
     if sym is not None and node.type == "class_definition":
         bases = node.child_by_field_name("superclasses")
         for base in bases.named_children if bases is not None else ():
-            if base.type == "identifier":
+            raw = _name_bytes(base) if base.type == "identifier" else None
+            if raw is not None:
                 walk.sites.append(
-                    _Site(sym, "base", _text(base).decode("utf-8", "replace"), *base.byte_range)
+                    _Site(sym, "base", raw.decode("utf-8", "replace"), *base.byte_range)
                 )
 
 
@@ -310,15 +337,14 @@ def _assignment_targets(node: Node) -> list[Node]:
 def _enter_statement(walk: _Walk, node: Node) -> None:
     """Module-level assignments/type aliases and class-level fields."""
     scope = walk.scopes[-1]
-    parent = node.parent
-    if scope is None or parent is None:
+    if scope is None or not walk.ancestors:
         return
-    at_module = parent.type == "module" and scope is walk.root
-    grand = parent.parent
+    parent_type = walk.ancestors[-1][0]
+    at_module = parent_type == "module" and scope is walk.root
     in_class = (
-        parent.type == "block"
-        and grand is not None
-        and grand.type == "class_definition"
+        parent_type == "block"
+        and len(walk.ancestors) > 1
+        and walk.ancestors[-2][0] == "class_definition"
         and scope.kind == "class"
     )
     if not (at_module or in_class):
@@ -343,7 +369,12 @@ def _enter_statement(walk: _Walk, node: Node) -> None:
     end_of_signature = value.start_byte if value is not None else node.end_byte
     signature = cut_signature(walk.content[node.start_byte : end_of_signature])
     for target in found:
-        simple = identifier_bytes(_text(target), walk.content, target.start_byte, target.end_byte)
+        raw = _name_bytes(target)
+        simple = (
+            identifier_bytes(raw, walk.content, target.start_byte, target.end_byte)
+            if raw is not None
+            else None
+        )
         if simple is None:
             continue
         actual: SymbolKind = kind
@@ -370,30 +401,46 @@ def _enter_call(walk: _Walk, node: Node) -> None:
     if scope is None or function is None or len(walk.sites) >= _MAX_CALL_SITES:
         return
     if function.type == "identifier":
-        name = _text(function).decode("utf-8", "replace")
-        walk.sites.append(_Site(scope, "name", name, *function.byte_range))
+        raw = _name_bytes(function)
+        if raw is not None:
+            walk.sites.append(
+                _Site(scope, "name", raw.decode("utf-8", "replace"), *function.byte_range)
+            )
     elif function.type == "attribute":
         owner = function.child_by_field_name("object")
         attribute = function.child_by_field_name("attribute")
-        if owner is not None and attribute is not None and _text(owner) in (b"self", b"cls"):
-            name = _text(attribute).decode("utf-8", "replace")
-            walk.sites.append(_Site(scope, "member", name, *attribute.byte_range))
+        # ``owner`` may be the whole nested prefix of a chain: test its type and size first.
+        if owner is None or attribute is None or owner.type != "identifier":
+            return
+        if owner.end_byte - owner.start_byte not in (3, 4) or _text(owner) not in (b"self", b"cls"):
+            return
+        raw = _name_bytes(attribute)
+        if raw is not None:
+            walk.sites.append(
+                _Site(scope, "member", raw.decode("utf-8", "replace"), *attribute.byte_range)
+            )
 
 
 def _enter(walk: _Walk, node: Node) -> bool:
     """Emit the node's tokens and open frames; True when its children must be walked."""
     kind = node.type
+    walk.budget.node()
     if kind in _SKIPPED:
         return False
+    if node.is_named and walk.ancestors and walk.ancestors[-1][0] in ("module", "block"):
+        walk.first_child.setdefault(walk.ancestors[-1][1], node.id)
     if walk.frames and (node.is_error or node.is_missing):
         walk.frames[-1].tainted = True
     frame_open = walk.frames[-1] if walk.frames else None
     if frame_open is not None and frame_open.body_id == node.id:
         frame_open.header_end = len(walk.tokens)
-    if kind == "expression_statement" and _is_docstring(node):
+    if kind == "expression_statement" and _is_docstring(walk, node):
         return False
     if kind == "decorated_definition":
         walk.decorated[node.id] = (node.start_byte, len(walk.tokens))
+        walk.property_decorator = False
+    elif kind == "decorator":
+        walk.property_decorator = walk.property_decorator or _is_property_decorator(node)
     elif kind in _DEFINITIONS:
         _enter_definition(walk, node)
     elif kind in ("expression_statement", "type_alias_statement"):
@@ -409,8 +456,11 @@ def _enter(walk: _Walk, node: Node) -> bool:
 
 def _finish_frame(walk: _Walk, entry: _Frame) -> None:
     if entry.tainted:
+        # Release what the dropped symbols were charged so they cannot starve valid siblings.
         for sym in walk.syms[entry.first_sym :]:
             sym.alive = False
+            walk.budget.release(sym.qualified, sym.signature, walk.output)
+        del walk.syms[entry.first_sym :]
         return
     # Definitions: decorators + header up to the body. Assignments: the whole statement.
     stop = entry.header_end if entry.is_definition else len(walk.tokens)
@@ -430,6 +480,7 @@ def _finish_frame(walk: _Walk, entry: _Frame) -> None:
 def _exit(walk: _Walk, node: Node, opened: bool) -> None:
     if opened:
         walk.tokens.append(_CLOSE)
+        walk.ancestors.pop()
     if walk.frames and walk.frames[-1].node_id == node.id:
         entry = walk.frames.pop()
         if entry.is_definition:
@@ -444,6 +495,7 @@ def _traverse(tree: Tree, walk: _Walk) -> None:
         if node is None:
             return
         if _enter(walk, node) and cursor.goto_first_child():
+            walk.ancestors.append((node.type, node.id))
             continue
         opened = False
         while True:
@@ -469,19 +521,27 @@ def _index_members(syms: Sequence[_Sym]) -> dict[tuple[int, str], list[_Sym]]:
 def _resolve(
     members: dict[tuple[int, str], list[_Sym]], site: _Site, kinds: frozenset[str]
 ) -> list[_Sym]:
-    """Same-file candidates by name. Heuristic: lexical scope order, no import/alias logic."""
+    """Same-file candidates by name. Heuristic: lexical scope order, no import/alias logic.
+
+    A name with more than ``_MAX_CANDIDATES`` definitions in the scope that binds it is
+    ambiguous noise: it yields no edge (and bounds the work per call site).
+    """
     if site.kind == "member":
         scope: _Sym | None = site.scope
         while scope is not None and scope.kind != "class":
             scope = scope.parent
         found = members.get((id(scope), site.name), []) if scope is not None else []
-        return [sym for sym in found if sym.kind == "method"]
+        found = [sym for sym in found if sym.kind == "method"]
+        return found if len(found) <= _MAX_CANDIDATES else []
     scope = site.scope.parent if site.kind == "base" else site.scope
     first = True
     while scope is not None:
         # Names of an enclosing class body are not visible from its methods.
         if scope.kind != "class" or first:
-            found = [s for s in members.get((id(scope), site.name), []) if s.kind in kinds]
+            here = members.get((id(scope), site.name), [])
+            if len(here) > _MAX_CANDIDATES:
+                return []
+            found = [s for s in here if s.kind in kinds]
             if found:
                 return found
         first = False
@@ -495,15 +555,19 @@ def _relations(
     members = _index_members(syms)
     per_source: dict[int, int] = {}
     seen: set[tuple[int, int, str]] = set()
+    memo: dict[tuple[int, str, str], list[_Sym]] = {}
     out: list[StructuralRelation] = []
     ordered = sorted(sites, key=lambda site: site.kind != "base")  # stable: bases first
     for site in ordered:
         source = index.get(id(site.scope))
-        if source is None or not site.scope.alive:
-            continue
+        if source is None or per_source.get(source, 0) >= MAX_RELATIONS_PER_SYMBOL:
+            continue  # unemitted source, or its relation cap is reached: no resolving at all
         base = site.kind == "base"
         kinds = frozenset({"class"}) if base else _CALLABLE_KINDS
-        for target in _resolve(members, site, kinds):
+        cache_key = (id(site.scope), site.kind, site.name)
+        if cache_key not in memo:
+            memo[cache_key] = _resolve(members, site, kinds)
+        for target in memo[cache_key]:
             key = (source, index[id(target)], "inherits" if base else "calls")
             if key in seen or per_source.get(source, 0) >= MAX_RELATIONS_PER_SYMBOL:
                 continue
@@ -524,7 +588,7 @@ def _relations(
     return tuple(out)
 
 
-def _parse_file(source: SourceFile, budget: NameBudget, output: list[int]) -> ParsedFile:
+def _parse_file(source: SourceFile, budget: Budget, output: list[int]) -> ParsedFile:
     content = source.content()
     empty = ParsedFile(
         path=source.path, language=source.language, parser_fingerprint=FINGERPRINT, symbols=()

@@ -18,7 +18,6 @@ from agent_context_platform.indexing.tree_sitter.base import (
     ParseRequest,
     SourceFile,
     StructuralAdapter,
-    StructuralError,
     parser_fingerprint,
     validate_module,
 )
@@ -278,24 +277,103 @@ def test_control_characters_in_signatures_are_cut() -> None:
     assert "\x01" not in item.signature
 
 
-def test_one_pathological_file_degrades_alone(monkeypatch: pytest.MonkeyPatch) -> None:
-    real = python._parse_file
-
-    def flaky(file: SourceFile, budget: _common.NameBudget, output: list[int]) -> ParsedFile:
-        if file.path == "pkg/bad.py":
-            raise StructuralError.__new__(StructuralError)
-        return real(file, budget, output)
-
-    monkeypatch.setattr(python, "_parse_file", flaky)
+def test_a_file_over_the_work_budget_degrades_alone(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(_common.Budget, "MAX_NODES_PER_FILE", 200)
+    big = "x = [" + ",".join("1" for _ in range(500)) + "]\n"
     module = in_process(
         request(
             source("pkg/a.py", "def a():\n    pass\n"),
-            source("pkg/bad.py", "def b():\n    pass\n"),
+            source("pkg/big.py", big + "def b():\n    pass\n"),
             source("pkg/c.py", "def c():\n    pass\n"),
         )
     )
     counts = {item.path: len(item.symbols) for item in module.files}
-    assert counts == {"pkg/a.py": 2, "pkg/bad.py": 0, "pkg/c.py": 2}
+    assert counts == {"pkg/a.py": 2, "pkg/big.py": 0, "pkg/c.py": 2}
+
+
+def test_a_real_1mib_file_over_the_default_budget_degrades_and_the_batch_survives() -> None:
+    literal = "x = [" + ",".join("1" for _ in range(MAX_SOURCE_BYTES // 2 - 10)) + "]\n"
+    started = time.monotonic()
+    module = python_adapter().parse(
+        request(source("pkg/big.py", literal), source("pkg/ok.py", "def a():\n    pass\n"))
+    )
+    assert time.monotonic() - started < 15
+    assert {item.path: len(item.symbols) for item in module.files} == {
+        "pkg/big.py": 0,
+        "pkg/ok.py": 2,
+    }
+
+
+def test_bugs_in_the_adapter_are_not_masked(monkeypatch: pytest.MonkeyPatch) -> None:
+    def broken(*_args: object) -> ParsedFile:
+        raise KeyError("bug")
+
+    monkeypatch.setattr(python, "_parse_file", broken)
+    with pytest.raises(KeyError):
+        parse_python(request(source("pkg/a.py", "x = 1\n")))
+
+
+def test_a_one_megabyte_call_chain_is_linear_through_the_sandbox() -> None:
+    chain = "a" + ".f()" * (MAX_SOURCE_BYTES // 4 - 8) + "\n"
+    started = time.monotonic()
+    module = python_adapter().parse(
+        request(source("pkg/chain.py", chain), source("pkg/ok.py", "def a():\n    pass\n"))
+    )
+    assert time.monotonic() - started < 12
+    assert len(module.files[1].symbols) == 2
+
+
+def test_many_same_named_definitions_and_calls_resolve_fast() -> None:
+    defs = "".join("def f():\n    pass\n" for _ in range(10_000))
+    calls = "def caller():\n" + "".join("    f()\n" for _ in range(30_000))
+    code = (defs + calls)[:MAX_SOURCE_BYTES]
+    started = time.monotonic()
+    parsed = symbols_of(code)["pkg/mod.py"]
+    assert time.monotonic() - started < 8
+    assert parsed.relations == ()  # more than 8 candidates: ambiguous, no edge
+
+
+def test_few_same_named_candidates_are_all_edges_and_resolution_stops_at_the_cap() -> None:
+    code = "def f():\n    pass\n\n\ndef f():\n    pass\n\n\ndef caller():\n    f()\n"
+    assert len(symbols_of(code)["pkg/mod.py"].relations) == 2
+    many = "".join(f"def g{n}():\n    pass\n" for n in range(100))
+    calls = "def caller():\n" + "".join(f"    g{n}()\n" for n in range(100))
+    assert len(symbols_of(many + calls)["pkg/mod.py"].relations) == 64
+
+
+def test_duplicate_targets_in_one_assignment_never_duplicate_a_symbol() -> None:
+    parsed = symbols_of("a = a = 1\nb, b = 1, 2\nc, (c, d) = 1, (2, 3)\n")["pkg/mod.py"]
+    names = sorted(s.qualified_name for s in parsed.symbols)
+    assert names == ["pkg.mod", "pkg.mod.a", "pkg.mod.b", "pkg.mod.c", "pkg.mod.d"]
+
+
+def test_dropped_broken_symbols_release_their_budget() -> None:
+    broken = "".join(f"def b{n}(self):\n    x = = 1\n\n\n" for n in range(12_000))
+    long_name = "n" * 500
+    heavy = "".join(f"def {long_name}{n}(self):\n    x = = 1\n\n\n" for n in range(400))
+    valid = "".join(f"def ok{n}():\n    pass\n\n\n" for n in range(50))
+    files = [
+        source("pkg/a.py", broken + valid),
+        source("pkg/b.py", heavy + valid),
+        source("pkg/c.py", valid),
+    ]
+    module = in_process(request(*files))
+    for parsed in module.files:
+        names = {s.qualified_name for s in parsed.symbols}
+        assert {f"pkg.{parsed.path[4]}.ok{n}" for n in range(50)} <= names
+
+
+def test_crlf_conversion_inside_string_literals_keeps_the_revision() -> None:
+    lf = 'def f():\n    return """a\nb\n  c"""\n'
+    crlf = lf.replace("\n", "\r\n")
+    assert digests(lf, "f") == digests(crlf, "f")
+    assert digests(lf, "f") != digests(lf.replace("b", "x"), "f")
+
+
+def test_an_error_between_class_members_drops_the_class() -> None:
+    code = "class C:\n    def a(self):\n        pass\n    ))\n    def b(self):\n        pass\n"
+    names = {s.qualified_name for s in symbols_of(code)["pkg/mod.py"].symbols}
+    assert not any(n.startswith("pkg.mod.C") for n in names)
 
 
 def test_relation_and_symbol_counts_are_bounded() -> None:
@@ -360,7 +438,7 @@ def test_output_over_budget_sheds_relations_then_symbols(monkeypatch: pytest.Mon
 
 def test_deeply_nested_definitions_around_a_large_body_hash_in_linear_time() -> None:
     depth = 100
-    literal = "x = [" + ",".join("a" for _ in range(300_000)) + "]\n"
+    literal = "x = [" + ",".join("a" for _ in range(200_000)) + "]\n"
     code = "".join(f"{' ' * i}def f{i}():\n" for i in range(depth)) + " " * depth + literal
     started = time.monotonic()
     module = python_adapter().parse(request(source("pkg/deep.py", code)))

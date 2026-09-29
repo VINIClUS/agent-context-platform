@@ -6,8 +6,8 @@ source never makes the *parent* refuse a whole batch of up to 64 files: an adapt
 what it cannot express instead of emitting something the confinement rules would reject.
 
 Reused by PLATFORM-034/035: ``frame``/``digest`` (normalized-token fingerprints),
-``cut_signature``, ``identifier_bytes``, ``module_name``, ``NameBudget``,
-``safe_module`` (per-file degradation) and ``normalize_module`` (golden-test view).
+``cut_signature``, ``identifier_bytes``, ``module_name``, ``Budget`` (name/output/work
+limits), ``safe_module`` (per-file degradation) and ``normalize_module`` (golden-test view).
 """
 
 from __future__ import annotations
@@ -15,8 +15,11 @@ from __future__ import annotations
 import hashlib
 import re
 import struct
+import time
 from collections.abc import Callable, Iterable
 from typing import Any, Final
+
+from pydantic import ValidationError
 
 from agent_context_platform.indexing.tree_sitter.base import (
     MAX_NAME_BYTES,
@@ -113,40 +116,77 @@ def module_name(path: str, *, package_files: tuple[str, ...] = ("__init__",)) ->
     return ".".join(reversed(run))
 
 
-class NameBudget:
-    """Bounds what one request may make the parent count: name bytes and output size."""
+class WorkBudgetExceeded(Exception):
+    """A file needs more parsing work than the adapter budget allows (content-free)."""
+
+
+class Budget:
+    """What one request may cost: name bytes, output size, syntax nodes and CPU time.
+
+    Work limits (design numbers, see ``python.py``): ``MAX_NODES_PER_FILE`` bounds one file
+    deterministically; ``CPU_SOFT_LIMIT`` (5 s from the start of the request) is a backstop on CPU time, kept well
+    under the runner's ``RLIMIT_CPU`` (10 s) so validation and serialisation still fit. A
+    file over budget degrades to no symbols; the rest of the batch continues.
+    """
+
+    MAX_NODES_PER_FILE: Final = 600_000
+    CPU_SOFT_LIMIT: Final = 5.0
 
     def __init__(self, name_limit: int = MAX_NAME_TOTAL_BYTES // 2) -> None:
         self._name_limit = name_limit
         self._names = 0
+        self._nodes = 0
+        self.max_nodes = self.MAX_NODES_PER_FILE
+        self._cpu_deadline = time.process_time() + self.CPU_SOFT_LIMIT  # from this request
 
     def new_file(self) -> None:
         self._names = 0
+        self._nodes = 0
+
+    def node(self) -> None:
+        """Count one syntax node; raise when the file (or the process CPU) is over budget."""
+        self._nodes += 1
+        if self._nodes > self.max_nodes:
+            raise WorkBudgetExceeded
+        if self._nodes % 2048 == 0 and time.process_time() > self._cpu_deadline:
+            raise WorkBudgetExceeded
+
+    @staticmethod
+    def _cost(qualified_name: str, signature: str) -> tuple[int, int]:
+        size = len(qualified_name.encode())
+        return size, size + len(signature.encode()) + _SYMBOL_OVERHEAD
 
     def take(self, qualified_name: str, signature: str, output: list[int]) -> bool:
-        size = len(qualified_name.encode())
+        size, cost = self._cost(qualified_name, signature)
         if size > MAX_NAME_BYTES or self._names + size > self._name_limit:
             return False
-        cost = size + len(signature.encode()) + _SYMBOL_OVERHEAD
         if output[0] + cost > OUTPUT_BUDGET:
             return False
         self._names += size
         output[0] += cost
         return True
 
+    def release(self, qualified_name: str, signature: str, output: list[int]) -> None:
+        """Give back what ``take`` charged (a symbol dropped after the fact)."""
+        size, cost = self._cost(qualified_name, signature)
+        self._names -= size
+        output[0] -= cost
+
 
 def safe_module(
     request: ParseRequest,
     fingerprint: str,
-    parse_file: Callable[[SourceFile, NameBudget, list[int]], ParsedFile],
+    parse_file: Callable[[SourceFile, Budget, list[int]], ParsedFile],
 ) -> ParsedModule:
     """Parse every file; a file whose answer would be refused degrades to *no symbols*.
 
     Passing ``validate_module`` per file implies passing it for the batch, so one
-    pathological file cannot take down the others. Only content-free error classes are
-    caught, never anything that could echo source.
+    pathological file cannot take down the others. Only the validation errors
+    (``ValidationError``, ``StructuralError``) and ``WorkBudgetExceeded`` are caught, so an
+    adapter bug (any other exception) still fails loudly. The wire contract has no
+    diagnostics channel: a degraded file is indistinguishable from an empty one (P032C).
     """
-    budget = NameBudget()
+    budget = Budget()
     output = [0]
     total = 0
     files: list[ParsedFile] = []
@@ -166,7 +206,7 @@ def safe_module(
                 ParsedModule(files=(parsed,)),
                 expected_fingerprint=fingerprint,
             )
-        except (ValueError, StructuralError, RecursionError):
+        except (ValidationError, StructuralError, WorkBudgetExceeded):
             output[0] = mark
             parsed = empty
         # The runner refuses the whole answer above MAX_OUTPUT_BYTES: measure the real JSON,
