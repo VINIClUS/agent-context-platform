@@ -636,20 +636,18 @@ def test_prepare_accepts_sdk_sanitized_canary_payload_as_text_plain() -> None:
 
 
 def test_prepare_accepts_value_equal_to_its_own_redaction_placeholder() -> None:
-    """Justifies value equality over "any finding rejects".
+    """A value that is exactly the engine's own placeholder is stable.
 
-    Redacting ``{"password": "<redacted:sensitive_field:1>"}`` produces a
-    finding (the placeholder text itself gets whole-value-redacted again,
-    because "password" is a sensitive field name) but the *output text is
-    identical* to the input, since it is the first structured-field
-    redaction in a fresh engine run. An "any finding rejects" recheck would
-    wrongly reject this; the value-equality recheck correctly accepts it.
+    Since SDK v0.3.3 the engine exempts text matching its own placeholder
+    grammar, so re-redacting ``{"password": "<redacted:sensitive_field:1>"}``
+    yields no finding and identical output; the value-equality recheck
+    accepts it.
     """
 
     async def exercise() -> None:
         value = {"password": "<redacted:sensitive_field:1>"}
         result = redact_json(value, _POLICY)
-        assert len(result.findings) == 1
+        assert result.findings == ()
         assert result.value == value
 
         item = _json_item("self-stable-placeholder", value, report=result.report)
@@ -661,26 +659,12 @@ def test_prepare_accepts_value_equal_to_its_own_redaction_placeholder() -> None:
 
 
 # ---------------------------------------------------------------------------
-# Known SDK gap: some already-sanitized shapes are unstable across a second
-# redact_json pass. xfail(strict=True) so a future SDK fix that makes these
-# pass is caught (XPASS) rather than silently masked.
+# Formerly known SDK gaps, closed by SDK v0.3.3 (redaction is idempotent on
+# its own output): already-sanitized shapes are stable across a second pass.
 # ---------------------------------------------------------------------------
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=ContentRequiresRedactionError,
-    reason=(
-        "SDK gap: a PEM/private-key-shaped value under a sensitive field name "
-        "lets the content-pattern detector win pass 1 (placeholder "
-        "<redacted:private_key:1>), but that placeholder text no longer "
-        "matches the content pattern on pass 2, so structured_field wins "
-        "instead (<redacted:sensitive_field:1>) -- a canonical mismatch. "
-        "Reachable via the SDK's default redact_json(value, policy) call, no "
-        "known_secrets required."
-    ),
-)
-def test_prepare_gap_pem_under_sensitive_field_name_is_unstable() -> None:
+def test_prepare_accepts_pem_under_sensitive_field_name() -> None:
     async def exercise() -> None:
         pem_canary = _CANARIES[10]
         value = {"private_key": pem_canary}
@@ -692,21 +676,7 @@ def test_prepare_gap_pem_under_sensitive_field_name_is_unstable() -> None:
     _run(exercise())
 
 
-@pytest.mark.xfail(
-    strict=True,
-    raises=ContentRequiresRedactionError,
-    reason=(
-        "SDK gap: a known_secrets-matched value under a sensitive field name "
-        "lets the known_secret detector win pass 1 only when the caller "
-        "supplies known_secrets (<redacted:known_secret:1>); the platform's "
-        "recheck never has known_secrets, so structured_field wins pass 2 "
-        "instead (<redacted:sensitive_field:1>). Only reachable if a producer "
-        "calls redact_json(..., known_secrets=[...]); grepping "
-        "agent-context-codex's src/ finds no such call today, so this is a "
-        "latent gap, not a presently demonstrated one."
-    ),
-)
-def test_prepare_gap_known_secret_under_sensitive_field_name_is_unstable() -> None:
+def test_prepare_accepts_known_secret_under_sensitive_field_name() -> None:
     async def exercise() -> None:
         secret = "s3cr3t-known-value-1234567890"
         value = {"password": secret}
