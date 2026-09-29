@@ -102,8 +102,9 @@ def refused(code: StructuralErrorCode, candidate: ParsedModule, req: ParseReques
 
 def test_valid_module_passes_and_carries_identity_arguments() -> None:
     candidate = module()
-    assert validate_module(request(), candidate, expected_fingerprint=FINGERPRINT) is candidate
-    item = candidate.files[0].symbols[0]
+    validated = validate_module(request(), candidate, expected_fingerprint=FINGERPRINT)
+    assert validated.files[0].path == candidate.files[0].path
+    item = validated.files[0].symbols[0]
     for name in (
         "language",
         "qualified_name",
@@ -143,7 +144,7 @@ def test_required_symbol_fields(missing: str) -> None:
         {"disambiguator": "a b"},
         {"disambiguator": "/etc/passwd"},
         {"disambiguator": "hunter2"},
-        {"disambiguator": "123456789"},
+        {"disambiguator": "1234567"},
         {"kind": "macro"},
         {"ref": "abc"},
         {"ref": ""},
@@ -743,3 +744,53 @@ def test_repeated_daemonizing_runs_leave_nothing(marker: str) -> None:
 def test_non_linux_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(runner.sys, "platform", "darwin")
     assert outcome("ok") is StructuralErrorCode.SPAWN_FAILED
+
+
+# --- opaque values ----------------------------------------------------------------------
+
+
+def test_every_output_field_is_classified() -> None:
+    for model in (ParsedModule, ParsedFile, ParsedSymbol, StructuralRelation):
+        assert set(model.model_fields) == set(base.FIELD_CONFINEMENT[model.__name__]), model
+    rehashed = {
+        name
+        for fields in base.FIELD_CONFINEMENT.values()
+        for name, how in fields.items()
+        if how == "rehashed"
+    }
+    assert rehashed == set(base.OPAQUE_FIELDS)
+
+
+def test_free_form_string_fields_are_token_confined_or_rehashed() -> None:
+    """A future free-form field must be classified, and only those classes may be free text."""
+    allowed = {"token", "numeric", "enum", "range", "parent", "rehashed", "structure"}
+    for fields in base.FIELD_CONFINEMENT.values():
+        assert set(fields.values()) <= allowed
+
+
+def test_opaque_digests_are_rehashed_in_the_parent() -> None:
+    canary = b"SECRET-CANARY-0123456789abcdef!".hex()  # 62 hex chars of stolen data
+    child = (canary + "0" * 64)[:64]
+    poisoned = module(
+        [symbol(signature_digest=child, semantic_fingerprint=child)],
+    )
+    stored = validate_module(request(), poisoned, expected_fingerprint=FINGERPRINT)
+    item = stored.files[0].symbols[0]
+    for name in base.OPAQUE_FIELDS:
+        value = getattr(item, name)
+        assert value == base.rehash_opaque(name, child)
+        assert len(value) == 64
+        assert canary[:16] not in value
+        assert value != child
+    assert item.signature_digest != item.semantic_fingerprint  # domain separated by field
+
+
+def test_rehash_is_deterministic_and_injective_on_the_child_value() -> None:
+    def digest_of(value: str) -> str:
+        checked = validate_module(
+            request(), module([symbol(signature_digest=value)]), expected_fingerprint=FINGERPRINT
+        )
+        return checked.files[0].symbols[0].signature_digest
+
+    assert digest_of("1" * 64) == digest_of("1" * 64)
+    assert digest_of("1" * 64) != digest_of("2" * 64)

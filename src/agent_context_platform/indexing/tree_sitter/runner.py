@@ -64,6 +64,9 @@ Known limits (be honest about them):
   run such children concurrently. A descendant that scrubs its environment (``execve``
   with an empty one) after killing the supervisor is not recognized while alive; the
   container ``pids_limit`` and restart bound that.
+- Concurrent runs share the UID, so an adapter of one run could signal the process of
+  another. INFRA-040 (follow-up) serializes adapter runs per indexer container or gives
+  each job its own PID namespace; until then run one adapter at a time per container.
 - Read isolation is NOT provided by the container: the adapter shares the indexer's
   filesystem view and could read any file the UID can (a ``.env``, ``/etc/passwd``).
   Confinement is by output validation (``base.validate_module`` only accepts text that

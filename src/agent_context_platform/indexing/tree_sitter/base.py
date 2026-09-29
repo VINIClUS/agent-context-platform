@@ -36,8 +36,17 @@ errors, never the offending value):
     from real tokens. All names of a file together are bounded (``MAX_NAME_TOTAL_BYTES``);
   * ``signature`` (whitespace runs collapsed) is a contiguous run of the
     whitespace-collapsed text inside the symbol's own byte range;
-  * ``ref`` and ``disambiguator`` are numeric (at most 8 digits); ``kind`` and the
+  * ``ref`` and ``disambiguator`` are numeric (at most 6 digits); ``kind`` and the
     relation ``kind`` are closed enums; ``language`` must equal the input's.
+
+  * opaque values (``OPAQUE_FIELDS``: ``signature_digest``, ``semantic_fingerprint``) are
+    hashes the parser makes up, so nothing ties them to the file and 32 bytes per symbol
+    could carry a secret. ``validate_module`` therefore never returns the child's value: it
+    stores ``sha256(domain_tag || field_name || child_value)`` computed in the parent
+    (``rehash_opaque``). Identity stays deterministic (the stored value changes if and only
+    if the child's does) and one-way (a secret cannot be read back out of it).
+    ``FIELD_CONFINEMENT`` classifies every output field; a test fails when a new field
+    is not classified.
 
   Residual channel: an adapter can still choose *which* tokens, symbols and ordering
   to emit, at most about ``log2(tokens in file)`` bits per symbol and only ever about
@@ -91,8 +100,8 @@ MAX_SIGNATURE_BYTES: Final = 512
 MAX_NAME_TOTAL_BYTES: Final = 256 * 1024
 
 _DIGEST = r"^[0-9a-f]{64}$"
-_DISAMBIGUATOR = r"^[0-9]{0,8}$"
-_REF = r"^[0-9]{1,8}$"
+_DISAMBIGUATOR = r"^[0-9]{0,6}$"
+_REF = r"^[0-9]{1,6}$"
 
 
 class StructuralErrorCode(StrEnum):
@@ -286,6 +295,50 @@ class StructuralAdapter(Protocol):
     def parse(self, request: ParseRequest) -> ParsedModule: ...
 
 
+# How every field of the adapter output is kept from carrying foreign data. A test requires
+# every model field to be listed here, so a new field cannot slip in unclassified.
+type Confinement = Literal["token", "numeric", "enum", "range", "parent", "rehashed", "structure"]
+FIELD_CONFINEMENT: Final[Mapping[str, Mapping[str, Confinement]]] = {
+    "ParsedModule": {"protocol_version": "enum", "files": "structure"},
+    "ParsedFile": {
+        "path": "parent",  # must equal an input path
+        "language": "parent",  # must equal the input language
+        "parser_fingerprint": "parent",  # must equal the host-computed fingerprint
+        "symbols": "structure",
+        "relations": "structure",
+    },
+    "ParsedSymbol": {
+        "ref": "numeric",
+        "language": "parent",
+        "qualified_name": "token",
+        "kind": "enum",
+        "disambiguator": "numeric",
+        "start_byte": "range",
+        "end_byte": "range",
+        "signature": "token",  # a contiguous run of the symbol's own source text
+        "signature_digest": "rehashed",
+        "semantic_fingerprint": "rehashed",
+        "evidence_kind": "enum",
+    },
+    "StructuralRelation": {
+        "source_ref": "numeric",
+        "target_ref": "numeric",
+        "kind": "enum",
+        "start_byte": "range",
+        "end_byte": "range",
+        "evidence_kind": "enum",
+    },
+}
+OPAQUE_FIELDS: Final = ("signature_digest", "semantic_fingerprint")
+_REHASH_DOMAIN: Final = b"agent-context/tree-sitter/opaque/v1"
+
+
+def rehash_opaque(field_name: str, child_value: str) -> str:
+    """One-way, parent-side replacement of an opaque adapter value."""
+    material = b"\0".join((_REHASH_DOMAIN, field_name.encode(), child_value.encode()))
+    return hashlib.sha256(material).hexdigest()
+
+
 def parser_fingerprint(name: str, version: str, config: Mapping[str, Any] | None = None) -> str:
     """Canonical SHA-256 of parser name, version and config (input of ``file_revision_id``)."""
     document = {"name": name, "version": version, "config": dict(config or {})}
@@ -296,9 +349,10 @@ def parser_fingerprint(name: str, version: str, config: Mapping[str, Any] | None
 def validate_module(
     request: ParseRequest, module: ParsedModule, *, expected_fingerprint: str
 ) -> ParsedModule:
-    """Check ``module`` against ``request``; return it unchanged or raise ``StructuralError``."""
+    """Check ``module`` against ``request``; return it with opaque values re-hashed, or raise."""
     sources = {item.path: item for item in request.files}
     seen: set[str] = set()
+    rehashed: list[ParsedFile] = []
     for parsed in module.files:
         source = sources.get(parsed.path)
         if source is None or parsed.path in seen:
@@ -309,9 +363,16 @@ def validate_module(
         if parsed.parser_fingerprint != expected_fingerprint:
             raise StructuralError(StructuralErrorCode.FINGERPRINT_MISMATCH)
         _validate_file(parsed, source.content())
+        symbols = tuple(
+            item.model_copy(
+                update={name: rehash_opaque(name, getattr(item, name)) for name in OPAQUE_FIELDS}
+            )
+            for item in parsed.symbols
+        )
+        rehashed.append(parsed.model_copy(update={"symbols": symbols}))
     if seen != set(sources):
         raise StructuralError(StructuralErrorCode.PATH_MISMATCH)
-    return module
+    return module.model_copy(update={"files": tuple(rehashed)})
 
 
 _SEPARATORS = re.compile(r"::|[./#]")
