@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import AsyncIterator
 from pathlib import Path
@@ -17,7 +18,7 @@ from mcp_helpers import (
     rpc_body,
 )
 from mcp_types import HEADER_MISMATCH
-from opentelemetry import trace
+from opentelemetry import baggage, trace
 
 from agent_context_platform.mcp.server import create_mcp_server
 
@@ -56,6 +57,10 @@ def build_tool_server() -> Any:
     @server.tool()
     def alpha() -> str:
         return "a"
+
+    @server.tool()
+    def baggage_seen() -> str:
+        return json.dumps(dict(baggage.get_all()))
 
     @server.tool()
     def trace_id() -> str:
@@ -195,7 +200,7 @@ async def test_tool_listing_order_is_deterministic(tool_client: httpx2.AsyncClie
     first = (await post(tool_client, "tools/list")).json()["result"]["tools"]
     second = (await post(tool_client, "tools/list")).json()["result"]["tools"]
 
-    assert [tool["name"] for tool in first] == ["alpha", "trace_id", "zeta"]
+    assert [tool["name"] for tool in first] == ["alpha", "baggage_seen", "trace_id", "zeta"]
     assert first == second
 
 
@@ -552,3 +557,21 @@ async def test_version_rejection_without_usable_id_answers_null_id(
 
     assert response.status_code == 400
     assert response.json()["id"] is None
+
+
+async def test_baggage_header_is_dropped_but_traceparent_is_honoured(
+    tool_client: httpx2.AsyncClient,
+) -> None:
+    extra = {"mcp-name": "baggage_seen", "traceparent": TRACEPARENT, "baggage": "secret=value"}
+    headers = mcp_headers("tools/call", **extra)
+    headers_trace = {**headers, "mcp-name": "trace_id"}
+
+    seen = await post(
+        tool_client, "tools/call", {"name": "baggage_seen", "arguments": {}}, headers=headers
+    )
+    traced = await post(
+        tool_client, "tools/call", {"name": "trace_id", "arguments": {}}, headers=headers_trace
+    )
+
+    assert json.loads(seen.json()["result"]["content"][0]["text"]) == {}
+    assert int(traced.json()["result"]["content"][0]["text"], 16) == TRACE_ID

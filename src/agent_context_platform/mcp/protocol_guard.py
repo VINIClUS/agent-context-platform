@@ -11,9 +11,10 @@ from mcp.shared.inbound import (
 )
 from mcp_types import INVALID_REQUEST
 from opentelemetry import context as otel_context
-from opentelemetry.propagate import extract
+from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 
+_TRACE_PROPAGATOR: Final = TraceContextTextMapPropagator()
 _BODY_LIMIT_STATUS: Final = 413
 _HTTP_BAD_REQUEST: Final = 400
 
@@ -144,8 +145,9 @@ class ProtocolGuard:
             )
             return
 
-        # W3C trace context from HTTP headers becomes the ambient parent of MCP spans.
-        token = otel_context.attach(extract(headers))
+        # Only W3C trace context is imported; client-supplied baggage is dropped entirely
+        # (empty allowlist) so attacker-controlled values never become ambient.
+        token = otel_context.attach(_TRACE_PROPAGATOR.extract(headers))
         try:
             await self._app(scope, self._replay(body, receive), send)
         finally:
