@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -30,6 +31,24 @@ ClaimOutcome = Literal["delivered", "retried", "dead_lettered", "lost_lease"]
 
 _UNATTRIBUTED_PROJECTOR_NAME = "<projection.runtime>"
 _UNATTRIBUTED_PROJECTOR_VERSION = "<unattributed>"
+_PUBLIC_ERROR_CLASS = re.compile(r"^[A-Za-z][A-Za-z0-9_.]{0,127}$")
+_FALLBACK_ERROR_CLASS = "UnnamedProjectionError"
+
+
+def _public_error_class(error: BaseException) -> str:
+    """Return a constraint-safe public error class for ``error``.
+
+    Outbox and dead-letter rows only accept ``^[A-Za-z][A-Za-z0-9_.]{0,127}$``.
+    A projector may raise an exception whose class name is non-ASCII, starts
+    with an underscore or is too long; persisting it unchanged would fail the
+    finalize transaction on every attempt and keep the poison row from ever
+    reaching the dead-letter queue.
+    """
+    name = type(error).__name__
+    if _PUBLIC_ERROR_CLASS.fullmatch(name):
+        return name
+    sanitized = re.sub(r"[^A-Za-z0-9_.]", "_", name).lstrip("_.0123456789")[:128]
+    return sanitized if _PUBLIC_ERROR_CLASS.fullmatch(sanitized) else _FALLBACK_ERROR_CLASS
 
 
 class OrphanedOutboxRowError(LookupError):
@@ -246,7 +265,11 @@ class ProjectionRunner:
         async with self._session_factory() as session:
             try:
                 event = await _load_event(session, row.event_id)
-            except OrphanedOutboxRowError as error:
+            except Exception as error:
+                # Orphaned rows and events the current SDK model can no longer
+                # validate are deterministic failures: count them against the
+                # bounded retry budget instead of aborting the run and leaving
+                # the row to be reclaimed forever without progress.
                 return await self._finalize_failure(
                     row=row,
                     event_id=row.event_id,
@@ -351,7 +374,7 @@ class ProjectionRunner:
         error: BaseException,
     ) -> ClaimOutcome:
         now = self._now()
-        error_class = type(error).__name__
+        error_class = _public_error_class(error)
         new_retry_count = row.retry_count + 1
 
         async with self._session_factory() as session:
@@ -398,9 +421,14 @@ class ProjectionRunner:
                 dlq_statement = dlq_insert.on_conflict_do_update(
                     index_elements=[DeadLetterRow.outbox_id],
                     set_={
+                        "projector_name": projector_name,
+                        "projector_version": projector_version,
                         "attempts": new_retry_count,
                         "error_class": error_class,
                         "status": DeadLetterStatus.OPEN,
+                        # Reopening a requeued or resolved dead letter must clear
+                        # its resolution, or the status/resolution check fails.
+                        "resolved_at": None,
                         "updated_at": now,
                     },
                 )

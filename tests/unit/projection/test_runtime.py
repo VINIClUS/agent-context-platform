@@ -809,3 +809,63 @@ def test_load_event_orders_content_refs_by_code_point_not_sql_collation() -> Non
 
     assert [ref.content_id for ref in reconstructed.content_refs] == ["B-ref", "a-ref"]
     assert verify_event(reconstructed)
+
+
+def test_process_claimed_row_retries_when_event_reconstruction_fails() -> None:
+    async def fake_load_event(_session: object, _event_id: object) -> object:
+        raise ValueError("stored event no longer validates")
+
+    original_load_event = runtime._load_event
+    runtime._load_event = fake_load_event  # type: ignore[assignment]
+    try:
+        runner = ProjectionRunner(
+            FakeSessionFactory([FakeSession()]),
+            FakeNeo4jStore(),
+            [RecordingProjector("graph.test", "1", handled_types=["graph.node.created"])],
+            worker_id="worker-a",
+            clock=lambda: NOW,
+        )
+        failures: list[tuple[object, BaseException]] = []
+
+        async def fake_finalize_failure(
+            *,
+            row: ClaimedOutboxRow,
+            event_id: object,
+            failing_projector: object,
+            error: BaseException,
+        ) -> str:
+            failures.append((failing_projector, error))
+            return "retried"
+
+        runner._finalize_failure = fake_finalize_failure  # type: ignore[method-assign]
+
+        outcome = asyncio.run(runner._process_claimed_row(_claimed_row()))
+    finally:
+        runtime._load_event = original_load_event  # type: ignore[assignment]
+
+    assert outcome == "retried"
+    [(failing_projector, error)] = failures
+    assert failing_projector is None
+    assert isinstance(error, ValueError)
+
+
+class _Ünïcode_Error(RuntimeError):  # deliberately hostile class name
+    pass
+
+
+class _PrivateError(RuntimeError):
+    pass
+
+
+@pytest.mark.parametrize(
+    ("error", "expected"),
+    [
+        (ValueError(), "ValueError"),
+        (_PrivateError(), "PrivateError"),
+        (_Ünïcode_Error(), "n_code_Error"),
+        (type("X" * 200, (RuntimeError,), {})(), "X" * 128),
+        (type("123", (RuntimeError,), {})(), "UnnamedProjectionError"),
+    ],
+)
+def test_public_error_class_is_always_constraint_safe(error: BaseException, expected: str) -> None:
+    assert runtime._public_error_class(error) == expected

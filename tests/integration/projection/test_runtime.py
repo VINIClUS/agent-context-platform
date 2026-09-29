@@ -553,3 +553,67 @@ def test_projection_runner_operates_correctly_under_set_role_agent_context_proje
             await reset_projection_state(projection_engine)
 
     asyncio.run(run_with_cleanup())
+
+
+def test_dead_lettering_again_reopens_a_resolved_dead_letter(
+    projection_engine: AsyncEngine,
+) -> None:
+    async def exercise() -> None:
+        factory = session_factory(projection_engine)
+        clock = MutableClock()
+
+        async with factory() as session:
+            _sealed, outbox_id = await seed_pending_event(
+                session, now=clock(), event_type="test.poison.happened"
+            )
+            await session.commit()
+
+        async with Neo4jStore(neo4j_integration_settings()) as store:
+            runner = ProjectionRunner(
+                factory,
+                store,
+                [PoisonProjector(message="SENTINEL-REOPEN-5d1b")],
+                worker_id="worker-reopen",
+                clock=clock,
+                max_attempts=1,
+            )
+            first = await runner.run_once(1)
+            assert first.dead_lettered == 1
+
+            # An operator resolves the dead letter and requeues its outbox row.
+            clock.advance(timedelta(seconds=1))
+            async with factory() as session:
+                await session.execute(
+                    update(DeadLetterRow)
+                    .where(DeadLetterRow.outbox_id == outbox_id)
+                    .values(status=DeadLetterStatus.RESOLVED, resolved_at=clock())
+                )
+                await session.execute(
+                    update(OutboxRow)
+                    .where(OutboxRow.outbox_id == outbox_id)
+                    .values(
+                        status=OutboxStatus.PENDING,
+                        available_at=clock(),
+                        dead_lettered_at=None,
+                    )
+                )
+                await session.commit()
+
+            clock.advance(timedelta(seconds=1))
+            second = await runner.run_once(1)
+            assert second.dead_lettered == 1
+
+        async with factory() as session:
+            dead_letter = await session.get(DeadLetterRow, outbox_id)
+            assert dead_letter is not None
+            assert dead_letter.status == DeadLetterStatus.OPEN
+            assert dead_letter.resolved_at is None
+            assert dead_letter.attempts == 2
+
+    async def run_with_cleanup() -> None:
+        try:
+            await exercise()
+        finally:
+            await reset_projection_state(projection_engine)
+
+    asyncio.run(run_with_cleanup())
