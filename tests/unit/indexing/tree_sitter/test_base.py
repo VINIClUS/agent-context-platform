@@ -22,8 +22,10 @@ from pydantic import ValidationError
 
 from agent_context_platform.indexing.tree_sitter import base, runner
 from agent_context_platform.indexing.tree_sitter.base import (
+    ParsedDiagnostic,
     ParsedFile,
     ParsedModule,
+    ParsedReference,
     ParsedSymbol,
     ParseRequest,
     SourceFile,
@@ -79,7 +81,9 @@ def second(**over: Any) -> dict[str, Any]:
     return data
 
 
-def module(symbols: list[dict[str, Any]] | None = None, **file_over: Any) -> ParsedModule:
+def module(
+    symbols: list[dict[str, Any]] | None = None, version: int = 2, **file_over: Any
+) -> ParsedModule:
     parsed: dict[str, Any] = {
         "path": "pkg/mod.py",
         "language": "python",
@@ -88,7 +92,9 @@ def module(symbols: list[dict[str, Any]] | None = None, **file_over: Any) -> Par
         "relations": [],
     }
     parsed.update(file_over)
-    return ParsedModule.model_validate_json(json.dumps({"protocol_version": 1, "files": [parsed]}))
+    return ParsedModule.model_validate_json(
+        json.dumps({"protocol_version": version, "files": [parsed]})
+    )
 
 
 def refused(code: StructuralErrorCode, candidate: ParsedModule, req: ParseRequest | None = None):
@@ -325,6 +331,9 @@ def test_well_behaved_adapter_round_trips() -> None:
         ("range", StructuralErrorCode.RANGE_OUT_OF_BOUNDS),
         ("foreign_path", StructuralErrorCode.PATH_MISMATCH),
         ("dangling", StructuralErrorCode.DANGLING_RELATION),
+        ("references_exfil", StructuralErrorCode.TEXT_NOT_IN_SOURCE),
+        ("references_v1", StructuralErrorCode.SCHEMA_VIOLATION),
+        ("diagnostics_free_text", StructuralErrorCode.SCHEMA_VIOLATION),
         ("wrong_evidence", StructuralErrorCode.SCHEMA_VIOLATION),
         ("extra_field", StructuralErrorCode.SCHEMA_VIOLATION),
         ("duplicate", StructuralErrorCode.DUPLICATE_SYMBOL),
@@ -785,7 +794,15 @@ def test_non_linux_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
 
 
 def test_every_output_field_is_classified() -> None:
-    for model in (ParsedModule, ParsedFile, ParsedSymbol, StructuralRelation):
+    models = (
+        ParsedModule,
+        ParsedFile,
+        ParsedSymbol,
+        StructuralRelation,
+        ParsedReference,
+        ParsedDiagnostic,
+    )
+    for model in models:
         assert set(model.model_fields) == set(base.FIELD_CONFINEMENT[model.__name__]), model
     rehashed = {
         name
@@ -798,7 +815,7 @@ def test_every_output_field_is_classified() -> None:
 
 def test_free_form_string_fields_are_token_confined_or_rehashed() -> None:
     """A future free-form field must be classified, and only those classes may be free text."""
-    allowed = {"token", "enum", "range", "parent", "derived", "rehashed", "structure"}
+    allowed = {"token", "numeric", "enum", "range", "parent", "derived", "rehashed", "structure"}
     for fields in base.FIELD_CONFINEMENT.values():
         assert set(fields.values()) <= allowed
 
@@ -1019,3 +1036,253 @@ def test_disambiguator_groups_by_name_and_kind_so_a_variable_does_not_shift_a_fu
 
 def test_the_same_declaration_under_different_refs_is_rejected() -> None:
     refused(StructuralErrorCode.DUPLICATE_SYMBOL, module([symbol(), symbol(ref="2")]))
+
+
+# --- unresolved references and diagnostics -----------------------------------------------
+
+# SOURCE: ``def a():`` is bytes 0..8, ``return 1`` is 13..21 (``return`` 13..19, ``a`` at 4).
+IMPORT_SOURCE = b"import os.path\nfrom ..pkg import x\n\ndef f():\n    a.b(1)\n"
+
+
+def ref(start: int, end: int, name: str, **over: Any) -> dict[str, Any]:
+    data: dict[str, Any] = {
+        "source": None,
+        "kind": "call",
+        "target_name": name,
+        "relative_level": 0,
+        "start_byte": start,
+        "end_byte": end,
+        "evidence_kind": "tree_sitter",
+        "confidence": "heuristic",
+    }
+    data.update(over)
+    return data
+
+
+def imp(start: int, end: int, name: str, **over: Any) -> dict[str, Any]:
+    return ref(start, end, name, kind="import", confidence="syntactic", **over)
+
+
+def validated(candidate: ParsedModule, req: ParseRequest | None = None) -> ParsedFile:
+    checked = validate_module(req or request(), candidate, expected_fingerprint=FINGERPRINT)
+    return checked.files[0]
+
+
+def test_valid_references_of_each_kind_and_relative_imports() -> None:
+    content = IMPORT_SOURCE
+    req = request(content)
+    call_at = content.index(b"a.b")
+    func_start = content.index(b"def f")
+    func = symbol(
+        qualified_name="pkg.mod.f",
+        start_byte=func_start,
+        end_byte=len(content),
+        signature="def f()",
+    )
+    references = [
+        imp(0, 14, "os.path"),
+        imp(15, 34, "pkg", relative_level=2),
+        imp(15, 34, "x", relative_level=2),
+        ref(call_at, call_at + 3, "a.b", source="1"),
+        ref(call_at, call_at + 1, "a", source="1"),
+        ref(func_start, func_start + 5, "def", kind="inherit", confidence="syntactic", source="1"),
+    ]
+    got = validated(module([func], references=references), req)
+    assert [item.source for item in got.references] == [None, None, None, "0", "0", "0"]
+    assert {item.kind for item in got.references} == {"import", "call", "inherit"}
+    assert got.references[1].relative_level == 2
+    assert got.diagnostics == ()
+
+
+def test_reference_source_is_remapped_to_a_symbol_index() -> None:
+    swapped = module([second(ref="7"), symbol(ref="3")], references=[ref(4, 5, "a", source="3")])
+    got = validated(swapped)
+    assert got.references[0].source == "1"
+
+
+@pytest.mark.parametrize(
+    ("reference", "code"),
+    [
+        (ref(4, 5, "b"), StructuralErrorCode.TEXT_NOT_IN_SOURCE),  # not a token in the range
+        (ref(4, 5, "a.return"), StructuralErrorCode.TEXT_NOT_IN_SOURCE),  # one segment outside
+        (ref(0, 3, "de"), StructuralErrorCode.TEXT_NOT_IN_SOURCE),  # prefix of a token
+        (ref(4, 5, "a b"), StructuralErrorCode.TEXT_NOT_IN_SOURCE),
+        (ref(4, 5, "a-b"), StructuralErrorCode.TEXT_NOT_IN_SOURCE),
+        (ref(4, 5, "a..a"), StructuralErrorCode.TEXT_NOT_IN_SOURCE),
+        (ref(4, len(SOURCE) + 1, "a"), StructuralErrorCode.RANGE_OUT_OF_BOUNDS),
+        (ref(4, 5, "a", source="9"), StructuralErrorCode.DANGLING_RELATION),
+        (
+            ref(13, 19, "return", source="1"),  # symbol 1 is bytes 0..8
+            StructuralErrorCode.RANGE_OUT_OF_BOUNDS,
+        ),
+        (ref(4, 12, "a", source="1"), StructuralErrorCode.RANGE_OUT_OF_BOUNDS),
+    ],
+)
+def test_references_are_confined_to_the_occurrence(
+    reference: dict[str, Any], code: StructuralErrorCode
+) -> None:
+    refused(code, module(references=[reference]))
+
+
+def test_a_target_from_elsewhere_in_the_file_is_not_enough() -> None:
+    """``return`` is a token of the file, but not of the occurrence range that is claimed."""
+    refused(StructuralErrorCode.TEXT_NOT_IN_SOURCE, module(references=[ref(4, 5, "return")]))
+    assert validated(module(references=[ref(13, 19, "return")])).references
+
+
+def test_duplicate_references_are_refused() -> None:
+    refused(
+        StructuralErrorCode.DUPLICATE_REFERENCE,
+        module(references=[ref(4, 5, "a"), ref(4, 5, "a", source="1")]),
+    )
+    # A different kind, level or range is a different occurrence.
+    assert validated(
+        module(references=[ref(4, 5, "a"), imp(4, 5, "a"), imp(4, 5, "a", relative_level=1)])
+    )
+
+
+def test_reference_caps(monkeypatch: pytest.MonkeyPatch) -> None:
+    two = [ref(4, 5, "a", source="1"), ref(4, 6, "a", source="1")]
+    monkeypatch.setattr(base, "MAX_REFERENCES_PER_SYMBOL", 1)
+    refused(StructuralErrorCode.COUNT_EXCEEDED, module(references=two))
+    monkeypatch.setattr(base, "MAX_REFERENCES_PER_SYMBOL", 64)
+    monkeypatch.setattr(base, "MAX_MODULE_REFERENCES", 1)
+    refused(StructuralErrorCode.COUNT_EXCEEDED, module(references=[ref(4, 5, "a"), imp(4, 5, "a")]))
+    assert validated(module(references=two))
+    monkeypatch.setattr(base, "MAX_REFERENCES_PER_FILE", 1)
+    refused(StructuralErrorCode.COUNT_EXCEEDED, module(references=two))
+
+
+def test_reference_names_count_against_the_name_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(base, "MAX_NAME_TOTAL_BYTES", len("pkg.mod.a"))
+    refused(StructuralErrorCode.COUNT_EXCEEDED, module(references=[ref(4, 5, "a")]))
+    monkeypatch.setattr(base, "MAX_NAME_TOTAL_BYTES", len("pkg.mod.a") + 1)
+    assert validated(module(references=[ref(4, 5, "a")]))
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"kind": "type_ref"},
+        {"kind": "Call"},
+        {"confidence": "certain"},
+        {"confidence": "syntactic"},  # a call is never syntactic
+        {"relative_level": -1},
+        {"relative_level": base.MAX_RELATIVE_LEVEL + 1},
+        {"relative_level": "1"},
+        {"evidence_kind": "scip"},
+        {"target_name": ""},
+        {"target_name": "a\nb"},
+        {"target_name": "x" * (base.MAX_NAME_BYTES + 1)},
+        {"start_byte": 5, "end_byte": 5},
+        {"start_byte": -1},
+        {"source": "abc"},
+        {"extra": 1},
+    ],
+)
+def test_reference_rejects(override: dict[str, Any]) -> None:
+    with pytest.raises(ValidationError):
+        ParsedReference.model_validate(ref(4, 5, "a", **override))
+
+
+def test_import_is_syntactic_and_call_is_heuristic() -> None:
+    with pytest.raises(ValidationError):
+        ParsedReference.model_validate(ref(4, 5, "a", kind="import"))
+    assert ParsedReference.model_validate(imp(4, 5, "a", relative_level=16)).relative_level == 16
+
+
+def test_reference_errors_do_not_echo_input() -> None:
+    with pytest.raises(ValidationError) as caught:
+        ParsedReference.model_validate(ref(4, 5, "SECRET-\x00-TEXT"))
+    assert "SECRET" not in str(caught.value)
+
+
+def test_valid_diagnostics() -> None:
+    codes = ("work_budget_exceeded", "syntax_recovered", "symbols_dropped", "references_capped")
+    got = validated(module(diagnostics=[{"code": code, "count": 3} for code in codes]))
+    assert [item.code for item in got.diagnostics] == list(codes)
+    degraded = module(
+        [],
+        diagnostics=[
+            {"code": "file_degraded", "count": 1},
+            {"code": "work_budget_exceeded", "count": 1},
+        ],
+    )
+    assert validated(degraded).symbols == ()
+    bounded = {"code": "syntax_recovered", "count": base.MAX_DIAGNOSTIC_COUNT}
+    assert (
+        validated(module(diagnostics=[bounded])).diagnostics[0].count == base.MAX_DIAGNOSTIC_COUNT
+    )
+
+
+@pytest.mark.parametrize(
+    "diagnostics",
+    [
+        [{"code": "boom", "count": 1}],
+        [{"code": "Syntax_Recovered", "count": 1}],
+        [{"code": "syntax_recovered", "count": 0}],
+        [{"code": "syntax_recovered", "count": -1}],
+        [{"code": "syntax_recovered", "count": base.MAX_DIAGNOSTIC_COUNT + 1}],
+        [{"code": "syntax_recovered", "count": "1"}],
+        [{"code": "syntax_recovered"}],
+        [{"code": "syntax_recovered", "count": 1, "message": "hunter2"}],
+        [{"count": 1, "code": "syntax_recovered", "detail": "/etc/passwd"}],
+        [{"code": "syntax_recovered", "count": 1}] * 2,
+        ["syntax_recovered"],
+        [{"code": "file_degraded", "count": 1}],  # no reason
+        [
+            {"code": "file_degraded", "count": 1},
+            {"code": "syntax_recovered", "count": 1},
+        ],  # still carries a symbol
+    ],
+)
+def test_diagnostics_refused(diagnostics: list[Any]) -> None:
+    with pytest.raises(ValidationError):
+        module(diagnostics=diagnostics)
+
+
+def test_degraded_file_carries_no_relations_or_references() -> None:
+    degraded = [{"code": "file_degraded", "count": 1}, {"code": "symbols_dropped", "count": 1}]
+    with pytest.raises(ValidationError):
+        module([], references=[ref(4, 5, "a")], diagnostics=degraded)
+
+
+def test_diagnostics_are_bounded_by_the_code_set() -> None:
+    assert len(base.DIAGNOSTIC_CODES) == 5
+    with pytest.raises(ValidationError):
+        ParsedFile.model_validate(
+            {
+                **module().files[0].model_dump(),
+                "diagnostics": [{"code": "syntax_recovered", "count": 1}] * 6,
+            }
+        )
+
+
+def test_protocol_one_still_validates_and_cannot_carry_new_fields() -> None:
+    old = module(version=1)
+    assert old.protocol_version == 1
+    assert validated(old).references == ()
+    refused(StructuralErrorCode.SCHEMA_VIOLATION, module(version=1, references=[ref(4, 5, "a")]))
+    refused(
+        StructuralErrorCode.SCHEMA_VIOLATION,
+        module(version=1, diagnostics=[{"code": "syntax_recovered", "count": 1}]),
+    )
+    assert request().protocol_version == base.PROTOCOL_VERSION == 2
+    with pytest.raises(ValidationError):
+        ParsedModule.model_validate({"protocol_version": 3, "files": []})
+
+
+def test_sandboxed_adapter_round_trips_references_and_diagnostics() -> None:
+    result = adapter("references_ok").parse(request())
+    assert isinstance(result, ParsedModule)
+    file = result.files[0]
+    assert [item.source for item in file.references] == ["0", None]
+    assert file.references[1].relative_level == 2
+    assert [item.code for item in file.diagnostics] == ["syntax_recovered"]
+    degraded = adapter("degraded_ok").parse(request())
+    assert isinstance(degraded, ParsedModule)
+    assert degraded.files[0].symbols == ()
+    assert {item.code for item in degraded.files[0].diagnostics} == {
+        "file_degraded",
+        "work_budget_exceeded",
+    }

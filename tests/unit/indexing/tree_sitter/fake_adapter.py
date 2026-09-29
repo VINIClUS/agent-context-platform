@@ -42,6 +42,21 @@ def symbol(ref: str, name: str, start: int, end: int, **over: object) -> dict[st
     return base
 
 
+def reference(start: int, end: int, name: str, **over: object) -> dict[str, object]:
+    base: dict[str, object] = {
+        "source": None,
+        "kind": "call",
+        "target_name": name,
+        "relative_level": 0,
+        "start_byte": start,
+        "end_byte": end,
+        "evidence_kind": "tree_sitter",
+        "confidence": "heuristic",
+    }
+    base.update(over)
+    return base
+
+
 def emit(document: object) -> None:
     sys.stdout.write(json.dumps(document))
     sys.stdout.flush()
@@ -137,6 +152,28 @@ def main() -> int:
     document: dict[str, object] = {"protocol_version": 1, "files": [parsed]}
     if MODE == "ok":
         pass
+    elif MODE == "references_ok":
+        document["protocol_version"] = 2
+        parsed["references"] = [
+            reference(4, 5, "a", source="1"),
+            reference(13, 19, "return", kind="import", confidence="syntactic", relative_level=2),
+        ]
+        parsed["diagnostics"] = [{"code": "syntax_recovered", "count": 1}]
+    elif MODE == "references_exfil":
+        document["protocol_version"] = 2
+        parsed["references"] = [reference(4, 5, "AWS_SECRET_KEY")]
+    elif MODE == "references_v1":
+        parsed["references"] = [reference(4, 5, "a")]
+    elif MODE == "degraded_ok":
+        document["protocol_version"] = 2
+        parsed["symbols"] = []
+        parsed["diagnostics"] = [
+            {"code": "file_degraded", "count": 1},
+            {"code": "work_budget_exceeded", "count": 1},
+        ]
+    elif MODE == "diagnostics_free_text":
+        document["protocol_version"] = 2
+        parsed["diagnostics"] = [{"code": "syntax_recovered", "count": 1, "detail": "secret"}]
     elif MODE == "range":
         parsed["symbols"] = [symbol("1", "pkg.a", 0, size + 1)]
     elif MODE == "foreign_path":

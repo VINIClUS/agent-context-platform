@@ -22,6 +22,10 @@ errors, never the offending value):
 - relation endpoints are refs of that file's symbols;
 - every assertion says ``evidence_kind="tree_sitter"`` (design 9.3), no default;
 - counts are bounded;
+- ``references`` (unresolved import/call/inherit candidates, protocol 2) and ``diagnostics``
+  (closed-enum degradation codes with bounded counts, no free text) are validated below.
+  Protocol 1 adapters emit neither (both default to empty) and still validate; a protocol 1
+  document that carries them is refused;
 - every free-text field is confined to the parsed file itself, so an adapter that read
   some other file (``/etc/passwd``, a ``.env``) cannot exfiltrate it through the output.
   Read isolation is not something the container gives (the adapter shares the indexer's
@@ -60,6 +64,19 @@ errors, never the offending value):
     ``FIELD_CONFINEMENT`` classifies every output field; a test fails when a new field
     is not classified.
 
+  * ``ParsedReference.target_name`` is a dotted identifier path (a new free-text channel, so
+    airtight): every segment is an identifier token located inside the occurrence range
+    ``[start_byte, end_byte]`` (``import os.path`` contains ``os`` and ``path``), the range lies
+    inside the file and, when ``source`` is set, inside that symbol's range. ``source`` is
+    remapped to a symbol index (None is module level), ``kind`` and ``confidence`` are closed
+    enums (``syntactic`` for import/inherit, ``heuristic`` for call: the target is a name, not a
+    resolved symbol), ``relative_level`` is an integer 0..``MAX_RELATIVE_LEVEL``. References are
+    capped per file and per source, duplicates are refused and the name bytes count against
+    ``MAX_NAME_TOTAL_BYTES``;
+  * ``ParsedFile.diagnostics`` is at most one ``ParsedDiagnostic`` per closed-enum code with a
+    bounded count. ``file_degraded`` needs a reason code and no symbols, relations or references,
+    so a degraded file is never mistaken for an empty one;
+
   Residual channel (inherent to structural output): an adapter can still choose *which*
   symbols, relations and ordering to emit, about one bit per candidate token or edge, at most about ``log2(tokens in file)`` bits per symbol and only ever about
   this file's own content. That leaks nothing beyond the file it was asked to parse.
@@ -96,7 +113,7 @@ from pydantic import (
 
 from agent_context_platform.indexing.identity import canonical_path
 
-PROTOCOL_VERSION: Final = 1
+PROTOCOL_VERSION: Final = 2
 EVIDENCE_KIND: Final = "tree_sitter"
 
 # Same default as scanner.ScanLimits.max_file_bytes: the scanner never yields larger files.
@@ -115,6 +132,12 @@ _DIGEST = r"^[0-9a-f]{64}$"
 _DISAMBIGUATOR = r"^[0-9]{0,6}$"
 _REF = r"^[0-9]{1,6}$"
 MAX_RELATIONS_PER_SYMBOL: Final = 64
+MAX_REFERENCES_PER_FILE: Final = 50_000
+MAX_REFERENCES_PER_SYMBOL: Final = 64
+# Imports pile up at module level, which is one source of its own.
+MAX_MODULE_REFERENCES: Final = 4096
+MAX_RELATIVE_LEVEL: Final = 16
+MAX_DIAGNOSTIC_COUNT: Final = 1_000_000
 
 
 class StructuralErrorCode(StrEnum):
@@ -139,6 +162,7 @@ class StructuralErrorCode(StrEnum):
     DUPLICATE_SYMBOL = "duplicate_symbol"
     COUNT_EXCEEDED = "count_exceeded"
     TEXT_NOT_IN_SOURCE = "text_not_in_source"
+    DUPLICATE_REFERENCE = "duplicate_reference"
 
 
 class StructuralError(Exception):
@@ -188,6 +212,22 @@ type SymbolKind = Literal[
     "property",
 ]
 type RelationKind = Literal["calls", "imports", "inherits", "references", "contains"]
+type ReferenceKind = Literal["import", "call", "inherit"]
+type ReferenceConfidence = Literal["syntactic", "heuristic"]
+type DiagnosticCode = Literal[
+    "work_budget_exceeded",
+    "syntax_recovered",
+    "symbols_dropped",
+    "references_capped",
+    "file_degraded",
+]
+DIAGNOSTIC_CODES: Final = (
+    "work_budget_exceeded",
+    "syntax_recovered",
+    "symbols_dropped",
+    "references_capped",
+    "file_degraded",
+)
 type Ref = Annotated[str, StringConstraints(pattern=_REF)]
 type Language = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_+\-]{0,31}$")]
 type RepoPath = Annotated[
@@ -231,7 +271,7 @@ class ParseRequest(BaseModel):
 
     model_config = _MODEL
 
-    protocol_version: Literal[1] = PROTOCOL_VERSION
+    protocol_version: Literal[1, 2] = PROTOCOL_VERSION
     files: tuple[SourceFile, ...] = Field(min_length=1, max_length=MAX_INPUT_FILES)
 
     @model_validator(mode="after")
@@ -286,6 +326,43 @@ class StructuralRelation(BaseModel):
         return self
 
 
+class ParsedReference(BaseModel):
+    """An unresolved structural reference: a name the syntax mentions, never a resolved symbol.
+
+    Cross-file resolution (PLATFORM-037) consumes these; nothing here says what the name is.
+    """
+
+    model_config = _MODEL
+
+    source: Ref | None = None
+    kind: ReferenceKind
+    target_name: Annotated[
+        Text, StringConstraints(min_length=1), AfterValidator(lambda v: _bounded(v, MAX_NAME_BYTES))
+    ]
+    relative_level: Annotated[int, Field(ge=0, le=MAX_RELATIVE_LEVEL)] = 0
+    start_byte: Annotated[int, Field(ge=0)]
+    end_byte: Annotated[int, Field(ge=0)]
+    evidence_kind: Literal["tree_sitter"]
+    confidence: ReferenceConfidence
+
+    @model_validator(mode="after")
+    def _consistent(self) -> Self:
+        if self.start_byte >= self.end_byte:
+            raise ValueError("empty or inverted byte range")
+        if (self.confidence == "heuristic") != (self.kind == "call"):
+            raise ValueError("confidence does not match the reference kind")
+        return self
+
+
+class ParsedDiagnostic(BaseModel):
+    """A content-free degradation report: a closed-enum code and how many times it happened."""
+
+    model_config = _MODEL
+
+    code: DiagnosticCode
+    count: Annotated[int, Field(ge=1, le=MAX_DIAGNOSTIC_COUNT)]
+
+
 class ParsedFile(BaseModel):
     """Normalized structure of one input file, tagged with the parser fingerprint."""
 
@@ -296,6 +373,19 @@ class ParsedFile(BaseModel):
     parser_fingerprint: Digest
     symbols: tuple[ParsedSymbol, ...]
     relations: tuple[StructuralRelation, ...] = ()
+    references: tuple[ParsedReference, ...] = ()
+    diagnostics: tuple[ParsedDiagnostic, ...] = Field(default=(), max_length=len(DIAGNOSTIC_CODES))
+
+    @model_validator(mode="after")
+    def _diagnostics_consistent(self) -> Self:
+        codes = [item.code for item in self.diagnostics]
+        if len(set(codes)) != len(codes):
+            raise ValueError("duplicate diagnostic code")
+        if "file_degraded" in codes and (
+            len(codes) < 2 or self.symbols or self.relations or self.references
+        ):
+            raise ValueError("a degraded file needs a reason and carries no structure")
+        return self
 
 
 class ParsedModule(BaseModel):
@@ -303,7 +393,7 @@ class ParsedModule(BaseModel):
 
     model_config = _MODEL
 
-    protocol_version: Literal[1] = PROTOCOL_VERSION
+    protocol_version: Literal[1, 2] = PROTOCOL_VERSION
     files: tuple[ParsedFile, ...]
 
 
@@ -330,6 +420,8 @@ FIELD_CONFINEMENT: Final[Mapping[str, Mapping[str, Confinement]]] = {
         "parser_fingerprint": "parent",  # must equal the host-computed fingerprint
         "symbols": "structure",
         "relations": "structure",
+        "references": "structure",
+        "diagnostics": "structure",
     },
     "ParsedSymbol": {
         "ref": "derived",
@@ -352,6 +444,17 @@ FIELD_CONFINEMENT: Final[Mapping[str, Mapping[str, Confinement]]] = {
         "end_byte": "range",
         "evidence_kind": "enum",
     },
+    "ParsedReference": {
+        "source": "derived",  # remapped to a symbol index, None is module level
+        "kind": "enum",
+        "target_name": "token",  # every segment is an identifier token inside the range
+        "relative_level": "numeric",
+        "start_byte": "range",
+        "end_byte": "range",
+        "evidence_kind": "enum",
+        "confidence": "enum",
+    },
+    "ParsedDiagnostic": {"code": "enum", "count": "numeric"},
 }
 OPAQUE_FIELDS: Final = ("signature_digest", "semantic_fingerprint")
 _REHASH_DOMAIN: Final = b"agent-context/tree-sitter/opaque/v1"
@@ -374,6 +477,10 @@ def validate_module(
     request: ParseRequest, module: ParsedModule, *, expected_fingerprint: str
 ) -> ParsedModule:
     """Check ``module`` against ``request``; return it with opaque values re-hashed, or raise."""
+    if module.protocol_version < 2 and any(
+        parsed.references or parsed.diagnostics for parsed in module.files
+    ):
+        raise StructuralError(StructuralErrorCode.SCHEMA_VIOLATION)
     sources = {item.path: item for item in request.files}
     seen: set[str] = set()
     texts: dict[str, _SourceText] = {}
@@ -447,7 +554,13 @@ def _finish(
         )
         for item in parsed.relations
     )
-    return parsed.model_copy(update={"symbols": symbols, "relations": relations})
+    references = tuple(
+        item.model_copy(update={"source": None if item.source is None else str(index[item.source])})
+        for item in parsed.references
+    )
+    return parsed.model_copy(
+        update={"symbols": symbols, "relations": relations, "references": references}
+    )
 
 
 _SEPARATORS = re.compile(r"::|[./#]")
@@ -490,11 +603,23 @@ class _SourceText:
         index = bisect_left(starts, start)
         return index < len(starts) and starts[index] + len(token) <= end
 
-    def final_ok(self, qualified_name: str, kind: str, start: int, end: int) -> bool:
-        """Every segment is an identifier and the final one is a token of the symbol's range."""
-        self.name_bytes += len(qualified_name.encode())
+    def charge(self, name: str) -> None:
+        """Count name bytes against the per-file budget."""
+        self.name_bytes += len(name.encode())
         if self.name_bytes > MAX_NAME_TOTAL_BYTES:
             raise StructuralError(StructuralErrorCode.COUNT_EXCEEDED)
+
+    def path_ok(self, target_name: str, start: int, end: int) -> bool:
+        """Every segment is an identifier token inside the occurrence range."""
+        self.charge(target_name)
+        return all(
+            _IDENT.fullmatch(raw) is not None and self._token_within(raw, start, end)
+            for raw in (segment.encode() for segment in _SEPARATORS.split(target_name))
+        )
+
+    def final_ok(self, qualified_name: str, kind: str, start: int, end: int) -> bool:
+        """Every segment is an identifier and the final one is a token of the symbol's range."""
+        self.charge(qualified_name)
         segments = [segment.encode() for segment in _SEPARATORS.split(qualified_name)]
         if not all(_IDENT.fullmatch(raw) for raw in segments):
             return False
@@ -524,10 +649,14 @@ class _SourceText:
 
 def _validate_file(parsed: ParsedFile, content: bytes) -> _SourceText:
     size = len(content)
-    if len(parsed.symbols) > MAX_SYMBOLS_PER_FILE or len(parsed.relations) > MAX_RELATIONS_PER_FILE:
+    if (
+        len(parsed.symbols) > MAX_SYMBOLS_PER_FILE
+        or len(parsed.relations) > MAX_RELATIONS_PER_FILE
+        or len(parsed.references) > MAX_REFERENCES_PER_FILE
+    ):
         raise StructuralError(StructuralErrorCode.COUNT_EXCEEDED)
     text = _SourceText(parsed.path, content)
-    refs: set[str] = set()
+    refs: dict[str, tuple[int, int]] = {}
     declarations: set[tuple[str, str, int, int]] = set()
     for symbol in parsed.symbols:
         if symbol.language != parsed.language:
@@ -541,7 +670,7 @@ def _validate_file(parsed: ParsedFile, content: bytes) -> _SourceText:
         declaration = (symbol.qualified_name, symbol.kind, symbol.start_byte, symbol.end_byte)
         if symbol.ref in refs or declaration in declarations:
             raise StructuralError(StructuralErrorCode.DUPLICATE_SYMBOL)
-        refs.add(symbol.ref)
+        refs[symbol.ref] = (symbol.start_byte, symbol.end_byte)
         declarations.add(declaration)
     per_source: dict[str, int] = {}
     for relation in parsed.relations:
@@ -552,4 +681,36 @@ def _validate_file(parsed: ParsedFile, content: bytes) -> _SourceText:
             raise StructuralError(StructuralErrorCode.RANGE_OUT_OF_BOUNDS)
         if relation.source_ref not in refs or relation.target_ref not in refs:
             raise StructuralError(StructuralErrorCode.DANGLING_RELATION)
+    _validate_references(parsed, size, refs, text)
     return text
+
+
+def _validate_references(
+    parsed: ParsedFile, size: int, refs: dict[str, tuple[int, int]], text: _SourceText
+) -> None:
+    per_source: dict[str | None, int] = {}
+    seen: set[tuple[str, str, int, int, int]] = set()
+    for reference in parsed.references:
+        limit = MAX_MODULE_REFERENCES if reference.source is None else MAX_REFERENCES_PER_SYMBOL
+        per_source[reference.source] = per_source.get(reference.source, 0) + 1
+        if per_source[reference.source] > limit:
+            raise StructuralError(StructuralErrorCode.COUNT_EXCEEDED)
+        low, high = 0, size
+        if reference.source is not None:
+            if reference.source not in refs:
+                raise StructuralError(StructuralErrorCode.DANGLING_RELATION)
+            low, high = refs[reference.source]
+        if reference.end_byte > high or reference.start_byte < low:
+            raise StructuralError(StructuralErrorCode.RANGE_OUT_OF_BOUNDS)
+        key = (
+            reference.kind,
+            reference.target_name,
+            reference.relative_level,
+            reference.start_byte,
+            reference.end_byte,
+        )
+        if key in seen:
+            raise StructuralError(StructuralErrorCode.DUPLICATE_REFERENCE)
+        seen.add(key)
+        if not text.path_ok(reference.target_name, reference.start_byte, reference.end_byte):
+            raise StructuralError(StructuralErrorCode.TEXT_NOT_IN_SOURCE)
