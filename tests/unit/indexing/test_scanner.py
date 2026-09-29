@@ -551,6 +551,50 @@ def test_forged_gitfile_cannot_borrow_another_repository(
     assert failure_of(forged) is ScanFailure.ROOT_MISMATCH
 
 
+def test_linked_worktree_with_foreign_commondir_is_refused(
+    repo: RepoBuilder, make_repo: MakeRepo, tmp_path: Path
+) -> None:
+    victim = make_repo("victim-common")
+    victim.write("secret.txt", "victim tree\n")
+    victim_head = victim.commit("victim")
+    linked = tmp_path / "linked-forged"
+    repo.git("worktree", "add", "-q", "-b", "forged", str(linked))
+    admin = repo.root / ".git" / "worktrees" / "linked-forged"
+    assert (admin / "gitdir").is_file()  # the backlink is valid
+    (admin / "commondir").write_text(f"{victim.root / '.git'}\n")
+
+    with pytest.raises(ScanError) as caught:
+        scan_repository(linked)
+
+    assert caught.value.reason is ScanFailure.ROOT_MISMATCH
+    assert victim_head not in repr(caught.value)
+
+
+def test_ordinary_repository_with_foreign_commondir_is_refused(
+    repo: RepoBuilder, make_repo: MakeRepo
+) -> None:
+    victim = make_repo("victim-plain")
+    victim.write("secret.txt", "victim tree\n")
+    victim.commit("victim")
+    (repo.root / ".git" / "commondir").write_text(f"{victim.root / '.git'}\n")
+
+    assert failure_of(repo.root) in {ScanFailure.ROOT_MISMATCH, *FAIL_CLOSED}
+
+
+def test_linked_worktree_admin_dir_must_belong_to_its_common_dir(
+    repo: RepoBuilder, tmp_path: Path
+) -> None:
+    linked = tmp_path / "linked-real"
+    repo.git("worktree", "add", "-q", "-b", "real", str(linked))
+    admin = repo.root / ".git" / "worktrees" / "linked-real"
+    common = repo.root / ".git"
+
+    assert scanner._is_admin_dir_of(common, admin)
+    assert not scanner._is_admin_dir_of(tmp_path, admin)
+    assert not scanner._is_admin_dir_of(common, common)
+    assert not scanner._is_admin_dir_of(common, common / "worktrees" / "absent")
+
+
 def test_submodule_style_checkout_is_accepted(repo: RepoBuilder, tmp_path: Path) -> None:
     modules = tmp_path / "modules-store"
     checkout = tmp_path / "sub-checkout"
@@ -568,7 +612,7 @@ def test_unreadable_worktree_backlink_is_refused(repo: RepoBuilder, tmp_path: Pa
     other.mkdir()
     (other / "gitdir").write_bytes(b"\xff\xfe")
 
-    assert not scanner._owns_git_dir("git", repo.root, other, ScanLimits())
+    assert not scanner._owns_git_dir("git", repo.root, other, other, ScanLimits())
 
 
 def test_include_in_repository_config_is_refused(repo: RepoBuilder) -> None:

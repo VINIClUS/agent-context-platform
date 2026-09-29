@@ -434,7 +434,7 @@ def _bootstrap(root: Path, limits: ScanLimits) -> _Repo:
     # ``core.worktree`` or a gitfile must not move the scan to another tree.
     if Path(toplevel).resolve() != root:
         raise ScanError(ScanFailure.ROOT_MISMATCH)
-    if not _owns_git_dir(git, root, Path(git_dir), limits):
+    if not _owns_git_dir(git, root, Path(git_dir), Path(common_dir), limits):
         raise ScanError(ScanFailure.ROOT_MISMATCH)
     info = os.stat(root)
     return _Repo(
@@ -447,7 +447,53 @@ def _bootstrap(root: Path, limits: ScanLimits) -> _Repo:
     )
 
 
-def _owns_git_dir(git: str, root: Path, git_dir: Path, limits: ScanLimits) -> bool:
+def _dir_identity(path: Path) -> tuple[int, int] | None:
+    """``(st_dev, st_ino)`` of a directory reached without following any symlink."""
+    parts = path.resolve().parts
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    try:
+        fd = os.open(parts[0], flags)
+    except OSError:
+        return None
+    try:
+        for name in parts[1:]:
+            try:
+                nxt = os.open(name, flags, dir_fd=fd)
+            except OSError:
+                return None
+            os.close(fd)
+            fd = nxt
+        info = os.fstat(fd)
+        return (info.st_dev, info.st_ino)
+    finally:
+        os.close(fd)
+
+
+def _is_admin_dir_of(common_dir: Path, admin_dir: Path) -> bool:
+    """Whether ``admin_dir`` is exactly ``<common_dir>/worktrees/<name>``.
+
+    Compared by device and inode, so neither string prefixes nor symlinks can
+    make a foreign repository's admin directory look like ours.
+    """
+    if admin_dir.parent.name != "worktrees" or not admin_dir.name:
+        return False
+    common = _dir_identity(common_dir)
+    grandparent = _dir_identity(admin_dir.parent.parent)
+    entry = _dir_identity(admin_dir.parent / admin_dir.name)
+    listed = _dir_identity(common_dir / "worktrees" / admin_dir.name)
+    admin = _dir_identity(admin_dir)
+    return (
+        common is not None
+        and common == grandparent
+        and admin is not None
+        and admin == entry
+        and admin == listed
+    )
+
+
+def _owns_git_dir(
+    git: str, root: Path, git_dir: Path, common_dir: Path, limits: ScanLimits
+) -> bool:
     """Whether ``git_dir`` really belongs to the checkout at ``root``.
 
     A hostile ``.git`` *file* can name any other repository's git dir, whose
@@ -455,15 +501,24 @@ def _owns_git_dir(git: str, root: Path, git_dir: Path, limits: ScanLimits) -> bo
     ordinary ``<root>/.git`` layout the git dir must point back at ``root``:
     a linked worktree records ``<root>/.git`` in its ``gitdir`` file, and a
     submodule records the checkout in ``core.worktree``.
+
+    The common directory (``commondir``) is checked too, since a valid
+    backlink says nothing about where refs and objects come from. A linked
+    worktree's admin dir must be exactly ``<common_dir>/worktrees/<name>``;
+    every other layout must have its common dir equal to the git dir itself.
     """
-    if git_dir == (root / ".git").resolve():
-        return True
+    git_identity = _dir_identity(git_dir)
+    if git_identity is None:
+        return False
+    own = _dir_identity(root / ".git")
+    if own is not None and git_identity == own:
+        return _dir_identity(common_dir) == git_identity
     backlink = git_dir / "gitdir"
     try:
         if backlink.is_file() and Path(backlink.read_text(encoding="utf-8").strip()).resolve() == (
             root / ".git"
         ):
-            return True
+            return _is_admin_dir_of(common_dir, git_dir)
     except (OSError, UnicodeDecodeError):
         return False
     code, out = _run_git(
@@ -478,7 +533,7 @@ def _owns_git_dir(git: str, root: Path, git_dir: Path, limits: ScanLimits) -> bo
     if code != 0:
         return False
     declared = out.decode("utf-8", errors="replace").rstrip("\n")
-    return (git_dir / declared).resolve() == root
+    return (git_dir / declared).resolve() == root and _dir_identity(common_dir) == git_identity
 
 
 @dataclass(frozen=True, slots=True)
