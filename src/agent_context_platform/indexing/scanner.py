@@ -1057,15 +1057,19 @@ def _safe_path(raw: bytes) -> str | None:
         text = raw.decode("utf-8")
     except UnicodeDecodeError:
         return None
-    return text if _is_safe_path(text) else None
+    return text if is_safe_repo_path(text) else None
 
 
-def _is_safe_path(text: str) -> bool:
+def is_safe_repo_path(text: str) -> bool:
+    """Whether ``text`` is a repo-relative POSIX path the scanner accepts (public for identity)."""
     if not text or text.startswith("/") or "\\" in text:
         return False
     if any(ord(character) < 32 or ord(character) == 127 for character in text):
         return False
     return all(part not in ("", ".", "..") and part.lower() != ".git" for part in text.split("/"))
+
+
+_is_safe_path = is_safe_repo_path
 
 
 @dataclass(frozen=True, slots=True)

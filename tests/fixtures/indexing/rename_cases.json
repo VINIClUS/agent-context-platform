@@ -1,0 +1,458 @@
+{
+  "_comment": "Frozen golden identities. Any change here is a deliberate re-identification of graph nodes.",
+  "root_namespace": "6ff9b492-0edb-50ba-bb24-6c063fa0a74f",
+  "repository_id": "0195f0a2-7c1e-7d3a-9b4e-5a1c2d3e4f50",
+  "other_repository_id": "0195f0a2-7c1e-7d3a-9b4e-5a1c2d3e4f51",
+  "repository_namespace": "6d6b5fd2-cd5b-5bb7-b05f-055cb65fa383",
+  "commits": [
+    "1111111111111111111111111111111111111111",
+    "2222222222222222222222222222222222222222",
+    "3333333333333333333333333333333333333333"
+  ],
+  "oids": {
+    "a": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "b": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+  },
+  "sha256_oid": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "digests": {
+    "one": "d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1d1",
+    "two": "e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2e2",
+    "parser_one": "a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1a1",
+    "parser_two": "a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2a2",
+    "body_one": "b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1b1",
+    "body_two": "b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2b2"
+  },
+  "ids": {
+    "app_logical": "8559d8f1-9a9c-5b0e-90c8-b3297cc3ea57",
+    "app_revision_a": "16f3a6a8-d6fb-5f9f-8257-6da20367ebf0",
+    "app_revision_b": "14e85311-6e43-5234-8fb6-568765ac0a0f",
+    "app_revision_sha256": "34c1370a-e28f-5215-b59e-52c1a177b617",
+    "app_logical_other_repo": "4f43ac5e-4394-5c6f-8d40-ca8c81ede65c",
+    "main_logical_c2": "845f3a37-09fe-507f-9455-c4471c299fba",
+    "app_logical_recreated_c3": "1d7875ce-aac5-5437-ae24-e118432c7581",
+    "copy_a_logical_c2": "9a6277eb-27e4-54ab-b3a1-1eefa09e52df",
+    "copy_b_logical_c2": "c323b4a6-d300-5b03-850e-2c60c9b25684",
+    "symbol_scip": "c090b397-b7a6-5db6-8b7b-b0ef7709b422",
+    "symbol_fallback": "e65c03c5-ea4d-5641-97bc-3ceede8559a2",
+    "symbol_fallback_overload_1": "13cab162-5d4f-52d0-8fda-e24b843356a1",
+    "symbol_revision_1": "99e01571-b4a6-5a05-b88e-2e438bc373f6",
+    "symbol_revision_2": "fc43b5cb-0f05-56fd-ad22-916f244c6362",
+    "nfc_logical": "4b7302e5-3f12-56f4-80c9-ff7567f528f2",
+    "provisional_new": "33e6e54d-3f9a-5c93-92b8-283515d0ea65",
+    "provisional_new_revision_a": "96334cf2-c1be-5cfd-ab5d-3efad7c900e6",
+    "provisional_new_other_checkout": "46c15e76-fec9-5a79-b3bf-d13a9edc7fcd",
+    "app_revision_a_parser_2": "59260f03-fc74-5551-8fdd-9e9d7d83f2a7",
+    "app_revision_a_typescript": "be557c38-41c7-50d8-9c3a-60f548f4fb0e",
+    "symbol_revision_1_body_2": "d02cfcaf-42fa-5b93-8204-c3e078b3c46d",
+    "nfd_logical": "6bfd5f7a-bee0-5680-b335-1bed80458c92"
+  },
+  "resolutions": [
+    {
+      "name": "exact_rename",
+      "commit": "2222222222222222222222222222222222222222",
+      "removed": [
+        {
+          "path": "src/app.py",
+          "logical_id": "8559d8f1-9a9c-5b0e-90c8-b3297cc3ea57",
+          "blob_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "added": [
+        {
+          "path": "src/main.py",
+          "blob_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "similar": [],
+      "expected": {
+        "logical_ids": {
+          "src/main.py": "8559d8f1-9a9c-5b0e-90c8-b3297cc3ea57"
+        },
+        "supersessions": []
+      }
+    },
+    {
+      "name": "rename_with_edit_no_evidence",
+      "commit": "2222222222222222222222222222222222222222",
+      "removed": [
+        {
+          "path": "src/app.py",
+          "logical_id": "8559d8f1-9a9c-5b0e-90c8-b3297cc3ea57",
+          "blob_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "added": [
+        {
+          "path": "src/main.py",
+          "blob_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      ],
+      "similar": [],
+      "expected": {
+        "logical_ids": {
+          "src/main.py": "845f3a37-09fe-507f-9455-c4471c299fba"
+        },
+        "supersessions": []
+      }
+    },
+    {
+      "name": "rename_with_edit_similarity",
+      "commit": "2222222222222222222222222222222222222222",
+      "removed": [
+        {
+          "path": "src/app.py",
+          "logical_id": "8559d8f1-9a9c-5b0e-90c8-b3297cc3ea57",
+          "blob_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "added": [
+        {
+          "path": "src/main.py",
+          "blob_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      ],
+      "similar": [
+        {
+          "old_path": "src/app.py",
+          "new_path": "src/main.py",
+          "score": 0.8
+        }
+      ],
+      "expected": {
+        "logical_ids": {
+          "src/main.py": "845f3a37-09fe-507f-9455-c4471c299fba"
+        },
+        "supersessions": [
+          {
+            "old": "8559d8f1-9a9c-5b0e-90c8-b3297cc3ea57",
+            "new": "845f3a37-09fe-507f-9455-c4471c299fba",
+            "confidence": 0.8,
+            "evidence_kind": "git",
+            "basis": "similarity"
+          }
+        ]
+      }
+    },
+    {
+      "name": "similarity_clamped_below_one",
+      "commit": "2222222222222222222222222222222222222222",
+      "removed": [
+        {
+          "path": "src/app.py",
+          "logical_id": "8559d8f1-9a9c-5b0e-90c8-b3297cc3ea57",
+          "blob_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "added": [
+        {
+          "path": "src/main.py",
+          "blob_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      ],
+      "similar": [
+        {
+          "old_path": "src/app.py",
+          "new_path": "src/main.py",
+          "score": 1.0
+        }
+      ],
+      "expected": {
+        "logical_ids": {
+          "src/main.py": "845f3a37-09fe-507f-9455-c4471c299fba"
+        },
+        "supersessions": [
+          {
+            "old": "8559d8f1-9a9c-5b0e-90c8-b3297cc3ea57",
+            "new": "845f3a37-09fe-507f-9455-c4471c299fba",
+            "confidence": 0.9,
+            "evidence_kind": "git",
+            "basis": "similarity"
+          }
+        ]
+      }
+    },
+    {
+      "name": "delete_recreate_same_path",
+      "commit": "3333333333333333333333333333333333333333",
+      "removed": [
+        {
+          "path": "src/app.py",
+          "logical_id": "8559d8f1-9a9c-5b0e-90c8-b3297cc3ea57",
+          "blob_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "added": [
+        {
+          "path": "src/app.py",
+          "blob_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "similar": [],
+      "expected": {
+        "logical_ids": {
+          "src/app.py": "1d7875ce-aac5-5437-ae24-e118432c7581"
+        },
+        "supersessions": [
+          {
+            "old": "8559d8f1-9a9c-5b0e-90c8-b3297cc3ea57",
+            "new": "1d7875ce-aac5-5437-ae24-e118432c7581",
+            "confidence": 0.25,
+            "evidence_kind": "git",
+            "basis": "path_reuse"
+          }
+        ]
+      }
+    },
+    {
+      "name": "copy_one_source_many_targets",
+      "commit": "2222222222222222222222222222222222222222",
+      "removed": [
+        {
+          "path": "src/app.py",
+          "logical_id": "8559d8f1-9a9c-5b0e-90c8-b3297cc3ea57",
+          "blob_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "added": [
+        {
+          "path": "src/a.py",
+          "blob_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+          "path": "src/b.py",
+          "blob_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "similar": [],
+      "expected": {
+        "logical_ids": {
+          "src/a.py": "9a6277eb-27e4-54ab-b3a1-1eefa09e52df",
+          "src/b.py": "c323b4a6-d300-5b03-850e-2c60c9b25684"
+        },
+        "supersessions": [
+          {
+            "old": "8559d8f1-9a9c-5b0e-90c8-b3297cc3ea57",
+            "new": "9a6277eb-27e4-54ab-b3a1-1eefa09e52df",
+            "confidence": 0.5,
+            "evidence_kind": "git",
+            "basis": "ambiguous_blob_match"
+          },
+          {
+            "old": "8559d8f1-9a9c-5b0e-90c8-b3297cc3ea57",
+            "new": "c323b4a6-d300-5b03-850e-2c60c9b25684",
+            "confidence": 0.5,
+            "evidence_kind": "git",
+            "basis": "ambiguous_blob_match"
+          }
+        ]
+      }
+    },
+    {
+      "name": "merge_many_sources_one_target",
+      "commit": "2222222222222222222222222222222222222222",
+      "removed": [
+        {
+          "path": "src/a.py",
+          "logical_id": "474dd2a8-48f8-5b6c-a8ff-cd642aaddd69",
+          "blob_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+          "path": "src/b.py",
+          "logical_id": "577c440c-ee96-5298-a76b-446130f422bb",
+          "blob_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "added": [
+        {
+          "path": "src/c.py",
+          "blob_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "similar": [],
+      "expected": {
+        "logical_ids": {
+          "src/c.py": "40b49c21-359c-522e-9b5d-d55c5fcdfc32"
+        },
+        "supersessions": [
+          {
+            "old": "474dd2a8-48f8-5b6c-a8ff-cd642aaddd69",
+            "new": "40b49c21-359c-522e-9b5d-d55c5fcdfc32",
+            "confidence": 0.5,
+            "evidence_kind": "git",
+            "basis": "ambiguous_blob_match"
+          },
+          {
+            "old": "577c440c-ee96-5298-a76b-446130f422bb",
+            "new": "40b49c21-359c-522e-9b5d-d55c5fcdfc32",
+            "confidence": 0.5,
+            "evidence_kind": "git",
+            "basis": "ambiguous_blob_match"
+          }
+        ]
+      }
+    },
+    {
+      "name": "two_exact_renames",
+      "commit": "2222222222222222222222222222222222222222",
+      "removed": [
+        {
+          "path": "src/a.py",
+          "logical_id": "474dd2a8-48f8-5b6c-a8ff-cd642aaddd69",
+          "blob_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+          "path": "src/b.py",
+          "logical_id": "577c440c-ee96-5298-a76b-446130f422bb",
+          "blob_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      ],
+      "added": [
+        {
+          "path": "src/x.py",
+          "blob_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        {
+          "path": "src/y.py",
+          "blob_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      ],
+      "similar": [],
+      "expected": {
+        "logical_ids": {
+          "src/x.py": "474dd2a8-48f8-5b6c-a8ff-cd642aaddd69",
+          "src/y.py": "577c440c-ee96-5298-a76b-446130f422bb"
+        },
+        "supersessions": []
+      }
+    },
+    {
+      "name": "unrelated_added_file",
+      "commit": "2222222222222222222222222222222222222222",
+      "removed": [],
+      "added": [
+        {
+          "path": "docs/new.md",
+          "blob_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      ],
+      "similar": [],
+      "expected": {
+        "logical_ids": {
+          "docs/new.md": "f0883b9d-f1ed-5913-9e28-d06ebc6ba41f"
+        },
+        "supersessions": []
+      }
+    }
+  ],
+  "_notes": "Indexers (PLATFORM-037/038) must compute the introducing commit from first-parent history (git log --first-parent --diff-filter=A equivalent) and pass it as introducing_commit_oid; never a first-observed commit. Rename-preserved lineages keep the original origin.",
+  "checkout_id": "0195f0a2-7c1e-7d3a-9b4e-5a1c2d3e4f60",
+  "introducing_commit": {
+    "history": [
+      {
+        "commit": "1111111111111111111111111111111111111111",
+        "added": [
+          "src/app.py"
+        ]
+      },
+      {
+        "commit": "2222222222222222222222222222222222222222",
+        "added": [
+          "src/x.py"
+        ]
+      },
+      {
+        "commit": "3333333333333333333333333333333333333333",
+        "added": []
+      }
+    ],
+    "path": "src/app.py",
+    "indexer_starts": [
+      "1111111111111111111111111111111111111111",
+      "2222222222222222222222222222222222222222",
+      "3333333333333333333333333333333333333333"
+    ],
+    "expected_introducing_commit": "1111111111111111111111111111111111111111",
+    "expected_logical_id": "8559d8f1-9a9c-5b0e-90c8-b3297cc3ea57"
+  },
+  "provisional_cases": [
+    {
+      "name": "untracked_then_committed_same_blob",
+      "introducing_commit": "2222222222222222222222222222222222222222",
+      "provisional": [
+        {
+          "path": "src/new.py",
+          "logical_id": "33e6e54d-3f9a-5c93-92b8-283515d0ea65",
+          "blob_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "committed": [
+        {
+          "path": "src/new.py",
+          "blob_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "expected": {
+        "logical_ids": {
+          "src/new.py": "ed70a5fb-023f-510d-9d60-60ba8ca9d04c"
+        },
+        "supersessions": [
+          {
+            "old": "33e6e54d-3f9a-5c93-92b8-283515d0ea65",
+            "new": "ed70a5fb-023f-510d-9d60-60ba8ca9d04c",
+            "confidence": 1.0,
+            "evidence_kind": "git",
+            "basis": "provisional_committed"
+          }
+        ]
+      }
+    },
+    {
+      "name": "untracked_edited_then_committed",
+      "introducing_commit": "2222222222222222222222222222222222222222",
+      "provisional": [
+        {
+          "path": "src/new.py",
+          "logical_id": "33e6e54d-3f9a-5c93-92b8-283515d0ea65",
+          "blob_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "committed": [
+        {
+          "path": "src/new.py",
+          "blob_oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+        }
+      ],
+      "expected": {
+        "logical_ids": {
+          "src/new.py": "ed70a5fb-023f-510d-9d60-60ba8ca9d04c"
+        },
+        "supersessions": [
+          {
+            "old": "33e6e54d-3f9a-5c93-92b8-283515d0ea65",
+            "new": "ed70a5fb-023f-510d-9d60-60ba8ca9d04c",
+            "confidence": 0.5,
+            "evidence_kind": "git",
+            "basis": "provisional_path_match"
+          }
+        ]
+      }
+    },
+    {
+      "name": "committed_without_provisional",
+      "introducing_commit": "2222222222222222222222222222222222222222",
+      "provisional": [],
+      "committed": [
+        {
+          "path": "src/new.py",
+          "blob_oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        }
+      ],
+      "expected": {
+        "logical_ids": {
+          "src/new.py": "ed70a5fb-023f-510d-9d60-60ba8ca9d04c"
+        },
+        "supersessions": []
+      }
+    }
+  ]
+}
