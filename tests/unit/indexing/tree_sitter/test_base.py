@@ -9,6 +9,7 @@ import json
 import os
 import resource
 import signal
+import subprocess
 import sys
 import time
 import uuid
@@ -721,6 +722,34 @@ def test_killing_the_supervisor_does_not_leave_orphans_or_zombies(marker: str) -
     assert _zombie_children() == []
     assert isinstance(outcome("ok"), ParsedModule)
     assert not runner._LIVE_SUPERVISORS
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="subreaper is Linux-only")
+def test_many_supervisor_kills_leave_no_orphans_or_zombies(marker: str) -> None:
+    for _ in range(30):
+        outcome("kill_supervisor", marker, limits=roomy())
+    assert isinstance(outcome("ok"), ParsedModule)
+    assert _marked(marker) == []
+    assert _zombie_children() == []
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="subreaper is Linux-only")
+def test_a_run_sweeps_orphans_left_by_a_finished_run(marker: str) -> None:
+    """An orphan with a dead token is swept by the next run's start sweep."""
+    runner._ensure_subreaper()
+    orphan = subprocess.Popen(
+        [sys.executable, "-c", "import time; time.sleep(60)", marker],
+        env={runner._RUN_KEY: "dead-token"},
+        start_new_session=True,
+    )
+    for _ in range(200):  # environ is empty until the interpreter has finished starting
+        if runner._has_run_key(orphan.pid):
+            break
+        time.sleep(0.01)
+    assert runner._has_run_key(orphan.pid)
+    assert isinstance(outcome("ok"), ParsedModule)
+    assert orphan.poll() is not None or orphan.wait(5) is not None
+    assert _marked(marker) == []
 
 
 def test_subreaper_failure_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:

@@ -54,10 +54,11 @@ Known limits (be honest about them):
 - The adapter runs as the same UID as the supervisor, so a compromised parser can SIGKILL
   the supervisor. The runner is therefore ALSO a child subreaper (``prctl`` once,
   process-wide), so the orphans of a dead supervisor re-parent to it, and after every
-  run ``_sweep_orphans`` kills and reaps them. It only touches this run's processes:
-  live ones must carry the run's ``AGENT_CONTEXT_SANDBOX_RUN`` token in their
-  environment, zombies must be session leaders (or in the run's session) that started
-  after the run's supervisor, and the supervisors of concurrent runs are excluded.
+  run (and at the start of the next) ``_sweep_orphans`` kills and reaps them. It touches
+  only children of the runner that are not live supervisors: live ones must carry the
+  ``AGENT_CONTEXT_SANDBOX_RUN`` key in their environment with ANY token (a finished run's
+  token is dead), zombies must be session leaders or in a session no live supervisor owns.
+  Concurrent runs' supervisors, and so their descendants, are excluded.
   Side effects and residuals: orphans of any other code in the worker process also
   re-parent to it (subreaper is process-wide), and a zombie sweep can in theory reap a
   foreign ``start_new_session`` child that exited during the run, so the worker should not
@@ -296,8 +297,8 @@ def _run(command: Sequence[str], payload: bytes, limits: Limits, env: dict[str, 
     if not sys.platform.startswith("linux"):
         raise StructuralError(StructuralErrorCode.SPAWN_FAILED)  # subreaper is Linux-only
     _ensure_subreaper()
-    token = uuid.uuid4().hex
-    env = {**env, _RUN_KEY: token}
+    _sweep_orphans()
+    env = {**env, _RUN_KEY: uuid.uuid4().hex}
     workdir = _make_workdir()
     try:
         argv = [
@@ -323,7 +324,6 @@ def _run(command: Sequence[str], payload: bytes, limits: Limits, env: dict[str, 
             )
         except OSError:
             raise StructuralError(StructuralErrorCode.SPAWN_FAILED) from None
-        started = _stat(process.pid)
         with _LIVE_LOCK:
             _LIVE_SUPERVISORS.add(process.pid)
         try:
@@ -332,7 +332,7 @@ def _run(command: Sequence[str], payload: bytes, limits: Limits, env: dict[str, 
             if not _exited(process, deadline):
                 raise StructuralError(StructuralErrorCode.TIMEOUT)
         finally:
-            _reap(process, token, started.starttime if started else 0)
+            _reap(process)
         if process.returncode != 0:
             raise StructuralError(StructuralErrorCode.NONZERO_EXIT)
         return output
@@ -354,7 +354,7 @@ def _exited(process: subprocess.Popen[bytes], deadline: float) -> bool:
         time.sleep(0.005)
 
 
-def _reap(process: subprocess.Popen[bytes], token: str, started: int) -> None:
+def _reap(process: subprocess.Popen[bytes]) -> None:
     """Stop every process of the run on every exit path, then reap the supervisor.
 
     SIGTERM goes to the supervisor alone (not the group) so it can sweep descendants that
@@ -372,7 +372,7 @@ def _reap(process: subprocess.Popen[bytes], token: str, started: int) -> None:
             with contextlib.suppress(OSError):
                 stream.close()
     try:
-        _sweep_orphans(process.pid, token, started)
+        _sweep_orphans(process.pid)
     finally:
         process.wait()
         with _LIVE_LOCK:
@@ -420,41 +420,45 @@ def _stat(pid: int) -> _Stat | None:
         return None
 
 
-def _has_token(pid: int, token: str) -> bool:
+def _has_run_key(pid: int) -> bool:
+    """True when the process environment carries ``_RUN_KEY`` with ANY token."""
     try:
         with open(f"/proc/{pid}/environ", "rb") as handle:
-            return f"{_RUN_KEY}={token}".encode() in handle.read().split(b"\0")
+            prefix = f"{_RUN_KEY}=".encode()
+            return any(item.startswith(prefix) for item in handle.read().split(b"\0"))
     except OSError:
         return False
 
 
-def _sweep_orphans(supervisor: int, token: str, started: int) -> None:
-    """Kill and reap what a dead supervisor left behind (it was SIGKILLed by the adapter).
+def _sweep_orphans(supervisor: int | None = None) -> None:
+    """Kill and reap every orphan of a finished run (supervisors SIGKILLed by the adapter).
 
-    The runner is a subreaper, so those orphans are its children. Only processes of THIS run
-    are touched, never the supervisors of concurrent runs (``_LIVE_SUPERVISORS``) nor other
-    children of the worker: a live orphan must carry this run's ``_RUN_KEY`` token in its
-    environment; a zombie orphan (nothing to read) must be a session leader or in the run's
-    session, and started after the run's supervisor. Repeats until none is left, because
-    killing an orphan re-parents its own children here.
+    The runner is a subreaper, so those orphans are its children. What is touched: children
+    of the runner that are not a live supervisor (``_LIVE_SUPERVISORS``, so concurrent runs
+    stay untouched) and either carry ``_RUN_KEY`` in their environment with ANY token (the
+    token of a finished run is dead, and a live run's processes are its supervisor's
+    descendants, not our children until their supervisor dies), or are zombies (nothing to
+    read) that led a session or sat in a session not owned by a live supervisor. Other
+    children of the worker are never touched. Runs at the start and end of every run and
+    repeats until nothing is left, because killing an orphan re-parents its own children.
     """
     me = os.getpid()
     deadline = time.monotonic() + _ORPHAN_SWEEP_SECONDS
     while time.monotonic() < deadline:
+        with _LIVE_LOCK:
+            live = set(_LIVE_SUPERVISORS) - {supervisor}
         victims: list[int] = []
         for name in os.listdir("/proc"):
             if not name.isdigit():
                 continue
             pid = int(name)
-            with _LIVE_LOCK:
-                foreign = pid in _LIVE_SUPERVISORS
-            info = None if foreign or pid == supervisor else _stat(pid)
+            info = None if pid in live or pid == supervisor else _stat(pid)
             if info is None or info.ppid != me:
                 continue
             if info.state == "Z":
-                if info.starttime >= started and info.sid in (supervisor, pid):
+                if info.sid == pid or (info.sid not in live and info.sid != os.getsid(0)):
                     victims.append(pid)
-            elif _has_token(pid, token):
+            elif _has_run_key(pid):
                 victims.append(pid)
         if not victims:
             return

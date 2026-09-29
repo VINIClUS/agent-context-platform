@@ -142,7 +142,7 @@ def test_daemonizing_adapters_do_not_exhaust_nproc(image: str) -> None:
 
 
 def test_killing_the_supervisor_does_not_wedge_nproc(image: str) -> None:
-    """20 runs whose adapter SIGKILLs its supervisor and leaves setsid daemons, then a benign run.
+    """60 runs whose adapter SIGKILLs its supervisor and leaves setsid daemons, then a benign run.
 
     Without the runner acting as a subreaper the orphans escape to PID 1 and fill
     RLIMIT_NPROC=16 for UID 10001, so the benign run fails with ``nonzero_exit``.
@@ -159,7 +159,7 @@ def test_killing_the_supervisor_does_not_wedge_nproc(image: str) -> None:
         "'        os._exit(0)\\n'\n"
         "'    os.closerange(0, 3); time.sleep(600)\\n'\n"
         "'time.sleep(0.2)')\n"
-        "for _ in range(20):\n"
+        "for _ in range(60):\n"
         "    try:\n"
         "        _run(['/usr/local/bin/python', '-c', attack, 'ac-kill-marker'], b'', Limits(), {})\n"
         "    except StructuralError:\n"
@@ -172,7 +172,9 @@ def test_killing_the_supervisor_does_not_wedge_nproc(image: str) -> None:
         "            left += b'ac-kill-marker' in open(f'/proc/{name}/cmdline', 'rb').read()\n"
         "        except OSError:\n"
         "            pass\n"
-        "print('benign-ok', left)\n"
+        "zombies = sum(1 for n in os.listdir('/proc') if n.isdigit() and n != str(os.getpid())"
+        " and open(f'/proc/{n}/stat').read().rsplit(')', 1)[1].split()[0] == 'Z')\n"
+        "print('benign-ok', left, zombies)\n"
     )
     result = _run(image, code)
-    assert result.stdout.split() == ["benign-ok", "0"], result.stderr[-500:]
+    assert result.stdout.split() == ["benign-ok", "0", "0"], result.stderr[-500:]
