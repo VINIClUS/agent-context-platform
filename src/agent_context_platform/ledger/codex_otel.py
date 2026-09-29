@@ -10,10 +10,14 @@ attribute is read for mapping, failures raise `CodexOtelError` carrying only a f
 code (never an attribute value), and content-bearing or personal attributes (`prompt`,
 `arguments`, `output`, `user.email`, `user.account_id`, ...) are never read.
 
-Only the OTLP *log* signal is accepted. Codex emits each event twice (log and trace-safe
+Exactly one OTLP signal is accepted, chosen by `CodexOtelMapperConfig.accepted_signal`
+(default `TRACE`, the trace-safe variant). Codex emits each event twice (log and trace-safe
 variants) with independently computed `event.timestamp` values, so consuming both would
-defeat idempotency. Source: `codex-rs/otel/src/events/shared.rs` (`log_event!`,
-`trace_event!`) at `rust-v0.147.0` and `rust-v0.157.1`.
+defeat idempotency. Under the CODEX-050 deployment Codex logs are disabled (they carry tool
+`arguments`, `output` and `user.email`/`user.account_id`); only trace-safe records reach the
+mapper. `error.message` and other free-text attributes are never read. Source:
+`codex-rs/otel/src/events/shared.rs` (`log_event!`, `trace_event!`) and
+`codex-rs/otel/src/targets.rs` at `rust-v0.147.0` and `rust-v0.157.1`.
 """
 
 from __future__ import annotations
@@ -118,7 +122,7 @@ class CodexOtelError(Exception):
 
 
 class OtelSignal(StrEnum):
-    """OTLP signal a record arrived on; only `LOG` is mapped."""
+    """OTLP signal a record arrived on; the config selects the single one that is mapped."""
 
     LOG = "log"
     TRACE = "trace"
@@ -137,13 +141,20 @@ class CodexOtelRecord:
 
 @dataclass(frozen=True, slots=True)
 class CodexOtelMapperConfig:
-    """Injected mapper settings. `hmac_key` keys the idempotency digest (>= 32 bytes)."""
+    """Injected mapper settings. `hmac_key` keys the idempotency digest (>= 32 bytes).
+
+    `accepted_signal` is the one signal a deployment consumes; the other is rejected with
+    `UNSUPPORTED_SIGNAL`. Default `TRACE` matches CODEX-050 (logs disabled for privacy).
+    """
 
     hmac_key: bytes = field(repr=False)
     producer: ProducerV1
     stream_id: str
+    accepted_signal: OtelSignal = OtelSignal.TRACE
 
     def __post_init__(self) -> None:
+        if not isinstance(self.accepted_signal, OtelSignal):
+            raise ValueError("accepted_signal must be an OtelSignal")
         if len(self.hmac_key) < MIN_KEY_BYTES:
             raise ValueError("hmac_key must be at least 32 bytes")
 
@@ -301,7 +312,7 @@ def map_record(
     Raises `CodexOtelError` for platform-origin, unknown-service, oversized or malformed
     input. `None` means "intentionally unmapped" (documented gap or unknown Codex event).
     """
-    if record.signal is not OtelSignal.LOG:
+    if record.signal is not config.accepted_signal:
         raise CodexOtelError(RejectionReason.UNSUPPORTED_SIGNAL)
     _check_service(record.resource)
     if len(record.attributes) > MAX_ATTRIBUTES:

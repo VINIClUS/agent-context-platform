@@ -29,7 +29,10 @@ from agent_context_platform.projection.projectors import event_lock_keys
 from agent_context_platform.projection.projectors.agent import AgentProjector, session_node_id
 
 FIXTURE = (
-    Path(__file__).resolve().parents[3] / "fixtures" / "codex_otel" / "conversation_starts.log.json"
+    Path(__file__).resolve().parents[3]
+    / "fixtures"
+    / "codex_otel"
+    / "conversation_starts.trace.json"
 )
 SESSION_ID = "0198a4b1-98c0-7c28-ae3f-000000000001"
 
@@ -51,7 +54,7 @@ def _otel_event() -> StoredEventV1:
     )
     draft = map_record(
         config,
-        CodexOtelRecord(OtelSignal.LOG, raw["resource"], raw["attributes"]),
+        CodexOtelRecord(OtelSignal.TRACE, raw["resource"], raw["attributes"]),
         observed_at=datetime(2026, 8, 13, 13, 0, 1, tzinfo=UTC),
     )
     assert draft is not None
