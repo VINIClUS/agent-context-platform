@@ -73,7 +73,13 @@ errors, never the offending value):
     cut by either range end is refused). The adapter therefore points the range at the name
     node itself (``os.path`` inside ``import os.path``; ``pkg`` inside ``from ..pkg import x``
     with ``relative_level=2``), never at the whole statement: a statement's own keywords would
-    be part of the name. The range lies inside the file and, when ``source`` is set, inside
+    be part of the name. A target that spans two places (``pkg.x`` of ``from ..pkg import x``)
+    uses the optional ``qualifier`` with its own range, checked exactly like the name range;
+    the effective target is ``qualifier + "." + target_name`` and ``relative_level`` applies to
+    the qualifier. The rule is by tokens only, with no lexical context: the qualifier range may
+    sit on a string literal's contents (TS ``from "./pkg"``: the range on ``./pkg`` has the one
+    identifier token ``pkg``, the ``./`` is the adapter's ``relative_level=1``) because a range
+    can only ever yield the tokens it covers. Both names are charged to the name budget; The range lies inside the file and, when ``source`` is set, inside
     that symbol's range. ``source`` is
     remapped to a symbol index (None is module level), ``kind`` and ``confidence`` are closed
     enums (``syntactic`` for import/inherit, ``heuristic`` for call: the target is a name, not a
@@ -93,10 +99,11 @@ errors, never the offending value):
   symbols, relations, references and ordering to emit, and only ever about this file's own
   content. Measured bounds, with T identifier tokens in the file: a symbol name carries at most
   ``log2(T)`` bits for its final segment plus ``log2(T)`` for the one range-bound segment; a
-  reference carries only its range, since the name is a function of it: at most ``2*log2(T)``
-  bits (which token span), plus 5 bits of level. A 256-token file with 511 module-level
-  references therefore carries about 511 * 16 bits = 1 KB (it was 50 KB while names were free
-  token orderings), and a whole-file range yields exactly one name. That leaks nothing beyond
+  reference carries only its ranges, since the names are functions of them: at most
+  ``2*log2(T)`` bits (which token span), ``4*log2(T)`` with a qualifier, plus 5 bits of level.
+  A 256-token file with 511 module-level references therefore carries at most about
+  511 * 32 bits = 2 KB with qualifiers (1 KB without; it was 50 KB while names were free token
+  orderings), and a whole-file range yields exactly one name. That leaks nothing beyond
   the file it was asked to parse.
 
 Adapter output carries no source text beyond qualified names, ``kind``s,
@@ -364,6 +371,19 @@ class ParsedReference(BaseModel):
     relative_level: Annotated[int, Field(ge=0, le=MAX_RELATIVE_LEVEL)] = 0
     start_byte: Annotated[int, Field(ge=0)]
     end_byte: Annotated[int, Field(ge=0)]
+    # Optional second name with its own range: the effective target is
+    # ``qualifier + "." + target_name`` and ``relative_level`` applies to the qualifier
+    # (``from ..pkg import x``: qualifier ``pkg`` at its range, name ``x`` at its own).
+    qualifier: (
+        Annotated[
+            Text,
+            StringConstraints(min_length=1),
+            AfterValidator(lambda v: _bounded(v, MAX_NAME_BYTES)),
+        ]
+        | None
+    ) = None
+    qualifier_start_byte: Annotated[int, Field(ge=0)] | None = None
+    qualifier_end_byte: Annotated[int, Field(ge=0)] | None = None
     evidence_kind: Literal["tree_sitter"]
     confidence: ReferenceConfidence
 
@@ -373,6 +393,11 @@ class ParsedReference(BaseModel):
             raise ValueError("empty or inverted byte range")
         if (self.confidence == "heuristic") != (self.kind == "call"):
             raise ValueError("confidence does not match the reference kind")
+        parts = (self.qualifier, self.qualifier_start_byte, self.qualifier_end_byte)
+        if any(part is None for part in parts) != all(part is None for part in parts):
+            raise ValueError("a qualifier needs its name and both range ends")
+        if self.qualifier is not None and self.qualifier_start_byte >= self.qualifier_end_byte:  # type: ignore[operator]
+            raise ValueError("empty or inverted byte range")
         return self
 
 
@@ -474,6 +499,9 @@ FIELD_CONFINEMENT: Final[Mapping[str, Mapping[str, Confinement]]] = {
         "relative_level": "numeric",
         "start_byte": "range",
         "end_byte": "range",
+        "qualifier": "token",  # equals the identifier tokens of its own range
+        "qualifier_start_byte": "range",
+        "qualifier_end_byte": "range",
         "evidence_kind": "enum",
         "confidence": "enum",
     },
@@ -730,7 +758,7 @@ def _validate_references(
     parsed: ParsedFile, size: int, refs: dict[str, tuple[int, int]], text: _SourceText
 ) -> None:
     per_source: dict[str | None, int] = {}
-    seen: set[tuple[str, str, int, int, int]] = set()
+    seen: set[tuple[str, str, int, int, int, str | None, int | None, int | None]] = set()
     for reference in parsed.references:
         limit = MAX_MODULE_REFERENCES if reference.source is None else MAX_REFERENCES_PER_SYMBOL
         per_source[reference.source] = per_source.get(reference.source, 0) + 1
@@ -743,15 +771,29 @@ def _validate_references(
             low, high = refs[reference.source]
         if reference.end_byte > high or reference.start_byte < low:
             raise StructuralError(StructuralErrorCode.RANGE_OUT_OF_BOUNDS)
+        if reference.qualifier is not None and (
+            reference.qualifier_end_byte > high  # type: ignore[operator]
+            or reference.qualifier_start_byte < low  # type: ignore[operator]
+        ):
+            raise StructuralError(StructuralErrorCode.RANGE_OUT_OF_BOUNDS)
         key = (
             reference.kind,
             reference.target_name,
             reference.relative_level,
             reference.start_byte,
             reference.end_byte,
+            reference.qualifier,
+            reference.qualifier_start_byte,
+            reference.qualifier_end_byte,
         )
         if key in seen:
             raise StructuralError(StructuralErrorCode.DUPLICATE_REFERENCE)
         seen.add(key)
         if not text.path_ok(reference.target_name, reference.start_byte, reference.end_byte):
+            raise StructuralError(StructuralErrorCode.TEXT_NOT_IN_SOURCE)
+        if reference.qualifier is not None and not text.path_ok(
+            reference.qualifier,
+            reference.qualifier_start_byte,  # type: ignore[arg-type]
+            reference.qualifier_end_byte,  # type: ignore[arg-type]
+        ):
             raise StructuralError(StructuralErrorCode.TEXT_NOT_IN_SOURCE)

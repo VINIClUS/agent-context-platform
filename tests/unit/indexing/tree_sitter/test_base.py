@@ -1393,3 +1393,111 @@ def test_a_response_above_the_declared_version_is_refused() -> None:
     result = outcome("references_ok", protocol_version=1)
     assert result is StructuralErrorCode.SCHEMA_VIOLATION
     assert outcome("references_v1", protocol_version=1) is StructuralErrorCode.SCHEMA_VIOLATION
+
+
+# --- qualified references ---------------------------------------------------------------
+
+FROM = b"from ..pkg import x\nfrom a.b import c\n"
+
+
+def qref(start: int, end: int, name: str, qs: int, qe: int, qualifier: str, **over: Any) -> Any:
+    return imp(
+        start,
+        end,
+        name,
+        qualifier=qualifier,
+        qualifier_start_byte=qs,
+        qualifier_end_byte=qe,
+        **over,
+    )
+
+
+def test_a_qualified_relative_import_carries_pkg_x_at_level_two() -> None:
+    at = FROM.index(b"pkg")
+    x = FROM.index(b" x") + 1
+    got = validated(
+        module([], references=[qref(x, x + 1, "x", at, at + 3, "pkg", relative_level=2)]),
+        request(FROM),
+    ).references[0]
+    assert (got.qualifier, got.target_name, got.relative_level) == ("pkg", "x", 2)
+
+
+def test_a_qualified_import_from_a_dotted_module() -> None:
+    ab = FROM.index(b"a.b")
+    c = FROM.index(b" c") + 1
+    got = validated(
+        module([], references=[qref(c, c + 1, "c", ab, ab + 3, "a.b")]), request(FROM)
+    ).references[0]
+    assert (got.qualifier, got.target_name) == ("a.b", "c")
+
+
+def test_a_qualifier_range_may_sit_on_a_string_literal() -> None:
+    ts = b'import { x } from "./pkg";'
+    at = ts.index(b"./pkg")
+    x = ts.index(b"x")
+    got = validated(
+        module([], references=[qref(x, x + 1, "x", at, at + 5, "pkg", relative_level=1)]),
+        request(ts),
+    ).references[0]
+    assert got.qualifier == "pkg"
+
+
+@pytest.mark.parametrize(
+    "qualifier",
+    [
+        ("pkg", 0, 4),  # the range holds ``from``
+        ("b.a", FROM.index(b"a.b"), FROM.index(b"a.b") + 3),  # out of order
+        ("a.b.c", FROM.index(b"a.b"), FROM.index(b"a.b") + 3),  # more than the range says
+        ("a", FROM.index(b"a.b"), FROM.index(b"a.b") + 3),  # fewer
+        ("a/b", FROM.index(b"a.b"), FROM.index(b"a.b") + 3),
+        ("a#b", FROM.index(b"a.b"), FROM.index(b"a.b") + 3),
+        ("a::b", FROM.index(b"a.b"), FROM.index(b"a.b") + 3),
+        ("ab", FROM.index(b"a.b"), FROM.index(b"a.b") + 3),
+        ("pkg", FROM.index(b"pkg") + 1, FROM.index(b"pkg") + 3),  # cuts the token
+    ],
+)
+def test_a_qualifier_that_is_not_its_range_is_refused(qualifier: tuple[str, int, int]) -> None:
+    name, start, end = qualifier
+    x = FROM.index(b" x") + 1
+    refused(
+        StructuralErrorCode.TEXT_NOT_IN_SOURCE,
+        module([], references=[qref(x, x + 1, "x", start, end, name)]),
+        request(FROM),
+    )
+
+
+def test_a_qualifier_outside_the_source_symbol_or_the_file_is_refused() -> None:
+    # symbol 1 is bytes 0..8 of SOURCE (``def a():``); ``return`` lies outside it.
+    outside = qref(4, 5, "a", 13, 19, "return", source="1")
+    refused(StructuralErrorCode.RANGE_OUT_OF_BOUNDS, module(references=[outside]))
+    beyond = qref(4, 5, "a", 4, len(SOURCE) + 1, "a")
+    refused(StructuralErrorCode.RANGE_OUT_OF_BOUNDS, module(references=[beyond]))
+    assert validated(module(references=[qref(4, 5, "a", 4, 5, "a", source="1")]))
+
+
+def test_qualified_reference_shape_and_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    for over in (
+        {"qualifier": None, "qualifier_start_byte": 4, "qualifier_end_byte": 5},
+        {"qualifier": "a", "qualifier_start_byte": None, "qualifier_end_byte": None},
+        {"qualifier": "a", "qualifier_start_byte": 5, "qualifier_end_byte": 5},
+        {"qualifier": "a", "qualifier_start_byte": -1, "qualifier_end_byte": 5},
+        {"qualifier": "a\nb", "qualifier_start_byte": 4, "qualifier_end_byte": 5},
+        {"qualifier": "", "qualifier_start_byte": 4, "qualifier_end_byte": 5},
+    ):
+        with pytest.raises(ValidationError):
+            ParsedReference.model_validate(ref(4, 5, "a", **over))
+    # ``pkg.mod.a`` (9) + name ``a`` (1) + qualifier ``a`` (1)
+    monkeypatch.setattr(base, "MAX_NAME_TOTAL_BYTES", 10)
+    refused(StructuralErrorCode.COUNT_EXCEEDED, module(references=[qref(4, 5, "a", 4, 5, "a")]))
+    monkeypatch.setattr(base, "MAX_NAME_TOTAL_BYTES", 11)
+    assert validated(module(references=[qref(4, 5, "a", 4, 5, "a")]))
+
+
+def test_duplicates_are_keyed_by_the_qualifier_too() -> None:
+    plain = imp(4, 5, "a")
+    refused(
+        StructuralErrorCode.DUPLICATE_REFERENCE,
+        module(references=[qref(4, 5, "a", 4, 5, "a"), qref(4, 5, "a", 4, 5, "a")]),
+    )
+    assert validated(module(references=[plain, qref(4, 5, "a", 4, 5, "a")]))
+    assert validated(module(references=[qref(4, 5, "a", 4, 5, "a"), qref(4, 5, "a", 4, 6, "a")]))
