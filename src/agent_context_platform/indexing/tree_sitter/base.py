@@ -514,6 +514,7 @@ def _validate_file(parsed: ParsedFile, content: bytes) -> _SourceText:
         raise StructuralError(StructuralErrorCode.COUNT_EXCEEDED)
     text = _SourceText(parsed.path, content)
     refs: set[str] = set()
+    declarations: set[tuple[str, str, int, int]] = set()
     for symbol in parsed.symbols:
         if symbol.language != parsed.language:
             raise StructuralError(StructuralErrorCode.LANGUAGE_MISMATCH)
@@ -523,9 +524,11 @@ def _validate_file(parsed: ParsedFile, content: bytes) -> _SourceText:
             symbol.qualified_name, symbol.kind, symbol.start_byte, symbol.end_byte
         ) or not text.signature_ok(symbol.signature, symbol.start_byte, symbol.end_byte):
             raise StructuralError(StructuralErrorCode.TEXT_NOT_IN_SOURCE)
-        if symbol.ref in refs:
+        declaration = (symbol.qualified_name, symbol.kind, symbol.start_byte, symbol.end_byte)
+        if symbol.ref in refs or declaration in declarations:
             raise StructuralError(StructuralErrorCode.DUPLICATE_SYMBOL)
         refs.add(symbol.ref)
+        declarations.add(declaration)
     per_source: dict[str, int] = {}
     for relation in parsed.relations:
         per_source[relation.source_ref] = per_source.get(relation.source_ref, 0) + 1

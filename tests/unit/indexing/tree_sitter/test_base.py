@@ -1015,3 +1015,7 @@ def test_disambiguator_groups_by_name_and_kind_so_a_variable_does_not_shift_a_fu
         )
 
     assert logical(with_var) == logical(without)
+
+
+def test_the_same_declaration_under_different_refs_is_rejected() -> None:
+    refused(StructuralErrorCode.DUPLICATE_SYMBOL, module([symbol(), symbol(ref="2")]))
