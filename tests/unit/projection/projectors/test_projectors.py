@@ -303,6 +303,20 @@ _REPRESENTATIVE_EVENTS = [
         context=_FULL_CONTEXT,
     ),
 ]
+_BASELESS_SNAPSHOT = _event(
+    "git.workspace_snapshot.captured",
+    {
+        "snapshot_id": "snap_2",
+        "base_commit": None,
+        "repository_id": "repo_1",
+        "checkout_id": "co_1",
+        "dirty_patch_sha256": "d" * 64,
+        "modified_content_sha256": [],
+        "untracked_paths": [],
+    },
+    context={"checkout_id": "co_1"},
+)
+_REPRESENTATIVE_EVENTS.append(_BASELESS_SNAPSHOT)
 _MERGED_NODE = re.compile(r"\(\w+:(\w+) \{\w+: \$(\w+)\}\)")
 
 
@@ -353,3 +367,13 @@ def test_every_projector_locks_the_same_full_set_first(event: StoredEventV1) -> 
         first = [p["node_id"] for q, p in tx.statements[: len(locked)]]
         assert all("_lock" in q for q, _ in tx.statements[: len(locked)]), projector.name
         assert first == [node_id for _, node_id in locked], projector.name
+
+
+def test_a_lone_turn_event_merges_the_three_portfolio_identities() -> None:
+    event = _event(
+        "agent.turn.started",
+        {"source": "codex_hook", **_IDS},
+        context={"workspace_id": "ws_1", "project_id": "prj_1", "repository_id": "repo_1"},
+    )
+    written = _written_nodes(event, PortfolioProjector())
+    assert written == {("Workspace", "ws_1"), ("Project", "prj_1"), ("Repository", "repo_1")}

@@ -46,6 +46,10 @@ _REPOSITORY_OBSERVED: Final = (
     + " "
     + newest_wins("remotes", "remote_identities")
 )
+# Identity-only merges: no properties, no relationships, no provenance growth.
+_WORKSPACE: Final = "MERGE (n:Workspace {workspace_id: $node_id})"
+_PROJECT: Final = "MERGE (n:Project {project_id: $node_id})"
+_REPOSITORY: Final = "MERGE (n:Repository {repository_id: $node_id})"
 _HAS_PROJECT: Final = relationship_statement(
     "Workspace", "workspace_id", "HAS_PROJECT", "Project", "project_id"
 )
@@ -63,19 +67,14 @@ def _repositories(event: StoredEventV1) -> list[str]:
 
 
 def lock_keys(event: StoredEventV1) -> list[tuple[str, str]]:
-    """Nodes `PortfolioProjector` writes for `event`, and no others."""
-    kind = event.event_type
-    if kind not in _HANDLED:
+    """Identity nodes `PortfolioProjector` merges for `event`, and no others."""
+    if event.event_type not in _HANDLED:
         return []
-    keys: set[tuple[str, str]] = set()
-    if kind == _REPOSITORY_OBSERVED_TYPE:
-        keys.add(("Repository", str(event.payload["repository_id"])))
-    project_id = event.context.project_id
-    if kind in _LINKING_TYPES and project_id is not None:
-        keys.add(("Project", project_id))
-        keys.update(("Repository", repository_id) for repository_id in _repositories(event))
-        if event.context.workspace_id is not None:
-            keys.add(("Workspace", event.context.workspace_id))
+    keys = [("Repository", repository_id) for repository_id in _repositories(event)]
+    if event.context.workspace_id is not None:
+        keys.append(("Workspace", event.context.workspace_id))
+    if event.context.project_id is not None:
+        keys.append(("Project", event.context.project_id))
     return sorted(keys)
 
 
@@ -93,6 +92,13 @@ class PortfolioProjector:
         workspace_id = event.context.workspace_id
         project_id = event.context.project_id
         repositories = _repositories(event)
+
+        if workspace_id is not None:
+            await tx.run(_WORKSPACE, parameters={"node_id": workspace_id})
+        if project_id is not None:
+            await tx.run(_PROJECT, parameters={"node_id": project_id})
+        for repository_id in repositories:
+            await tx.run(_REPOSITORY, parameters={"node_id": repository_id})
 
         if event.event_type == _REPOSITORY_OBSERVED_TYPE:
             observed = RepositoryObservedV1.model_validate(dict(event.payload))
