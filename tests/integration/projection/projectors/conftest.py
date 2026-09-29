@@ -100,10 +100,19 @@ def build_event(
     return seal_event(draft, [], 1, None)
 
 
+TRANSACTION_ATTEMPTS = [0]
+
+
 async def project_event(store: Neo4jStore, event: StoredEventV1) -> None:
-    """Apply one event in its own write transaction, as the runtime does."""
+    """Apply one event in its own write transaction, as the runtime does.
+
+    `TRANSACTION_ATTEMPTS` counts callback runs; the driver re-runs a callback
+    only after a transient failure such as a deadlock, so attempts beyond one
+    per event are retries.
+    """
 
     async def run(tx: Neo4jTransaction) -> None:
+        TRANSACTION_ATTEMPTS[0] += 1
         for projector in PROJECTORS:
             if projector.handles(event.event_type):
                 await projector.project(tx, event)

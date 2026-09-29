@@ -7,14 +7,17 @@ import json
 import random
 from collections.abc import Awaitable, Callable
 from pathlib import Path
+from typing import LiteralString
 
 import pytest
 from agent_context_sdk import StoredEventV1
 
-from agent_context_platform.projection.neo4j import Neo4jStore
+from agent_context_platform.projection.neo4j import Neo4jStore, Neo4jTransaction
+from agent_context_platform.projection.projectors import lock_nodes
 
 from ..conftest import neo4j_integration_settings
 from .conftest import (
+    TRANSACTION_ATTEMPTS,
     build_event,
     digest,
     graph_state,
@@ -105,7 +108,9 @@ def test_concurrent_workers_converge_on_the_same_digest() -> None:
         events = session_events()
         expected = digest(await state_after(store, events))
         await wipe_projected_graph(store)
+        TRANSACTION_ATTEMPTS[0] = 0
         await asyncio.gather(*(project_event(store, event) for event in events * 3))
+        assert TRANSACTION_ATTEMPTS[0] == len(events) * 3, "a transaction was retried (deadlock)"
         assert digest(await graph_state(store)) == expected
 
     with_graph(body)
@@ -207,7 +212,7 @@ def test_the_same_oid_in_two_repositories_is_two_commits() -> None:
         ids = [
             n["id"] for n in (await graph_state(store))["nodes"] if n["id"].startswith("Commit:")
         ]
-        assert ids == [f"Commit:commit:repo_1:{'a' * 40}", f"Commit:commit:repo_2:{'a' * 40}"]
+        assert ids == [f"Commit:commit:6:repo_1:{'a' * 40}", f"Commit:commit:6:repo_2:{'a' * 40}"]
 
     with_graph(body)
 
@@ -224,5 +229,69 @@ def test_the_graph_holds_content_ids_and_never_content_text() -> None:
             for key in props:
                 if "content" in key or "message" in key:
                     assert key.endswith(("_content_id", "_content_sha256")), key
+
+    with_graph(body)
+
+
+_SLOW_POINTER_UPDATE: LiteralString = (
+    "MERGE (n:Checkout {checkout_id: $node_id}) "
+    "WITH n, collect(n.head_order) AS seen "
+    "UNWIND range(1, $stall) AS step "
+    "WITH n, seen, count(step) AS steps "
+    "WITH n, (size(seen) = 0 OR $order > seen[0]) AS newer "
+    "SET n.head_commit = CASE WHEN newer THEN $head_commit ELSE n.head_commit END, "
+    "n.head_order = CASE WHEN newer THEN $order ELSE n.head_order END"
+)
+
+
+async def _race_two_pointer_updates(store: Neo4jStore, *, lock: bool) -> str:
+    """The older worker decides "I am newer" and stalls before writing; the newer one runs.
+
+    The statement has the same shape as `newest_wins` (read the pointer, compare,
+    write) but is stretched so the interleaving is deterministic instead of a
+    microsecond window.
+    """
+
+    async def create(tx: Neo4jTransaction) -> None:
+        # MERGE that creates the node locks it via its uniqueness constraint,
+        # which would serialize the workers by itself. Race on an existing node.
+        await tx.run("MERGE (n:Checkout {checkout_id: 'co_1'})", parameters={})
+
+    await store.execute_write(create)
+    started = asyncio.Event()
+
+    def worker(order: str, head: str, stall: int) -> Awaitable[None]:
+        async def run(tx: Neo4jTransaction) -> None:
+            if lock:
+                await lock_nodes(tx, [("Checkout", "co_1")])
+            started.set()
+            await tx.run(
+                _SLOW_POINTER_UPDATE,
+                parameters={
+                    "node_id": "co_1",
+                    "order": order,
+                    "head_commit": head,
+                    "stall": stall,
+                },
+            )
+
+        return store.execute_write(run)
+
+    older = asyncio.create_task(worker("1", "older", 10_000_000))
+    await started.wait()
+    await asyncio.sleep(0.5)
+    await worker("2", "newer", 1)
+    await older
+    nodes = {n["id"]: n["props"] for n in (await graph_state(store))["nodes"]}
+    return str(nodes["Checkout:co_1"]["head_commit"])
+
+
+def test_the_node_lock_stops_an_older_worker_overwriting_a_newer_pointer() -> None:
+    async def body(store: Neo4jStore) -> None:
+        assert await _race_two_pointer_updates(store, lock=True) == "newer"
+        await wipe_projected_graph(store)
+        # Control: the same interleaving without the lock loses the update, so
+        # the assertion above is only satisfied because `lock_nodes` serializes.
+        assert await _race_two_pointer_updates(store, lock=False) == "older"
 
     with_graph(body)

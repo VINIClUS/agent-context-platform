@@ -80,6 +80,8 @@ class RecordingTransaction:
 
 def test_node_ids_derive_from_native_identifiers_and_stay_unambiguous() -> None:
     assert session_node_id("thr_1") == "thr_1"
+    assert turn_node_id("thr_1", "turn_2") == "turn:5:thr_1:turn_2"
+    assert tool_call_node_id("thr_1", "call_3") == "tool_call:5:thr_1:call_3"
     assert turn_node_id("a", "b:c") != turn_node_id("a:b", "c")
     assert tool_call_node_id("a", "b:c") != tool_call_node_id("a:b", "c")
     assert turn_node_id("s", "t") != tool_call_node_id("s", "t")
@@ -89,7 +91,8 @@ def test_node_ids_derive_from_native_identifiers_and_stay_unambiguous() -> None:
 
 def test_commit_id_is_scoped_by_repository() -> None:
     oid = "a" * 40
-    assert commit_node_id("repo_1", oid) == f"commit:repo_1:{oid}"
+    assert commit_node_id("repo_1", oid) == f"commit:6:repo_1:{oid}"
+    assert commit_node_id("a:b", "c" * 40) != commit_node_id("a", "b:" + "c" * 40)
     assert commit_node_id("repo_1", oid) != commit_node_id("repo_2", oid)
 
 

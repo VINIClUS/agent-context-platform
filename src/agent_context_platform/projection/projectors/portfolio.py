@@ -16,6 +16,7 @@ from agent_context_platform.projection.neo4j import Neo4jTransaction
 from agent_context_platform.projection.projectors import (
     assert_link,
     event_order,
+    lock_nodes,
     min_non_null,
     newest_wins,
     node_statement,
@@ -39,9 +40,6 @@ _LINKING_TYPES: Final = frozenset(
     }
 )
 
-_WORKSPACE: Final = "MERGE (n:Workspace {workspace_id: $node_id})"
-_PROJECT: Final = "MERGE (n:Project {project_id: $node_id})"
-_REPOSITORY: Final = "MERGE (n:Repository {repository_id: $node_id})"
 _REPOSITORY_OBSERVED: Final = (
     node_statement("Repository", "repository_id")
     + min_non_null("object_format")
@@ -69,9 +67,20 @@ class PortfolioProjector:
         workspace_id = event.context.workspace_id
         project_id = event.context.project_id
         repository_ids = {event.context.repository_id}
+        payload_repository = event.payload.get("repository_id")
+        if isinstance(payload_repository, str):
+            repository_ids.add(payload_repository)
+        repositories = sorted(id_ for id_ in repository_ids if id_ is not None)
+
+        locked = [("Repository", repository_id) for repository_id in repositories]
+        if workspace_id is not None:
+            locked.append(("Workspace", workspace_id))
+        if project_id is not None:
+            locked.append(("Project", project_id))
+        await lock_nodes(tx, locked)
+
         if event.event_type == _REPOSITORY_OBSERVED_TYPE:
             observed = RepositoryObservedV1.model_validate(dict(event.payload))
-            repository_ids.add(observed.repository_id)
             await tx.run(
                 _REPOSITORY_OBSERVED,
                 parameters={
@@ -81,14 +90,9 @@ class PortfolioProjector:
                     "remote_identities": list(observed.remote_identities),
                 },
             )
-        if workspace_id is not None:
-            await tx.run(_WORKSPACE, parameters={"node_id": workspace_id})
-        if project_id is not None:
-            await tx.run(_PROJECT, parameters={"node_id": project_id})
         links = event.event_type in _LINKING_TYPES
         if links and workspace_id is not None and project_id is not None:
             await assert_link(tx, _HAS_PROJECT, event, workspace_id, project_id)
-        for repository_id in sorted(id_ for id_ in repository_ids if id_ is not None):
-            await tx.run(_REPOSITORY, parameters={"node_id": repository_id})
-            if links and project_id is not None:
+        if links and project_id is not None:
+            for repository_id in repositories:
                 await assert_link(tx, _USES_REPOSITORY, event, project_id, repository_id)

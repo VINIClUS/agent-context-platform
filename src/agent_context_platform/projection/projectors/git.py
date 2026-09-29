@@ -28,6 +28,7 @@ from agent_context_platform.projection.projectors import (
     assert_link,
     event_order,
     fill_once,
+    lock_nodes,
     min_non_null,
     newest_wins,
     node_statement,
@@ -36,8 +37,11 @@ from agent_context_platform.projection.projectors import (
 
 
 def commit_node_id(repository_id: str, oid: str) -> str:
-    """Graph identity of a commit: the same OID may exist in two repositories."""
-    return f"commit:{repository_id}:{oid}"
+    """Graph identity of a commit; the same OID may exist in two repositories.
+
+    The length prefix keeps `(repository, oid)` unambiguous, like the other helpers.
+    """
+    return f"commit:{len(repository_id)}:{repository_id}:{oid}"
 
 
 def branch_node_id(repository_id: str, name: str) -> str:
@@ -95,9 +99,33 @@ _SESSION_PRODUCED_COMMIT: Final = relationship_statement(
 )
 
 
+def _session_node(event: StoredEventV1) -> list[tuple[str, str]]:
+    session_id = event.context.session_id
+    return [] if session_id is None else [("Session", session_id)]
+
+
 async def _checkout_observed(tx: Neo4jTransaction, event: StoredEventV1) -> None:
     payload = CheckoutObservedV1.model_validate(dict(event.payload))
     checkout = payload.checkout_id
+    branch = (
+        branch_node_id(payload.repository_id, payload.branch)
+        if payload.branch is not None
+        else None
+    )
+    head = (
+        commit_node_id(payload.repository_id, payload.head_commit)
+        if payload.head_commit is not None
+        else None
+    )
+    await lock_nodes(
+        tx,
+        [
+            ("Checkout", checkout),
+            ("Repository", payload.repository_id),
+            *([("Branch", branch)] if branch is not None else []),
+            *([("Commit", head)] if head is not None else []),
+        ],
+    )
     await tx.run(
         _CHECKOUT_OBSERVED,
         parameters={
@@ -111,8 +139,7 @@ async def _checkout_observed(tx: Neo4jTransaction, event: StoredEventV1) -> None
         },
     )
     await assert_link(tx, _CHECKOUT_IN_REPOSITORY, event, checkout, payload.repository_id)
-    if payload.branch is not None:
-        branch = branch_node_id(payload.repository_id, payload.branch)
+    if branch is not None:
         await tx.run(
             _BRANCH,
             parameters={
@@ -144,6 +171,16 @@ async def _stub_commit(
 async def _commit_observed(tx: Neo4jTransaction, event: StoredEventV1) -> None:
     payload = CommitObservedV1.model_validate(dict(event.payload))
     commit = commit_node_id(payload.repository_id, payload.commit_id)
+    parents = [commit_node_id(payload.repository_id, oid) for oid in payload.parent_commit_ids]
+    await lock_nodes(
+        tx,
+        [
+            ("Commit", commit),
+            ("Repository", payload.repository_id),
+            *(("Commit", parent) for parent in parents),
+            *_session_node(event),
+        ],
+    )
     await tx.run(
         _COMMIT_OBSERVED,
         parameters={
@@ -167,6 +204,20 @@ async def _commit_observed(tx: Neo4jTransaction, event: StoredEventV1) -> None:
 async def _snapshot_captured(tx: Neo4jTransaction, event: StoredEventV1) -> None:
     payload = WorkspaceSnapshotCapturedV1.model_validate(dict(event.payload))
     snapshot = payload.snapshot_id
+    await lock_nodes(
+        tx,
+        [
+            ("WorkspaceSnapshot", snapshot),
+            ("Checkout", payload.checkout_id),
+            ("Repository", payload.repository_id),
+            *(
+                [("Commit", commit_node_id(payload.repository_id, payload.base_commit))]
+                if payload.base_commit is not None
+                else []
+            ),
+            *_session_node(event),
+        ],
+    )
     await tx.run(
         _SNAPSHOT,
         parameters={
