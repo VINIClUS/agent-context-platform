@@ -490,7 +490,7 @@ def test_local_relationship_target_uses_the_declared_kind() -> None:
     local.kind = scip_pb2.SymbolInformation.Class
     owner = doc.symbols.add()
     owner.symbol = GLOBAL
-    owner.relationships.add().symbol = "local 1"
+    owner.relationships.add(symbol="local 1", is_reference=True)
     file_ids = {"src/a.py": uuid.UUID(int=9)}
     result = run(build(doc), file_logical_ids=file_ids)
 
@@ -640,3 +640,128 @@ def test_enclosing_range_must_contain_the_occurrence() -> None:
         ("invalid_range", 4),
     ]
     assert len(result.documents[0].occurrences) == 6
+
+
+def _ld(field: int, payload: bytes) -> bytes:
+    return bytes([field << 3 | 2]) + _length(payload) + payload
+
+
+def _bare_index(*fields: bytes, metadata: int = 1) -> bytes:
+    tool = _ld(1, b"unit")
+    return _ld(1, _ld(2, tool)) * metadata + b"".join(fields)
+
+
+def _refused(data: bytes, reason: str, **limits: int) -> None:
+    with pytest.raises(ScipImportError) as caught:
+        import_scip(data, REPO, COMMIT, limits=ScipLimits(**limits))
+    assert caught.value.reason == reason
+
+
+def _document_with(*fields: bytes) -> bytes:
+    return _ld(2, _ld(1, b"a.py") + b"".join(fields))
+
+
+def test_signature_documentation_occurrences_are_capped_before_parsing() -> None:
+    # Thread: SymbolInformation.signature_documentation is a Document with its own occurrences.
+    signature = _ld(7, b"\x12\x00" * 3_000_000)  # Signature.occurrences
+    symbol = _ld(3, signature)
+    _refused(
+        _bare_index(_document_with(symbol)),
+        "too_many_occurrences",
+        max_occurrences_per_document=1000,
+    )
+    external = _ld(3, signature)
+    _refused(_bare_index(external), "too_many_occurrences", max_occurrences_per_document=1000)
+
+
+def test_packed_range_and_enclosing_range_are_bounded_before_parsing() -> None:
+    # Threads: packed legacy range / enclosing_range must be counted by element.
+    for field in (1, 7):
+        packed = _ld(field, b"\x01" * 5_000_000)
+        occurrence = _ld(2, packed)
+        _refused(_bare_index(_document_with(occurrence)), "too_many_repeated_items")
+        split = _ld(2, _ld(field, b"\x01\x01\x01") + _ld(field, b"\x01\x01"))
+        _refused(_bare_index(_document_with(split)), "too_many_repeated_items")
+    ok = _ld(2, _ld(1, b"\x00\x00\x01") + _ld(7, b"\x00\x00\x00\x02"))
+    result = import_scip(_bare_index(_document_with(ok)), REPO, COMMIT, limits=ScipLimits())
+    assert result.run.tool_name == "unit"
+
+
+def test_duplicate_metadata_and_tool_info_are_refused_before_merging() -> None:
+    # Threads: repeated Index.metadata and repeated Metadata.tool_info concatenate arguments.
+    _refused(_bare_index(metadata=2), "duplicate_message_field")
+    tool = _ld(2, _ld(3, b"arg") * 200)
+    _refused(_ld(1, tool * 3), "duplicate_message_field")
+
+
+def test_duplicate_singular_message_in_any_parent_is_refused() -> None:
+    signature = _ld(7, _ld(1, b"x"))
+    _refused(_bare_index(_document_with(_ld(3, signature + signature))), "duplicate_message_field")
+
+
+def test_element_budget_and_nesting_depth_are_enforced() -> None:
+    many = b"".join(_document_with(_ld(2, b"")) for _ in range(50))
+    _refused(_bare_index(many), "too_many_elements", max_total_elements=100)
+
+    deep = _document_with(_ld(3, _ld(7, _ld(5, b"x"))))
+    _refused(_bare_index(deep), "too_deeply_nested", max_nesting_depth=2)
+    assert import_scip(_bare_index(deep), REPO, COMMIT).run.tool_name == "unit"
+
+
+def test_unpacked_and_fixed_repeated_elements_are_counted() -> None:
+    varints = b"".join(b"\x08\x01" for _ in range(1_200))  # unpacked repeated int32 range
+    occurrence = _ld(2, b"".join(bytes([1 << 3, 1]) for _ in range(9)) + varints[:0])
+    _refused(_bare_index(_document_with(occurrence)), "too_many_repeated_items")
+
+
+def _all_messages() -> list[object]:
+    pending = list(scip_pb2.DESCRIPTOR.message_types_by_name.values())
+    found = []
+    while pending:
+        message = pending.pop()
+        pending.extend(message.nested_types)
+        found.append(message)
+    return found
+
+
+def test_prescan_plans_cover_every_repeated_and_message_field() -> None:
+    from agent_context_platform.indexing.scip import _field_plans
+
+    plans = _field_plans(ScipLimits())
+    messages = _all_messages()
+    assert {m.full_name for m in messages} == set(plans)  # type: ignore[attr-defined]
+    for message in messages:
+        for field in message.fields:  # type: ignore[attr-defined]
+            plan = plans[message.full_name][field.number]  # type: ignore[attr-defined]
+            assert plan.name == field.full_name
+            assert plan.repeated == field.is_repeated
+            assert (plan.message is not None) == (field.message_type is not None)
+            if field.message_type is not None:
+                assert field.message_type.full_name in plans
+            if field.is_repeated:
+                assert 0 < plan.cap <= ScipLimits().max_documents * 10
+
+
+def test_escaped_identifiers_need_a_non_identifier_character() -> None:
+    assert not is_valid_symbol("s m n v `abc`.")
+    assert not is_valid_symbol("s m n v `a_b-c$`#")
+    assert is_valid_symbol("s m n v abc.")
+    assert is_valid_symbol("s m n v `a.b`.")
+    assert is_valid_symbol("s m n v `a``b`.")
+
+
+def test_relationship_without_kind_flags_is_dropped_and_not_in_the_revision() -> None:
+    def imported(with_empty: bool) -> SemanticIndex:
+        doc = document()
+        info = doc.symbols.add()
+        info.symbol = GLOBAL
+        info.relationships.add(symbol="scip-python python pkg 1.0 b/g().", is_reference=True)
+        if with_empty:
+            info.relationships.add(symbol="scip-python python pkg 1.0 c/h().")
+        return run(build(doc))
+
+    plain, extra = imported(False), imported(True)
+    assert len(extra.documents[0].symbols[0].relationships) == 1
+    assert codes(extra) == ["empty_relationship"]
+    assert codes(plain) == []
+    assert extra.documents[0].symbols[0].revision_id == plain.documents[0].symbols[0].revision_id

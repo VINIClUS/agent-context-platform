@@ -41,6 +41,7 @@ from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
 from typing import Final, Literal
 
+from google.protobuf.descriptor import FieldDescriptor as _FD
 from google.protobuf.message import DecodeError, Message
 
 from agent_context_platform.indexing.identity import (
@@ -79,10 +80,14 @@ type ImportErrorReason = Literal[
     "too_many_symbols",
     "too_many_relationships",
     "too_many_repeated_items",
+    "too_many_elements",
+    "too_deeply_nested",
+    "duplicate_message_field",
     "symbol_too_long",
 ]
 type DiagnosticCode = Literal[
     "duplicate_document",
+    "empty_relationship",
     "invalid_range",
     "invalid_roles",
     "invalid_symbol",
@@ -117,6 +122,10 @@ class ScipLimits:
     max_total_occurrences: int = 2_000_000
     max_total_symbols: int = 1_000_000
     max_repeated_items_per_message: int = 1_000
+    # Every field occurrence and packed scalar of the whole index, at 2 bytes minimum on
+    # the wire each; bounds pre-scan time and what a parse can materialize.
+    max_total_elements: int = 25_000_000
+    max_nesting_depth: int = 8
     max_external_symbols: int = 500_000
     max_relationships_per_symbol: int = 10_000
     max_symbol_length: int = 4096
@@ -282,37 +291,30 @@ def import_scip(
         raise ValueError("commit must be a lowercase 40 or 64 character hex object id")
     if len(index_bytes) > limits.max_index_bytes:
         raise ScipImportError("index_too_large")
-    # Pre-scan the wire format and cap every repeated message count before any message
-    # is materialized; a full ParseFromString would build them all first.
+    # One descriptor-driven pre-scan of the whole wire format bounds every repeated
+    # element, singular message, depth and the total before anything is materialized.
+    _prescan(index_bytes, limits)
     index = scip_pb2.Index()
     document_slices: list[tuple[int, int]] = []
     external_slices: list[tuple[int, int]] = []
     for number, start, stop in _walk(index_bytes, 0, len(index_bytes)):
-        if number == 1:
-            _merge_metadata(index, index_bytes[start:stop], limits)
+        if number == 1:  # exactly once, enforced by the pre-scan
+            index.metadata.SetInParent()
+            try:
+                index.metadata.MergeFromString(index_bytes[start:stop])
+            except DecodeError:
+                raise ScipImportError("malformed") from None
         elif number == 2:
             document_slices.append((start, stop))
-            if len(document_slices) > limits.max_documents:
-                raise ScipImportError("too_many_documents")
         elif number == 3:
             external_slices.append((start, stop))
-            if len(external_slices) > limits.max_external_symbols:
-                raise ScipImportError("too_many_external_symbols")
     run = _run(index, commit, toolchain, limits)
 
     importer = _Importer(repository_id, limits, file_logical_ids or {}, sources or {})
     documents: list[SemanticDocument] = []
     seen: set[str] = set()
-    total_occurrences = total_symbols = 0
     for start, stop in document_slices:
         chunk = index_bytes[start:stop]
-        occurrence_count, symbol_count = _prescan_document(chunk, limits)
-        total_occurrences += occurrence_count
-        total_symbols += symbol_count
-        if total_occurrences > limits.max_total_occurrences:
-            raise ScipImportError("too_many_occurrences")
-        if total_symbols > limits.max_total_symbols:
-            raise ScipImportError("too_many_symbols")
         document = _parse(scip_pb2.Document, chunk)
         path = document.relative_path
         if len(path.encode("utf-8")) > _MAX_PATH_BYTES or not is_safe_repo_path(path):
@@ -324,7 +326,7 @@ def import_scip(
         seen.add(path)
         documents.append(importer.document(document))
     external_infos = (
-        _parse_symbol_information(index_bytes[start:stop], limits)
+        _parse(scip_pb2.SymbolInformation, index_bytes[start:stop])
         for start, stop in external_slices
     )
     external = tuple(
@@ -391,76 +393,172 @@ def _parse[T: Message](message_type: type[T], data: bytes) -> T:
         raise ScipImportError("malformed") from None
 
 
-def _count_children(data: bytes, field: int, cap: int, reason: ImportErrorReason) -> int:
-    count = 0
-    for number, _, _ in _walk(data, 0, len(data)):
-        if number == field:
-            count += 1
-            if count > cap:
-                raise ScipImportError(reason)
-    return count
+_HIGH_BIT_ONLY: Final = bytes(range(128))
+_FIXED32: Final = frozenset({_FD.TYPE_FIXED32, _FD.TYPE_SFIXED32, _FD.TYPE_FLOAT})
+_FIXED64: Final = frozenset({_FD.TYPE_FIXED64, _FD.TYPE_SFIXED64, _FD.TYPE_DOUBLE})
+_LENGTH_DELIMITED: Final = frozenset({_FD.TYPE_STRING, _FD.TYPE_BYTES})
 
 
-def _merge_metadata(index: scip_pb2.Index, data: bytes, limits: ScipLimits) -> None:
-    for number, start, stop in _walk(data, 0, len(data)):
-        if number == 2:  # tool_info
-            _count_children(data[start:stop], 3, limits.max_tool_arguments, "tool_info_too_large")
-    index.metadata.SetInParent()
-    try:
-        index.metadata.MergeFromString(data)
-    except DecodeError:
-        raise ScipImportError("malformed") from None
+@dataclass(frozen=True, slots=True)
+class _FieldPlan:
+    """How the pre-scan treats one field, derived from its descriptor."""
+
+    name: str
+    message: str | None  # full name of the message type, for message fields
+    repeated: bool
+    element: str  # "message", "length_delimited", "fixed32", "fixed64" or "varint"
+    cap: int
+    reason: ImportErrorReason
 
 
-def _prescan_document(data: bytes, limits: ScipLimits) -> tuple[int, int]:
-    """Count a document's occurrences and symbols, bounding nested repeats, before parsing."""
-    occurrences = symbols = 0
-    nested = limits.max_repeated_items_per_message
-    occurrence_caps, symbol_caps = _occurrence_caps(limits), _symbol_caps(limits)
-    for number, start, stop in _walk(data, 0, len(data)):
-        if number == 2:
-            occurrences += 1
-            if occurrences > limits.max_occurrences_per_document:
-                raise ScipImportError("too_many_occurrences")
-            # A message with more than ``nested`` children is at least 2 * nested bytes.
-            if stop - start > 2 * nested:
-                _bound_repeats(data[start:stop], occurrence_caps)
-        elif number == 3:
-            symbols += 1
-            if symbols > limits.max_symbols_per_document:
-                raise ScipImportError("too_many_symbols")
-            if stop - start > 2 * min(nested, limits.max_relationships_per_symbol):
-                _bound_repeats(data[start:stop], symbol_caps)
-    return occurrences, symbols
+def _field_plans(limits: ScipLimits) -> dict[str, dict[int, _FieldPlan]]:
+    """Plan every field of every message in the vendored proto; nothing is hand-listed.
 
-
-def _bound_repeats(data: bytes, caps: Mapping[int, tuple[int, ImportErrorReason]]) -> None:
-    """Refuse a message whose listed repeated fields exceed their ``(cap, reason)``."""
-    counts: dict[int, int] = {}
-    for number, _, _ in _walk(data, 0, len(data)):
-        if number in caps:
-            counts[number] = counts.get(number, 0) + 1
-            if counts[number] > caps[number][0]:
-                raise ScipImportError(caps[number][1])
-
-
-def _occurrence_caps(limits: ScipLimits) -> dict[int, tuple[int, ImportErrorReason]]:
-    cap = limits.max_repeated_items_per_message
-    # override_documentation (4) and diagnostics (6)
-    return {4: (cap, "too_many_repeated_items"), 6: (cap, "too_many_repeated_items")}
-
-
-def _symbol_caps(limits: ScipLimits) -> dict[int, tuple[int, ImportErrorReason]]:
-    # documentation (3) and relationships (4)
-    return {
-        3: (limits.max_repeated_items_per_message, "too_many_repeated_items"),
-        4: (limits.max_relationships_per_symbol, "too_many_relationships"),
+    Each repeated field gets ``max_repeated_items_per_message`` unless ``overrides``
+    names a specific bound; each singular message field is refused when it appears
+    twice in one parent (the SCIP "exactly once" rule; merging would concatenate its
+    repeated content).
+    """
+    default = limits.max_repeated_items_per_message
+    overrides: dict[str, tuple[int, ImportErrorReason]] = {
+        "scip.Index.documents": (limits.max_documents, "too_many_documents"),
+        "scip.Index.external_symbols": (limits.max_external_symbols, "too_many_external_symbols"),
+        "scip.Document.occurrences": (
+            limits.max_occurrences_per_document,
+            "too_many_occurrences",
+        ),
+        "scip.Signature.occurrences": (
+            limits.max_occurrences_per_document,
+            "too_many_occurrences",
+        ),
+        "scip.Document.symbols": (limits.max_symbols_per_document, "too_many_symbols"),
+        "scip.SymbolInformation.relationships": (
+            limits.max_relationships_per_symbol,
+            "too_many_relationships",
+        ),
+        "scip.ToolInfo.arguments": (limits.max_tool_arguments, "tool_info_too_large"),
+        # A range has 3 or 4 integers; more is only ever an allocation attack.
+        "scip.Occurrence.range": (4, "too_many_repeated_items"),
+        "scip.Occurrence.enclosing_range": (4, "too_many_repeated_items"),
     }
+    plans: dict[str, dict[int, _FieldPlan]] = {}
+    pending = list(scip_pb2.DESCRIPTOR.message_types_by_name.values())
+    while pending:
+        message = pending.pop()
+        pending.extend(message.nested_types)
+        fields: dict[int, _FieldPlan] = {}
+        for field in message.fields:
+            if field.message_type is not None:
+                element = "message"
+            elif field.type in _LENGTH_DELIMITED:
+                element = "length_delimited"
+            elif field.type in _FIXED32:
+                element = "fixed32"
+            elif field.type in _FIXED64:
+                element = "fixed64"
+            else:
+                element = "varint"
+            cap, reason = overrides.get(field.full_name, (default, "too_many_repeated_items"))
+            fields[field.number] = _FieldPlan(
+                name=field.full_name,
+                message=field.message_type.full_name if field.message_type else None,
+                repeated=field.is_repeated,
+                element=element,
+                cap=cap,
+                reason=reason,
+            )
+        plans[message.full_name] = fields
+    return plans
 
 
-def _parse_symbol_information(data: bytes, limits: ScipLimits) -> scip_pb2.SymbolInformation:
-    _bound_repeats(data, _symbol_caps(limits))
-    return _parse(scip_pb2.SymbolInformation, data)
+class _PreScan:
+    """Walks the wire format with the descriptors and refuses amplification before parsing.
+
+    Counts every element (each field occurrence and each packed scalar) against one
+    global budget, every repeated field against its cap (packed scalars included),
+    rejects a singular message field that repeats in its parent, and bounds depth.
+    """
+
+    def __init__(self, limits: ScipLimits) -> None:
+        self._limits = limits
+        self._plans = _field_plans(limits)
+        self._elements = 0
+        self._occurrences = 0
+        self._symbols = 0
+
+    def _spend(self, count: int) -> None:
+        self._elements += count
+        if self._elements > self._limits.max_total_elements:
+            raise ScipImportError("too_many_elements")
+
+    def scan(self, data: bytes, start: int, end: int, message: str, depth: int) -> None:
+        if depth > self._limits.max_nesting_depth:
+            raise ScipImportError("too_deeply_nested")
+        plan = self._plans[message]
+        seen: dict[int, int] = {}
+        position = start
+        while position < end:
+            key, position = _varint(data, position, end)
+            number, wire_type = key >> 3, key & 7
+            if number == 0:
+                raise ScipImportError("malformed")
+            self._spend(1)
+            field = plan.get(number)
+            added = 1
+            if wire_type == 0:
+                _, position = _varint(data, position, end)
+            elif wire_type == 1:
+                position += 8
+            elif wire_type == 5:
+                position += 4
+            elif wire_type == 2:
+                length, position = _varint(data, position, end)
+                stop = position + length
+                if stop > end:
+                    raise ScipImportError("malformed")
+                if field is not None and field.message is not None:
+                    self._enter(field)
+                    self.scan(data, position, stop, field.message, depth + 1)
+                elif field is not None and field.repeated and field.element != "length_delimited":
+                    added = self._packed(data[position:stop], field.element)
+                    self._spend(added)
+                position = stop
+            else:
+                raise ScipImportError("malformed")
+            if position > end:
+                raise ScipImportError("malformed")
+            if field is None:
+                continue
+            seen[number] = count = seen.get(number, 0) + added
+            if field.repeated:
+                if count > field.cap:
+                    raise ScipImportError(field.reason)
+            elif field.message is not None and count > 1:
+                raise ScipImportError("duplicate_message_field")
+
+    def _enter(self, field: _FieldPlan) -> None:
+        if field.message == "scip.Occurrence":
+            self._occurrences += 1
+            if self._occurrences > self._limits.max_total_occurrences:
+                raise ScipImportError("too_many_occurrences")
+        elif field.message == "scip.SymbolInformation":
+            self._symbols += 1
+            if self._symbols > self._limits.max_total_symbols:
+                raise ScipImportError("too_many_symbols")
+
+    @staticmethod
+    def _packed(payload: bytes, element: str) -> int:
+        """Number of scalars in a packed payload, counted in C, not per element."""
+        if element == "fixed32":
+            return len(payload) // 4
+        if element == "fixed64":
+            return len(payload) // 8
+        continuation = len(payload.translate(None, _HIGH_BIT_ONLY))  # bytes with the high bit
+        return len(payload) - continuation
+
+
+def _prescan(index_bytes: bytes, limits: ScipLimits) -> None:
+    _PreScan(limits).scan(index_bytes, 0, len(index_bytes), "scip.Index", 0)
 
 
 def _run(index: scip_pb2.Index, commit: str, toolchain: str | None, limits: ScipLimits) -> IndexRun:
@@ -651,6 +749,9 @@ class _Importer:
             if target_id is None:
                 continue
             kinds = _relationship_kinds(related)
+            if not kinds:  # asserts no SCIP relationship semantics: not evidence
+                self.diagnose("empty_relationship", path, None)
+                continue
             relationships.append(
                 SemanticRelationship(info.symbol, symbol_id, related.symbol, target_id, kinds)
             )
@@ -728,13 +829,15 @@ def _name_end(symbol: str, position: int) -> int:
     size = len(symbol)
     if position < size and symbol[position] == "`":
         position += 1
-        start = position
+        special = False  # the grammar needs one non-identifier character (else not canonical)
         while position < size:
             if symbol[position] == "`":
                 if symbol.startswith("``", position):
                     position += 2
+                    special = True
                     continue
-                return position + 1 if position > start else -1
+                return position + 1 if special else -1
+            special = special or symbol[position] not in _IDENT_CHARS
             position += 1
         return -1
     start = position
