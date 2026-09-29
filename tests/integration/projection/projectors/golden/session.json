@@ -1,0 +1,326 @@
+{
+  "nodes": [
+    {
+      "id": "Branch:branch:6:repo_1:main",
+      "props": {
+        "branch_id": "branch:6:repo_1:main",
+        "name": "main",
+        "repository_id": "repo_1"
+      }
+    },
+    {
+      "id": "Checkout:co_1",
+      "props": {
+        "branch": "main",
+        "checkout_id": "co_1",
+        "detached": false,
+        "head_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "head_order": "2026-08-13T13:00:11.000000|0198a4b1-98c0-7c28-ae3f-00000000000b",
+        "object_format": "sha1",
+        "repository_id": "repo_1"
+      }
+    },
+    {
+      "id": "Commit:commit:6:repo_1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "props": {
+        "commit_id": "commit:6:repo_1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "oid": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "repository_id": "repo_1"
+      }
+    },
+    {
+      "id": "Commit:commit:6:repo_1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "props": {
+        "authored_at": "2026-08-13T13:00:10.000000000+00:00",
+        "commit_id": "commit:6:repo_1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "committed_at": "2026-08-13T13:00:11.000000000+00:00",
+        "message_content_id": "msg_commit_1",
+        "oid": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "repository_id": "repo_1",
+        "tree_id": "cccccccccccccccccccccccccccccccccccccccc"
+      }
+    },
+    {
+      "id": "Project:prj_1",
+      "props": {
+        "project_id": "prj_1"
+      }
+    },
+    {
+      "id": "Repository:repo_1",
+      "props": {
+        "object_format": "sha1",
+        "remote_identities": [
+          "github.com/acme/app"
+        ],
+        "remotes_order": "2026-08-13T13:00:01.000000|0198a4b1-98c0-7c28-ae3f-000000000001",
+        "repository_id": "repo_1"
+      }
+    },
+    {
+      "id": "Session:sess_1",
+      "props": {
+        "duration_ms": 1000,
+        "end_reason": "exit",
+        "ended_at": "2026-08-13T13:00:13.000000000+00:00",
+        "ended_order": "2026-08-13T13:00:13.000000|0198a4b1-98c0-7c28-ae3f-00000000000d",
+        "model": "gpt-5",
+        "session_id": "sess_1",
+        "start_reason": "startup",
+        "started_at": "2026-08-13T13:00:03.000000000+00:00",
+        "status": "ended"
+      }
+    },
+    {
+      "id": "ToolCall:tool_call:6:sess_1:call_1",
+      "props": {
+        "completed_at": "2026-08-13T13:00:07.000000000+00:00",
+        "completed_order": "2026-08-13T13:00:07.000000|0198a4b1-98c0-7c28-ae3f-000000000007",
+        "duration_ms": 120,
+        "input_content_id": "in_1",
+        "output_content_id": "out_1",
+        "output_observed_at": "2026-08-13T13:00:06.000000000+00:00",
+        "session_id": "sess_1",
+        "started_at": "2026-08-13T13:00:05.000000000+00:00",
+        "status": "completed",
+        "success": true,
+        "tool_call_id": "tool_call:6:sess_1:call_1",
+        "tool_name": "Bash",
+        "turn_id": "turn:6:sess_1:turn_1"
+      }
+    },
+    {
+      "id": "Turn:turn:6:sess_1:turn_1",
+      "props": {
+        "assistant_message_content_id": "msg_asst_1",
+        "completed_at": "2026-08-13T13:00:09.000000000+00:00",
+        "completed_order": "2026-08-13T13:00:09.000000|0198a4b1-98c0-7c28-ae3f-000000000009",
+        "duration_ms": 900,
+        "error_class": "ToolError",
+        "session_id": "sess_1",
+        "started_at": "2026-08-13T13:00:04.000000000+00:00",
+        "status": "completed",
+        "stop_hook_active": false,
+        "stopped_at": "2026-08-13T13:00:08.000000000+00:00",
+        "stopped_order": "2026-08-13T13:00:08.000000|0198a4b1-98c0-7c28-ae3f-000000000008",
+        "success": false,
+        "turn_id": "turn:6:sess_1:turn_1",
+        "user_message_content_id": "msg_user_1"
+      }
+    },
+    {
+      "id": "Workspace:ws_1",
+      "props": {
+        "workspace_id": "ws_1"
+      }
+    },
+    {
+      "id": "WorkspaceSnapshot:snap_1",
+      "props": {
+        "base_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "checkout_id": "co_1",
+        "collections_order": "2026-08-13T13:00:12.000000|0198a4b1-98c0-7c28-ae3f-00000000000c",
+        "dirty_patch_sha256": "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd",
+        "modified_content_sha256": [
+          "dddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddddd"
+        ],
+        "repository_id": "repo_1",
+        "snapshot_id": "snap_1",
+        "untracked_paths": [
+          "notes.md"
+        ]
+      }
+    }
+  ],
+  "relationships": [
+    {
+      "from": "Branch:branch:6:repo_1:main",
+      "props": {
+        "source_event_ids": [
+          "0198a4b1-98c0-7c28-ae3f-000000000002",
+          "0198a4b1-98c0-7c28-ae3f-00000000000b"
+        ]
+      },
+      "to": "Repository:repo_1",
+      "type": "IN_REPOSITORY"
+    },
+    {
+      "from": "Checkout:co_1",
+      "props": {
+        "source_event_ids": [
+          "0198a4b1-98c0-7c28-ae3f-00000000000c"
+        ]
+      },
+      "to": "WorkspaceSnapshot:snap_1",
+      "type": "HAS_SNAPSHOT"
+    },
+    {
+      "from": "Checkout:co_1",
+      "props": {
+        "source_event_ids": [
+          "0198a4b1-98c0-7c28-ae3f-000000000002",
+          "0198a4b1-98c0-7c28-ae3f-00000000000b"
+        ]
+      },
+      "to": "Repository:repo_1",
+      "type": "IN_REPOSITORY"
+    },
+    {
+      "from": "Checkout:co_1",
+      "props": {
+        "source_event_ids": [
+          "0198a4b1-98c0-7c28-ae3f-000000000002"
+        ]
+      },
+      "to": "Commit:commit:6:repo_1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "type": "OBSERVED_AT"
+    },
+    {
+      "from": "Checkout:co_1",
+      "props": {
+        "source_event_ids": [
+          "0198a4b1-98c0-7c28-ae3f-00000000000b"
+        ]
+      },
+      "to": "Commit:commit:6:repo_1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "type": "OBSERVED_AT"
+    },
+    {
+      "from": "Checkout:co_1",
+      "props": {
+        "source_event_ids": [
+          "0198a4b1-98c0-7c28-ae3f-000000000002",
+          "0198a4b1-98c0-7c28-ae3f-00000000000b"
+        ]
+      },
+      "to": "Branch:branch:6:repo_1:main",
+      "type": "OBSERVED_ON"
+    },
+    {
+      "from": "Commit:commit:6:repo_1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "props": {
+        "source_event_ids": [
+          "0198a4b1-98c0-7c28-ae3f-000000000002",
+          "0198a4b1-98c0-7c28-ae3f-00000000000a"
+        ]
+      },
+      "to": "Repository:repo_1",
+      "type": "IN_REPOSITORY"
+    },
+    {
+      "from": "Commit:commit:6:repo_1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "props": {
+        "source_event_ids": [
+          "0198a4b1-98c0-7c28-ae3f-00000000000a"
+        ]
+      },
+      "to": "Commit:commit:6:repo_1:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "type": "HAS_PARENT"
+    },
+    {
+      "from": "Commit:commit:6:repo_1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "props": {
+        "source_event_ids": [
+          "0198a4b1-98c0-7c28-ae3f-00000000000a",
+          "0198a4b1-98c0-7c28-ae3f-00000000000b",
+          "0198a4b1-98c0-7c28-ae3f-00000000000c"
+        ]
+      },
+      "to": "Repository:repo_1",
+      "type": "IN_REPOSITORY"
+    },
+    {
+      "from": "Project:prj_1",
+      "props": {
+        "source_event_ids": [
+          "0198a4b1-98c0-7c28-ae3f-000000000001",
+          "0198a4b1-98c0-7c28-ae3f-000000000002",
+          "0198a4b1-98c0-7c28-ae3f-000000000003",
+          "0198a4b1-98c0-7c28-ae3f-00000000000b",
+          "0198a4b1-98c0-7c28-ae3f-00000000000d"
+        ]
+      },
+      "to": "Repository:repo_1",
+      "type": "USES_REPOSITORY"
+    },
+    {
+      "from": "Session:sess_1",
+      "props": {
+        "source_event_ids": [
+          "0198a4b1-98c0-7c28-ae3f-000000000004",
+          "0198a4b1-98c0-7c28-ae3f-000000000008",
+          "0198a4b1-98c0-7c28-ae3f-000000000009"
+        ]
+      },
+      "to": "Turn:turn:6:sess_1:turn_1",
+      "type": "HAS_TURN"
+    },
+    {
+      "from": "Session:sess_1",
+      "props": {
+        "source_event_ids": [
+          "0198a4b1-98c0-7c28-ae3f-00000000000a"
+        ]
+      },
+      "to": "Commit:commit:6:repo_1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "type": "PRODUCED"
+    },
+    {
+      "from": "Session:sess_1",
+      "props": {
+        "source_event_ids": [
+          "0198a4b1-98c0-7c28-ae3f-00000000000c"
+        ]
+      },
+      "to": "WorkspaceSnapshot:snap_1",
+      "type": "PRODUCED"
+    },
+    {
+      "from": "Session:sess_1",
+      "props": {
+        "source_event_ids": [
+          "0198a4b1-98c0-7c28-ae3f-000000000003",
+          "0198a4b1-98c0-7c28-ae3f-00000000000d"
+        ]
+      },
+      "to": "Checkout:co_1",
+      "type": "TARGETED"
+    },
+    {
+      "from": "Turn:turn:6:sess_1:turn_1",
+      "props": {
+        "source_event_ids": [
+          "0198a4b1-98c0-7c28-ae3f-000000000005",
+          "0198a4b1-98c0-7c28-ae3f-000000000006",
+          "0198a4b1-98c0-7c28-ae3f-000000000007"
+        ]
+      },
+      "to": "ToolCall:tool_call:6:sess_1:call_1",
+      "type": "INVOKED"
+    },
+    {
+      "from": "Workspace:ws_1",
+      "props": {
+        "source_event_ids": [
+          "0198a4b1-98c0-7c28-ae3f-000000000001",
+          "0198a4b1-98c0-7c28-ae3f-000000000002",
+          "0198a4b1-98c0-7c28-ae3f-000000000003",
+          "0198a4b1-98c0-7c28-ae3f-00000000000b",
+          "0198a4b1-98c0-7c28-ae3f-00000000000d"
+        ]
+      },
+      "to": "Project:prj_1",
+      "type": "HAS_PROJECT"
+    },
+    {
+      "from": "WorkspaceSnapshot:snap_1",
+      "props": {
+        "source_event_ids": [
+          "0198a4b1-98c0-7c28-ae3f-00000000000c"
+        ]
+      },
+      "to": "Commit:commit:6:repo_1:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "type": "BASED_ON"
+    }
+  ]
+}
