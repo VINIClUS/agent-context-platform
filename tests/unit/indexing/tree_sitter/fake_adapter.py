@@ -218,6 +218,8 @@ def main() -> int:
 
         if pydantic_core.to_json({"a": 1}) != b'{"a":1}':
             return 8
+    elif MODE == "exit121":
+        return 121  # an ordinary adapter failure that must not look like a confinement failure
     elif MODE == "crash":
         return 9
     emit(document)

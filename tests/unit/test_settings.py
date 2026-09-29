@@ -332,7 +332,7 @@ def test_indexer_confinement_settings_default_closed_and_load_from_environment(
 ) -> None:
     settings = Settings()
     assert settings.indexer_allow_unconfined_adapters is False
-    assert settings.indexer_checkout_roots == ()
+    assert settings.indexer_checkout_roots == ("/work",)
 
     monkeypatch.setenv("AGENT_CONTEXT_INDEXER_ALLOW_UNCONFINED_ADAPTERS", "true")
     monkeypatch.setenv("AGENT_CONTEXT_INDEXER_CHECKOUT_ROOTS", '["/work"]')
@@ -340,6 +340,11 @@ def test_indexer_confinement_settings_default_closed_and_load_from_environment(
     assert settings.indexer_allow_unconfined_adapters is True
     assert settings.indexer_checkout_roots == ("/work",)
 
+    monkeypatch.setenv("AGENT_CONTEXT_INDEXER_CHECKOUT_ROOTS", "[]")
+    with pytest.raises(ValidationError):
+        Settings()
+
+    monkeypatch.setenv("AGENT_CONTEXT_INDEXER_CHECKOUT_ROOTS", '["/work"]')
     monkeypatch.setenv("AGENT_CONTEXT_INDEXER_ALLOW_UNCONFINED_ADAPTERS", "maybe")
     with pytest.raises(ValidationError):
         Settings()

@@ -21,9 +21,22 @@ Design:
 - from ABI 4 the TCP bind/connect rights are handled too (defense in depth: the container
   has no network);
 - the allowed set is computed in ONE place (``read_set``) from the adapter command and can
-  only be widened through ``Limits.extra_read_paths``; ``check_read_set`` refuses a set
-  that touches a checkout root (equal, ancestor or inside);
-- when the kernel cannot enforce it the runner fails closed (``LandlockUnavailable``).
+  only be widened through ``Limits.extra_read_paths``. ``check_read_set`` refuses a set that
+  breaks the absolute floor (never ``/``, ``$HOME``, ``/etc``, ``/tmp``, ... or any other
+  path of depth 1 except the fixed system library directories) or that touches a checkout
+  root (equal, ancestor or inside);
+- the interpreter's prefix is granted only after the interpreter has been positively
+  identified (its real path has ``lib/pythonX.Y`` beside it, or it is the host's
+  ``sys.executable``), never by position: a direct-executable adapter gets its own file only;
+- ``python -m <module>`` is supported: the parent resolves the top-level package with
+  ``find_spec`` and grants that package directory only. Because the import system lists the
+  directory it searches, the package's parent directory gets ``read_dir`` alone (names, no
+  file content), unless it is already covered;
+- the trampoline confirms the ruleset on a dedicated status pipe (one byte, written after
+  ``landlock_restrict_self`` succeeded, close-on-exec before the adapter starts), so an
+  adapter's own exit status can never be mistaken for a confinement failure;
+- when the kernel cannot enforce it the runner fails closed (``LandlockUnavailable``), and a
+  kernel refusal in the adapter process fails closed even with the dev escape hatch on.
 
 Kernel requirement: Landlock must be enabled in the LSM list (``CONFIG_SECURITY_LANDLOCK``
 and ``landlock`` in ``/sys/kernel/security/lsm`` or the ``lsm=`` boot parameter), and the
@@ -40,14 +53,16 @@ used. Structural output about the input file itself is the residual channel and 
 from __future__ import annotations
 
 import ctypes
+import importlib.util
 import json
 import os
 import platform
+import re
 import stat
 import struct
 import sys
 from collections.abc import Iterable, Sequence
-from typing import Final
+from typing import Final, NamedTuple
 
 # Syscall numbers, ``landlock_create_ruleset``/``landlock_add_rule``/``landlock_restrict_self``.
 # Kernel UAPI: arch/x86/entry/syscalls/syscall_64.tbl (444, 445, 446) and
@@ -91,12 +106,29 @@ DIR_RIGHTS: Final = FS_EXECUTE | FS_READ_FILE | FS_READ_DIR
 FILE_RIGHTS: Final = FS_EXECUTE | FS_READ_FILE
 DEVICE_RIGHTS: Final = FS_READ_FILE
 
-# Exit statuses of the trampoline (the runner maps CONFINE_FAILED to SandboxUnavailable).
-CONFINE_FAILED_EXIT: Final = 121
+# Exit statuses of the trampoline. The runner does NOT read them as a signal (an adapter can
+# exit with any status); it reads the handshake byte the trampoline writes on the status pipe.
+CONFINE_FAILED_EXIT: Final = 121  # informational: the status pipe is the signal, not this
 EXEC_FAILED_EXIT: Final = 120
+HANDSHAKE: Final = b"1"
 
 SYSTEM_LIBRARY_DIRS: Final = ("/lib", "/lib64", "/usr/lib", "/usr/lib64", "/usr/local/lib")
 SYSTEM_FILES: Final = ("/etc/ld.so.cache", "/dev/null", "/dev/urandom")
+# Trees no read rule may equal or contain (paths below them, such as a venv under /home, are
+# fine). ``$HOME`` is added at check time.
+FORBIDDEN_TREES: Final = (
+    "/home",
+    "/root",
+    "/etc",
+    "/srv",
+    "/var",
+    "/mnt",
+    "/media",
+    "/tmp",
+    "/proc",
+    "/sys",
+    "/run",
+)
 
 
 class LandlockUnavailable(Exception):
@@ -147,9 +179,14 @@ def _ruleset_attr(abi: int) -> bytes:
     return struct.pack("<QQ", fs_mask(abi), net_mask(abi))[:size]
 
 
-def restrict(paths: Iterable[str], abi: int | None = None) -> None:
+def restrict(
+    paths: Iterable[str],
+    abi: int | None = None,
+    listing: Iterable[str] = (),
+) -> None:
     """Confine THIS process (and its future children) to read/execute below ``paths``.
 
+    ``listing`` directories get ``read_dir`` only (entry names, never file content).
     Irreversible. Raises ``LandlockUnavailable`` and applies nothing when any step fails.
     """
     level = abi_version() if abi is None else abi
@@ -163,7 +200,9 @@ def restrict(paths: Iterable[str], abi: int | None = None) -> None:
         raise LandlockUnavailable
     try:
         for path in paths:
-            _allow(libc, add_rule, ruleset, path)
+            _allow(libc, add_rule, ruleset, path, None)
+        for path in listing:
+            _allow(libc, add_rule, ruleset, path, FS_READ_DIR)
         if libc.prctl(PR_SET_NO_NEW_PRIVS, 1, 0, 0, 0) != 0:
             raise LandlockUnavailable
         if libc.syscall(restrict_self, ruleset, 0) != 0:
@@ -172,7 +211,7 @@ def restrict(paths: Iterable[str], abi: int | None = None) -> None:
         os.close(ruleset)
 
 
-def _allow(libc: ctypes.CDLL, add_rule: int, ruleset: int, path: str) -> None:
+def _allow(libc: ctypes.CDLL, add_rule: int, ruleset: int, path: str, only: int | None) -> None:
     try:
         fd = os.open(path, os.O_PATH | os.O_CLOEXEC)
     except OSError:
@@ -180,7 +219,7 @@ def _allow(libc: ctypes.CDLL, add_rule: int, ruleset: int, path: str) -> None:
     try:
         mode = os.fstat(fd).st_mode
         if stat.S_ISDIR(mode):
-            rights = DIR_RIGHTS
+            rights = DIR_RIGHTS if only is None else only
         elif stat.S_ISREG(mode):
             rights = FILE_RIGHTS
         else:
@@ -192,51 +231,144 @@ def _allow(libc: ctypes.CDLL, add_rule: int, ruleset: int, path: str) -> None:
         os.close(fd)
 
 
+class ReadSet(NamedTuple):
+    """What an adapter may touch: ``read`` (read/execute below) and ``listing`` (names only)."""
+
+    read: tuple[str, ...]
+    listing: tuple[str, ...] = ()
+
+
+_PYTHON_NAME = re.compile(r"^python(\d+(\.\d+)*)?$")
+
+
 def _real(path: str) -> str:
     return os.path.realpath(path)
 
 
-def read_set(command: Sequence[str], extra: Iterable[str] = ()) -> tuple[str, ...]:
+def _python_prefix(executable: str) -> str | None:
+    """Prefix of ``executable`` when it is positively a Python interpreter, else ``None``.
+
+    Positive means: the real path is the host's ``sys.executable``, or it is named
+    ``pythonX[.Y]`` with a ``lib/python<ver>`` directory beside it. Never decided by position.
+    """
+    real = _real(executable)
+    prefix = os.path.dirname(os.path.dirname(real))
+    if real == _real(sys.executable) and os.path.isdir(os.path.join(prefix, "lib")):
+        return prefix
+    if not _PYTHON_NAME.match(os.path.basename(real)):
+        return None
+    lib = os.path.join(prefix, "lib")
+    try:
+        if any(name.startswith("python3") for name in os.listdir(lib)):
+            return prefix
+    except OSError:
+        return None
+    return None
+
+
+def _module_locations(module: str) -> tuple[list[str], list[str]]:
+    """(package dirs or module files, their parent dirs) of the top-level of ``module``."""
+    try:
+        spec = importlib.util.find_spec(module.split(".")[0])
+    except (ImportError, ValueError, AttributeError):
+        return [], []
+    if spec is None:
+        return [], []
+    places = list(spec.submodule_search_locations or [])
+    if not places and spec.origin and os.path.isfile(spec.origin):
+        places = [spec.origin]
+    real = [_real(item) for item in places]
+    return real, [os.path.dirname(item) for item in real]
+
+
+def read_set(command: Sequence[str], extra: Iterable[str] = ()) -> ReadSet:
     """The only paths an adapter started with ``command`` may read (real paths, sorted).
 
-    The single place that decides it: the interpreter's real prefix (its stdlib and
-    extension modules), the virtualenv it runs from (site-packages: the tree-sitter bindings
-    and grammar ``.so`` files, ``pyvenv.cfg``), the adapter script when ``command[1]`` is
-    one (the file only, not its directory; later arguments are data, never granted), the system library directories,
-    ``/etc/ld.so.cache`` and two device nodes, plus ``extra``. Paths that do not exist are
-    left out.
+    The single place that decides it:
+
+    - the executable file, plus, only when it is positively a Python interpreter, its
+      ``lib`` directory (stdlib, extension modules) and the virtualenv it runs from
+      (site-packages: the tree-sitter bindings and grammar ``.so`` files, ``pyvenv.cfg``);
+    - the adapter script when ``command[1]`` is one (the file only, never its directory), or
+      the top-level package of ``command[1:3] == ["-m", module]`` resolved by ``find_spec``
+      in this process (the package directory only, its parent listable);
+    - the system library directories, ``/etc/ld.so.cache`` and two device nodes;
+    - ``extra`` (``Limits.extra_read_paths``).
+
+    Paths that do not exist are left out. ``check_read_set`` validates the result.
     """
     found: set[str] = set()
     interpreter = command[0]
-    found.add(_real(os.path.dirname(os.path.dirname(_real(interpreter)))))
     found.add(_real(interpreter))
-    bin_dir = os.path.dirname(os.path.abspath(interpreter))
-    venv = os.path.dirname(bin_dir)
-    if os.path.isfile(os.path.join(venv, "pyvenv.cfg")):
-        found.add(_real(venv))
-    if len(command) > 1 and os.path.isabs(command[1]) and os.path.isfile(command[1]):
-        found.add(_real(command[1]))  # the script; later arguments are never granted
+    prefix = _python_prefix(interpreter)
+    if prefix is not None:
+        found.add(os.path.join(prefix, "lib"))
+        venv = os.path.dirname(os.path.dirname(os.path.abspath(interpreter)))
+        if os.path.isfile(os.path.join(venv, "pyvenv.cfg")):
+            found.add(_real(venv))
+    listing: set[str] = set()
+    if len(command) > 2 and command[1] == "-m":
+        places, parents = _module_locations(command[2])
+        found.update(places)
+        listing.update(parents)
+    elif len(command) > 1 and os.path.isabs(command[1]) and os.path.isfile(command[1]):
+        found.add(_real(command[1]))  # the script; later arguments are data, never granted
     found.update(_real(item) for item in (*SYSTEM_LIBRARY_DIRS, *SYSTEM_FILES, *extra))
-    return tuple(sorted(item for item in found if os.path.lexists(item)))
+    read = tuple(sorted(item for item in found if os.path.lexists(item)))
+    uncovered = (item for item in listing if os.path.isdir(item) and not _covered(item, read))
+    return ReadSet(read, tuple(sorted(uncovered)))
+
+
+def _covered(path: str, roots: Iterable[str]) -> bool:
+    return any(_within(path, root) for root in roots)
 
 
 def _within(path: str, root: str) -> bool:
     return path == root or path.startswith(root.rstrip("/") + "/")
 
 
-def check_read_set(paths: Iterable[str], checkout_roots: Iterable[str]) -> None:
-    """Refuse a set with a path equal to, above or inside any checkout root."""
+def _depth(path: str) -> int:
+    return len([part for part in path.split("/") if part])
+
+
+def _floor_violation(path: str) -> bool:
+    """True for ``/``, any depth-1 path but the fixed library dirs, and any forbidden tree."""
+    fixed = {*SYSTEM_LIBRARY_DIRS, *(_real(item) for item in SYSTEM_LIBRARY_DIRS)}
+    if _depth(path) <= 1 and path not in fixed:
+        return True
+    trees = (*FORBIDDEN_TREES, _real(os.path.expanduser("~")))
+    return any(_within(tree, path) for tree in trees)  # equal to, or an ancestor of, a tree
+
+
+def check_read_set(rules: ReadSet | Iterable[str], checkout_roots: Iterable[str]) -> None:
+    """Refuse a set that breaks the floor or has a path equal to, above or in a checkout root.
+
+    An empty ``checkout_roots`` is refused too: the overlap check must never be disabled by
+    omission.
+    """
     roots = [_real(root) for root in checkout_roots]
+    if not roots:
+        raise UnsafeReadSet
+    paths = (*rules.read, *rules.listing) if isinstance(rules, ReadSet) else tuple(rules)
     for path in paths:
         real = _real(path)
+        if _floor_violation(real):
+            raise UnsafeReadSet
         if any(_within(real, root) or _within(root, real) for root in roots):
             raise UnsafeReadSet
 
 
 def _trampoline(argv: Sequence[str]) -> None:
-    """``landlock.py <json {"paths": [...]}> <command...>``: confine, then exec the adapter."""
+    """``landlock.py <json {"read": [], "listing": [], "status_fd": n}> <command...>``.
+
+    Confines, writes the handshake byte on the status pipe, makes the pipe close-on-exec (so
+    the adapter never holds it and cannot forge the byte) and execs the adapter.
+    """
     try:
-        restrict(json.loads(argv[1])["paths"])
+        plan = json.loads(argv[1])
+        restrict(plan["read"], listing=plan["listing"])
+        os.write(plan["status_fd"], HANDSHAKE)
+        os.set_inheritable(plan["status_fd"], False)
     except BaseException:
         os._exit(CONFINE_FAILED_EXIT)
     command = list(argv[2:])

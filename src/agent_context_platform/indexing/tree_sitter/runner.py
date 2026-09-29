@@ -26,17 +26,32 @@ This runner, per adapter run:
   ``RLIMIT_CPU`` 10 s, ``RLIMIT_NOFILE`` 32, ``RLIMIT_FSIZE`` 0, ``RLIMIT_NPROC`` 16,
   ``RLIMIT_CORE`` 0 (a core would hold source text);
 - Landlock read confinement (``landlock.py``), applied in the adapter process itself right
-  before its ``execv`` (a trampoline the supervisor execs, so the supervisor keeps ``/proc``):
-  the adapter can read only its interpreter prefix and stdlib, its virtualenv
-  (site-packages: bindings and grammar ``.so`` files), the adapter script, the system library
-  dirs, ``/etc/ld.so.cache``, ``/dev/null`` and ``/dev/urandom``; it can write, create,
-  truncate, rename and unlink nothing anywhere, and from ABI 4 it cannot bind or connect TCP.
-  The restriction is inherited by every descendant and cannot be lifted. Fails closed: when
-  Landlock is unavailable (ENOSYS, EOPNOTSUPP, ABI 0, seccomp, unknown architecture) the
-  runner raises ``SandboxUnavailable`` instead of running the adapter, unless
-  ``Limits.allow_unconfined`` (setting ``AGENT_CONTEXT_INDEXER_ALLOW_UNCONFINED_ADAPTERS``,
-  default false, DEV ONLY, logged once as a WARN) is on. A read set that touches a checkout
-  root (``Limits.checkout_roots``) is refused with ``UNSAFE_READ_SET``;
+  before its ``execv`` (a trampoline the supervisor execs, so the supervisor keeps
+  ``/proc``). The adapter can read only:
+
+  * its executable and, if it is positively a Python interpreter, that interpreter's ``lib``
+    directory (stdlib) and virtualenv (site-packages: bindings and grammar ``.so`` files);
+  * the script in ``command[1]`` (the file only), or the top-level package of
+    ``-m <module>`` (resolved with ``find_spec`` here; the package directory only, its
+    parent listable but not readable);
+  * the system library dirs, ``/etc/ld.so.cache``, ``/dev/null`` and ``/dev/urandom``.
+
+  It can write, create, truncate, rename and unlink nothing anywhere, and from ABI 4 it
+  cannot bind or connect TCP. The restriction is inherited by every descendant and cannot be
+  lifted. A read set that breaks the floor (``/``, ``$HOME``, ``/etc``, ``/tmp``, any other
+  depth-1 path but the fixed lib dirs) or touches a checkout root
+  (``Limits.checkout_roots``, default ``/work``, never empty) is refused with
+  ``UNSAFE_READ_SET``, so is an editable install of the adapter that lives inside the
+  checkout being indexed.
+
+  Fails closed: when Landlock is unavailable (ENOSYS, EOPNOTSUPP, ABI 0, seccomp, unknown
+  architecture) the runner raises ``SandboxUnavailable`` instead of running the adapter,
+  unless ``Limits.allow_unconfined`` (setting
+  ``AGENT_CONTEXT_INDEXER_ALLOW_UNCONFINED_ADAPTERS``, default false, DEV ONLY, logged once
+  as a WARN) is on. The hatch only covers a kernel that lacks Landlock: when the probe
+  passed and the kernel then refuses the ruleset in the adapter process, the run still fails
+  closed with ``SandboxUnavailable``. The trampoline confirms the ruleset on a dedicated
+  status pipe, so an adapter's own exit status is never read as a confinement result;
 - a wall-clock deadline (default 20 s) that also covers hangs a CPU limit cannot;
 - an environment allowlist (``LANG``/``LC_ALL`` plus what the caller passes), so no
   secret of the worker leaks in; the working directory is a fresh empty temporary
@@ -144,7 +159,7 @@ from agent_context_platform.indexing.tree_sitter.base import (
     parser_fingerprint,
     validate_module,
 )
-from agent_context_platform.settings import Settings
+from agent_context_platform.settings import DEFAULT_CHECKOUT_ROOTS, Settings
 
 _LOG = logging.getLogger(__name__)
 MAX_STDERR_BYTES: Final = 64 * 1024
@@ -154,12 +169,12 @@ _RUN_KEY: Final = "AGENT_CONTEXT_SANDBOX_RUN"
 _DEFAULT_ENV_ALLOWLIST: Final = ("LANG", "LC_ALL")
 
 # Per-run supervisor (constant source; limits JSON and argv arrive as arguments, never
-# interpolated). It becomes a child subreaper, so every descendant of the adapter that
-# is orphaned (double fork, setsid daemon) is re-parented to it instead of escaping;
-# forks the adapter with the rlimits; and, once the adapter exits or on SIGTERM, kills
-# and reaps every descendant before it exits itself. With a trampoline (``landlock.py``) the
-# adapter child execs it instead of the command: it confines itself, then execs the command. PDEATHSIG is SIGTERM (not SIGKILL)
-# so that the supervisor still runs that cleanup if the runner dies.
+# interpolated). It becomes a child subreaper, so every descendant of the adapter that is
+# orphaned (double fork, setsid daemon) is re-parented to it instead of escaping; forks the
+# adapter with the rlimits; and, once the adapter exits or on SIGTERM, kills and reaps every
+# descendant before it exits itself. With a trampoline (``landlock.py``) the adapter child
+# execs it instead of the command: it confines itself, then execs the command. PDEATHSIG is
+# SIGTERM (not SIGKILL) so that the supervisor still runs that cleanup if the runner dies.
 _SUPERVISOR: Final = r"""
 import ctypes, json, os, resource, signal, sys, time
 libc = ctypes.CDLL(None, use_errno=True)
@@ -246,10 +261,11 @@ class Limits:
     wall_seconds: float = 20.0
     max_output_bytes: int = MAX_OUTPUT_BYTES
     max_stderr_bytes: int = MAX_STDERR_BYTES
-    # Landlock. ``checkout_roots``: directories being indexed, never readable by the adapter.
+    # Landlock. ``checkout_roots``: directories being indexed, never readable by the adapter
+    # (default: the indexer image's checkout mount, ``/work``; must not be empty).
     # ``extra_read_paths``: the only way to widen the computed read set. ``allow_unconfined``
     # runs adapters without Landlock when the kernel lacks it (DEV ONLY, logged once).
-    checkout_roots: tuple[str, ...] = ()
+    checkout_roots: tuple[str, ...] = DEFAULT_CHECKOUT_ROOTS
     extra_read_paths: tuple[str, ...] = ()
     allow_unconfined: bool = False
 
@@ -263,6 +279,8 @@ class Limits:
         )
 
     def __post_init__(self) -> None:
+        if not self.checkout_roots:  # never disable the overlap check by omission
+            raise ValueError("checkout_roots must not be empty")
         for name in (
             "address_space_bytes",
             "cpu_seconds",
@@ -345,6 +363,10 @@ def _run(command: Sequence[str], payload: bytes, limits: Limits, env: dict[str, 
     confined = _confinement(command, limits)
     env = {**env, _RUN_KEY: uuid.uuid4().hex}
     workdir = _make_workdir()
+    # Status pipe: the trampoline writes one byte once the ruleset is in force. The write end
+    # is inherited only by the supervisor and the trampoline; it is close-on-exec afterwards,
+    # so the adapter (whatever it exits with) can neither hold it nor forge the byte.
+    status_r, status_w = os.pipe() if confined is not None else (-1, -1)
     try:
         argv = [
             sys.executable,
@@ -355,7 +377,13 @@ def _run(command: Sequence[str], payload: bytes, limits: Limits, env: dict[str, 
             str(os.getpid()),
             json.dumps(limits.rlimits()),
             landlock.__file__ if confined is not None else "",
-            json.dumps({"paths": confined or []}),
+            json.dumps(
+                {
+                    "read": confined.read if confined else [],
+                    "listing": confined.listing if confined else [],
+                    "status_fd": status_w,
+                }
+            ),
             *command,
         ]
         with _LIVE_LOCK:  # sweep, spawn and registration are atomic against other sweeps
@@ -369,6 +397,7 @@ def _run(command: Sequence[str], payload: bytes, limits: Limits, env: dict[str, 
                     cwd=workdir,
                     env=env,
                     close_fds=True,
+                    pass_fds=(status_w,) if confined is not None else (),
                     start_new_session=True,
                 )
             except OSError:
@@ -381,33 +410,46 @@ def _run(command: Sequence[str], payload: bytes, limits: Limits, env: dict[str, 
                 raise StructuralError(StructuralErrorCode.TIMEOUT)
         finally:
             _reap(process)
-        if confined is not None and process.returncode == landlock.CONFINE_FAILED_EXIT:
+        if confined is not None and not _confirmed(status_r):
             raise SandboxUnavailable  # the kernel refused the ruleset: nothing ran
         if process.returncode != 0:
             raise StructuralError(StructuralErrorCode.NONZERO_EXIT)
         return output
     finally:
+        for fd in (status_r, status_w):
+            if fd >= 0:
+                with contextlib.suppress(OSError):
+                    os.close(fd)
         if workdir != _FALLBACK_CWD:
             shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _confirmed(status_r: int) -> bool:
+    """True when the trampoline confirmed the ruleset (the supervisor has exited by now)."""
+    try:
+        os.set_blocking(status_r, False)
+        return os.read(status_r, 1) == landlock.HANDSHAKE
+    except OSError:
+        return False
 
 
 _WARN_LOCK = threading.Lock()
 _warned_unconfined = False
 
 
-def _confinement(command: Sequence[str], limits: Limits) -> tuple[str, ...] | None:
+def _confinement(command: Sequence[str], limits: Limits) -> landlock.ReadSet | None:
     """Read set to confine the adapter to, or ``None`` only under the dev escape hatch."""
     if landlock.abi_version() < 1:
         if not limits.allow_unconfined:
             raise SandboxUnavailable
         _warn_unconfined()
         return None
-    paths = landlock.read_set(command, limits.extra_read_paths)
+    rules = landlock.read_set(command, limits.extra_read_paths)
     try:
-        landlock.check_read_set(paths, limits.checkout_roots)
+        landlock.check_read_set(rules, limits.checkout_roots)
     except landlock.UnsafeReadSet:
         raise StructuralError(StructuralErrorCode.UNSAFE_READ_SET) from None
-    return paths
+    return rules
 
 
 def _warn_unconfined() -> None:
