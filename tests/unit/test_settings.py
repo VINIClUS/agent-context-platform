@@ -235,3 +235,33 @@ def test_installed_sdk_matches_the_pinned_public_version() -> None:
 
     assert __version__ == pinned["version"]
     assert f"agent-context-sdk=={pinned['version']}" in pyproject["project"]["dependencies"]
+
+
+def test_mcp_transport_guard_defaults_are_loopback_only_and_bounded() -> None:
+    settings = Settings(environment="test")
+
+    assert settings.mcp.allowed_hosts == ("127.0.0.1:*", "localhost:*", "[::1]:*")
+    assert settings.mcp.allowed_origins == (
+        "http://127.0.0.1:*",
+        "http://localhost:*",
+        "http://[::1]:*",
+    )
+    assert settings.mcp.max_request_body_bytes == 1_048_576
+
+
+def test_mcp_guard_settings_load_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENT_CONTEXT_MCP__ALLOWED_HOSTS", '["mcp.example.test"]')
+    monkeypatch.setenv("AGENT_CONTEXT_MCP__ALLOWED_ORIGINS", '["https://app.example.test"]')
+    monkeypatch.setenv("AGENT_CONTEXT_MCP__MAX_REQUEST_BODY_BYTES", "4096")
+
+    settings = Settings()
+
+    assert settings.mcp.allowed_hosts == ("mcp.example.test",)
+    assert settings.mcp.allowed_origins == ("https://app.example.test",)
+    assert settings.mcp.max_request_body_bytes == 4096
+
+
+@pytest.mark.parametrize("value", [0, -1])
+def test_mcp_rejects_non_positive_body_limit(value: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(mcp={"max_request_body_bytes": value})
