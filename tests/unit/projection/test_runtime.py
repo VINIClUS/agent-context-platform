@@ -923,3 +923,21 @@ def test_process_claimed_row_retries_when_a_projector_cannot_classify_the_event(
     [(failing_projector, error)] = failures
     assert failing_projector is exploding
     assert isinstance(error, KeyError)
+
+
+@pytest.mark.parametrize(
+    ("name", "version"),
+    [("", "1"), ("n" * 256, "1"), ("graph.test", ""), ("graph.test", "v" * 65)],
+)
+def test_runner_rejects_projector_identities_that_cannot_be_persisted(
+    name: str, version: str
+) -> None:
+    projector = RecordingProjector(name, version, handled_types=[])
+    with pytest.raises(ValueError, match=r"projector (name|version)"):
+        ProjectionRunner(
+            FakeSessionFactory([]),
+            FakeNeo4jStore(),
+            [projector],
+            worker_id="worker-a",
+            clock=lambda: NOW,
+        )

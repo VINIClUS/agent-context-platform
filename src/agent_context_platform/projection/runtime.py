@@ -171,6 +171,14 @@ class ProjectionRunner:
         if base_retry_delay <= timedelta(0):
             raise ValueError("base_retry_delay must be positive")
         identities = [(projector.name, projector.version) for projector in projectors]
+        for name, version in identities:
+            # Checkpoint and dead-letter columns cap these at 255 and 64: an
+            # identity that cannot be persisted would make every finalize fail
+            # and the row replay forever instead of reaching a terminal state.
+            if not name.strip() or len(name) > 255:
+                raise ValueError("projector name must be 1-255 characters")
+            if not version.strip() or len(version) > 64:
+                raise ValueError("projector version must be 1-64 characters")
         if len(identities) != len(set(identities)):
             raise ValueError("projectors must have unique (name, version) pairs")
 
@@ -262,6 +270,7 @@ class ProjectionRunner:
             return sorted(claimed_rows, key=lambda row: row.outbox_id)
 
     async def _process_claimed_row(self, row: ClaimedOutboxRow) -> ClaimOutcome:
+        load_error: Exception | None = None
         async with self._session_factory() as session:
             try:
                 event = await _load_event(session, row.event_id)
@@ -270,12 +279,16 @@ class ProjectionRunner:
                 # validate are deterministic failures: count them against the
                 # bounded retry budget instead of aborting the run and leaving
                 # the row to be reclaimed forever without progress.
-                return await self._finalize_failure(
-                    row=row,
-                    event_id=row.event_id,
-                    failing_projector=None,
-                    error=error,
-                )
+                load_error = error
+        if load_error is not None:
+            # Finalize only after the load session is released, so a failure
+            # never holds one pooled connection while waiting for another.
+            return await self._finalize_failure(
+                row=row,
+                event_id=row.event_id,
+                failing_projector=None,
+                error=load_error,
+            )
 
         matching: list[Projector] = []
         for projector in self._projectors:
