@@ -42,7 +42,7 @@ dev = [
 
 [package.metadata]
 requires-dist = [
-    { name = "agent-context-sdk", path = "build/sdk/agent_context_sdk-0.3.3-py3-none-any.whl" },
+    { name = "agent-context-sdk", path = "build/sdk/agent_context_sdk-0.4.0-py3-none-any.whl" },
     { name = "alembic", specifier = ">=1.19.1,<2" },
     { name = "argon2-cffi", specifier = "==25.1.0" },
     { name = "boto3", specifier = ">=1.43.76,<2" },
@@ -73,15 +73,15 @@ dev = [
 
 [[package]]
 name = "agent-context-sdk"
-version = "0.3.3"
-source = { path = "build/sdk/agent_context_sdk-0.3.3-py3-none-any.whl" }
+version = "0.4.0"
+source = { path = "build/sdk/agent_context_sdk-0.4.0-py3-none-any.whl" }
 dependencies = [
     { name = "pydantic" },
     { name = "rfc8785" },
     { name = "uuid6" },
 ]
 wheels = [
-    { filename = "agent_context_sdk-0.3.3-py3-none-any.whl", hash = "sha256:1e3202c1c2247a7b6e2c3b02727c41aa8887aa74080dbf1e2c10dea3ca825592" },
+    { filename = "agent_context_sdk-0.4.0-py3-none-any.whl", hash = "sha256:706d26edb3ec4c61a7b7f34a79b85d727041cccb0fcee97ba11a97f42ce9798e" },
 ]
 
 [package.metadata]
