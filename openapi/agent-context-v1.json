@@ -1,0 +1,357 @@
+{
+  "components": {
+    "schemas": {
+      "AcceptedEventV1": {
+        "additionalProperties": false,
+        "description": "Result for an event that was newly stored or already known.",
+        "properties": {
+          "event_id": {
+            "format": "uuid7",
+            "title": "Event Id",
+            "type": "string"
+          },
+          "status": {
+            "enum": [
+              "accepted",
+              "existing"
+            ],
+            "title": "Status",
+            "type": "string"
+          },
+          "stream_sequence": {
+            "exclusiveMinimum": 0.0,
+            "title": "Stream Sequence",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "event_id",
+          "status",
+          "stream_sequence"
+        ],
+        "title": "AcceptedEventV1",
+        "type": "object"
+      },
+      "ErrorDetailV1": {
+        "description": "Fixed, content-free error description; ``code`` is stable, ``message`` is not.",
+        "properties": {
+          "code": {
+            "title": "Code",
+            "type": "string"
+          },
+          "message": {
+            "title": "Message",
+            "type": "string"
+          }
+        },
+        "required": [
+          "code",
+          "message"
+        ],
+        "title": "ErrorDetailV1",
+        "type": "object"
+      },
+      "ErrorResponseV1": {
+        "description": "Body of every failure the route answers before or instead of a batch outcome.",
+        "properties": {
+          "error": {
+            "$ref": "#/components/schemas/ErrorDetailV1"
+          },
+          "request_id": {
+            "title": "Request Id",
+            "type": "string"
+          }
+        },
+        "required": [
+          "error",
+          "request_id"
+        ],
+        "title": "ErrorResponseV1",
+        "type": "object"
+      },
+      "IngestBatchResponseV1": {
+        "additionalProperties": false,
+        "description": "Atomic ingestion outcome for a submitted batch.",
+        "properties": {
+          "accepted": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/AcceptedEventV1"
+            },
+            "title": "Accepted",
+            "type": "array"
+          },
+          "batch_id": {
+            "format": "uuid7",
+            "title": "Batch Id",
+            "type": "string"
+          },
+          "rejected": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/RejectedEventV1"
+            },
+            "title": "Rejected",
+            "type": "array"
+          }
+        },
+        "required": [
+          "batch_id"
+        ],
+        "title": "IngestBatchResponseV1",
+        "type": "object"
+      },
+      "RejectedEventV1": {
+        "additionalProperties": false,
+        "description": "Public, safe result for a recoverable event-specific ingestion rejection.",
+        "properties": {
+          "error_code": {
+            "pattern": "^[a-z][a-z0-9_]{0,127}$",
+            "title": "Error Code",
+            "type": "string"
+          },
+          "event_id": {
+            "format": "uuid7",
+            "title": "Event Id",
+            "type": "string"
+          },
+          "retryable": {
+            "title": "Retryable",
+            "type": "boolean"
+          }
+        },
+        "required": [
+          "event_id",
+          "error_code",
+          "retryable"
+        ],
+        "title": "RejectedEventV1",
+        "type": "object"
+      }
+    }
+  },
+  "info": {
+    "title": "Agent Context Ingestion API",
+    "version": "v1"
+  },
+  "openapi": "3.1.0",
+  "paths": {
+    "/v1/ingestion/batches": {
+      "post": {
+        "operationId": "ingest_batch_v1_ingestion_batches_post",
+        "parameters": [
+          {
+            "description": "Must equal the batch_id in the body.",
+            "in": "header",
+            "name": "Idempotency-Key",
+            "required": true,
+            "schema": {
+              "format": "uuid",
+              "type": "string"
+            }
+          }
+        ],
+        "requestBody": {
+          "content": {
+            "application/json": {
+              "schema": {
+                "description": "agent-context-sdk IngestBatchRequestV1.",
+                "title": "IngestBatchRequestV1",
+                "type": "object"
+              }
+            }
+          },
+          "required": true
+        },
+        "responses": {
+          "200": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestBatchResponseV1"
+                }
+              }
+            },
+            "description": "Successful Response"
+          },
+          "400": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseV1"
+                }
+              }
+            },
+            "description": "Idempotency-Key header absent: `idempotency_key_required`.",
+            "headers": {
+              "x-request-id": {
+                "description": "Request ID: echoed when a short safe token, otherwise generated.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "401": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseV1"
+                }
+              }
+            },
+            "description": "Missing or invalid producer credential: `missing_credential`, `invalid_credential`.",
+            "headers": {
+              "WWW-Authenticate": {
+                "description": "Always `Bearer`.",
+                "schema": {
+                  "type": "string"
+                }
+              },
+              "x-request-id": {
+                "description": "Request ID: echoed when a short safe token, otherwise generated.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "403": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseV1"
+                }
+              }
+            },
+            "description": "Credential lacks the scope or names another producer: `insufficient_scope`, `producer_mismatch`.",
+            "headers": {
+              "x-request-id": {
+                "description": "Request ID: echoed when a short safe token, otherwise generated.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "409": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/IngestBatchResponseV1"
+                }
+              }
+            },
+            "description": "Whole batch rejected, nothing stored: `idempotency_conflict`, `stream_quarantined`; other events are `batch_rejected`.",
+            "headers": {
+              "x-request-id": {
+                "description": "Request ID: echoed when a short safe token, otherwise generated.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "413": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseV1"
+                }
+              }
+            },
+            "description": "Request body exceeds the size limit: `request_too_large`.",
+            "headers": {
+              "x-request-id": {
+                "description": "Request ID: echoed when a short safe token, otherwise generated.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "422": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/IngestBatchResponseV1"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorResponseV1"
+                    }
+                  ],
+                  "title": "Response 422 Ingest Batch V1 Ingestion Batches Post"
+                }
+              }
+            },
+            "description": "Error envelope: `invalid_request_schema`, `idempotency_key_mismatch`. Batch response, nothing stored: `duplicate_idempotency_key`, `duplicate_content_id`, `unsupported_media_type`, `invalid_content_encoding`, `content_requires_redaction`, `content_resolution_mismatch`.",
+            "headers": {
+              "x-request-id": {
+                "description": "Request ID: echoed when a short safe token, otherwise generated.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "500": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ErrorResponseV1"
+                }
+              }
+            },
+            "description": "Unexpected failure: `internal_error`.",
+            "headers": {
+              "x-request-id": {
+                "description": "Request ID: echoed when a short safe token, otherwise generated.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "503": {
+            "content": {
+              "application/json": {
+                "schema": {
+                  "anyOf": [
+                    {
+                      "$ref": "#/components/schemas/IngestBatchResponseV1"
+                    },
+                    {
+                      "$ref": "#/components/schemas/ErrorResponseV1"
+                    }
+                  ],
+                  "title": "Response 503 Ingest Batch V1 Ingestion Batches Post"
+                }
+              }
+            },
+            "description": "Error envelope: `ingestion_unavailable`, `auth_overloaded`, `service_unavailable`. Batch response (retryable outage): rejected events carry `service_unavailable` with `retryable` true.",
+            "headers": {
+              "Retry-After": {
+                "description": "Seconds to wait before retrying.",
+                "schema": {
+                  "type": "integer"
+                }
+              },
+              "x-request-id": {
+                "description": "Request ID: echoed when a short safe token, otherwise generated.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          }
+        },
+        "summary": "Ingest Batch",
+        "tags": [
+          "ingestion"
+        ]
+      }
+    }
+  }
+}

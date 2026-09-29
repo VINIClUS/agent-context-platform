@@ -1,0 +1,28 @@
+{
+  "name": "validation-error",
+  "description": "Well-formed JSON that violates the request schema (a batch needs 1 to 500 events): 422 with the fixed error envelope, no echo of the input.",
+  "request": {
+    "method": "POST",
+    "path": "/v1/ingestion/batches",
+    "headers": {
+      "content-type": "application/json",
+      "idempotency-key": "01900000-0000-7000-8000-000000000104",
+      "authorization": "Bearer <producer-token>"
+    },
+    "body": {
+      "batch_id": "01900000-0000-7000-8000-000000000104",
+      "events": []
+    }
+  },
+  "response": {
+    "status": 422,
+    "headers": {},
+    "body": {
+      "error": {
+        "code": "invalid_request_schema",
+        "message": "The request body does not match the ingestion schema."
+      },
+      "request_id": "<request-id>"
+    }
+  }
+}
