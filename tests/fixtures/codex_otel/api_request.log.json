@@ -1,0 +1,31 @@
+{
+  "_provenance": "source-derived (hand-built from codex-rs/otel/src/events/session_telemetry.rs and shared.rs at rust-v0.147.0 and rust-v0.157.1); not a captured export; G4 diffs against a real sandbox export",
+  "description": "codex.api_request (gap: no SDK event)",
+  "signal": "log",
+  "resource": {
+    "service.name": "codex_cli_rs",
+    "service.version": "0.147.0"
+  },
+  "attributes": {
+    "event.name": "codex.api_request",
+    "duration_ms": "412",
+    "http.response.status_code": 200,
+    "attempt": 1,
+    "auth.header_attached": true,
+    "auth.header_name": "authorization",
+    "auth.retry_after_unauthorized": false,
+    "endpoint": "/responses",
+    "auth.request_id": "req_canary_1",
+    "auth.cf_ray": "ray-canary",
+    "event.timestamp": "2026-08-13T13:00:01.000Z",
+    "conversation.id": "0198a4b1-98c0-7c28-ae3f-000000000001",
+    "app.version": "0.147.0",
+    "originator": "codex_cli_rs",
+    "terminal.type": "xterm",
+    "model": "gpt-5.5",
+    "slug": "gpt-5.5",
+    "user.account_id": "acct-canary-7f3a",
+    "user.email": "canary-user@example.invalid",
+    "auth_mode": "chatgpt"
+  }
+}
