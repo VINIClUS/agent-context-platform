@@ -1,0 +1,31 @@
+{
+  "_provenance": "source-derived (hand-built from codex-rs/otel/src/events/session_telemetry.rs and shared.rs at rust-v0.147.0 and rust-v0.157.1); not a captured export; G4 diffs against a real sandbox export",
+  "description": "codex.conversation_starts, trace-safe variant (mcp_server_count instead of mcp_servers; no user.*)",
+  "signal": "trace",
+  "resource": {
+    "service.name": "codex_cli_rs",
+    "service.version": "0.147.0"
+  },
+  "attributes": {
+    "event.name": "codex.conversation_starts",
+    "provider_name": "openai",
+    "auth.env_openai_api_key_present": false,
+    "auth.env_codex_api_key_present": false,
+    "auth.env_codex_api_key_enabled": false,
+    "auth.env_refresh_token_url_override_present": false,
+    "reasoning_effort": "medium",
+    "reasoning_summary": "auto",
+    "context_window": 272000,
+    "auto_compact_token_limit": 244800,
+    "approval_policy": "on-request",
+    "sandbox_policy": "workspace-write",
+    "mcp_server_count": 2,
+    "event.timestamp": "2026-08-13T13:00:00.124Z",
+    "conversation.id": "0198a4b1-98c0-7c28-ae3f-000000000001",
+    "app.version": "0.147.0",
+    "originator": "codex_cli_rs",
+    "terminal.type": "xterm",
+    "model": "gpt-5.5",
+    "slug": "gpt-5.5"
+  }
+}
