@@ -335,6 +335,14 @@ def test_event_lock_keys_cover_every_node_each_projector_writes(event: StoredEve
 
 
 @pytest.mark.parametrize("event", _REPRESENTATIVE_EVENTS, ids=lambda e: e.event_type)
+def test_event_lock_keys_hold_only_nodes_some_projector_writes(event: StoredEventV1) -> None:
+    written = set().union(
+        *(_written_nodes(event, p) for p in PROJECTORS if p.handles(event.event_type))
+    )
+    assert set(event_lock_keys(event)) <= written, set(event_lock_keys(event)) - written
+
+
+@pytest.mark.parametrize("event", _REPRESENTATIVE_EVENTS, ids=lambda e: e.event_type)
 def test_every_projector_locks_the_same_full_set_first(event: StoredEventV1) -> None:
     locked = event_lock_keys(event)
     for projector in PROJECTORS:

@@ -208,7 +208,8 @@ def lock_keys(event: StoredEventV1) -> list[tuple[str, str]]:
     """Nodes `GitProjector` touches for `event`, from the same ID helpers it writes with."""
     kind = event.event_type
     session = event.context.session_id
-    keys = [] if session is None else [("Session", session)]
+    # Only commit and snapshot events assert `Session-[:PRODUCED]`.
+    keys = [] if session is None or kind == "git.checkout.observed" else [("Session", session)]
     if kind == "git.checkout.observed":
         checkout = CheckoutObservedV1.model_validate(dict(event.payload))
         repository = checkout.repository_id

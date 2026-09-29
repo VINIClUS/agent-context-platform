@@ -63,13 +63,20 @@ def _repositories(event: StoredEventV1) -> list[str]:
 
 
 def lock_keys(event: StoredEventV1) -> list[tuple[str, str]]:
-    """Nodes `PortfolioProjector` touches for `event`."""
-    keys = [("Repository", repository_id) for repository_id in _repositories(event)]
-    if event.context.workspace_id is not None:
-        keys.append(("Workspace", event.context.workspace_id))
-    if event.context.project_id is not None:
-        keys.append(("Project", event.context.project_id))
-    return keys if event.event_type in _HANDLED else []
+    """Nodes `PortfolioProjector` writes for `event`, and no others."""
+    kind = event.event_type
+    if kind not in _HANDLED:
+        return []
+    keys: set[tuple[str, str]] = set()
+    if kind == _REPOSITORY_OBSERVED_TYPE:
+        keys.add(("Repository", str(event.payload["repository_id"])))
+    project_id = event.context.project_id
+    if kind in _LINKING_TYPES and project_id is not None:
+        keys.add(("Project", project_id))
+        keys.update(("Repository", repository_id) for repository_id in _repositories(event))
+        if event.context.workspace_id is not None:
+            keys.add(("Workspace", event.context.workspace_id))
+    return sorted(keys)
 
 
 class PortfolioProjector:
