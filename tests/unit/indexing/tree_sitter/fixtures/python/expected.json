@@ -1,0 +1,472 @@
+{
+ "files": [
+  {
+   "language": "python",
+   "parser_fingerprint": "1cec4e2bed983ed944d97093309b738f3c59dd6fa2177a012483f97567bf8259",
+   "path": "pkg/__init__.py",
+   "relations": [],
+   "symbols": [
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg#module#0",
+     "range": [
+      0,
+      138
+     ],
+     "semantic_fingerprint": "17095489e0ac7036d5655506fd40beb4b610854dbe1db42f8f1a0b03063058b3",
+     "signature": "",
+     "signature_digest": "9259e18f5395272204a21c72e58bbbd22f24eb4b9175f012e4f7c14fa3b73027"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.__all__#variable#0",
+     "range": [
+      90,
+      121
+     ],
+     "semantic_fingerprint": "f6c80b249ae360c42fea76131b421568ad8a323f7c19f92bee5207f8e7076c8c",
+     "signature": "__all__ =",
+     "signature_digest": "2a708ed819d91f9b099dfb6638d221861001edc7297db50100607514b40c4357"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.VERSION#constant#0",
+     "range": [
+      122,
+      137
+     ],
+     "semantic_fingerprint": "eb0fd13ad82dec704c7d7c5fabfc0084f84e54a14c48113e07b569b9b2411509",
+     "signature": "VERSION =",
+     "signature_digest": "c1c28e0dcd3ae056644b84359cba4d3a211cc7b155492a41ac1621bea99a6824"
+    }
+   ]
+  },
+  {
+   "language": "python",
+   "parser_fingerprint": "1cec4e2bed983ed944d97093309b738f3c59dd6fa2177a012483f97567bf8259",
+   "path": "pkg/models.py",
+   "relations": [
+    {
+     "evidence_kind": "tree_sitter",
+     "kind": "inherits",
+     "range": [
+      344,
+      348
+     ],
+     "source": "pkg.models.Account#class#0",
+     "target": "pkg.models.Base#class#0"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "kind": "inherits",
+     "range": [
+      1146,
+      1153
+     ],
+     "source": "pkg.models.Ledger#class#0",
+     "target": "pkg.models.Account#class#0"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "kind": "calls",
+     "range": [
+      483,
+      489
+     ],
+     "source": "pkg.models.Account.describe#method#0",
+     "target": "pkg.models.helper#function#0"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "kind": "calls",
+     "range": [
+      764,
+      771
+     ],
+     "source": "pkg.models.Account.make#method#0",
+     "target": "pkg.models.Account#class#0"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "kind": "calls",
+     "range": [
+      865,
+      869
+     ],
+     "source": "pkg.models.Account.build#method#0",
+     "target": "pkg.models.Account.make#method#0"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "kind": "calls",
+     "range": [
+      938,
+      944
+     ],
+     "source": "pkg.models.Account.refresh#method#0",
+     "target": "pkg.models.Account.reload#method#0"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "kind": "calls",
+     "range": [
+      960,
+      968
+     ],
+     "source": "pkg.models.Account.refresh#method#0",
+     "target": "pkg.models.Account.describe#method#0"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "kind": "calls",
+     "range": [
+      1268,
+      1273
+     ],
+     "source": "pkg.models.Ledger.total#method#0",
+     "target": "pkg.models.Ledger.total.inner#function#0"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "kind": "calls",
+     "range": [
+      1278,
+      1287
+     ],
+     "source": "pkg.models.Ledger.total#method#0",
+     "target": "pkg.models.fetch_all#function#0"
+    }
+   ],
+   "symbols": [
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models#module#0",
+     "range": [
+      0,
+      1482
+     ],
+     "semantic_fingerprint": "b6ada3475be9f3c32237d24950c6739f6a90a73373fa9ad89edfc5d8ac74aa8d",
+     "signature": "",
+     "signature_digest": "9259e18f5395272204a21c72e58bbbd22f24eb4b9175f012e4f7c14fa3b73027"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.MAX_ITEMS#constant#0",
+     "range": [
+      108,
+      122
+     ],
+     "semantic_fingerprint": "92273234c8ecd2a46608ec4999a64b95aac8dc9cb303c355e9c686a5617c2d73",
+     "signature": "MAX_ITEMS =",
+     "signature_digest": "12c8889083c89e0f82dc94e04c3d2186323ce1b31185df820af4be1e743e6dd0"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.default_name#variable#0",
+     "range": [
+      123,
+      149
+     ],
+     "semantic_fingerprint": "9dc84716a365acb8dac27411bcb2e281107171e8cb185600e2208321d4e245b3",
+     "signature": "default_name: str =",
+     "signature_digest": "e8f08d729f9340223058cd00d005a8894ea1bc23b79af7b6faebf473f13f8f77"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.first#variable#0",
+     "range": [
+      150,
+      170
+     ],
+     "semantic_fingerprint": "0fdda4306a79fa767976a311e7928af4e9c11fda54dd4328505f5a9ef4fddd01",
+     "signature": "first, second =",
+     "signature_digest": "c6d1d39e03f8f5686e0fa702bfc3876c9a2314051d597e2c03cf104c70f0958d"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.second#variable#0",
+     "range": [
+      150,
+      170
+     ],
+     "semantic_fingerprint": "0fdda4306a79fa767976a311e7928af4e9c11fda54dd4328505f5a9ef4fddd01",
+     "signature": "first, second =",
+     "signature_digest": "c6d1d39e03f8f5686e0fa702bfc3876c9a2314051d597e2c03cf104c70f0958d"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.Amount#type#0",
+     "range": [
+      172,
+      189
+     ],
+     "semantic_fingerprint": "c10eb77e98d49d63ca174476e951f51b7db862394fe5cc572077b89710c8159e",
+     "signature": "type Amount =",
+     "signature_digest": "2b37de0786c0a4801e7a590fc8f47c7cbb6e226abce44e847c2aa06713d88c49"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.Base#class#0",
+     "range": [
+      192,
+      316
+     ],
+     "semantic_fingerprint": "0c954e0fad8d748409e3ad1d9b47a8d30ee2db192f188bdaab2bc0e19d632d21",
+     "signature": "class Base(abc.ABC):",
+     "signature_digest": "dfa9d67693fe5c2d8e89735ccf0bffcbd7f28eec931b7002043ca56014c65e3e"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.Base.kind#field#0",
+     "range": [
+      243,
+      256
+     ],
+     "semantic_fingerprint": "028c8117a3914dad50e1fb99a8417fd1ad50b098928c2292fb367592c370fbf0",
+     "signature": "kind =",
+     "signature_digest": "4de2235ac0f8dd42eaf848c520ceb48992866abc91e50455659debb45e9a9836"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.Base.describe#method#0",
+     "range": [
+      262,
+      316
+     ],
+     "semantic_fingerprint": "56b16d50cd4ddd284e4cc025d4a0dcca341d1c73445f38d1dfafd490aeb2fb2c",
+     "signature": "def describe(self) -> str:",
+     "signature_digest": "8273e240b1996fc977435f079309289b879fba36de0449d58ffffe53537d391c"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.Account#class#0",
+     "range": [
+      319,
+      1130
+     ],
+     "semantic_fingerprint": "d3f278a20d181c6509ebb03bbb40e530f2cc066be2df960e9bf8e2bbbc600889",
+     "signature": "class Account(Base):",
+     "signature_digest": "0aae59433146d25fb201e14650bce3470de5a7e11bb5bedf061572fb04dfffea"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.Account.balance#field#0",
+     "range": [
+      378,
+      394
+     ],
+     "semantic_fingerprint": "54de6a79cac7fa6da62a84aebc2da2f3a339b7f347f197e42d0c8be2411fa511",
+     "signature": "balance: int =",
+     "signature_digest": "c24aa6c2c3f3f50cbbd13cfefef1e9b6e16510c3feec21da1ea5018f836fe531"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.Account.describe#method#0",
+     "range": [
+      400,
+      502
+     ],
+     "semantic_fingerprint": "b5f7a4b92460200bead8eb7ee87f5f700eeb7bdf8a8e78468a4ffb176e118d62",
+     "signature": "def describe(self) -> str:",
+     "signature_digest": "89626ffb18352277c658313cce9ae454b92609c7963c25aba1d5acab977735c9"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.Account.name#property#0",
+     "range": [
+      508,
+      569
+     ],
+     "semantic_fingerprint": "790088a7d2364fab63970d8778041ebf86730c6378b75deacc7c082673cc8f2a",
+     "signature": "def name(self) -> str:",
+     "signature_digest": "57af55babfa1dc7123d5c49753555416d05a239545bd6ef5c93823bdb7f6367d"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.Account.name#property#1",
+     "range": [
+      575,
+      654
+     ],
+     "semantic_fingerprint": "4359f6b212572b7eb813b4c347bcca17fdf9986093137a2bf3c824ff056b4484",
+     "signature": "def name(self, value: str) -> None:",
+     "signature_digest": "58ac7ad896c1fe1ba1ce7bae82c7073d7dabc7ccc5d87f6461529c8cc473c2d0"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.Account.make#method#0",
+     "range": [
+      660,
+      778
+     ],
+     "semantic_fingerprint": "f0230f78369e3d24056ff24a1d91553d29f27679063434330621fe418f111eb4",
+     "signature": "def make(kind: str = \"basic\", *, limit: int = MAX_ITEMS) -> \"Account\":",
+     "signature_digest": "5cbf729c5dea15dae3c2ae0230d1d2df6b13054dbb1eb56ece6825e95bd997cb"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.Account.build#method#0",
+     "range": [
+      784,
+      880
+     ],
+     "semantic_fingerprint": "d8fa366642b04b2373229f3cf7dd9f229059894b09768911148614df290d7c7e",
+     "signature": "def build(cls, **options: Any) -> \"Account\":",
+     "signature_digest": "d760c1548fe44b4d9744042eec2d49dcaa960b5d7f53d81b318d3a583c404658"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.Account.refresh#method#0",
+     "range": [
+      886,
+      970
+     ],
+     "semantic_fingerprint": "e40480c34801eeec7be42ce54eef6d64410a7bdd6c4fd012cfa7fafc378e6e59",
+     "signature": "async def refresh(self) -> None:",
+     "signature_digest": "8229faac1b1dbdeec4a0d2ee99fd30e74f263600835d8cd46c1a7f7cc5b3579f"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.Account.reload#method#0",
+     "range": [
+      976,
+      1027
+     ],
+     "semantic_fingerprint": "70b235358c744b7ae4e8044e74c18b7cec5b29ed77e84880ddc7c32863f85a2d",
+     "signature": "async def reload(self) -> None:",
+     "signature_digest": "ea88c71694ff6ac4775ff154dd17ba3bb2c218fc5086fb60c01d1a32173c213e"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.Account.Meta#class#0",
+     "range": [
+      1033,
+      1130
+     ],
+     "semantic_fingerprint": "2e4aa1bf615ba3a9aea9405786627ffb1e55ae8bb433b8c14c25f36fc32b6134",
+     "signature": "class Meta:",
+     "signature_digest": "b8c2c8a3e65ef0fd4850d2c62b19a195cfb4e055353b930926b2532bbd43be0b"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.Account.Meta.table#field#0",
+     "range": [
+      1053,
+      1071
+     ],
+     "semantic_fingerprint": "a347388dc383a9f39228f055a7f6df47373e4e8ab1ddf653478913fdaca1a404",
+     "signature": "table =",
+     "signature_digest": "7b7cac532cf4152139efe901d53b0347b13e9d98a547a46424fe88a7285dfe0a"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.Account.Meta.label#method#0",
+     "range": [
+      1081,
+      1130
+     ],
+     "semantic_fingerprint": "bd15a2634e3a690bc285f8d6da6855ee29a7dee371ee55e37c16c5c843a0357f",
+     "signature": "def label(self) -> str:",
+     "signature_digest": "c9735f9acd4fc46cea2ef49949608e528a864cb2dfce7df98cc0586afb1553b1"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.Ledger#class#0",
+     "range": [
+      1133,
+      1291
+     ],
+     "semantic_fingerprint": "7ff7aca1ee9f490339e319ced6da9e82c7b9f0a7258fac513a771eaa75db7211",
+     "signature": "class Ledger(Account, Missing):",
+     "signature_digest": "6148eec89d24dec9a40f132b2399b5079901bd366b3ec18cb4df5620fc26acd1"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.Ledger.total#method#0",
+     "range": [
+      1169,
+      1291
+     ],
+     "semantic_fingerprint": "9e1a1144c8e29ca84c74a07cd688e23bc1927a999ceefe6c75f8aca4dafea1f7",
+     "signature": "def total(self) -> int:",
+     "signature_digest": "1d219bd8fcf01338baf4018702ad701fb10ed23624d23b5ae99efb8158a0ba41"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.Ledger.total.inner#function#0",
+     "range": [
+      1201,
+      1251
+     ],
+     "semantic_fingerprint": "ef290732dcd3de26b54cf19ec3629e597451f660d690c747cdf12dca9f873436",
+     "signature": "def inner(x: int) -> int:",
+     "signature_digest": "83897deed06a0f3f6016fd68530d7b558ad976a15beaf5550fc6262d8c98fb78"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.helper#function#0",
+     "range": [
+      1294,
+      1384
+     ],
+     "semantic_fingerprint": "0e3aad96d1d4147128ed58e1b2ba2e5b6ca0d81758966a30ef9b267ee39196bb",
+     "signature": "def helper(value: str) -> str:",
+     "signature_digest": "a525bb403cb3c46e257c668274c43d3cc61dccb60728aceca8c963d31047053b"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.models.fetch_all#function#0",
+     "range": [
+      1387,
+      1481
+     ],
+     "semantic_fingerprint": "f4b015b3064f00e109e3eff4d882dd93cd74129fa5b709eafcfeba1f3a76ac00",
+     "signature": "async def fetch_all() -> list[Account]:",
+     "signature_digest": "a4854ad9a994beeef5ce5da550a5611107300d1c05c8fd9c8d574ddbdc36a373"
+    }
+   ]
+  },
+  {
+   "language": "python",
+   "parser_fingerprint": "1cec4e2bed983ed944d97093309b738f3c59dd6fa2177a012483f97567bf8259",
+   "path": "pkg/service.py",
+   "relations": [
+    {
+     "evidence_kind": "tree_sitter",
+     "kind": "calls",
+     "range": [
+      223,
+      226
+     ],
+     "source": "pkg.service.run#function#0",
+     "target": "pkg.service.run#function#0"
+    }
+   ],
+   "symbols": [
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.service#module#0",
+     "range": [
+      0,
+      229
+     ],
+     "semantic_fingerprint": "0aac41da14f5f896ff2ab9cf04c4ab5812c96f84e29bf22e802f29663b03c46b",
+     "signature": "",
+     "signature_digest": "9259e18f5395272204a21c72e58bbbd22f24eb4b9175f012e4f7c14fa3b73027"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.service.run#function#0",
+     "range": [
+      86,
+      228
+     ],
+     "semantic_fingerprint": "39cbd13b9574dcd8d3133d425f7ad8c9bc508379e21a5779aa6ea0280c73ba0d",
+     "signature": "def run() -> None:",
+     "signature_digest": "83bb44cd7df4b06b4ae630405078c9d8438a798e9d870fc13bfff70d61b028f6"
+    }
+   ]
+  }
+ ],
+ "protocol_version": 1
+}
