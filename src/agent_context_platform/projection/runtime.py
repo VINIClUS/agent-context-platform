@@ -160,16 +160,23 @@ class ProjectionRunner:
         lease_duration: timedelta = timedelta(seconds=30),
         max_attempts: int = 5,
         base_retry_delay: timedelta = timedelta(seconds=1),
+        max_retry_delay: timedelta = timedelta(hours=1),
         clock: Clock = lambda: datetime.now(UTC),
     ) -> None:
         if not worker_id.strip():
             raise ValueError("worker_id must not be blank")
+        if len(worker_id) > 255:
+            # `projection.outbox.lease_owner` is varchar(255): a longer id would
+            # make every claim transaction fail.
+            raise ValueError("worker_id must be at most 255 characters")
         if max_attempts < 1:
             raise ValueError("max_attempts must be at least 1")
         if lease_duration <= timedelta(0):
             raise ValueError("lease_duration must be positive")
         if base_retry_delay <= timedelta(0):
             raise ValueError("base_retry_delay must be positive")
+        if max_retry_delay < base_retry_delay:
+            raise ValueError("max_retry_delay must not be shorter than base_retry_delay")
         identities = [(projector.name, projector.version) for projector in projectors]
         for name, version in identities:
             # Checkpoint and dead-letter columns cap these at 255 and 64: an
@@ -189,6 +196,7 @@ class ProjectionRunner:
         self._lease_duration = lease_duration
         self._max_attempts = max_attempts
         self._base_retry_delay = base_retry_delay
+        self._max_retry_delay = max_retry_delay
         self._clock = clock
 
     async def run_once(self, limit: int) -> ProjectionRunReport:
@@ -469,7 +477,9 @@ class ProjectionRunner:
                     "status": OutboxStatus.PENDING,
                     "retry_count": new_retry_count,
                     "available_at": now
-                    + self._retry_delay(self._base_retry_delay, new_retry_count),
+                    + self._retry_delay(
+                        self._base_retry_delay, new_retry_count, self._max_retry_delay
+                    ),
                     "last_error_class": error_class,
                     "lease_owner": None,
                     "lease_expires_at": None,
@@ -483,6 +493,15 @@ class ProjectionRunner:
             return "retried"
 
     @staticmethod
-    def _retry_delay(base_delay: timedelta, retry_count: int) -> timedelta:
-        multiplier: float = 2 ** (retry_count - 1)
-        return timedelta(seconds=base_delay.total_seconds() * multiplier)
+    def _retry_delay(
+        base_delay: timedelta, retry_count: int, max_delay: timedelta = timedelta(hours=1)
+    ) -> timedelta:
+        """Exponential backoff capped at ``max_delay``.
+
+        The exponent is capped before the multiplication, so a large retry
+        count can never overflow ``timedelta`` and leave a row stuck short of
+        the dead-letter queue.
+        """
+        multiplier: float = 2 ** min(retry_count - 1, 62)
+        seconds = min(base_delay.total_seconds() * multiplier, max_delay.total_seconds())
+        return timedelta(seconds=seconds)

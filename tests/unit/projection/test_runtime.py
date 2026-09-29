@@ -941,3 +941,24 @@ def test_runner_rejects_projector_identities_that_cannot_be_persisted(
             worker_id="worker-a",
             clock=lambda: NOW,
         )
+
+
+def test_runner_rejects_a_worker_id_longer_than_the_lease_column() -> None:
+    with pytest.raises(ValueError, match="worker_id"):
+        ProjectionRunner(
+            FakeSessionFactory([]),
+            FakeNeo4jStore(),
+            [],
+            worker_id="w" * 256,
+            clock=lambda: NOW,
+        )
+
+
+def test_retry_delay_is_capped_and_never_overflows() -> None:
+    base = timedelta(seconds=1)
+    cap = timedelta(hours=1)
+
+    assert ProjectionRunner._retry_delay(base, 1, cap) == base
+    assert ProjectionRunner._retry_delay(base, 3, cap) == base * 4
+    assert ProjectionRunner._retry_delay(base, 48, cap) == cap
+    assert ProjectionRunner._retry_delay(base, 10_000, cap) == cap
