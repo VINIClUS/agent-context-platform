@@ -483,18 +483,49 @@ FORBIDDEN_SYMBOLS = {
 }
 
 
-def test_project_source_uses_no_session_or_handshake_symbols() -> None:
-    sources = sorted(SOURCE_ROOT.rglob("*.py"))
-    assert sources, "source scan found no files"
+def scoped_sources(package_root: Path) -> list[Path]:
+    """The MCP package plus app.py, where the MCP route is wired."""
+    return sorted([*(package_root / "mcp").rglob("*.py"), package_root / "app.py"])
 
-    offenders = [
-        f"{path.relative_to(SOURCE_ROOT)}: {label}"
-        for path in sources
+
+def find_offenders(package_root: Path) -> list[str]:
+    return [
+        f"{path.relative_to(package_root)}: {label}"
+        for path in scoped_sources(package_root)
+        if path.exists()
         for label, pattern in FORBIDDEN_SYMBOLS.items()
         if re.search(pattern, path.read_text(encoding="utf-8"), re.IGNORECASE)
     ]
 
-    assert offenders == []
+
+def test_project_source_uses_no_session_or_handshake_symbols() -> None:
+    """Invariant: no file under mcp/ or app.py may contain a forbidden symbol.
+
+    Other modules are out of scope so unrelated code may use generic words.
+    """
+    sources = scoped_sources(SOURCE_ROOT)
+    assert SOURCE_ROOT / "app.py" in sources
+    assert SOURCE_ROOT / "mcp" / "server.py" in sources
+
+    assert find_offenders(SOURCE_ROOT) == []
+
+
+@pytest.mark.parametrize("relative", ["app.py", "mcp/new_module.py", "mcp/deep/nested.py"])
+def test_scoped_scan_fails_when_a_symbol_is_added_in_scope(tmp_path: Path, relative: str) -> None:
+    (tmp_path / "mcp" / "deep").mkdir(parents=True)
+    (tmp_path / "app.py").write_text("x = 1\n")
+    (tmp_path / relative).write_text('h = "Mcp-Session-Id"\n')
+
+    assert find_offenders(tmp_path) == [f"{relative}: session header"]
+
+
+def test_scoped_scan_ignores_unrelated_modules(tmp_path: Path) -> None:
+    (tmp_path / "mcp").mkdir()
+    (tmp_path / "app.py").write_text("x = 1\n")
+    (tmp_path / "projection").mkdir()
+    (tmp_path / "projection" / "runtime.py").write_text("def initialize(): ...\n")
+
+    assert find_offenders(tmp_path) == []
 
 
 def test_source_scan_detects_forbidden_symbols() -> None:
@@ -575,3 +606,72 @@ async def test_baggage_header_is_dropped_but_traceparent_is_honoured(
 
     assert json.loads(seen.json()["result"]["content"][0]["text"]) == {}
     assert int(traced.json()["result"]["content"][0]["text"], 16) == TRACE_ID
+
+
+@pytest.mark.parametrize(
+    ("host", "status"),
+    [
+        ("localhost:8000", 200),
+        ("localhost:1", 200),
+        ("localhost:65535", 200),
+        ("localhost:abc", 421),
+        ("localhost:80.evil.com", 421),
+        ("localhost:80x", 421),
+        ("localhost:123456", 421),
+        ("localhost:-1", 421),
+        ("localhost:8 0", 421),
+    ],
+)
+async def test_port_wildcard_accepts_only_one_to_five_digits(host: str, status: int) -> None:
+    async with mcp_client(allowed_hosts=("localhost:*",)) as client:
+        headers = {**mcp_headers("server/discover"), "host": host}
+        response = await post(client, "server/discover", headers=headers)
+
+    assert response.status_code == status
+
+
+async def test_origin_port_wildcard_rejects_malformed_ports() -> None:
+    async with mcp_client(allowed_origins=("http://localhost:*",)) as client:
+        statuses = []
+        for origin in (
+            "http://localhost:3000",
+            "http://localhost:abc",
+            "http://localhost:80.evil.com",
+        ):
+            headers = {**mcp_headers("server/discover"), "origin": origin}
+            statuses.append((await post(client, "server/discover", headers=headers)).status_code)
+
+    assert statuses == [200, 403, 403]
+
+
+@pytest.mark.parametrize(("name", "status"), [("host", 421), ("origin", 403)])
+async def test_duplicate_host_or_origin_is_rejected(name: str, status: int) -> None:
+    from agent_context_platform.mcp.protocol_guard import ProtocolGuard
+
+    sent: list[dict[str, Any]] = []
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    async def downstream(*_args: Any) -> None:
+        raise AssertionError("request with duplicate header reached the MCP app")
+
+    guard = ProtocolGuard(
+        downstream,
+        allowed_hosts=("h",),
+        allowed_origins=("https://ok.test",),
+        max_body_bytes=10,
+    )
+    headers = [(b"host", b"h"), (b"origin", b"https://ok.test")]
+    value = b"h" if name == "host" else b"https://ok.test"
+    headers.append((name.encode(), value))  # duplicate of an otherwise allowed value
+    await guard({"type": "http", "method": "POST", "headers": headers}, None, send)  # type: ignore[arg-type]
+
+    assert sent[0]["status"] == status
+
+
+def test_port_wildcard_rejects_non_ascii_digits() -> None:
+    from agent_context_platform.mcp.protocol_guard import _matches
+
+    assert not _matches("localhost:\u0663\u0663", ("localhost:*",))
+    assert _matches("localhost:33", ("localhost:*",))

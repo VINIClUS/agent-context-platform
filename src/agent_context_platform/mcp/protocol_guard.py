@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping
 from typing import Any, Final
 
@@ -27,15 +28,18 @@ class _ClientDisconnectedError(Exception):
     """Raised internally when the client goes away before the body is complete."""
 
 
+_PORT: Final = re.compile(r"[0-9]{1,5}", re.ASCII)
+
+
 def _matches(value: str, allowed: Iterable[str]) -> bool:
-    """Exact match, or ``prefix:*`` for any non-empty port after the prefix."""
+    """Exact match, or ``prefix:*`` for a 1-5 digit port after the prefix."""
     for pattern in allowed:
         if value == pattern:
             return True
         if (
             pattern.endswith(":*")
-            and len(value) > len(pattern) - 1
             and value.startswith(pattern[:-1])
+            and _PORT.fullmatch(value[len(pattern) - 1 :])
         ):
             return True
     return False
@@ -106,12 +110,18 @@ class ProtocolGuard:
 
         headers = self._single_valued_headers(scope)
         host = headers.get("host")
-        if host is None or not _matches(host, self._allowed_hosts):
+        if (
+            self._is_duplicated(scope, b"host")
+            or host is None
+            or not _matches(host, self._allowed_hosts)
+        ):
             await _respond(send, 421, _error_body(INVALID_REQUEST, "Invalid Host"))
             return
         # A missing Origin is a non-browser client; a present one must be listed.
         origin = headers.get("origin")
-        if origin is not None and not _matches(origin, self._allowed_origins):
+        if self._is_duplicated(scope, b"origin") or (
+            origin is not None and not _matches(origin, self._allowed_origins)
+        ):
             await _respond(send, 403, _error_body(INVALID_REQUEST, "Invalid Origin"))
             return
         if scope["method"] != "POST":
@@ -152,6 +162,11 @@ class ProtocolGuard:
             await self._app(scope, self._replay(body, receive), send)
         finally:
             otel_context.detach(token)
+
+    @staticmethod
+    def _is_duplicated(scope: Scope, name: bytes) -> bool:
+        """Ambiguous repeated Host/Origin headers are rejected, never resolved."""
+        return sum(1 for header_name, _ in scope["headers"] if header_name.lower() == name) > 1
 
     @staticmethod
     def _single_valued_headers(scope: Scope) -> dict[str, str]:
