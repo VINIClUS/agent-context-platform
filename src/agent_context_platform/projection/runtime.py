@@ -277,9 +277,21 @@ class ProjectionRunner:
                     error=error,
                 )
 
-        matching = [
-            projector for projector in self._projectors if projector.handles(event.event_type)
-        ]
+        matching: list[Projector] = []
+        for projector in self._projectors:
+            try:
+                handles = projector.handles(event.event_type)
+            except Exception as error:
+                # A projector that cannot classify this event is a poison
+                # failure like any other: count it against the retry budget.
+                return await self._finalize_failure(
+                    row=row,
+                    event_id=event.event_id,
+                    failing_projector=projector,
+                    error=error,
+                )
+            if handles:
+                matching.append(projector)
         if not matching:
             applied = await self._finalize_success(row=row, event=event, matching=())
             return "delivered" if applied else "lost_lease"

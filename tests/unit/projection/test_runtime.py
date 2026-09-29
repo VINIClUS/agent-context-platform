@@ -869,3 +869,57 @@ class _PrivateError(RuntimeError):
 )
 def test_public_error_class_is_always_constraint_safe(error: BaseException, expected: str) -> None:
     assert runtime._public_error_class(error) == expected
+
+
+class _ExplodingClassifier:
+    name = "graph.exploding"
+    version = "1"
+
+    def handles(self, event_type: str) -> bool:
+        raise KeyError(event_type)
+
+    async def project(self, tx: object, event: object) -> None:  # pragma: no cover
+        raise AssertionError("never called")
+
+
+def test_process_claimed_row_retries_when_a_projector_cannot_classify_the_event() -> None:
+    event = build_stored_event(event_type="graph.node.created")
+
+    async def fake_load_event(_session: object, _event_id: object) -> object:
+        return event
+
+    original_load_event = runtime._load_event
+    runtime._load_event = fake_load_event  # type: ignore[assignment]
+    try:
+        exploding = _ExplodingClassifier()
+        neo4j = FakeNeo4jStore()
+        runner = ProjectionRunner(
+            FakeSessionFactory([FakeSession()]),
+            neo4j,
+            [exploding],
+            worker_id="worker-a",
+            clock=lambda: NOW,
+        )
+        failures: list[tuple[object, BaseException]] = []
+
+        async def fake_finalize_failure(
+            *,
+            row: ClaimedOutboxRow,
+            event_id: object,
+            failing_projector: object,
+            error: BaseException,
+        ) -> str:
+            failures.append((failing_projector, error))
+            return "retried"
+
+        runner._finalize_failure = fake_finalize_failure  # type: ignore[method-assign]
+
+        outcome = asyncio.run(runner._process_claimed_row(_claimed_row()))
+    finally:
+        runtime._load_event = original_load_event  # type: ignore[assignment]
+
+    assert outcome == "retried"
+    assert neo4j.write_calls == 0
+    [(failing_projector, error)] = failures
+    assert failing_projector is exploding
+    assert isinstance(error, KeyError)
