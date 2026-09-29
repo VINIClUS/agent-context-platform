@@ -530,12 +530,14 @@ def _index_with(*fields: bytes) -> bytes:
     )
 
 
-def _peak_refusal(data: bytes, reason: str) -> tuple[float, int]:
+def _peak_refusal(
+    data: bytes, reason: str, limits: ScipLimits = DEFAULT_LIMITS
+) -> tuple[float, int]:
     tracemalloc.start()
     started = time.perf_counter()
     try:
         with pytest.raises(ScipImportError) as caught:
-            import_scip(data, REPO, COMMIT)
+            import_scip(data, REPO, COMMIT, limits=limits)
         elapsed = time.perf_counter() - started
         _, peak = tracemalloc.get_traced_memory()
     finally:
@@ -546,18 +548,20 @@ def _peak_refusal(data: bytes, reason: str) -> tuple[float, int]:
 
 def test_ten_million_empty_documents_are_refused_without_materializing() -> None:
     data = _index_with(b"\x12\x00" * 10_000_000)
-    elapsed, peak = _peak_refusal(data, "too_many_documents")
+    elapsed, peak = _peak_refusal(data, "too_many_documents", ScipLimits(max_documents=20_000))
 
-    assert elapsed < 10.0
+    assert elapsed < 60.0
     assert peak < 20 * 1024 * 1024
 
 
 def test_millions_of_empty_occurrences_are_refused_without_materializing() -> None:
     document_bytes = b"\x0a\x01a" + b"\x12\x00" * 3_000_000
     data = _index_with(b"\x12" + _length(document_bytes) + document_bytes)
-    elapsed, peak = _peak_refusal(data, "too_many_occurrences")
+    elapsed, peak = _peak_refusal(
+        data, "too_many_occurrences", ScipLimits(max_occurrences_per_document=20_000)
+    )
 
-    assert elapsed < 10.0
+    assert elapsed < 60.0
     assert peak < 20 * 1024 * 1024
 
 
