@@ -18,6 +18,8 @@ from typing import Any
 import pytest
 from agent_context_sdk import IngestBatchRequestV1, IngestBatchResponseV1
 
+from agent_context_platform.ledger.api import REQUEST_REF_TEMPLATE
+
 pytestmark = pytest.mark.contract
 
 ROOT = Path(__file__).parents[2]
@@ -102,6 +104,20 @@ def test_snapshot_declares_every_frozen_status_with_its_schema() -> None:
     assert "WWW-Authenticate" in responses["401"]["headers"]
 
 
+def test_documented_request_schema_is_the_sdk_schema() -> None:
+    document: dict[str, Any] = json.loads(SNAPSHOT.read_bytes())
+    schemas = document["components"]["schemas"]
+    body = document["paths"]["/v1/ingestion/batches"]["post"]["requestBody"]
+    sdk = IngestBatchRequestV1.model_json_schema(ref_template=REQUEST_REF_TEMPLATE)
+    defs = sdk.pop("$defs")
+
+    assert body["content"]["application/json"]["schema"] == {
+        "$ref": "#/components/schemas/IngestBatchRequestV1"
+    }
+    assert schemas["IngestBatchRequestV1"] == sdk
+    assert {name: schemas[name] for name in defs} == defs
+
+
 def test_check_mode_reports_drift(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
 ) -> None:
@@ -143,7 +159,7 @@ def test_fixtures_are_self_describing_and_match_the_frozen_contract(path: Path) 
     declared = document["paths"]["/v1/ingestion/batches"]["post"]["responses"]
     response = fixture["response"]
 
-    assert set(fixture) == {"name", "description", "request", "response"}
+    assert set(fixture) == {"name", "description", "setup", "request", "response"}
     assert fixture["description"]
     assert str(response["status"]) in declared
     assert fixture["request"]["path"] == "/v1/ingestion/batches"

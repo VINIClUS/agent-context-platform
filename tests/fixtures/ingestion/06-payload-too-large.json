@@ -1,6 +1,7 @@
 {
   "name": "payload-too-large",
   "description": "Body larger than the server's max request body; the harness limit is 4096 bytes, compact JSON serialization. Rejected while streaming, before schema validation.",
+  "setup": [],
   "request": {
     "method": "POST",
     "path": "/v1/ingestion/batches",
@@ -16,7 +17,7 @@
           "event_id": "01900000-0000-7000-8000-000000000006",
           "event_type": "agent.session.started",
           "schema_version": "1.0.0",
-          "stream_id": "stream-fixture-c",
+          "stream_id": "stream-fixture-06",
           "occurred_at": "2026-01-01T00:00:00Z",
           "observed_at": "2026-01-01T00:00:00Z",
           "producer": {
@@ -43,7 +44,7 @@
             "disposition": "sanitized",
             "finding_counts": {}
           },
-          "idempotency_key": "key-fixture-6",
+          "idempotency_key": "key-fixture-06",
           "content_claims": []
         }
       ],

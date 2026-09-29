@@ -1,6 +1,7 @@
 {
   "name": "success",
-  "description": "Two new events on one stream; every event is accepted with consecutive stream sequences. Send first: later fixtures depend on this state.",
+  "description": "Two new events on one stream; every event is accepted with consecutive stream sequences.",
+  "setup": [],
   "request": {
     "method": "POST",
     "path": "/v1/ingestion/batches",
@@ -13,10 +14,10 @@
       "batch_id": "01900000-0000-7000-8000-000000000101",
       "events": [
         {
-          "event_id": "01900000-0000-7000-8000-000000000001",
+          "event_id": "01900000-0000-7000-8000-000000000011",
           "event_type": "agent.session.started",
           "schema_version": "1.0.0",
-          "stream_id": "stream-fixture-a",
+          "stream_id": "stream-fixture-01",
           "occurred_at": "2026-01-01T00:00:00Z",
           "observed_at": "2026-01-01T00:00:00Z",
           "producer": {
@@ -43,14 +44,14 @@
             "disposition": "sanitized",
             "finding_counts": {}
           },
-          "idempotency_key": "key-fixture-1",
+          "idempotency_key": "key-fixture-01-1",
           "content_claims": []
         },
         {
-          "event_id": "01900000-0000-7000-8000-000000000002",
+          "event_id": "01900000-0000-7000-8000-000000000012",
           "event_type": "agent.session.started",
           "schema_version": "1.0.0",
-          "stream_id": "stream-fixture-a",
+          "stream_id": "stream-fixture-01",
           "occurred_at": "2026-01-01T00:00:00Z",
           "observed_at": "2026-01-01T00:00:00Z",
           "producer": {
@@ -77,7 +78,7 @@
             "disposition": "sanitized",
             "finding_counts": {}
           },
-          "idempotency_key": "key-fixture-2",
+          "idempotency_key": "key-fixture-01-2",
           "content_claims": []
         }
       ],
@@ -91,12 +92,12 @@
       "batch_id": "01900000-0000-7000-8000-000000000101",
       "accepted": [
         {
-          "event_id": "01900000-0000-7000-8000-000000000001",
+          "event_id": "01900000-0000-7000-8000-000000000011",
           "status": "accepted",
           "stream_sequence": 1
         },
         {
-          "event_id": "01900000-0000-7000-8000-000000000002",
+          "event_id": "01900000-0000-7000-8000-000000000012",
           "status": "accepted",
           "stream_sequence": 2
         }

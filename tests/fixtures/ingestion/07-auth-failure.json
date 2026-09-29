@@ -1,6 +1,7 @@
 {
   "name": "auth-failure",
   "description": "No Authorization header: 401 missing_credential with WWW-Authenticate: Bearer. Authentication precedes every other check.",
+  "setup": [],
   "request": {
     "method": "POST",
     "path": "/v1/ingestion/batches",
@@ -15,7 +16,7 @@
           "event_id": "01900000-0000-7000-8000-000000000007",
           "event_type": "agent.session.started",
           "schema_version": "1.0.0",
-          "stream_id": "stream-fixture-d",
+          "stream_id": "stream-fixture-07",
           "occurred_at": "2026-01-01T00:00:00Z",
           "observed_at": "2026-01-01T00:00:00Z",
           "producer": {
@@ -42,7 +43,7 @@
             "disposition": "sanitized",
             "finding_counts": {}
           },
-          "idempotency_key": "key-fixture-7",
+          "idempotency_key": "key-fixture-07",
           "content_claims": []
         }
       ],

@@ -32,6 +32,49 @@
         "title": "AcceptedEventV1",
         "type": "object"
       },
+      "ContentClaimV1": {
+        "additionalProperties": false,
+        "description": "Producer-declared identity and metadata for sanitized content.",
+        "properties": {
+          "content_id": {
+            "title": "Content Id",
+            "type": "string"
+          },
+          "content_sha256": {
+            "pattern": "^[0-9a-f]{64}$",
+            "title": "Content Sha256",
+            "type": "string"
+          },
+          "media_type": {
+            "title": "Media Type",
+            "type": "string"
+          },
+          "uncompressed_bytes": {
+            "minimum": 0,
+            "title": "Uncompressed Bytes",
+            "type": "integer"
+          }
+        },
+        "required": [
+          "content_id",
+          "content_sha256",
+          "media_type",
+          "uncompressed_bytes"
+        ],
+        "title": "ContentClaimV1",
+        "type": "object"
+      },
+      "ContentDisposition": {
+        "description": "Outcome of the redaction and content-retention boundary.",
+        "enum": [
+          "sanitized",
+          "metadata_only",
+          "dropped_redaction_failure",
+          "purged"
+        ],
+        "title": "ContentDisposition",
+        "type": "string"
+      },
       "ErrorDetailV1": {
         "description": "Fixed, content-free error description; ``code`` is stable, ``message`` is not.",
         "properties": {
@@ -69,6 +112,278 @@
         "title": "ErrorResponseV1",
         "type": "object"
       },
+      "EventContextV1": {
+        "additionalProperties": false,
+        "description": "Optional domain identifiers that scope an event.",
+        "properties": {
+          "checkout_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Checkout Id"
+          },
+          "project_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Project Id"
+          },
+          "repository_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Repository Id"
+          },
+          "session_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Session Id"
+          },
+          "tool_call_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Tool Call Id"
+          },
+          "turn_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Turn Id"
+          },
+          "workspace_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Workspace Id"
+          }
+        },
+        "title": "EventContextV1",
+        "type": "object"
+      },
+      "EventDraftV1": {
+        "additionalProperties": false,
+        "description": "Producer-created event awaiting server content resolution and sealing.",
+        "properties": {
+          "content_claims": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/ContentClaimV1"
+            },
+            "title": "Content Claims",
+            "type": "array"
+          },
+          "context": {
+            "$ref": "#/components/schemas/EventContextV1"
+          },
+          "event_id": {
+            "format": "uuid7",
+            "title": "Event Id",
+            "type": "string"
+          },
+          "event_type": {
+            "title": "Event Type",
+            "type": "string"
+          },
+          "idempotency_key": {
+            "title": "Idempotency Key",
+            "type": "string"
+          },
+          "observed_at": {
+            "format": "date-time",
+            "pattern": "(?:[zZ]|[+-]00:00)$",
+            "title": "Observed At",
+            "type": "string"
+          },
+          "occurred_at": {
+            "format": "date-time",
+            "pattern": "(?:[zZ]|[+-]00:00)$",
+            "title": "Occurred At",
+            "type": "string"
+          },
+          "payload": {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/FrozenJsonValue"
+            },
+            "title": "Payload",
+            "type": "object"
+          },
+          "producer": {
+            "$ref": "#/components/schemas/ProducerV1"
+          },
+          "redaction": {
+            "$ref": "#/components/schemas/EventRedactionSummaryV1"
+          },
+          "schema_version": {
+            "const": "1.0.0",
+            "default": "1.0.0",
+            "title": "Schema Version",
+            "type": "string"
+          },
+          "stream_id": {
+            "title": "Stream Id",
+            "type": "string"
+          },
+          "trace": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/TraceContextV1"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          }
+        },
+        "required": [
+          "event_type",
+          "stream_id",
+          "occurred_at",
+          "observed_at",
+          "producer",
+          "payload",
+          "redaction",
+          "idempotency_key"
+        ],
+        "title": "EventDraftV1",
+        "type": "object"
+      },
+      "EventRedactionSummaryV1": {
+        "additionalProperties": false,
+        "description": "Event-level summary of the local redaction outcome.",
+        "properties": {
+          "disposition": {
+            "$ref": "#/components/schemas/ContentDisposition"
+          },
+          "finding_counts": {
+            "additionalProperties": {
+              "exclusiveMinimum": 0,
+              "type": "integer"
+            },
+            "title": "Finding Counts",
+            "type": "object"
+          },
+          "policy_version": {
+            "title": "Policy Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "policy_version",
+          "disposition"
+        ],
+        "title": "EventRedactionSummaryV1",
+        "type": "object"
+      },
+      "FrozenJsonValue": {
+        "anyOf": [
+          {
+            "type": "boolean"
+          },
+          {
+            "type": "integer"
+          },
+          {
+            "type": "number"
+          },
+          {
+            "type": "string"
+          },
+          {
+            "items": {
+              "$ref": "#/components/schemas/FrozenJsonValue"
+            },
+            "type": "array"
+          },
+          {
+            "additionalProperties": {
+              "$ref": "#/components/schemas/FrozenJsonValue"
+            },
+            "type": "object"
+          },
+          {
+            "type": "null"
+          }
+        ]
+      },
+      "IngestBatchRequestV1": {
+        "additionalProperties": false,
+        "description": "A bounded, atomically processed collection of event drafts and bytes.",
+        "properties": {
+          "batch_id": {
+            "format": "uuid7",
+            "title": "Batch Id",
+            "type": "string"
+          },
+          "content_items": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/SanitizedContentItemV1"
+            },
+            "title": "Content Items",
+            "type": "array"
+          },
+          "events": {
+            "items": {
+              "$ref": "#/components/schemas/EventDraftV1"
+            },
+            "maxItems": 500,
+            "minItems": 1,
+            "title": "Events",
+            "type": "array"
+          }
+        },
+        "required": [
+          "batch_id",
+          "events"
+        ],
+        "title": "IngestBatchRequestV1",
+        "type": "object"
+      },
       "IngestBatchResponseV1": {
         "additionalProperties": false,
         "description": "Atomic ingestion outcome for a submitted batch.",
@@ -101,6 +416,156 @@
         "title": "IngestBatchResponseV1",
         "type": "object"
       },
+      "MetadataOnlyReason": {
+        "description": "Safe cause for retaining only allowlisted event metadata.",
+        "enum": [
+          "source_unmapped",
+          "source_invalid",
+          "spool_pressure"
+        ],
+        "title": "MetadataOnlyReason",
+        "type": "string"
+      },
+      "ProducerV1": {
+        "additionalProperties": false,
+        "description": "Identity of the adapter that observed an event.",
+        "properties": {
+          "name": {
+            "title": "Name",
+            "type": "string"
+          },
+          "producer_id": {
+            "title": "Producer Id",
+            "type": "string"
+          },
+          "version": {
+            "title": "Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "producer_id",
+          "name",
+          "version"
+        ],
+        "title": "ProducerV1",
+        "type": "object"
+      },
+      "RedactionFindingSummaryV1": {
+        "additionalProperties": false,
+        "description": "Aggregate count and correlation labels for one detector finding category.",
+        "properties": {
+          "category": {
+            "title": "Category",
+            "type": "string"
+          },
+          "correlation_labels": {
+            "default": [],
+            "items": {
+              "pattern": "^hmac-sha256:[0-9a-f]{64}$",
+              "type": "string"
+            },
+            "title": "Correlation Labels",
+            "type": "array"
+          },
+          "count": {
+            "exclusiveMinimum": 0,
+            "title": "Count",
+            "type": "integer"
+          },
+          "detector": {
+            "title": "Detector",
+            "type": "string"
+          },
+          "detector_version": {
+            "title": "Detector Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "detector",
+          "detector_version",
+          "category",
+          "count"
+        ],
+        "title": "RedactionFindingSummaryV1",
+        "type": "object"
+      },
+      "RedactionReportV1": {
+        "additionalProperties": false,
+        "description": "Secret-safe aggregate report for one sanitized or discarded content item.",
+        "properties": {
+          "disposition": {
+            "$ref": "#/components/schemas/ContentDisposition"
+          },
+          "error_class": {
+            "anyOf": [
+              {
+                "pattern": "^[A-Za-z][A-Za-z0-9_.]{0,127}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Error Class"
+          },
+          "failed_detector": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Failed Detector"
+          },
+          "failed_detector_version": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Failed Detector Version"
+          },
+          "findings": {
+            "default": [],
+            "items": {
+              "$ref": "#/components/schemas/RedactionFindingSummaryV1"
+            },
+            "title": "Findings",
+            "type": "array"
+          },
+          "metadata_only_reason": {
+            "anyOf": [
+              {
+                "$ref": "#/components/schemas/MetadataOnlyReason"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null
+          },
+          "policy_version": {
+            "title": "Policy Version",
+            "type": "string"
+          }
+        },
+        "required": [
+          "policy_version",
+          "disposition"
+        ],
+        "title": "RedactionReportV1",
+        "type": "object"
+      },
       "RejectedEventV1": {
         "additionalProperties": false,
         "description": "Public, safe result for a recoverable event-specific ingestion rejection.",
@@ -126,6 +591,94 @@
           "retryable"
         ],
         "title": "RejectedEventV1",
+        "type": "object"
+      },
+      "SanitizedContentItemV1": {
+        "additionalProperties": false,
+        "description": "One verified, sanitized content payload supplied with an ingestion batch.",
+        "properties": {
+          "claim": {
+            "$ref": "#/components/schemas/ContentClaimV1"
+          },
+          "redaction_report": {
+            "$ref": "#/components/schemas/RedactionReportV1"
+          },
+          "sanitized_bytes_base64": {
+            "title": "Sanitized Bytes Base64",
+            "type": "string"
+          }
+        },
+        "required": [
+          "claim",
+          "sanitized_bytes_base64",
+          "redaction_report"
+        ],
+        "title": "SanitizedContentItemV1",
+        "type": "object"
+      },
+      "TraceContextV1": {
+        "additionalProperties": false,
+        "description": "Optional distributed tracing and event-causation identifiers.",
+        "properties": {
+          "causation_event_id": {
+            "anyOf": [
+              {
+                "format": "uuid7",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Causation Event Id"
+          },
+          "correlation_id": {
+            "anyOf": [
+              {
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Correlation Id"
+          },
+          "span_id": {
+            "anyOf": [
+              {
+                "not": {
+                  "const": "0000000000000000"
+                },
+                "pattern": "^[0-9a-f]{16}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Span Id"
+          },
+          "trace_id": {
+            "anyOf": [
+              {
+                "not": {
+                  "const": "00000000000000000000000000000000"
+                },
+                "pattern": "^[0-9a-f]{32}$",
+                "type": "string"
+              },
+              {
+                "type": "null"
+              }
+            ],
+            "default": null,
+            "title": "Trace Id"
+          }
+        },
+        "title": "TraceContextV1",
         "type": "object"
       }
     }
@@ -155,9 +708,7 @@
           "content": {
             "application/json": {
               "schema": {
-                "description": "agent-context-sdk IngestBatchRequestV1.",
-                "title": "IngestBatchRequestV1",
-                "type": "object"
+                "$ref": "#/components/schemas/IngestBatchRequestV1"
               }
             }
           },

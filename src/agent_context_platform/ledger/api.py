@@ -58,6 +58,8 @@ from agent_context_platform.ledger.service import IngestionService
 logger = logging.getLogger("agent_context_platform.ledger.api")
 
 INGESTION_PATH: Final = "/v1/ingestion/batches"
+REQUEST_SCHEMA_NAME: Final = "IngestBatchRequestV1"
+REQUEST_REF_TEMPLATE: Final = "#/components/schemas/{model}"
 REQUEST_ID_HEADER: Final = "x-request-id"
 
 _REQUEST_ID_PATTERN: Final = re.compile(r"[A-Za-z0-9._-]{1,64}", re.ASCII)
@@ -283,6 +285,19 @@ _RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
 }
 
 
+def request_schema_components() -> dict[str, dict[str, Any]]:
+    """Component schemas documenting the request body: the SDK model and its ``$defs``.
+
+    OpenAPI metadata only; the handler never binds the body to this model.
+    """
+    schema: dict[str, Any] = IngestBatchRequestV1.model_json_schema(
+        ref_template=REQUEST_REF_TEMPLATE
+    )
+    components: dict[str, dict[str, Any]] = schema.pop("$defs", {})
+    components[REQUEST_SCHEMA_NAME] = schema
+    return components
+
+
 router = APIRouter(prefix="/v1/ingestion", tags=["ingestion"])
 
 
@@ -295,11 +310,7 @@ router = APIRouter(prefix="/v1/ingestion", tags=["ingestion"])
             "required": True,
             "content": {
                 "application/json": {
-                    "schema": {
-                        "type": "object",
-                        "title": "IngestBatchRequestV1",
-                        "description": "agent-context-sdk IngestBatchRequestV1.",
-                    }
+                    "schema": {"$ref": f"#/components/schemas/{REQUEST_SCHEMA_NAME}"}
                 }
             },
         },

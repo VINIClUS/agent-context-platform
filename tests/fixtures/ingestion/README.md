@@ -9,14 +9,17 @@ the only "secret" is the canary in `05-redaction-required.json`.
 
 Each file is one JSON object:
 
-- `name`, `description`: what the case shows and what state it needs.
+- `name`, `description`: what the case shows.
+- `setup`: requests (same shape as `request`) to send first, each expected to answer 200;
+  they create the state the case needs. Usually empty.
 - `request`: `method`, `path`, `headers`, `body`. Serialize `body` as compact JSON
   (`separators=(",", ":")`, UTF-8); the size limit in `06` is measured on those bytes.
 - `response`: `status`, `headers` (only contract headers: `retry-after`,
   `www-authenticate`) and `body`.
 
-Files are numbered and stateful: run them in order against a fresh ledger
-(`02` replays `01`, `03` repeats an event from `01`).
+Fixtures are self-contained and order independent: each uses its own streams, event ids,
+batch ids and idempotency keys, and states its prerequisite in `setup`. Run them against
+a ledger that has not seen them before.
 
 ## Placeholders and normalization
 

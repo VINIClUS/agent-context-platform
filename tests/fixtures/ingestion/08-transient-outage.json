@@ -1,6 +1,7 @@
 {
   "name": "transient-outage",
   "description": "The database is unreachable while ingesting: 503 with Retry-After, every new event rejected as service_unavailable with retryable true. Replay the same request later.",
+  "setup": [],
   "request": {
     "method": "POST",
     "path": "/v1/ingestion/batches",
@@ -16,7 +17,7 @@
           "event_id": "01900000-0000-7000-8000-000000000008",
           "event_type": "agent.session.started",
           "schema_version": "1.0.0",
-          "stream_id": "stream-fixture-e",
+          "stream_id": "stream-fixture-08",
           "occurred_at": "2026-01-01T00:00:00Z",
           "observed_at": "2026-01-01T00:00:00Z",
           "producer": {
@@ -43,7 +44,7 @@
             "disposition": "sanitized",
             "finding_counts": {}
           },
-          "idempotency_key": "key-fixture-8",
+          "idempotency_key": "key-fixture-08",
           "content_claims": []
         }
       ],

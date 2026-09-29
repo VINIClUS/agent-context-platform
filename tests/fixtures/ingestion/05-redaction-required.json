@@ -1,6 +1,7 @@
 {
   "name": "redaction-required",
   "description": "Content marked sanitized still changes when the platform re-applies its redaction policy (it holds a canary credential): the whole batch is rejected with content_requires_redaction and nothing is stored.",
+  "setup": [],
   "request": {
     "method": "POST",
     "path": "/v1/ingestion/batches",
@@ -16,7 +17,7 @@
           "event_id": "01900000-0000-7000-8000-000000000005",
           "event_type": "agent.session.started",
           "schema_version": "1.0.0",
-          "stream_id": "stream-fixture-b",
+          "stream_id": "stream-fixture-05",
           "occurred_at": "2026-01-01T00:00:00Z",
           "observed_at": "2026-01-01T00:00:00Z",
           "producer": {
@@ -43,7 +44,7 @@
             "disposition": "sanitized",
             "finding_counts": {}
           },
-          "idempotency_key": "key-fixture-5",
+          "idempotency_key": "key-fixture-05",
           "content_claims": [
             {
               "content_id": "content-fixture-1",

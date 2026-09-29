@@ -1,6 +1,57 @@
 {
   "name": "partial-duplicate",
-  "description": "New batch_id that repeats one stored event (same event_id and idempotency_key) and adds one new event: the stored one is existing, the new one is accepted.",
+  "description": "Setup stores one event; the request has a new batch_id that repeats that event (same event_id and idempotency_key) and adds a new one: the stored one is existing, the new one is accepted.",
+  "setup": [
+    {
+      "method": "POST",
+      "path": "/v1/ingestion/batches",
+      "headers": {
+        "content-type": "application/json",
+        "idempotency-key": "01900000-0000-7000-8000-000000000301",
+        "authorization": "Bearer <producer-token>"
+      },
+      "body": {
+        "batch_id": "01900000-0000-7000-8000-000000000301",
+        "events": [
+          {
+            "event_id": "01900000-0000-7000-8000-000000000031",
+            "event_type": "agent.session.started",
+            "schema_version": "1.0.0",
+            "stream_id": "stream-fixture-03",
+            "occurred_at": "2026-01-01T00:00:00Z",
+            "observed_at": "2026-01-01T00:00:00Z",
+            "producer": {
+              "producer_id": "fixture-producer",
+              "name": "Codex",
+              "version": "1.0.0"
+            },
+            "context": {
+              "workspace_id": null,
+              "project_id": null,
+              "repository_id": null,
+              "checkout_id": null,
+              "session_id": null,
+              "turn_id": null,
+              "tool_call_id": null
+            },
+            "trace": null,
+            "payload": {
+              "source": "codex",
+              "session_id": "session-fixture-1"
+            },
+            "redaction": {
+              "policy_version": "1.0.0",
+              "disposition": "sanitized",
+              "finding_counts": {}
+            },
+            "idempotency_key": "key-fixture-03-1",
+            "content_claims": []
+          }
+        ],
+        "content_items": []
+      }
+    }
+  ],
   "request": {
     "method": "POST",
     "path": "/v1/ingestion/batches",
@@ -13,10 +64,10 @@
       "batch_id": "01900000-0000-7000-8000-000000000103",
       "events": [
         {
-          "event_id": "01900000-0000-7000-8000-000000000001",
+          "event_id": "01900000-0000-7000-8000-000000000031",
           "event_type": "agent.session.started",
           "schema_version": "1.0.0",
-          "stream_id": "stream-fixture-a",
+          "stream_id": "stream-fixture-03",
           "occurred_at": "2026-01-01T00:00:00Z",
           "observed_at": "2026-01-01T00:00:00Z",
           "producer": {
@@ -43,14 +94,14 @@
             "disposition": "sanitized",
             "finding_counts": {}
           },
-          "idempotency_key": "key-fixture-1",
+          "idempotency_key": "key-fixture-03-1",
           "content_claims": []
         },
         {
-          "event_id": "01900000-0000-7000-8000-000000000003",
+          "event_id": "01900000-0000-7000-8000-000000000033",
           "event_type": "agent.session.started",
           "schema_version": "1.0.0",
-          "stream_id": "stream-fixture-a",
+          "stream_id": "stream-fixture-03",
           "occurred_at": "2026-01-01T00:00:00Z",
           "observed_at": "2026-01-01T00:00:00Z",
           "producer": {
@@ -77,7 +128,7 @@
             "disposition": "sanitized",
             "finding_counts": {}
           },
-          "idempotency_key": "key-fixture-3",
+          "idempotency_key": "key-fixture-03-3",
           "content_claims": []
         }
       ],
@@ -91,14 +142,14 @@
       "batch_id": "01900000-0000-7000-8000-000000000103",
       "accepted": [
         {
-          "event_id": "01900000-0000-7000-8000-000000000001",
+          "event_id": "01900000-0000-7000-8000-000000000031",
           "status": "existing",
           "stream_sequence": 1
         },
         {
-          "event_id": "01900000-0000-7000-8000-000000000003",
+          "event_id": "01900000-0000-7000-8000-000000000033",
           "status": "accepted",
-          "stream_sequence": 3
+          "stream_sequence": 2
         }
       ],
       "rejected": []

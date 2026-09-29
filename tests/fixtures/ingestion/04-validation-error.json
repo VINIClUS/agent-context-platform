@@ -1,6 +1,7 @@
 {
   "name": "validation-error",
   "description": "Well-formed JSON that violates the request schema (a batch needs 1 to 500 events): 422 with the fixed error envelope, no echo of the input.",
+  "setup": [],
   "request": {
     "method": "POST",
     "path": "/v1/ingestion/batches",

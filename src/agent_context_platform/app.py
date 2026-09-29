@@ -2,7 +2,7 @@ import secrets
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
-from typing import Literal
+from typing import Any, Literal
 
 from agent_context_sdk import RedactionPolicyV1  # type: ignore[import-untyped, unused-ignore]
 from fastapi import FastAPI
@@ -12,7 +12,12 @@ from starlette.routing import Route
 from agent_context_platform.content.blob_store import S3BlobStore
 from agent_context_platform.content.service import ContentService
 from agent_context_platform.db import create_engine, session_factory
-from agent_context_platform.ledger.api import IngestionRuntime, RequestContextMiddleware, router
+from agent_context_platform.ledger.api import (
+    IngestionRuntime,
+    RequestContextMiddleware,
+    request_schema_components,
+    router,
+)
 from agent_context_platform.ledger.auth import (
     Argon2Verifier,
     ProducerAuthenticator,
@@ -139,6 +144,18 @@ def create_app(
 
     application = FastAPI(title="Agent Context Platform", lifespan=lifespan)
     application.state.settings = resolved_settings
+    framework_openapi = application.openapi
+
+    def openapi() -> dict[str, Any]:
+        """Framework schema plus the SDK request model the raw-body route documents."""
+        schema = framework_openapi()
+        schemas = schema.setdefault("components", {}).setdefault("schemas", {})
+        for name, component in request_schema_components().items():
+            if schemas.setdefault(name, component) != component:
+                raise RuntimeError(f"OpenAPI component {name} conflicts with the request schema")
+        return schema
+
+    application.openapi = openapi  # type: ignore[method-assign]
     application.state.ingestion = ingestion
     application.include_router(router)
     application.add_middleware(RequestContextMiddleware)

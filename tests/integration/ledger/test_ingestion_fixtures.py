@@ -2,8 +2,8 @@
 
 Each fixture request goes through the ASGI app over ``httpx2.ASGITransport`` (no
 sockets) against the real ``IngestionService``, PostgreSQL and S3. Fixtures are
-ordered and stateful (see the fixture README), so the stack is module-scoped and
-the fixtures run in file order. Only the volatile ``request_id`` is normalized.
+self-contained (own streams, own setup requests), so any order works; the stack is
+module-scoped. Only the volatile ``request_id`` is normalized.
 """
 
 from __future__ import annotations
@@ -141,15 +141,11 @@ def _normalized(body: Any) -> Any:
     return body
 
 
-@pytest.mark.parametrize("path", FIXTURES, ids=lambda path: path.stem)
-def test_service_answers_each_fixture_exactly(apps: Apps, path: Path) -> None:
-    fixture = json.loads(path.read_text(encoding="utf-8"))
-    request = fixture["request"]
+def _send(app: Any, request: dict[str, Any]) -> httpx2.Response:
     headers = {
         name: f"Bearer {TOKEN}" if value == "Bearer <producer-token>" else value
         for name, value in request["headers"].items()
     }
-    app = apps.unavailable if fixture["name"] == OUTAGE_FIXTURE else apps.healthy
 
     async def send() -> httpx2.Response:
         async with httpx2.AsyncClient(
@@ -162,7 +158,18 @@ def test_service_answers_each_fixture_exactly(apps: Apps, path: Path) -> None:
                 headers=headers,
             )
 
-    response = asyncio.run(send())
+    return asyncio.run(send())
+
+
+@pytest.mark.parametrize("path", FIXTURES, ids=lambda path: path.stem)
+def test_service_answers_each_fixture_exactly(apps: Apps, path: Path) -> None:
+    fixture = json.loads(path.read_text(encoding="utf-8"))
+    app = apps.unavailable if fixture["name"] == OUTAGE_FIXTURE else apps.healthy
+
+    for setup in fixture["setup"]:
+        assert _send(apps.healthy, setup).status_code == 200
+
+    response = _send(app, fixture["request"])
 
     expected = fixture["response"]
     assert response.status_code == expected["status"], response.text
