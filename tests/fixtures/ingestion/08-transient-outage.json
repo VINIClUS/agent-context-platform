@@ -1,0 +1,71 @@
+{
+  "name": "transient-outage",
+  "description": "The database is unreachable while ingesting: 503 with Retry-After, every new event rejected as service_unavailable with retryable true. Replay the same request later.",
+  "setup": [],
+  "request": {
+    "method": "POST",
+    "path": "/v1/ingestion/batches",
+    "headers": {
+      "content-type": "application/json",
+      "idempotency-key": "01900000-0000-7000-8000-000000000108",
+      "authorization": "Bearer <producer-token>"
+    },
+    "body": {
+      "batch_id": "01900000-0000-7000-8000-000000000108",
+      "events": [
+        {
+          "event_id": "01900000-0000-7000-8000-000000000008",
+          "event_type": "agent.session.started",
+          "schema_version": "1.0.0",
+          "stream_id": "stream-fixture-08",
+          "occurred_at": "2026-01-01T00:00:00Z",
+          "observed_at": "2026-01-01T00:00:00Z",
+          "producer": {
+            "producer_id": "fixture-producer",
+            "name": "Codex",
+            "version": "1.0.0"
+          },
+          "context": {
+            "workspace_id": null,
+            "project_id": null,
+            "repository_id": null,
+            "checkout_id": null,
+            "session_id": null,
+            "turn_id": null,
+            "tool_call_id": null
+          },
+          "trace": null,
+          "payload": {
+            "source": "codex",
+            "session_id": "session-fixture-1"
+          },
+          "redaction": {
+            "policy_version": "1.0.0",
+            "disposition": "sanitized",
+            "finding_counts": {}
+          },
+          "idempotency_key": "key-fixture-08",
+          "content_claims": []
+        }
+      ],
+      "content_items": []
+    }
+  },
+  "response": {
+    "status": 503,
+    "headers": {
+      "retry-after": "5"
+    },
+    "body": {
+      "batch_id": "01900000-0000-7000-8000-000000000108",
+      "accepted": [],
+      "rejected": [
+        {
+          "event_id": "01900000-0000-7000-8000-000000000008",
+          "error_code": "service_unavailable",
+          "retryable": true
+        }
+      ]
+    }
+  }
+}

@@ -42,7 +42,7 @@ from fastapi.responses import JSONResponse, Response
 from opentelemetry import context as otel_context
 from opentelemetry import trace
 from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapPropagator
-from pydantic import ValidationError
+from pydantic import BaseModel, ValidationError
 from sqlalchemy.exc import InterfaceError, OperationalError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
@@ -57,7 +57,18 @@ from agent_context_platform.ledger.service import IngestionService
 
 logger = logging.getLogger("agent_context_platform.ledger.api")
 
+SECURITY_SCHEME_NAME: Final = "ProducerBearer"
+SECURITY_SCHEME: Final[dict[str, Any]] = {
+    "type": "http",
+    "scheme": "bearer",
+    "description": (
+        "Producer token of the form `<prefix>.<secret>`, registered with scope `events:ingest`. "
+        "Sent as `Authorization: Bearer <token>`."
+    ),
+}
 INGESTION_PATH: Final = "/v1/ingestion/batches"
+REQUEST_SCHEMA_NAME: Final = "IngestBatchRequestV1"
+REQUEST_REF_TEMPLATE: Final = "#/components/schemas/{model}"
 REQUEST_ID_HEADER: Final = "x-request-id"
 
 _REQUEST_ID_PATTERN: Final = re.compile(r"[A-Za-z0-9._-]{1,64}", re.ASCII)
@@ -199,31 +210,122 @@ def _log(request: Request, event: str, **fields: Any) -> None:
     )
 
 
+class ErrorDetailV1(BaseModel):
+    """Fixed, content-free error description; ``code`` is stable, ``message`` is not."""
+
+    code: str
+    message: str
+
+
+class ErrorResponseV1(BaseModel):
+    """Body of every failure the route answers before or instead of a batch outcome."""
+
+    error: ErrorDetailV1
+    request_id: str
+
+
+_REQUEST_ID_HEADER_DOC: Final[dict[str, Any]] = {
+    "description": "Request ID: echoed when a short safe token, otherwise generated.",
+    "schema": {"type": "string"},
+}
+_RETRY_AFTER_HEADER_DOC: Final[dict[str, Any]] = {
+    "description": "Seconds to wait before retrying.",
+    "schema": {"type": "integer"},
+}
+_BATCH_OR_ERROR: Final = IngestBatchResponseV1 | ErrorResponseV1
+
+# OpenAPI metadata only: mirrors the status mapping in the module docstring. The
+# ingestion snapshot (``openapi/agent-context-v1.json``) freezes this table.
+_RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
+    200: {
+        "model": IngestBatchResponseV1,
+        "description": "Every event is `accepted` (created now) or `existing` (already stored).",
+        "headers": {"x-request-id": _REQUEST_ID_HEADER_DOC},
+    },
+    400: {
+        "model": ErrorResponseV1,
+        "description": "Idempotency-Key header absent: `idempotency_key_required`.",
+        "headers": {"x-request-id": _REQUEST_ID_HEADER_DOC},
+    },
+    401: {
+        "model": ErrorResponseV1,
+        "description": "Missing or invalid producer credential: "
+        "`missing_credential`, `invalid_credential`.",
+        "headers": {
+            "x-request-id": _REQUEST_ID_HEADER_DOC,
+            "WWW-Authenticate": {"description": "Always `Bearer`.", "schema": {"type": "string"}},
+        },
+    },
+    403: {
+        "model": ErrorResponseV1,
+        "description": "Credential lacks the scope or names another producer: "
+        "`insufficient_scope`, `producer_mismatch`.",
+        "headers": {"x-request-id": _REQUEST_ID_HEADER_DOC},
+    },
+    409: {
+        "model": IngestBatchResponseV1,
+        "description": "Whole batch rejected, nothing stored: `idempotency_conflict`, "
+        "`stream_quarantined`; other events are `batch_rejected`.",
+        "headers": {"x-request-id": _REQUEST_ID_HEADER_DOC},
+    },
+    413: {
+        "model": ErrorResponseV1,
+        "description": "Request body exceeds the size limit: `request_too_large`.",
+        "headers": {"x-request-id": _REQUEST_ID_HEADER_DOC},
+    },
+    422: {
+        "model": _BATCH_OR_ERROR,
+        "description": "Error envelope: `invalid_request_schema`, `idempotency_key_mismatch`. "
+        "Batch response, nothing stored: `duplicate_idempotency_key`, `duplicate_content_id`, "
+        "`unsupported_media_type`, `invalid_content_encoding`, `content_requires_redaction`, "
+        "`content_resolution_mismatch`.",
+        "headers": {"x-request-id": _REQUEST_ID_HEADER_DOC},
+    },
+    500: {
+        "model": ErrorResponseV1,
+        "description": "Unexpected failure: `internal_error`.",
+        "headers": {"x-request-id": _REQUEST_ID_HEADER_DOC},
+    },
+    503: {
+        "model": _BATCH_OR_ERROR,
+        "description": "Error envelope: `ingestion_unavailable`, `auth_overloaded`, "
+        "`service_unavailable`. Batch response (retryable outage): rejected events carry "
+        "`service_unavailable` with `retryable` true.",
+        "headers": {
+            "x-request-id": _REQUEST_ID_HEADER_DOC,
+            "Retry-After": _RETRY_AFTER_HEADER_DOC,
+        },
+    },
+}
+
+
+def request_schema_components() -> dict[str, dict[str, Any]]:
+    """Component schemas documenting the request body: the SDK model and its ``$defs``.
+
+    OpenAPI metadata only; the handler never binds the body to this model.
+    """
+    schema: dict[str, Any] = IngestBatchRequestV1.model_json_schema(
+        ref_template=REQUEST_REF_TEMPLATE
+    )
+    components: dict[str, dict[str, Any]] = schema.pop("$defs", {})
+    components[REQUEST_SCHEMA_NAME] = schema
+    return components
+
+
 router = APIRouter(prefix="/v1/ingestion", tags=["ingestion"])
 
 
 @router.post(
     "/batches",
     response_model=IngestBatchResponseV1,
-    responses={
-        400: {"description": "Idempotency-Key header absent."},
-        401: {"description": "Missing or invalid producer credential."},
-        403: {"description": "Insufficient scope or producer mismatch."},
-        409: {"model": IngestBatchResponseV1, "description": "Batch rejected, nothing stored."},
-        413: {"description": "Request body too large."},
-        422: {"description": "Schema, content or Idempotency-Key error."},
-        503: {"description": "Retryable outage or ingestion not configured."},
-    },
+    responses=_RESPONSES,
     openapi_extra={
+        "security": [{SECURITY_SCHEME_NAME: []}],
         "requestBody": {
             "required": True,
             "content": {
                 "application/json": {
-                    "schema": {
-                        "type": "object",
-                        "title": "IngestBatchRequestV1",
-                        "description": "agent-context-sdk IngestBatchRequestV1.",
-                    }
+                    "schema": {"$ref": f"#/components/schemas/{REQUEST_SCHEMA_NAME}"}
                 }
             },
         },

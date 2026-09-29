@@ -1,0 +1,95 @@
+{
+  "name": "redaction-required",
+  "description": "Content marked sanitized still changes when the platform re-applies its redaction policy (it holds a canary credential): the whole batch is rejected with content_requires_redaction and nothing is stored.",
+  "setup": [],
+  "request": {
+    "method": "POST",
+    "path": "/v1/ingestion/batches",
+    "headers": {
+      "content-type": "application/json",
+      "idempotency-key": "01900000-0000-7000-8000-000000000105",
+      "authorization": "Bearer <producer-token>"
+    },
+    "body": {
+      "batch_id": "01900000-0000-7000-8000-000000000105",
+      "events": [
+        {
+          "event_id": "01900000-0000-7000-8000-000000000005",
+          "event_type": "agent.session.started",
+          "schema_version": "1.0.0",
+          "stream_id": "stream-fixture-05",
+          "occurred_at": "2026-01-01T00:00:00Z",
+          "observed_at": "2026-01-01T00:00:00Z",
+          "producer": {
+            "producer_id": "fixture-producer",
+            "name": "Codex",
+            "version": "1.0.0"
+          },
+          "context": {
+            "workspace_id": null,
+            "project_id": null,
+            "repository_id": null,
+            "checkout_id": null,
+            "session_id": null,
+            "turn_id": null,
+            "tool_call_id": null
+          },
+          "trace": null,
+          "payload": {
+            "source": "codex",
+            "session_id": "session-fixture-1"
+          },
+          "redaction": {
+            "policy_version": "1.0.0",
+            "disposition": "sanitized",
+            "finding_counts": {}
+          },
+          "idempotency_key": "key-fixture-05",
+          "content_claims": [
+            {
+              "content_id": "content-fixture-1",
+              "content_sha256": "b583c7ce199e255f0dc295c491bba46ce8242c78cb3b4774b9a87a35ee731692",
+              "media_type": "text/plain",
+              "uncompressed_bytes": 42
+            }
+          ]
+        }
+      ],
+      "content_items": [
+        {
+          "claim": {
+            "content_id": "content-fixture-1",
+            "content_sha256": "b583c7ce199e255f0dc295c491bba46ce8242c78cb3b4774b9a87a35ee731692",
+            "media_type": "text/plain",
+            "uncompressed_bytes": 42
+          },
+          "sanitized_bytes_base64": "cGFzc3dvcmQ9QUdFTlRfQ09OVEVYVF9DQU5BUllfZml4dHVyZV81ZDFl",
+          "redaction_report": {
+            "policy_version": "1.0.0",
+            "disposition": "sanitized",
+            "findings": [],
+            "metadata_only_reason": null,
+            "error_class": null,
+            "failed_detector": null,
+            "failed_detector_version": null
+          }
+        }
+      ]
+    }
+  },
+  "response": {
+    "status": 422,
+    "headers": {},
+    "body": {
+      "batch_id": "01900000-0000-7000-8000-000000000105",
+      "accepted": [],
+      "rejected": [
+        {
+          "event_id": "01900000-0000-7000-8000-000000000005",
+          "error_code": "content_requires_redaction",
+          "retryable": false
+        }
+      ]
+    }
+  }
+}

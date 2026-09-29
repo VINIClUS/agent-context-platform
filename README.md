@@ -89,6 +89,19 @@ tears the stack down afterwards. `scripts/test-services.sh status` shows the run
 `AGENT_CONTEXT_TEST_PROJECT` overrides the derived Compose project name, which otherwise comes from
 this checkout's path so concurrent worktrees never collide.
 
+## Ingestion API contract
+
+`openapi/agent-context-v1.json` freezes the ingestion v1 HTTP surface (`/v1/ingestion/*` and the
+components it references; health, MCP and admin routes are not part of it). It is immutable: a
+change needs a new API version. `tests/contract/test_openapi_snapshot.py` compares its SHA-256
+with the live application, and `tests/fixtures/ingestion/` holds the consumer request/response
+fixtures (see its README).
+
+```bash
+uv run python scripts/export-openapi.py --check   # exit 1 on drift
+uv run python scripts/export-openapi.py           # rewrite the snapshot (new API versions only)
+```
+
 ## Development workflow
 
 Create feature worktrees as siblings of repository checkouts, using an immutable SHA captured from
