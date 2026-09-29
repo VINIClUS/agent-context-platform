@@ -64,7 +64,7 @@ from collections.abc import Mapping, Sequence
 from dataclasses import dataclass, field, replace
 from enum import StrEnum
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from agent_context_sdk import canonical_json_bytes, sha256_hex
 
@@ -89,6 +89,7 @@ _SELECT_POLL_SECONDS = 0.25
 _BINARY_SNIFF_BYTES = 8_000
 _METADATA_OUTPUT_CAP = 65_536
 _INFO_COPY_CAP = 1_048_576
+_METADATA_FILE_CAP = 4096
 _SCAN_DOMAIN = b"agent-context-platform:scan:v1\0"
 _DIRTY_DOMAIN = b"agent-context-platform:dirty:v1\0"
 _GITLINK_MODE = "160000"
@@ -447,6 +448,38 @@ def _bootstrap(root: Path, limits: ScanLimits) -> _Repo:
     )
 
 
+def _read_metadata(path: Path, cap: int = _METADATA_FILE_CAP) -> bytes | None:
+    """Read one repository metadata file: no symlink, regular file, bounded.
+
+    Returns ``None`` when the file is absent. Anything else unusual (a symlink,
+    a non-regular file, more than ``cap`` bytes) fails closed without revealing
+    content. At most ``cap + 1`` bytes are ever read.
+    """
+    try:
+        fd = os.open(path, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
+    except FileNotFoundError:
+        return None
+    except OSError:
+        raise ScanError(ScanFailure.ROOT_MISMATCH) from None
+    try:
+        if not stat.S_ISREG(os.fstat(fd).st_mode):
+            raise ScanError(ScanFailure.ROOT_MISMATCH)
+        data = b""
+        while len(data) <= cap:
+            try:
+                chunk = os.read(fd, cap + 1 - len(data))
+            except OSError:
+                raise ScanError(ScanFailure.ROOT_MISMATCH) from None
+            if not chunk:
+                break
+            data += chunk
+    finally:
+        os.close(fd)
+    if len(data) > cap:
+        raise ScanError(ScanFailure.ROOT_MISMATCH)
+    return data
+
+
 def _dir_identity(path: Path) -> tuple[int, int] | None:
     """``(st_dev, st_ino)`` of a directory reached without following any symlink."""
     parts = path.resolve().parts
@@ -510,17 +543,21 @@ def _owns_git_dir(
     git_identity = _dir_identity(git_dir)
     if git_identity is None:
         return False
+    # Small pointer files are read through the bounded, symlink-free helper.
+    for pointer in {git_dir, common_dir}:
+        for name in ("HEAD", "commondir"):
+            _read_metadata(pointer / name)
     own = _dir_identity(root / ".git")
     if own is not None and git_identity == own:
         return _dir_identity(common_dir) == git_identity
-    backlink = git_dir / "gitdir"
-    try:
-        if backlink.is_file() and Path(backlink.read_text(encoding="utf-8").strip()).resolve() == (
-            root / ".git"
-        ):
+    backlink = _read_metadata(git_dir / "gitdir")
+    if backlink is not None:
+        try:
+            target = Path(backlink.decode("utf-8").strip()).resolve()
+        except (UnicodeDecodeError, ValueError, OSError):
+            return False
+        if target == root / ".git":
             return _is_admin_dir_of(common_dir, git_dir)
-    except (OSError, UnicodeDecodeError):
-        return False
     code, out = _run_git(
         git,
         ["config", "--file", str(git_dir / "config"), "--get", "core.worktree"],
@@ -658,24 +695,11 @@ def _safe_config(repo: _Repo, limits: ScanLimits) -> str:
 
 def _copy_info_file(source: Path, destination: Path) -> None:
     try:
-        fd = os.open(source, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC)
-    except FileNotFoundError:
-        return
-    except OSError:
+        data = _read_metadata(source, _INFO_COPY_CAP)
+    except ScanError:
         raise ScanError(ScanFailure.UNSUPPORTED_REPOSITORY) from None
-    try:
-        if not stat.S_ISREG(os.fstat(fd).st_mode):
-            raise ScanError(ScanFailure.UNSUPPORTED_REPOSITORY)
-        data = b""
-        while len(data) <= _INFO_COPY_CAP:
-            chunk = os.read(fd, _CHUNK_SIZE)
-            if not chunk:
-                break
-            data += chunk
-    finally:
-        os.close(fd)
-    if len(data) > _INFO_COPY_CAP:
-        raise ScanError(ScanFailure.UNSUPPORTED_REPOSITORY)
+    if data is None:
+        return
     destination.parent.mkdir(exist_ok=True)
     destination.write_bytes(data)
 
@@ -685,6 +709,7 @@ class _GitOutput:
     index: bytes
     head_tree: bytes
     status: bytes
+    flags: bytes = b""
 
 
 def _run_in_private_view(repo: _Repo, head: _Head, limits: ScanLimits) -> _GitOutput:
@@ -719,6 +744,7 @@ def _run_in_private_view(repo: _Repo, head: _Head, limits: ScanLimits) -> _GitOu
             )[1]
 
         index = run(["ls-files", "--stage", "-z"])
+        flags = run(["ls-files", "-v", "-z"])
         head_tree = run(["ls-tree", "-r", "-z", head.oid]) if head.oid is not None else b""
         status = run(
             [
@@ -731,7 +757,7 @@ def _run_in_private_view(repo: _Repo, head: _Head, limits: ScanLimits) -> _GitOu
                 "--ignore-submodules=all",
             ]
         )
-        return _GitOutput(index=index, head_tree=head_tree, status=status)
+        return _GitOutput(index=index, head_tree=head_tree, status=status, flags=flags)
     except OSError:
         raise ScanError(ScanFailure.GIT_FAILED) from None
     finally:
@@ -794,6 +820,19 @@ def _parse_index(raw: bytes, rejections: list[Rejection]) -> dict[str, _IndexEnt
         else:
             entries[path] = _IndexEntry(mode=mode, oid=oid, conflicted=False)
     return entries
+
+
+def _parse_flagged(raw: bytes) -> set[str]:
+    """Paths whose index entry carries assume-unchanged, skip-worktree or similar flags."""
+    flagged: set[str] = set()
+    for token in _split_z(raw):
+        if len(token) < 3 or token[1:2] != b" ":
+            raise ScanError(ScanFailure.MALFORMED_OUTPUT)
+        if token[:1] != b"H":
+            path = _safe_path(token[2:])
+            if path is not None:
+                flagged.add(path)
+    return flagged
 
 
 def _parse_head_gitlinks(raw: bytes) -> dict[str, str]:
@@ -910,6 +949,8 @@ class _Observed:
     skipped: SkipReason | None
     # Bytes actually read from the file, even when the digest was discarded.
     consumed: int = 0
+    # Git blob OID of the bytes read, in the repository's object format.
+    blob_oid: str | None = None
 
 
 def _skipped(
@@ -945,7 +986,15 @@ def _open_component(parent: int, name: str) -> int | SkipReason:
     return fd
 
 
-def _observe(root_fd: int, path: str, *, file_cap: int, budget: int) -> _Observed:
+def _blob_hasher(object_format: str, size: int) -> Any:
+    hasher = hashlib.sha256() if object_format == "sha256" else hashlib.sha1(usedforsecurity=False)
+    hasher.update(b"blob %d\0" % size)
+    return hasher
+
+
+def _observe(
+    root_fd: int, path: str, *, file_cap: int, budget: int, object_format: str = "sha1"
+) -> _Observed:
     """Read one worktree path by a component-wise ``O_NOFOLLOW`` walk from the root."""
     parts = path.split("/")
     held: list[int] = []
@@ -957,7 +1006,9 @@ def _observe(root_fd: int, path: str, *, file_cap: int, budget: int) -> _Observe
                 return _skipped(opened)
             held.append(opened)
             parent = opened
-        return _observe_leaf(parent, parts[-1], file_cap=file_cap, budget=budget)
+        return _observe_leaf(
+            parent, parts[-1], file_cap=file_cap, budget=budget, object_format=object_format
+        )
     finally:
         for fd in held:
             os.close(fd)
@@ -970,7 +1021,9 @@ def _over_cap(size: int, file_cap: int, budget: int, kind: FileKind) -> _Observe
     return _skipped(reason, kind, size)
 
 
-def _observe_leaf(parent: int, name: str, *, file_cap: int, budget: int) -> _Observed:
+def _observe_leaf(
+    parent: int, name: str, *, file_cap: int, budget: int, object_format: str = "sha1"
+) -> _Observed:
     try:
         info = os.stat(name, dir_fd=parent, follow_symlinks=False)
     except FileNotFoundError:
@@ -982,11 +1035,23 @@ def _observe_leaf(parent: int, name: str, *, file_cap: int, budget: int) -> _Obs
             target = os.readlink(os.fsencode(name), dir_fd=parent)
         except OSError:
             return _skipped(SkipReason.UNREADABLE, FileKind.SYMLINK)
+        # ``readlink`` is bounded by PATH_MAX; every branch charges its length
+        # (never past the remaining budget), so links cannot be read for free.
+        charge = min(len(target), budget)
         over = _over_cap(len(target), file_cap, budget, FileKind.SYMLINK)
         if over is not None:
-            return over
+            return replace(over, consumed=charge)
+        blob = _blob_hasher(object_format, len(target))
+        blob.update(target)
         return _Observed(
-            FileKind.SYMLINK, len(target), sha256_hex(target), False, os.fsdecode(target), None
+            FileKind.SYMLINK,
+            len(target),
+            sha256_hex(target),
+            False,
+            os.fsdecode(target),
+            None,
+            len(target),
+            blob.hexdigest(),
         )
     if not stat.S_ISREG(info.st_mode):
         return _skipped(SkipReason.UNREADABLE, FileKind.OTHER)
@@ -1007,6 +1072,7 @@ def _observe_leaf(parent: int, name: str, *, file_cap: int, budget: int) -> _Obs
         ):
             return _skipped(SkipReason.ESCAPES_REPOSITORY, FileKind.FILE)
         digest = hashlib.sha256()
+        blob = _blob_hasher(object_format, opened.st_size)
         total = 0
         sniff = b""
         cap = min(file_cap, budget)
@@ -1030,12 +1096,20 @@ def _observe_leaf(parent: int, name: str, *, file_cap: int, budget: int) -> _Obs
             if len(sniff) < _BINARY_SNIFF_BYTES:
                 sniff += chunk[: _BINARY_SNIFF_BYTES - len(sniff)]
             digest.update(chunk)
+            blob.update(chunk)
     finally:
         os.close(fd)
-    return _Observed(FileKind.FILE, total, digest.hexdigest(), b"\x00" in sniff, None, None, total)
+    # A file whose length changed since fstat cannot match any blob OID.
+    blob_oid = blob.hexdigest() if total == opened.st_size else None
+    return _Observed(
+        FileKind.FILE, total, digest.hexdigest(), b"\x00" in sniff, None, None, total, blob_oid
+    )
 
 
 # --- orchestration ------------------------------------------------------------------
+
+
+_RACE_SKIPS = frozenset({SkipReason.MISSING, SkipReason.UNREADABLE, SkipReason.ESCAPES_REPOSITORY})
 
 
 def _kind_for_mode(mode: str) -> FileKind:
@@ -1057,6 +1131,10 @@ def _scan(root: Path, limits: ScanLimits) -> RepositoryScan:
         head_links = _parse_head_gitlinks(output.head_tree)
         rejected_changes: list[str] = []
         changes, untracked_raw = _parse_status(output.status, rejections, rejected_changes)
+        flagged = _parse_flagged(output.flags)
+        # Tracked paths whose bytes no longer match the index although status
+        # called them clean: edited between status and the read.
+        raced: dict[str, str | None] = {}
 
         bytes_read = 0
         processed = 0
@@ -1069,6 +1147,7 @@ def _scan(root: Path, limits: ScanLimits) -> RepositoryScan:
                 path,
                 file_cap=limits.max_file_bytes,
                 budget=max(limits.max_total_bytes - bytes_read, 0),
+                object_format=repo.object_format,
             )
             # Charge what was actually read, even if the digest was discarded.
             bytes_read += (seen.size or 0) if seen.skipped is None else seen.consumed
@@ -1105,6 +1184,15 @@ def _scan(root: Path, limits: ScanLimits) -> RepositoryScan:
                 )
                 continue
             seen = observe(path)
+            if change is None and path not in flagged and not entry.conflicted:
+                # Compare the bytes actually read with the index blob. A
+                # mismatch also fires when eol or attribute conversion makes the
+                # worktree bytes legitimately differ: dirty is the safe side.
+                if seen.skipped is None:
+                    if seen.blob_oid != entry.oid:
+                        raced[path] = seen.sha256
+                elif seen.skipped in _RACE_SKIPS:
+                    raced[path] = None
             kind = seen.kind if seen.skipped is None else _kind_for_mode(entry.mode)
             files.append(
                 TrackedFile(
@@ -1196,20 +1284,24 @@ def _scan(root: Path, limits: ScanLimits) -> RepositoryScan:
     )
     untracked_records.extend([path, None, None, "omitted"] for path in omitted_untracked)
     modified_paths = tuple(
-        sorted({*changes, *(record[0] for record in gitlink_changes)}, key=_sort_key)
+        sorted({*changes, *raced, *(record[0] for record in gitlink_changes)}, key=_sort_key)
     )
+    raced_records = [[path, raced[path]] for path in sorted(raced, key=_sort_key)]
     # Changes at rejected paths stay dirty; only marker, status code and a
     # count are recorded, never the raw path.
     rejected_records = sorted(
         [code, rejected_changes.count(code)] for code in set(rejected_changes)
     )
-    is_dirty = bool(change_records or gitlink_changes or untracked_records or rejected_records)
+    is_dirty = bool(
+        change_records or raced_records or gitlink_changes or untracked_records or rejected_records
+    )
     dirty_digest: str | None = None
     if is_dirty:
         payload: bytes = canonical_json_bytes(
             {
                 "head": head.oid,
                 "changes": change_records,
+                "raced": raced_records,
                 "gitlinks": [list(item) for item in gitlink_changes],
                 "untracked": untracked_records,
                 "truncated": truncated,

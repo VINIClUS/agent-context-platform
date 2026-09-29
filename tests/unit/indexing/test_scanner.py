@@ -7,6 +7,7 @@ import subprocess
 import traceback
 from collections.abc import Callable
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -941,12 +942,14 @@ def test_growing_file_bytes_count_toward_total(
     repo.write("grow.txt", b"x" * 10)
     real = scanner._observe
 
-    def grown(root_fd: int, path: str, *, file_cap: int, budget: int) -> scanner._Observed:
+    def grown(
+        root_fd: int, path: str, *, file_cap: int, budget: int, object_format: str
+    ) -> scanner._Observed:
         if path == "grow.txt":
             return scanner._Observed(
                 FileKind.FILE, 9_000, None, None, None, SkipReason.TOO_LARGE, consumed=9_000
             )
-        return real(root_fd, path, file_cap=file_cap, budget=budget)
+        return real(root_fd, path, file_cap=file_cap, budget=budget, object_format=object_format)
 
     monkeypatch.setattr(scanner, "_observe", grown)
 
@@ -1076,3 +1079,151 @@ def test_growing_file_with_little_budget_left_never_exceeds_total(
 
     assert result.bytes_read <= limits.max_total_bytes
     assert TruncationReason.MAX_TOTAL_BYTES in result.truncation_reasons
+
+
+def _linked(repo: RepoBuilder, tmp_path: Path, name: str) -> tuple[Path, Path]:
+    linked = tmp_path / name
+    repo.git("worktree", "add", "-q", "-b", name, str(linked))
+    return linked, repo.root / ".git" / "worktrees" / name
+
+
+def test_symlinked_worktree_backlink_is_refused(repo: RepoBuilder, tmp_path: Path) -> None:
+    linked, admin = _linked(repo, tmp_path, "sym-backlink")
+    real = tmp_path / "elsewhere-gitdir"
+    real.write_text(str(linked / ".git"))
+    (admin / "gitdir").unlink()
+    (admin / "gitdir").symlink_to(real)
+
+    assert failure_of(linked) is ScanFailure.ROOT_MISMATCH
+
+
+def test_oversized_worktree_backlink_is_refused_without_reading_past_cap(
+    repo: RepoBuilder, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    linked, admin = _linked(repo, tmp_path, "big-backlink")
+    (admin / "gitdir").write_bytes(str(linked / ".git").encode() + b"\n" + b"x" * 200_000)
+    asked: list[int] = []
+    real_read = os.read
+
+    def spy(fd: int, size: int) -> bytes:
+        asked.append(size)
+        return real_read(fd, size)
+
+    monkeypatch.setattr(scanner.os, "read", spy)
+
+    assert failure_of(linked) is ScanFailure.ROOT_MISMATCH
+    assert scanner._METADATA_FILE_CAP + 1 in asked
+
+
+@pytest.mark.parametrize("name", ["commondir", "HEAD"])
+def test_symlinked_pointer_files_are_refused(repo: RepoBuilder, tmp_path: Path, name: str) -> None:
+    linked, admin = _linked(repo, tmp_path, f"sym-{name.lower()}")
+    target = admin / name
+    copy = tmp_path / f"copy-{name}"
+    copy.write_bytes(target.read_bytes())
+    target.unlink()
+    target.symlink_to(copy)
+
+    # Git's own bootstrap may reject a symlinked HEAD first; either way it fails closed.
+    assert failure_of(linked) in {ScanFailure.ROOT_MISMATCH, *FAIL_CLOSED}
+
+
+def test_read_metadata_is_bounded_and_content_free(tmp_path: Path) -> None:
+    ok = tmp_path / "ok"
+    ok.write_bytes(b"a" * scanner._METADATA_FILE_CAP)
+    big = tmp_path / "big"
+    big.write_bytes(b"secret-" * 5000)
+    fifo = tmp_path / "fifo"
+    os.mkfifo(fifo)
+
+    assert scanner._read_metadata(ok) == b"a" * scanner._METADATA_FILE_CAP
+    assert scanner._read_metadata(tmp_path / "absent") is None
+    for bad in (big, fifo):
+        with pytest.raises(ScanError) as caught:
+            scanner._read_metadata(bad)
+        assert "secret" not in repr(caught.value)
+
+
+def test_file_edited_between_status_and_read_is_dirty(
+    repo: RepoBuilder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    assert not scan_repository(repo.root).workspace.is_dirty
+    real = scanner._run_in_private_view
+
+    def edit_after_status(*args: Any, **kwargs: Any) -> Any:
+        output = real(*args, **kwargs)
+        (repo.root / "README.md").write_bytes(b"edited after status\n")
+        return output
+
+    monkeypatch.setattr(scanner, "_run_in_private_view", edit_after_status)
+
+    result = scan_repository(repo.root)
+
+    assert result.workspace.is_dirty
+    assert "README.md" in result.workspace.modified_paths
+    assert result.workspace.dirty_state_sha256 is not None
+
+
+def test_file_deleted_between_status_and_read_is_dirty(
+    repo: RepoBuilder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real = scanner._run_in_private_view
+
+    def delete_after_status(*args: Any, **kwargs: Any) -> Any:
+        output = real(*args, **kwargs)
+        (repo.root / "README.md").unlink()
+        return output
+
+    monkeypatch.setattr(scanner, "_run_in_private_view", delete_after_status)
+
+    assert "README.md" in scan_repository(repo.root).workspace.modified_paths
+
+
+def test_assume_unchanged_edit_is_not_flagged_by_the_blob_check(repo: RepoBuilder) -> None:
+    repo.git("update-index", "--assume-unchanged", "README.md")
+    repo.write("README.md", "edited but hidden by the flag\n")
+
+    assert "README.md" not in scan_repository(repo.root).workspace.modified_paths
+
+
+def test_clean_repository_has_no_blob_mismatch(repo: RepoBuilder) -> None:
+    assert not scan_repository(repo.root).workspace.is_dirty
+
+
+def test_blob_oid_matches_git_for_sha256_repository(tmp_path: Path) -> None:
+    data = b"hello\n"
+    header = b"blob 6\0"
+    hasher = scanner._blob_hasher("sha256", len(data))
+    hasher.update(data)
+    assert hasher.hexdigest() == hashlib.sha256(header + data).hexdigest()
+    sha1 = scanner._blob_hasher("sha1", len(data))
+    sha1.update(data)
+    assert sha1.hexdigest() == "ce013625030ba8dba906f756967f9e9ca394464a"
+
+
+def test_many_long_symlinks_never_exceed_total_budget(repo: RepoBuilder) -> None:
+    for index in range(30):
+        os.symlink("t" * 60 + str(index), repo.root / f"link{index:02d}")
+    limits = ScanLimits(max_total_bytes=200)
+
+    result = scan_repository(repo.root, limits)
+
+    assert 0 < result.bytes_read <= limits.max_total_bytes
+    assert TruncationReason.MAX_TOTAL_BYTES in result.truncation_reasons
+
+
+def test_skipped_symlink_is_charged_up_to_the_budget(tmp_path: Path) -> None:
+    root = tmp_path / "w"
+    root.mkdir()
+    os.symlink("t" * 80, root / "l")
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        over_file = scanner._observe_leaf(fd, "l", file_cap=10, budget=1000)
+        over_budget = scanner._observe_leaf(fd, "l", file_cap=1000, budget=50)
+        ok = scanner._observe_leaf(fd, "l", file_cap=1000, budget=1000)
+    finally:
+        os.close(fd)
+
+    assert over_file.skipped is SkipReason.TOO_LARGE and over_file.consumed == 80
+    assert over_budget.skipped is SkipReason.BUDGET_EXHAUSTED and over_budget.consumed == 50
+    assert ok.skipped is None and ok.consumed == 80
