@@ -31,6 +31,8 @@ from agent_context_platform.indexing.tree_sitter.base import (
 from agent_context_platform.indexing.tree_sitter.runner import Limits, SandboxedAdapter
 from agent_context_platform.settings import Settings
 
+from .conftest import PACKAGE_READ_PATHS
+
 pytestmark = pytest.mark.unit
 
 FAKE = str(Path(__file__).with_name("fake_adapter.py"))
@@ -51,7 +53,9 @@ def command(mode: str, *args: str) -> list[str]:
 
 
 def limits(**over: Any) -> Limits:
-    return Limits(**{"wall_seconds": 10.0, "cpu_seconds": 5, **over})
+    base = {"wall_seconds": 10.0, "cpu_seconds": 5, "extra_read_paths": PACKAGE_READ_PATHS}
+    extra = tuple(over.pop("extra_read_paths", ()))
+    return Limits(**{**base, **over, "extra_read_paths": (*PACKAGE_READ_PATHS, *extra)})
 
 
 def adapter(mode: str, *args: str, **over: Any) -> SandboxedAdapter:

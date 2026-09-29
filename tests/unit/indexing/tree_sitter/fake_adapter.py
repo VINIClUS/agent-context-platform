@@ -5,7 +5,6 @@ Standalone on purpose: it runs inside the sandbox as an untrusted child.
 
 from __future__ import annotations
 
-import base64
 import errno
 import hashlib
 import json
@@ -133,23 +132,29 @@ def main() -> int:
     if MODE == "ignore_stdin":
         emit({"protocol_version": 1, "files": []})
         return 0
-    request = json.loads(sys.stdin.read())
+    raw = sys.stdin.read()
     if MODE == "read_other_file":
         # Prints {attempt: errno name or "ok"}; ARG is the os.pathsep-joined list to open.
+        # Raw on purpose: the probe must not need the platform package to be readable.
         emit({"probe": probe(ARG.split(os.pathsep))})
         return 0
-    file = request["files"][0]
-    size = len(base64.b64decode(file["content_b64"]))
+    # The REAL request model, so the tests exercise the real validation. The package is
+    # readable only through ``Limits.extra_read_paths`` (see conftest.PACKAGE_READ_PATHS).
+    from agent_context_platform.indexing.tree_sitter.base import ParseRequest
+
+    request = ParseRequest.model_validate_json(raw)
+    file = request.files[0]
+    size = len(file.content())
     fingerprint = os.environ.get("FAKE_FINGERPRINT", "")
     good = symbol("1", "pkg.a", 0, min(size, 8), signature="def a()")
     parsed: dict[str, object] = {
-        "path": file["path"],
-        "language": file["language"],
+        "path": file.path,
+        "language": file.language,
         "parser_fingerprint": fingerprint,
         "symbols": [good],
         "relations": [],
     }
-    document: dict[str, object] = {"protocol_version": 1, "files": [parsed]}
+    document: dict[str, object] = {"protocol_version": request.protocol_version, "files": [parsed]}
     if MODE == "ok":
         pass
     elif MODE == "references_ok":
@@ -163,6 +168,7 @@ def main() -> int:
         document["protocol_version"] = 2
         parsed["references"] = [reference(4, 5, "AWS_SECRET_KEY")]
     elif MODE == "references_v1":
+        document["protocol_version"] = 1
         parsed["references"] = [reference(4, 5, "a")]
     elif MODE == "degraded_ok":
         document["protocol_version"] = 2

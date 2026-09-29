@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import base64
 import contextlib
+import dataclasses
 import io
 import json
 import os
@@ -37,6 +38,8 @@ from agent_context_platform.indexing.tree_sitter.base import (
     validate_module,
 )
 from agent_context_platform.indexing.tree_sitter.runner import Limits, SandboxedAdapter
+
+from .conftest import PACKAGE_READ_PATHS
 
 pytestmark = pytest.mark.unit
 
@@ -296,6 +299,9 @@ def test_parser_fingerprint_is_canonical() -> None:
 def adapter(mode: str, arg: str = "", **kwargs: Any) -> SandboxedAdapter:
     command = [sys.executable, FAKE, mode, *([arg] if arg else [])]
     limits = kwargs.pop("limits", Limits(wall_seconds=3.0, cpu_seconds=2))
+    limits = dataclasses.replace(
+        limits, extra_read_paths=(*PACKAGE_READ_PATHS, *limits.extra_read_paths)
+    )
     env = {"FAKE_FINGERPRINT": FINGERPRINT, **kwargs.pop("env", {})}
     return SandboxedAdapter(
         command,
@@ -1080,17 +1086,18 @@ def test_valid_references_of_each_kind_and_relative_imports() -> None:
         signature="def f()",
     )
     references = [
-        imp(0, 14, "os.path"),
-        imp(15, 34, "pkg", relative_level=2),
-        imp(15, 34, "x", relative_level=2),
+        imp(7, 14, "os.path"),  # the dotted-name node of ``import os.path``
+        imp(22, 25, "pkg", relative_level=2),  # ``from ..pkg import x``: range on ``pkg``
+        imp(33, 34, "x", relative_level=2),
         ref(call_at, call_at + 3, "a.b", source="1"),
         ref(call_at, call_at + 1, "a", source="1"),
-        ref(func_start, func_start + 5, "def", kind="inherit", confidence="syntactic", source="1"),
+        ref(func_start, func_start + 3, "def", kind="inherit", confidence="syntactic", source="1"),
     ]
     got = validated(module([func], references=references), req)
     assert [item.source for item in got.references] == [None, None, None, "0", "0", "0"]
     assert {item.kind for item in got.references} == {"import", "call", "inherit"}
     assert got.references[1].relative_level == 2
+    assert got.references[1].target_name == "pkg"
     assert got.diagnostics == ()
 
 
@@ -1124,6 +1131,59 @@ def test_references_are_confined_to_the_occurrence(
     refused(code, module(references=[reference]))
 
 
+WORDS = b"alpha beta gamma delta"
+
+
+@pytest.mark.parametrize(
+    "name",
+    ["delta.alpha", "beta.alpha", "gamma.beta.alpha", "alpha.gamma", "alpha.alpha", "delta"],
+)
+def test_reference_names_out_of_order_or_partial_are_refused(name: str) -> None:
+    req = request(WORDS)
+    refused(
+        StructuralErrorCode.TEXT_NOT_IN_SOURCE,
+        module([], references=[ref(0, len(WORDS), name)]),
+        req,
+    )
+    assert validated(module([], references=[ref(0, len(WORDS), "alpha.beta.gamma.delta")]), req)
+
+
+def test_a_whole_file_range_only_yields_the_one_name_of_its_tokens() -> None:
+    """511 references over whole-file ranges cannot each say something different."""
+    req = request(WORDS)
+    for name in ("alpha.beta", "alpha.gamma.beta", "beta.alpha.gamma.delta"):
+        refused(
+            StructuralErrorCode.TEXT_NOT_IN_SOURCE,
+            module([], references=[imp(0, len(WORDS), name)]),
+            req,
+        )
+    # A statement is not a name: its keywords are tokens of the range.
+    refused(
+        StructuralErrorCode.TEXT_NOT_IN_SOURCE,
+        module([], references=[imp(0, 14, "os.path")]),
+        request(b"import os.path\n"),
+    )
+
+
+@pytest.mark.parametrize("name", ["a/b", "a#b", "a::b", "a.b/c", ".a.b", "a.b.", "a..b"])
+def test_reference_separators_other_than_a_dot_are_refused(name: str) -> None:
+    req = request(b"a b c/d")
+    refused(StructuralErrorCode.TEXT_NOT_IN_SOURCE, module([], references=[ref(0, 3, name)]), req)
+    slashed = request(b"a/b#c::d")
+    refused(
+        StructuralErrorCode.TEXT_NOT_IN_SOURCE,
+        module([], references=[ref(0, 8, name)]),
+        slashed,
+    )
+
+
+def test_a_range_that_cuts_a_token_is_refused() -> None:
+    req = request(b"alpha beta")
+    refused(StructuralErrorCode.TEXT_NOT_IN_SOURCE, module([], references=[ref(1, 5, "lpha")]), req)
+    refused(StructuralErrorCode.TEXT_NOT_IN_SOURCE, module([], references=[ref(0, 4, "alph")]), req)
+    assert validated(module([], references=[ref(0, 5, "alpha")]), req)
+
+
 def test_a_target_from_elsewhere_in_the_file_is_not_enough() -> None:
     """``return`` is a token of the file, but not of the occurrence range that is claimed."""
     refused(StructuralErrorCode.TEXT_NOT_IN_SOURCE, module(references=[ref(4, 5, "return")]))
@@ -1139,6 +1199,7 @@ def test_duplicate_references_are_refused() -> None:
     assert validated(
         module(references=[ref(4, 5, "a"), imp(4, 5, "a"), imp(4, 5, "a", relative_level=1)])
     )
+    assert validated(module(references=[ref(4, 5, "a"), ref(4, 6, "a")]))
 
 
 def test_reference_caps(monkeypatch: pytest.MonkeyPatch) -> None:
@@ -1258,6 +1319,29 @@ def test_diagnostics_are_bounded_by_the_code_set() -> None:
         )
 
 
+def test_a_go_receiver_still_passes_and_a_long_range_bound_name_does_not() -> None:
+    go = b"func (t T) m() {}"
+    receiver = symbol(
+        qualified_name="T.m", start_byte=0, end_byte=len(go), signature="func (t T) m() {}"
+    )
+    assert validated(module([receiver]), request(go))
+    words = [f"w{n}".encode() for n in range(91)]
+    text = b" ".join(words)
+    name = ".".join(word.decode() for word in words)  # 90 non-final segments, all range tokens
+    long = symbol(qualified_name=name, start_byte=0, end_byte=len(text), signature="")
+    refused(StructuralErrorCode.TEXT_NOT_IN_SOURCE, module([long]), request(text))
+    two = symbol(qualified_name="w1.w2.w3", start_byte=0, end_byte=len(text), signature="")
+    refused(StructuralErrorCode.TEXT_NOT_IN_SOURCE, module([two]), request(text))
+    # Path components and other emitted symbols are structure, so they stay unlimited.
+    paths = request(text, path="w1/w2/w3/mod.py")
+    ok = symbol(qualified_name="w1.w2.w3.w4", start_byte=0, end_byte=len(text), signature="")
+    assert validated(module([ok], path="w1/w2/w3/mod.py"), paths)
+
+
+def test_diagnostic_counts_saturate_at_one_thousand() -> None:
+    assert base.MAX_DIAGNOSTIC_COUNT == 1000
+
+
 def test_protocol_one_still_validates_and_cannot_carry_new_fields() -> None:
     old = module(version=1)
     assert old.protocol_version == 1
@@ -1273,6 +1357,7 @@ def test_protocol_one_still_validates_and_cannot_carry_new_fields() -> None:
 
 
 def test_sandboxed_adapter_round_trips_references_and_diagnostics() -> None:
+    assert isinstance(adapter("ok").parse(request()), ParsedModule)
     result = adapter("references_ok").parse(request())
     assert isinstance(result, ParsedModule)
     file = result.files[0]
@@ -1286,3 +1371,25 @@ def test_sandboxed_adapter_round_trips_references_and_diagnostics() -> None:
         "file_degraded",
         "work_budget_exceeded",
     }
+
+
+def test_request_carries_the_declared_version_and_serve_accepts_both() -> None:
+    v1 = adapter("ok", protocol_version=1).parse(request())
+    assert isinstance(v1, ParsedModule)
+    assert v1.protocol_version == 1  # the fake echoes the version of the request it parsed
+    v2 = adapter("ok").parse(request())
+    assert isinstance(v2, ParsedModule)
+    assert v2.protocol_version == 2
+    for version in (1, 2):
+        stdin = io.BytesIO(
+            request().model_copy(update={"protocol_version": version}).model_dump_json().encode()
+        )
+        stdout = io.BytesIO()
+        assert runner.serve(lambda _req, v=version: module(version=v), stdin, stdout) == 0
+        assert json.loads(stdout.getvalue())["protocol_version"] == version
+
+
+def test_a_response_above_the_declared_version_is_refused() -> None:
+    result = outcome("references_ok", protocol_version=1)
+    assert result is StructuralErrorCode.SCHEMA_VIOLATION
+    assert outcome("references_v1", protocol_version=1) is StructuralErrorCode.SCHEMA_VIOLATION

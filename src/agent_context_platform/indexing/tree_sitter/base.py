@@ -10,6 +10,9 @@ Wire protocol: one bounded JSON document each way (``ParseRequest`` on stdin,
 ``ParsedModule`` on stdout). Both sides validate with pydantic models that are
 frozen, strict and ``extra="forbid"``, with ``hide_input_in_errors`` so that a
 validation failure never echoes source text into logs.
+Protocol versions 1 and 2 are both spoken. ``SandboxedAdapter`` declares the version it speaks
+(default 2), the request carries it, ``serve`` accepts both, and a response may not claim a
+higher version than the adapter declared. Version 1 has no ``references`` or ``diagnostics``.
 
 Trust rules enforced by ``validate_module`` (fail closed, typed content-free
 errors, never the offending value):
@@ -64,22 +67,37 @@ errors, never the offending value):
     ``FIELD_CONFINEMENT`` classifies every output field; a test fails when a new field
     is not classified.
 
-  * ``ParsedReference.target_name`` is a dotted identifier path (a new free-text channel, so
-    airtight): every segment is an identifier token located inside the occurrence range
-    ``[start_byte, end_byte]`` (``import os.path`` contains ``os`` and ``path``), the range lies
-    inside the file and, when ``source`` is set, inside that symbol's range. ``source`` is
+  * ``ParsedReference.target_name`` is a function of its range (a new free-text channel, so
+    airtight): it EQUALS the identifier tokens found in ``[start_byte, end_byte]``, in source
+    order, joined by ``.`` (only ``.`` separates; ``/``, ``#`` and ``::`` are refused, a token
+    cut by either range end is refused). The adapter therefore points the range at the name
+    node itself (``os.path`` inside ``import os.path``; ``pkg`` inside ``from ..pkg import x``
+    with ``relative_level=2``), never at the whole statement: a statement's own keywords would
+    be part of the name. The range lies inside the file and, when ``source`` is set, inside
+    that symbol's range. ``source`` is
     remapped to a symbol index (None is module level), ``kind`` and ``confidence`` are closed
     enums (``syntactic`` for import/inherit, ``heuristic`` for call: the target is a name, not a
     resolved symbol), ``relative_level`` is an integer 0..``MAX_RELATIVE_LEVEL``. References are
-    capped per file and per source, duplicates are refused and the name bytes count against
-    ``MAX_NAME_TOTAL_BYTES``;
+    capped per file (``MAX_REFERENCES_PER_FILE``, the total that binds symbols and module level
+    together), per symbol and at module level, duplicates are refused and the name bytes count
+    against ``MAX_NAME_TOTAL_BYTES``;
   * ``ParsedFile.diagnostics`` is at most one ``ParsedDiagnostic`` per closed-enum code with a
     bounded count. ``file_degraded`` needs a reason code and no symbols, relations or references,
-    so a degraded file is never mistaken for an empty one;
+    so a degraded file is never mistaken for an empty one. Counts saturate at
+    ``MAX_DIAGNOSTIC_COUNT`` (1000);
+  * of the non-final ``qualified_name`` segments, at most ``MAX_RANGE_BOUND_PREFIX`` (one, for
+    Go receivers) may rest only on "a token inside the symbol's own range"; the others must be
+    path components or names of emitted symbols;
 
   Residual channel (inherent to structural output): an adapter can still choose *which*
-  symbols, relations and ordering to emit, about one bit per candidate token or edge, at most about ``log2(tokens in file)`` bits per symbol and only ever about
-  this file's own content. That leaks nothing beyond the file it was asked to parse.
+  symbols, relations, references and ordering to emit, and only ever about this file's own
+  content. Measured bounds, with T identifier tokens in the file: a symbol name carries at most
+  ``log2(T)`` bits for its final segment plus ``log2(T)`` for the one range-bound segment; a
+  reference carries only its range, since the name is a function of it: at most ``2*log2(T)``
+  bits (which token span), plus 5 bits of level. A 256-token file with 511 module-level
+  references therefore carries about 511 * 16 bits = 1 KB (it was 50 KB while names were free
+  token orderings), and a whole-file range yields exactly one name. That leaks nothing beyond
+  the file it was asked to parse.
 
 Adapter output carries no source text beyond qualified names, ``kind``s,
 ``disambiguator``s and signatures. A signature is bounded to
@@ -137,7 +155,11 @@ MAX_REFERENCES_PER_SYMBOL: Final = 64
 # Imports pile up at module level, which is one source of its own.
 MAX_MODULE_REFERENCES: Final = 4096
 MAX_RELATIVE_LEVEL: Final = 16
-MAX_DIAGNOSTIC_COUNT: Final = 1_000_000
+# Adapters saturate a count at this value; a larger one is refused.
+MAX_DIAGNOSTIC_COUNT: Final = 1000
+# Non-final qualified-name segments that may be bound only by "a token inside the symbol's own
+# range" (Go receivers). Path components and other emitted symbols are bound to structure.
+MAX_RANGE_BOUND_PREFIX: Final = 1
 
 
 class StructuralErrorCode(StrEnum):
@@ -577,8 +599,15 @@ class _SourceText:
 
     def __init__(self, path: str, content: bytes) -> None:
         self._tokens: dict[bytes, list[int]] = {}
+        # Every identifier token in source order, for the reference-name check.
+        self._starts: list[int] = []
+        self._ends: list[int] = []
+        self._words: list[bytes] = []
         for match in _IDENT.finditer(content):
             self._tokens.setdefault(match.group(), []).append(match.start())
+            self._starts.append(match.start())
+            self._ends.append(match.end())
+            self._words.append(match.group())
         self._path_parts = _path_parts(path)
         self.name_bytes = 0
         # Whitespace-collapsed text, with the original offset of every collapsed byte.
@@ -610,12 +639,19 @@ class _SourceText:
             raise StructuralError(StructuralErrorCode.COUNT_EXCEEDED)
 
     def path_ok(self, target_name: str, start: int, end: int) -> bool:
-        """Every segment is an identifier token inside the occurrence range."""
+        """The name equals the range's identifier tokens, in order, joined by ``.``."""
         self.charge(target_name)
-        return all(
-            _IDENT.fullmatch(raw) is not None and self._token_within(raw, start, end)
-            for raw in (segment.encode() for segment in _SEPARATORS.split(target_name))
-        )
+        index = bisect_left(self._starts, start)
+        if index and self._ends[index - 1] > start:
+            return False  # a token is cut by the start of the range
+        for wanted in target_name.encode().split(b"."):
+            if index >= len(self._starts) or self._ends[index] > end:
+                return False
+            if self._words[index] != wanted:
+                return False
+            index += 1
+        # Another token in range, or one cut by the end of the range, is not the name.
+        return index >= len(self._starts) or self._starts[index] >= end
 
     def final_ok(self, qualified_name: str, kind: str, start: int, end: int) -> bool:
         """Every segment is an identifier and the final one is a token of the symbol's range."""
@@ -631,12 +667,16 @@ class _SourceText:
     def prefix_ok(
         self, qualified_name: str, start: int, end: int, finals: set[bytes], paths: set[bytes]
     ) -> bool:
-        """Non-final segments: a path component, another symbol's name, or a token in range."""
+        """Non-final segments: a path component, another symbol's name, or (a few) range tokens."""
         segments = [segment.encode() for segment in _SEPARATORS.split(qualified_name)]
-        return all(
-            raw in paths or raw in finals or self._token_within(raw, start, end)
-            for raw in segments[:-1]
-        )
+        range_bound = 0
+        for raw in segments[:-1]:
+            if raw in paths or raw in finals:
+                continue
+            if not self._token_within(raw, start, end):
+                return False
+            range_bound += 1
+        return range_bound <= MAX_RANGE_BOUND_PREFIX
 
     def signature_ok(self, signature: str, start: int, end: int) -> bool:
         needle = _WHITESPACE.sub(b" ", signature.encode()).strip()

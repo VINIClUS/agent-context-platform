@@ -143,7 +143,7 @@ import time
 import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
-from typing import IO, Any, Final
+from typing import IO, Any, Final, Literal
 
 from pydantic import ValidationError
 
@@ -151,6 +151,7 @@ from agent_context_platform.indexing.tree_sitter import landlock
 from agent_context_platform.indexing.tree_sitter.base import (
     MAX_OUTPUT_BYTES,
     MAX_REQUEST_BYTES,
+    PROTOCOL_VERSION,
     ParsedModule,
     ParseRequest,
     SandboxUnavailable,
@@ -317,10 +318,13 @@ class SandboxedAdapter:
         parser_config: Mapping[str, Any] | None = None,
         limits: Limits | None = None,
         env: Mapping[str, str] | None = None,
+        protocol_version: Literal[1, 2] = PROTOCOL_VERSION,
     ) -> None:
         if not command or not os.path.isabs(command[0]):
             raise ValueError("command must be an argv whose first item is an absolute path")
         self._command = tuple(command)
+        # The wire version this adapter speaks: requests carry it and responses may not exceed it.
+        self._protocol_version = protocol_version
         self._language = language
         self._limits = limits or Limits()
         self._env = _child_env(env)
@@ -337,7 +341,8 @@ class SandboxedAdapter:
     def parse(self, request: ParseRequest) -> ParsedModule:
         if any(item.language != self._language for item in request.files):
             raise StructuralError(StructuralErrorCode.LANGUAGE_MISMATCH)
-        payload = request.model_dump_json().encode("utf-8")
+        versioned = request.model_copy(update={"protocol_version": self._protocol_version})
+        payload = versioned.model_dump_json().encode("utf-8")
         if len(payload) > MAX_REQUEST_BYTES:
             raise StructuralError(StructuralErrorCode.INPUT_TOO_LARGE)
         raw = _run(self._command, payload, self._limits, self._env)
@@ -347,6 +352,8 @@ class SandboxedAdapter:
             raise StructuralError(StructuralErrorCode.SCHEMA_VIOLATION) from None
         except ValueError:
             raise StructuralError(StructuralErrorCode.MALFORMED_OUTPUT) from None
+        if module.protocol_version > self._protocol_version:
+            raise StructuralError(StructuralErrorCode.SCHEMA_VIOLATION)
         return validate_module(request, module, expected_fingerprint=self._fingerprint)
 
 
