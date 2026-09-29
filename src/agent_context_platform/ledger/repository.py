@@ -571,6 +571,24 @@ class LedgerRepository:
         return cast(list[StoredEventV1], results)
 
     @staticmethod
+    async def get_event(session: AsyncSession, event_id: PythonUUID) -> StoredEventV1 | None:
+        """Load one stored event by ID, or ``None`` when it does not exist.
+
+        This is the single reconstruction path for readers such as the
+        projection runtime: content refs are re-sorted by ``content_id`` in
+        Python (see the module docstring), never trusted to SQL collation.
+        """
+        event = await session.get(EventRow, event_id)
+        if event is None:
+            return None
+        content_refs = (
+            await session.scalars(
+                select(EventContentRefRow).where(EventContentRefRow.event_id == event_id)
+            )
+        ).all()
+        return _row_to_stored_event(event, content_refs)
+
+    @staticmethod
     async def get_by_idempotency_keys(
         session: AsyncSession, keys: Sequence[tuple[str, str]]
     ) -> dict[tuple[str, str], StoredEventV1]:
