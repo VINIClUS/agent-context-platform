@@ -9,6 +9,7 @@ import base64
 import hashlib
 import json
 import os
+import signal
 import sys
 import time
 
@@ -47,18 +48,18 @@ def emit(document: object) -> None:
 def spawn_sleepers() -> None:
     """Leave a sleeping descendant marked by ARG in its argv (escaping the process group)."""
     ignore = MODE == "ignore_term"
+    if MODE == "kill_supervisor":
+        os.kill(os.getppid(), signal.SIGKILL)  # a compromised parser attacking its supervisor
     if os.fork() != 0:
         time.sleep(0.5)  # let the descendants exec before the adapter exits
         return
     try:
         if MODE != "ignore_term":
             os.setsid()
-        if MODE == "double_fork" and os.fork() != 0:
+        if MODE in ("double_fork", "kill_supervisor") and os.fork() != 0:
             os._exit(0)
         os.closerange(0, 3)
         if ignore:
-            import signal
-
             signal.signal(signal.SIGTERM, signal.SIG_IGN)
         os.execv(sys.executable, [sys.executable, "-c", "import time; time.sleep(600)", ARG])
     finally:
@@ -75,7 +76,7 @@ def main() -> int:
     file = request["files"][0]
     size = len(base64.b64decode(file["content_b64"]))
     fingerprint = os.environ.get("FAKE_FINGERPRINT", "")
-    good = symbol("a", "pkg.a", 0, min(size, 8), signature="def a()")
+    good = symbol("1", "pkg.a", 0, min(size, 8), signature="def a()")
     parsed: dict[str, object] = {
         "path": file["path"],
         "language": file["language"],
@@ -87,14 +88,14 @@ def main() -> int:
     if MODE == "ok":
         pass
     elif MODE == "range":
-        parsed["symbols"] = [symbol("a", "pkg.a", 0, size + 1)]
+        parsed["symbols"] = [symbol("1", "pkg.a", 0, size + 1)]
     elif MODE == "foreign_path":
         parsed["path"] = "other/file.py"
     elif MODE == "dangling":
         parsed["relations"] = [
             {
-                "source_ref": "a",
-                "target_ref": "missing",
+                "source_ref": "1",
+                "target_ref": "99",
                 "kind": "calls",
                 "start_byte": 0,
                 "end_byte": 1,
@@ -102,11 +103,11 @@ def main() -> int:
             }
         ]
     elif MODE == "wrong_evidence":
-        parsed["symbols"] = [symbol("a", "pkg.a", 0, 1, evidence_kind="scip")]
+        parsed["symbols"] = [symbol("1", "pkg.a", 0, 1, evidence_kind="scip")]
     elif MODE == "extra_field":
         good["source_text"] = "secret"
     elif MODE == "duplicate":
-        parsed["symbols"] = [symbol("a", "pkg.a", 0, 1), symbol("b", "pkg.a", 0, 1)]
+        parsed["symbols"] = [symbol("1", "pkg.a", 0, 8), symbol("2", "pkg.a", 0, 8)]
     elif MODE == "bad_language":
         parsed["language"] = "go"
     elif MODE == "bad_json":
@@ -148,7 +149,13 @@ def main() -> int:
     elif MODE == "env":
         if "AGENT_CONTEXT_SECRET" in os.environ:
             return 6
-    elif MODE in ("setsid_child", "double_fork", "ignore_term", "hang_with_daemon"):
+    elif MODE in (
+        "setsid_child",
+        "double_fork",
+        "ignore_term",
+        "hang_with_daemon",
+        "kill_supervisor",
+    ):
         spawn_sleepers()
         if MODE == "hang_with_daemon":
             time.sleep(600)

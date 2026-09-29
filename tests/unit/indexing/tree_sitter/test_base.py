@@ -49,7 +49,7 @@ def request(content: bytes = SOURCE, path: str = "pkg/mod.py") -> ParseRequest:
 
 def symbol(**over: Any) -> dict[str, Any]:
     data: dict[str, Any] = {
-        "ref": "a",
+        "ref": "1",
         "language": "python",
         "qualified_name": "pkg.mod.a",
         "kind": "function",
@@ -61,6 +61,19 @@ def symbol(**over: Any) -> dict[str, Any]:
         "semantic_fingerprint": DIGEST,
         "evidence_kind": "tree_sitter",
     }
+    data.update(over)
+    return data
+
+
+def second(**over: Any) -> dict[str, Any]:
+    """A second, distinct symbol: ``return`` sits inside bytes 9..len of ``SOURCE``."""
+    data = symbol(
+        ref="2",
+        qualified_name="pkg.mod.return",
+        start_byte=9,
+        end_byte=len(SOURCE),
+        signature="return 1",
+    )
     data.update(over)
     return data
 
@@ -127,9 +140,13 @@ def test_required_symbol_fields(missing: str) -> None:
         {"qualified_name": "x" * (base.MAX_NAME_BYTES + 1)},
         {"signature": "s" * (base.MAX_SIGNATURE_BYTES + 1)},
         {"signature": "é" * base.MAX_SIGNATURE_BYTES},
-        {"disambiguator": "d" * (base.MAX_DISAMBIGUATOR_BYTES + 1)},
         {"disambiguator": "a b"},
         {"disambiguator": "/etc/passwd"},
+        {"disambiguator": "hunter2"},
+        {"disambiguator": "123456789"},
+        {"kind": "macro"},
+        {"ref": "abc"},
+        {"ref": ""},
         {"kind": "Function"},
         {"kind": "function\n"},
         {"signature_digest": "ABC"},
@@ -152,8 +169,8 @@ def test_validation_errors_do_not_echo_input() -> None:
 
 def test_relation_requires_evidence_and_range() -> None:
     good = {
-        "source_ref": "a",
-        "target_ref": "b",
+        "source_ref": "1",
+        "target_ref": "2",
         "kind": "calls",
         "start_byte": 0,
         "end_byte": 1,
@@ -191,8 +208,8 @@ def test_range_beyond_input_is_refused() -> None:
 
 def test_relation_range_beyond_input_is_refused() -> None:
     relation = {
-        "source_ref": "a",
-        "target_ref": "a",
+        "source_ref": "1",
+        "target_ref": "1",
         "kind": "calls",
         "start_byte": 0,
         "end_byte": len(SOURCE) + 1,
@@ -225,21 +242,19 @@ def test_dangling_relation_endpoints() -> None:
             "evidence_kind": "tree_sitter",
         }
 
-    refused(StructuralErrorCode.DANGLING_RELATION, module(relations=[relation("a", "ghost")]))
-    refused(StructuralErrorCode.DANGLING_RELATION, module(relations=[relation("ghost", "a")]))
-    ok = module(
-        [symbol(), symbol(ref="b", qualified_name="pkg.mod.return")], relations=[relation("a", "b")]
-    )
+    refused(StructuralErrorCode.DANGLING_RELATION, module(relations=[relation("1", "99")]))
+    refused(StructuralErrorCode.DANGLING_RELATION, module(relations=[relation("99", "1")]))
+    ok = module([symbol(), second()], relations=[relation("1", "2")])
     assert validate_module(request(), ok, expected_fingerprint=FINGERPRINT)
 
 
 def test_duplicate_symbols_are_refused() -> None:
-    refused(StructuralErrorCode.DUPLICATE_SYMBOL, module([symbol(), symbol(ref="b")]))
+    refused(StructuralErrorCode.DUPLICATE_SYMBOL, module([symbol(), symbol(ref="2")]))
     refused(
         StructuralErrorCode.DUPLICATE_SYMBOL,
-        module([symbol(), symbol(qualified_name="pkg.mod.return")]),
+        module([symbol(), second(ref="1")]),
     )
-    distinct = module([symbol(), symbol(ref="b", disambiguator="2")])
+    distinct = module([symbol(), symbol(ref="2", disambiguator="2")])
     assert validate_module(request(), distinct, expected_fingerprint=FINGERPRINT)
 
 
@@ -247,12 +262,12 @@ def test_count_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(base, "MAX_SYMBOLS_PER_FILE", 1)
     refused(
         StructuralErrorCode.COUNT_EXCEEDED,
-        module([symbol(), symbol(ref="b", qualified_name="pkg.mod.return")]),
+        module([symbol(), second()]),
     )
     monkeypatch.setattr(base, "MAX_RELATIONS_PER_FILE", 0)
     relation = {
-        "source_ref": "a",
-        "target_ref": "a",
+        "source_ref": "1",
+        "target_ref": "1",
         "kind": "calls",
         "start_byte": 0,
         "end_byte": 1,
@@ -540,7 +555,7 @@ def test_realistic_python_and_typescript_names_and_signatures_pass() -> None:
                 signature="class Repo",
             ),
             symbol(
-                ref="m",
+                ref="2",
                 qualified_name="repo.store.Repo.fetch",
                 start_byte=fetch,
                 end_byte=end,
@@ -560,7 +575,7 @@ def test_realistic_python_and_typescript_names_and_signatures_pass() -> None:
                 signature="get(id: string, fallback?: T): T | undefined",
             ),
             symbol(
-                ref="w",
+                ref="2",
                 qualified_name="Util.wrap",
                 start_byte=TS_SOURCE.index(b"namespace"),
                 end_byte=len(TS_SOURCE) - 1,
@@ -578,6 +593,7 @@ def test_realistic_python_and_typescript_names_and_signatures_pass() -> None:
         {"qualified_name": "pkg.zzz_secret_token"},
         {"signature": "DB_PASSWORD=hunter2"},
         {"signature": "def a() # smuggled"},
+        {"qualified_name": "pkg.mod.zzz_secret_token"},
     ],
 )
 def test_text_not_in_the_parsed_file_is_refused(override: dict[str, Any]) -> None:
@@ -600,16 +616,41 @@ def test_signature_must_come_from_the_symbols_own_range() -> None:
     assert caught.value.code is StructuralErrorCode.TEXT_NOT_IN_SOURCE
 
 
-def test_too_many_unverifiable_segments_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
-    monkeypatch.setattr(base, "MAX_UNCHECKED_SEGMENTS", 1)
-    refused(StructuralErrorCode.COUNT_EXCEEDED, module([symbol(qualified_name="pkg.mod.ef.:.ac")]))
+def test_total_name_bytes_are_bounded(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(base, "MAX_NAME_TOTAL_BYTES", 12)
+    refused(StructuralErrorCode.COUNT_EXCEEDED, module([symbol(), second()]))
 
 
-def test_text_segments_from_path_and_whitespace_only_signature() -> None:
-    ok = module([symbol(qualified_name="pkg.mod", signature="")])
-    assert validate_module(request(), ok, expected_fingerprint=FINGERPRINT)
-    spaced = module([symbol(signature="def   a()")])
-    assert validate_module(request(), spaced, expected_fingerprint=FINGERPRINT)
+@pytest.mark.parametrize(
+    "name",
+    [
+        "h.u.n.t.e.r.2",  # one-character segments spelling out foreign data
+        "pkg.mod.a.",  # empty segment
+        "pkg.mod.2",  # not an identifier
+        "p.mod.a",  # non-final segment shorter than two characters
+        "pkg.mod.return",  # final token exists in the file, but outside the symbol's range
+        "<lambda>",
+    ],
+)
+def test_names_are_confined_to_identifier_tokens(name: str) -> None:
+    refused(StructuralErrorCode.TEXT_NOT_IN_SOURCE, module([symbol(qualified_name=name)]))
+
+
+def test_single_character_final_segment_and_module_names() -> None:
+    assert validate_module(request(), module([symbol()]), expected_fingerprint=FINGERPRINT)
+    named_module = module([symbol(qualified_name="pkg.mod", kind="module", signature="")])
+    assert validate_module(request(), named_module, expected_fingerprint=FINGERPRINT)
+    # A path component only qualifies a module, never another kind.
+    refused(StructuralErrorCode.TEXT_NOT_IN_SOURCE, module([symbol(qualified_name="pkg.mod")]))
+
+
+def test_whitespace_only_signature_and_collapsing() -> None:
+    assert validate_module(
+        request(), module([symbol(signature="")]), expected_fingerprint=FINGERPRINT
+    )
+    assert validate_module(
+        request(), module([symbol(signature="def   a()")]), expected_fingerprint=FINGERPRINT
+    )
 
 
 # --- descendants ------------------------------------------------------------------------
@@ -658,6 +699,38 @@ def test_no_descendant_survives_a_timeout(marker: str) -> None:
     result = outcome("hang_with_daemon", marker, limits=roomy(1.5))
     assert result is StructuralErrorCode.TIMEOUT
     assert _marked(marker) == []
+
+
+def _zombie_children() -> list[int]:
+    found = []
+    for entry in Path("/proc").iterdir():
+        if entry.name.isdigit():
+            info = runner._stat(int(entry.name))
+            if info is not None and info.ppid == os.getpid() and info.state == "Z":
+                found.append(int(entry.name))
+    return found
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="subreaper is Linux-only")
+def test_killing_the_supervisor_does_not_leave_orphans_or_zombies(marker: str) -> None:
+    for _ in range(3):
+        result = outcome("kill_supervisor", marker, limits=roomy())
+        assert result is StructuralErrorCode.NONZERO_EXIT
+        assert _marked(marker) == []
+    assert _zombie_children() == []
+    assert isinstance(outcome("ok"), ParsedModule)
+    assert not runner._LIVE_SUPERVISORS
+
+
+def test_subreaper_failure_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runner, "_subreaper_set", False)
+
+    class NoLibc:
+        def prctl(self, *args: Any) -> int:
+            return -1
+
+    monkeypatch.setattr(runner.ctypes, "CDLL", lambda *a, **k: NoLibc())
+    assert outcome("ok") is StructuralErrorCode.SPAWN_FAILED
 
 
 @pytest.mark.skipif(not sys.platform.startswith("linux"), reason="subreaper is Linux-only")

@@ -23,14 +23,25 @@ errors, never the offending value):
 - every assertion says ``evidence_kind="tree_sitter"`` (design 9.3), no default;
 - counts are bounded;
 - every free-text field is confined to the parsed file itself, so an adapter that read
-  some other file (``/etc/passwd``, a ``.env``) cannot exfiltrate it through the output:
-  each ``qualified_name`` segment (split on ``.``, ``::``, ``/``, ``#``) occurs in the
-  file's bytes or is a component of its path, ``signature`` (whitespace runs collapsed)
-  is a contiguous run of the whitespace-collapsed text inside the symbol's own byte
-  range, ``disambiguator`` is ``[A-Za-z0-9:._-]{0,64}``, and every other text field
-  (ref, kind, language) is a restricted token. Read isolation is not something the
-  container gives (the adapter shares the indexer's filesystem view); this is the
-  confinement.
+  some other file (``/etc/passwd``, a ``.env``) cannot exfiltrate it through the output.
+  Read isolation is not something the container gives (the adapter shares the indexer's
+  filesystem view); this is the confinement:
+
+  * ``qualified_name`` is a path of identifier tokens split on ``.``, ``::``, ``/``,
+    ``#``. The final segment must be an identifier token located inside the symbol's own
+    ``[start_byte, end_byte)`` (for ``kind="module"`` a component of the file path also
+    qualifies); every other segment is an identifier token occurring in the file, or a
+    path component, and at least two characters long. Tokens only, no substrings. Names
+    that are not made of identifiers (``<lambda>``) are refused: adapters name them
+    from real tokens. All names of a file together are bounded (``MAX_NAME_TOTAL_BYTES``);
+  * ``signature`` (whitespace runs collapsed) is a contiguous run of the
+    whitespace-collapsed text inside the symbol's own byte range;
+  * ``ref`` and ``disambiguator`` are numeric (at most 8 digits); ``kind`` and the
+    relation ``kind`` are closed enums; ``language`` must equal the input's.
+
+  Residual channel: an adapter can still choose *which* tokens, symbols and ordering
+  to emit, at most about ``log2(tokens in file)`` bits per symbol and only ever about
+  this file's own content. That leaks nothing beyond the file it was asked to parse.
 
 Adapter output carries no source text beyond qualified names, ``kind``s,
 ``disambiguator``s and signatures. A signature is bounded to
@@ -77,13 +88,11 @@ MAX_SYMBOLS_PER_FILE: Final = 10_000
 MAX_RELATIONS_PER_FILE: Final = 50_000
 MAX_NAME_BYTES: Final = 512
 MAX_SIGNATURE_BYTES: Final = 512
-MAX_DISAMBIGUATOR_BYTES: Final = 64  # mirrored by _DISAMBIGUATOR
-MAX_UNCHECKED_SEGMENTS: Final = 1024
+MAX_NAME_TOTAL_BYTES: Final = 256 * 1024
 
 _DIGEST = r"^[0-9a-f]{64}$"
-_KIND = r"^[a-z][a-z0-9_]{0,31}$"
-_DISAMBIGUATOR = r"^[A-Za-z0-9:._-]{0,64}$"
-_REF = r"^[A-Za-z0-9_.:\-]{1,64}$"
+_DISAMBIGUATOR = r"^[0-9]{0,8}$"
+_REF = r"^[0-9]{1,8}$"
 
 
 class StructuralErrorCode(StrEnum):
@@ -135,7 +144,19 @@ def _safe_path(value: str) -> str:
 _MODEL = ConfigDict(frozen=True, extra="forbid", strict=True, hide_input_in_errors=True)
 
 type Digest = Annotated[str, StringConstraints(pattern=_DIGEST)]
-type Kind = Annotated[str, StringConstraints(pattern=_KIND)]
+type SymbolKind = Literal[
+    "function",
+    "method",
+    "class",
+    "interface",
+    "type",
+    "variable",
+    "constant",
+    "module",
+    "field",
+    "property",
+]
+type RelationKind = Literal["calls", "imports", "inherits", "references", "contains"]
 type Ref = Annotated[str, StringConstraints(pattern=_REF)]
 type Language = Annotated[str, StringConstraints(pattern=r"^[a-z][a-z0-9_+\-]{0,31}$")]
 type RepoPath = Annotated[
@@ -199,7 +220,7 @@ class ParsedSymbol(BaseModel):
     qualified_name: Annotated[
         Text, StringConstraints(min_length=1), AfterValidator(lambda v: _bounded(v, MAX_NAME_BYTES))
     ]
-    kind: Kind
+    kind: SymbolKind
     disambiguator: Annotated[str, StringConstraints(pattern=_DISAMBIGUATOR)] = ""
     start_byte: Annotated[int, Field(ge=0)]
     end_byte: Annotated[int, Field(ge=0)]
@@ -222,7 +243,7 @@ class StructuralRelation(BaseModel):
 
     source_ref: Ref
     target_ref: Ref
-    kind: Kind
+    kind: RelationKind
     start_byte: Annotated[int, Field(ge=0)]
     end_byte: Annotated[int, Field(ge=0)]
     evidence_kind: Literal["tree_sitter"]
@@ -294,7 +315,7 @@ def validate_module(
 
 
 _SEPARATORS = re.compile(r"::|[./#]")
-_TOKEN = re.compile(rb"[A-Za-z0-9_$\x80-\xff]+")
+_IDENT = re.compile(rb"[A-Za-z_$\x80-\xff][A-Za-z0-9_$\x80-\xff]*")
 _WHITESPACE = re.compile(rb"[ \t\r\n\f\v]+")
 
 
@@ -302,13 +323,13 @@ class _SourceText:
     """Confinement oracle for one file: what names and signatures may legitimately say."""
 
     def __init__(self, path: str, content: bytes) -> None:
-        self._content = content
-        self._tokens = set(_TOKEN.findall(content))
+        self._tokens: dict[bytes, list[int]] = {}
+        for match in _IDENT.finditer(content):
+            self._tokens.setdefault(match.group(), []).append(match.start())
         self._path_parts = {
             part.encode() for piece in path.split("/") for part in (piece, *piece.split("."))
         }
-        self._known: set[bytes] = set()
-        self._unchecked = 0
+        self.name_bytes = 0
         # Whitespace-collapsed text, with the original offset of every collapsed byte.
         pieces: list[bytes] = []
         offsets = array("I")
@@ -326,17 +347,27 @@ class _SourceText:
         pieces.append(chunk)
         offsets.extend(range(origin, origin + len(chunk)))
 
-    def name_ok(self, qualified_name: str) -> bool:
-        for segment in _SEPARATORS.split(qualified_name):
-            raw = segment.encode()
-            if not raw or raw in self._known or raw in self._tokens or raw in self._path_parts:
-                continue
-            self._unchecked += 1
-            if self._unchecked > MAX_UNCHECKED_SEGMENTS:
-                raise StructuralError(StructuralErrorCode.COUNT_EXCEEDED)
-            if raw not in self._content:
+    def _token_within(self, token: bytes, start: int, end: int) -> bool:
+        starts = self._tokens.get(token, [])
+        index = bisect_left(starts, start)
+        return index < len(starts) and starts[index] + len(token) <= end
+
+    def name_ok(self, qualified_name: str, kind: str, start: int, end: int) -> bool:
+        self.name_bytes += len(qualified_name.encode())
+        if self.name_bytes > MAX_NAME_TOTAL_BYTES:
+            raise StructuralError(StructuralErrorCode.COUNT_EXCEEDED)
+        segments = [segment.encode() for segment in _SEPARATORS.split(qualified_name)]
+        for position, raw in enumerate(segments):
+            if not _IDENT.fullmatch(raw):
                 return False
-            self._known.add(raw)
+            if position < len(segments) - 1:
+                if len(raw) < 2 or not (raw in self._tokens or raw in self._path_parts):
+                    return False
+            elif not (
+                self._token_within(raw, start, end)
+                or (kind == "module" and len(raw) >= 2 and raw in self._path_parts)
+            ):
+                return False
         return True
 
     def signature_ok(self, signature: str, start: int, end: int) -> bool:
@@ -360,9 +391,9 @@ def _validate_file(parsed: ParsedFile, content: bytes) -> None:
             raise StructuralError(StructuralErrorCode.LANGUAGE_MISMATCH)
         if symbol.end_byte > size:
             raise StructuralError(StructuralErrorCode.RANGE_OUT_OF_BOUNDS)
-        if not text.name_ok(symbol.qualified_name) or not text.signature_ok(
-            symbol.signature, symbol.start_byte, symbol.end_byte
-        ):
+        if not text.name_ok(
+            symbol.qualified_name, symbol.kind, symbol.start_byte, symbol.end_byte
+        ) or not text.signature_ok(symbol.signature, symbol.start_byte, symbol.end_byte):
             raise StructuralError(StructuralErrorCode.TEXT_NOT_IN_SOURCE)
         key = (symbol.qualified_name, symbol.kind, symbol.disambiguator)
         if symbol.ref in refs or key in keys:

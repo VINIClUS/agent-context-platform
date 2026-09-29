@@ -51,9 +51,19 @@ Known limits (be honest about them):
   the adapter runs a dedicated UID. Because the supervisor sweeps descendants,
   survivors of earlier runs no longer accumulate against it. The backstop is the
   compose ``pids_limit``.
-- The adapter runs as the same UID as the supervisor, so a compromised parser could
-  signal the supervisor (SIGKILL) and let daemons outlive the run; the container
-  lifecycle and ``pids_limit`` bound that, a distinct UID per run would remove it.
+- The adapter runs as the same UID as the supervisor, so a compromised parser can SIGKILL
+  the supervisor. The runner is therefore ALSO a child subreaper (``prctl`` once,
+  process-wide), so the orphans of a dead supervisor re-parent to it, and after every
+  run ``_sweep_orphans`` kills and reaps them. It only touches this run's processes:
+  live ones must carry the run's ``AGENT_CONTEXT_SANDBOX_RUN`` token in their
+  environment, zombies must be session leaders (or in the run's session) that started
+  after the run's supervisor, and the supervisors of concurrent runs are excluded.
+  Side effects and residuals: orphans of any other code in the worker process also
+  re-parent to it (subreaper is process-wide), and a zombie sweep can in theory reap a
+  foreign ``start_new_session`` child that exited during the run, so the worker should not
+  run such children concurrently. A descendant that scrubs its environment (``execve``
+  with an empty one) after killing the supervisor is not recognized while alive; the
+  container ``pids_limit`` and restart bound that.
 - Read isolation is NOT provided by the container: the adapter shares the indexer's
   filesystem view and could read any file the UID can (a ``.env``, ``/etc/passwd``).
   Confinement is by output validation (``base.validate_module`` only accepts text that
@@ -79,6 +89,7 @@ parse function, print one module. Adapters (PLATFORM-033 to 035) call it from
 from __future__ import annotations
 
 import contextlib
+import ctypes
 import json
 import os
 import selectors
@@ -87,7 +98,9 @@ import signal
 import subprocess
 import sys
 import tempfile
+import threading
 import time
+import uuid
 from collections.abc import Callable, Mapping, Sequence
 from dataclasses import dataclass
 from typing import IO, Any, Final
@@ -108,6 +121,7 @@ from agent_context_platform.indexing.tree_sitter.base import (
 MAX_STDERR_BYTES: Final = 64 * 1024
 _CHUNK: Final = 65_536
 _FALLBACK_CWD: Final = "/"
+_RUN_KEY: Final = "AGENT_CONTEXT_SANDBOX_RUN"
 _DEFAULT_ENV_ALLOWLIST: Final = ("LANG", "LC_ALL")
 
 # Per-run supervisor (constant source; limits JSON and argv arrive as arguments, never
@@ -278,6 +292,9 @@ def _child_env(extra: Mapping[str, str] | None) -> dict[str, str]:
 def _run(command: Sequence[str], payload: bytes, limits: Limits, env: dict[str, str]) -> bytes:
     if not sys.platform.startswith("linux"):
         raise StructuralError(StructuralErrorCode.SPAWN_FAILED)  # subreaper is Linux-only
+    _ensure_subreaper()
+    token = uuid.uuid4().hex
+    env = {**env, _RUN_KEY: token}
     workdir = _make_workdir()
     try:
         argv = [
@@ -303,13 +320,16 @@ def _run(command: Sequence[str], payload: bytes, limits: Limits, env: dict[str, 
             )
         except OSError:
             raise StructuralError(StructuralErrorCode.SPAWN_FAILED) from None
+        started = _stat(process.pid)
+        with _LIVE_LOCK:
+            _LIVE_SUPERVISORS.add(process.pid)
         try:
             deadline = time.monotonic() + limits.wall_seconds
             output = _communicate(process, payload, limits, deadline)
             if not _exited(process, deadline):
                 raise StructuralError(StructuralErrorCode.TIMEOUT)
         finally:
-            _reap(process)
+            _reap(process, token, started.starttime if started else 0)
         if process.returncode != 0:
             raise StructuralError(StructuralErrorCode.NONZERO_EXIT)
         return output
@@ -331,7 +351,7 @@ def _exited(process: subprocess.Popen[bytes], deadline: float) -> bool:
         time.sleep(0.005)
 
 
-def _reap(process: subprocess.Popen[bytes]) -> None:
+def _reap(process: subprocess.Popen[bytes], token: str, started: int) -> None:
     """Stop every process of the run on every exit path, then reap the supervisor.
 
     SIGTERM goes to the supervisor alone (not the group) so it can sweep descendants that
@@ -348,7 +368,102 @@ def _reap(process: subprocess.Popen[bytes]) -> None:
         if stream is not None:
             with contextlib.suppress(OSError):
                 stream.close()
-    process.wait()
+    try:
+        _sweep_orphans(process.pid, token, started)
+    finally:
+        process.wait()
+        with _LIVE_LOCK:
+            _LIVE_SUPERVISORS.discard(process.pid)
+
+
+_LIVE_SUPERVISORS: set[int] = set()
+_LIVE_LOCK = threading.Lock()
+_SUBREAPER_LOCK = threading.Lock()
+_subreaper_set = False
+_ORPHAN_SWEEP_SECONDS: Final = 3.0
+
+
+def _ensure_subreaper() -> None:
+    """Make this process a child subreaper (once): orphans of a dead supervisor come here."""
+    global _subreaper_set
+    with _SUBREAPER_LOCK:
+        if _subreaper_set:
+            return
+        try:
+            libc = ctypes.CDLL(None, use_errno=True)
+            failed = libc.prctl(36, 1, 0, 0, 0) != 0  # PR_SET_CHILD_SUBREAPER
+        except (OSError, AttributeError):
+            failed = True
+        if failed:
+            raise StructuralError(StructuralErrorCode.SPAWN_FAILED)
+        _subreaper_set = True
+
+
+@dataclass(frozen=True, slots=True)
+class _Stat:
+    state: str
+    ppid: int
+    sid: int
+    starttime: int
+
+
+def _stat(pid: int) -> _Stat | None:
+    try:
+        with open(f"/proc/{pid}/stat", "rb") as handle:
+            data = handle.read()
+        fields = data[data.rindex(b")") + 2 :].split()
+        return _Stat(fields[0].decode(), int(fields[1]), int(fields[3]), int(fields[19]))
+    except (OSError, ValueError, IndexError):
+        return None
+
+
+def _has_token(pid: int, token: str) -> bool:
+    try:
+        with open(f"/proc/{pid}/environ", "rb") as handle:
+            return f"{_RUN_KEY}={token}".encode() in handle.read().split(b"\0")
+    except OSError:
+        return False
+
+
+def _sweep_orphans(supervisor: int, token: str, started: int) -> None:
+    """Kill and reap what a dead supervisor left behind (it was SIGKILLed by the adapter).
+
+    The runner is a subreaper, so those orphans are its children. Only processes of THIS run
+    are touched, never the supervisors of concurrent runs (``_LIVE_SUPERVISORS``) nor other
+    children of the worker: a live orphan must carry this run's ``_RUN_KEY`` token in its
+    environment; a zombie orphan (nothing to read) must be a session leader or in the run's
+    session, and started after the run's supervisor. Repeats until none is left, because
+    killing an orphan re-parents its own children here.
+    """
+    me = os.getpid()
+    deadline = time.monotonic() + _ORPHAN_SWEEP_SECONDS
+    while time.monotonic() < deadline:
+        victims: list[int] = []
+        for name in os.listdir("/proc"):
+            if not name.isdigit():
+                continue
+            pid = int(name)
+            with _LIVE_LOCK:
+                foreign = pid in _LIVE_SUPERVISORS
+            info = None if foreign or pid == supervisor else _stat(pid)
+            if info is None or info.ppid != me:
+                continue
+            if info.state == "Z":
+                if info.starttime >= started and info.sid in (supervisor, pid):
+                    victims.append(pid)
+            elif _has_token(pid, token):
+                victims.append(pid)
+        if not victims:
+            return
+        for pid in victims:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, signal.SIGKILL)
+        for pid in victims:
+            with contextlib.suppress(ChildProcessError):
+                for _ in range(200):
+                    if os.waitpid(pid, os.WNOHANG)[0] != 0:
+                        break
+                    time.sleep(0.005)
 
 
 def _make_workdir() -> str:

@@ -139,3 +139,40 @@ def test_daemonizing_adapters_do_not_exhaust_nproc(image: str) -> None:
     )
     result = _run(image, code)
     assert result.stdout.split() == ["50", "0"], result.stderr[-500:]
+
+
+def test_killing_the_supervisor_does_not_wedge_nproc(image: str) -> None:
+    """20 runs whose adapter SIGKILLs its supervisor and leaves setsid daemons, then a benign run.
+
+    Without the runner acting as a subreaper the orphans escape to PID 1 and fill
+    RLIMIT_NPROC=16 for UID 10001, so the benign run fails with ``nonzero_exit``.
+    """
+    code = (
+        "import os\n"
+        "from agent_context_platform.indexing.tree_sitter.base import StructuralError\n"
+        "from agent_context_platform.indexing.tree_sitter.runner import Limits, _run\n"
+        "attack = ('import os, signal, time\\n'\n"
+        "'os.kill(os.getppid(), signal.SIGKILL)\\n'\n"
+        "'if os.fork() == 0:\\n'\n"
+        "'    os.setsid()\\n'\n"
+        "'    if os.fork() != 0:\\n'\n"
+        "'        os._exit(0)\\n'\n"
+        "'    os.closerange(0, 3); time.sleep(600)\\n'\n"
+        "'time.sleep(0.2)')\n"
+        "for _ in range(20):\n"
+        "    try:\n"
+        "        _run(['/usr/local/bin/python', '-c', attack, 'ac-kill-marker'], b'', Limits(), {})\n"
+        "    except StructuralError:\n"
+        "        pass\n"
+        "_run(['/usr/local/bin/python', '-c', 'pass'], b'', Limits(), {})\n"
+        "left = 0\n"
+        "for name in os.listdir('/proc'):\n"
+        "    if name.isdigit() and int(name) != os.getpid():\n"
+        "        try:\n"
+        "            left += b'ac-kill-marker' in open(f'/proc/{name}/cmdline', 'rb').read()\n"
+        "        except OSError:\n"
+        "            pass\n"
+        "print('benign-ok', left)\n"
+    )
+    result = _run(image, code)
+    assert result.stdout.split() == ["benign-ok", "0"], result.stderr[-500:]
