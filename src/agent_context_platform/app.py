@@ -39,6 +39,7 @@ def _build_ingestion(settings: Settings) -> tuple[IngestionRuntime, AsyncEngine]
                 memory_cost_kib=ingestion.argon2_memory_cost_kib,
                 parallelism=ingestion.argon2_parallelism,
                 max_concurrency=ingestion.argon2_max_concurrency,
+                max_queue_depth=ingestion.argon2_max_queue_depth,
             ),
         ),
         service=IngestionService(

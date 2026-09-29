@@ -26,9 +26,13 @@ _HASHER = PasswordHasher(time_cost=1, memory_cost=8, parallelism=1)
 VERIFIER = _HASHER.hash(TOKEN)
 
 
-def _verifier(max_concurrency: int = 2) -> Argon2Verifier:
+def _verifier(max_concurrency: int = 2, max_queue_depth: int = 8) -> Argon2Verifier:
     return Argon2Verifier(
-        time_cost=1, memory_cost_kib=8, parallelism=1, max_concurrency=max_concurrency
+        time_cost=1,
+        memory_cost_kib=8,
+        parallelism=1,
+        max_concurrency=max_concurrency,
+        max_queue_depth=max_queue_depth,
     )
 
 
@@ -212,3 +216,31 @@ def test_verifier_bounds_concurrent_worker_threads(monkeypatch: pytest.MonkeyPat
     asyncio.run(run())
 
     assert peak == 2
+
+
+def test_verifier_sheds_load_beyond_the_queue_depth(monkeypatch: pytest.MonkeyPatch) -> None:
+    import threading
+
+    from agent_context_platform.ledger.auth import AuthOverloadedError
+
+    verifier = _verifier(max_concurrency=1, max_queue_depth=2)
+    release = threading.Event()
+
+    def blocked(_verifier: str, _token: str) -> bool:
+        release.wait(timeout=5)
+        return True
+
+    monkeypatch.setattr(verifier, "_verify_blocking", blocked)
+
+    async def run() -> list[object]:
+        tasks = [asyncio.ensure_future(verifier.verify(VERIFIER, TOKEN)) for _ in range(5)]
+        await asyncio.sleep(0.1)
+        release.set()
+        return await asyncio.gather(*tasks, return_exceptions=True)
+
+    results = asyncio.run(run())
+
+    assert results.count(True) == 3  # one running, two queued
+    assert sum(isinstance(result, AuthOverloadedError) for result in results) == 2
+    assert verifier._pending == 0
+    assert AuthOverloadedError.status_code == 503

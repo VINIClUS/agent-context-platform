@@ -38,6 +38,7 @@ from agent_context_platform.app import create_app
 from agent_context_platform.ledger.api import IngestionRuntime
 from agent_context_platform.ledger.auth import (
     Argon2Verifier,
+    AuthOverloadedError,
     ProducerAuthenticator,
     ProducerRegistration,
 )
@@ -105,7 +106,13 @@ class Harness:
         self.runtime = IngestionRuntime(
             authenticator=ProducerAuthenticator(
                 lookup,
-                Argon2Verifier(time_cost=1, memory_cost_kib=8, parallelism=1, max_concurrency=2),
+                Argon2Verifier(
+                    time_cost=1,
+                    memory_cost_kib=8,
+                    parallelism=1,
+                    max_concurrency=2,
+                    max_queue_depth=8,
+                ),
                 clock=lambda: NOW,
             ),
             service=self.service,  # type: ignore[arg-type]
@@ -469,6 +476,22 @@ async def test_database_outage_is_a_retryable_503(harness: Harness) -> None:
     assert response.json()["error"]["code"] == "service_unavailable"
     assert "retry-after" in response.headers
     assert CANARY not in response.text
+
+
+async def test_auth_queue_overload_is_a_content_free_503_with_retry_after(
+    harness: Harness, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    async def overloaded(_verifier: str | None, _token: str) -> bool:
+        raise AuthOverloadedError
+
+    monkeypatch.setattr(harness.runtime.authenticator._verifier, "verify", overloaded)
+
+    response = await _post(harness, _batch())
+
+    assert response.status_code == 503
+    assert response.json()["error"]["code"] == "auth_overloaded"
+    assert "retry-after" in response.headers
+    assert harness.service.batches == []
 
 
 async def test_unexpected_failure_is_a_fixed_500_that_leaks_nothing(

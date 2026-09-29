@@ -67,6 +67,13 @@ class InsufficientScopeError(AuthError):
     code = "insufficient_scope"
 
 
+class AuthOverloadedError(AuthError):
+    """The verification queue is full: shed load instead of delaying legitimate callers."""
+
+    status_code = 503
+    code = "auth_overloaded"
+
+
 class ProducerMismatchError(AuthError):
     status_code = 403
     code = "producer_mismatch"
@@ -142,6 +149,10 @@ class SqlProducerLookup:
 class Argon2Verifier:
     """Argon2id verification in worker threads, bounded by ``max_concurrency``.
 
+    At most ``max_queue_depth`` further verifications may wait; more raise
+    ``AuthOverloadedError`` at once, so a flood of bad tokens cannot build an
+    unbounded backlog in front of legitimate callers.
+
     Stored verifiers carry their own parameters, so ``verify`` honours whatever
     cost each registration was provisioned with. The cost arguments only shape
     the dummy verifier used for unknown prefixes, so those requests cost as much
@@ -155,18 +166,27 @@ class Argon2Verifier:
         memory_cost_kib: int,
         parallelism: int,
         max_concurrency: int,
+        max_queue_depth: int,
     ) -> None:
         self._hasher = PasswordHasher(
             time_cost=time_cost, memory_cost=memory_cost_kib, parallelism=parallelism
         )
         self._dummy_verifier = self._hasher.hash(_DUMMY_PLAINTEXT)
         self._slots = asyncio.Semaphore(max_concurrency)
+        self._capacity = max_concurrency + max_queue_depth
+        self._pending = 0
 
     async def verify(self, verifier: str | None, token: str) -> bool:
         """Verify ``token``; ``verifier=None`` runs the dummy-hash path and is always False."""
+        if self._pending >= self._capacity:
+            raise AuthOverloadedError
         expected = self._dummy_verifier if verifier is None else verifier
-        async with self._slots:
-            matched = await asyncio.to_thread(self._verify_blocking, expected, token)
+        self._pending += 1
+        try:
+            async with self._slots:
+                matched = await asyncio.to_thread(self._verify_blocking, expected, token)
+        finally:
+            self._pending -= 1
         return matched and verifier is not None
 
     def _verify_blocking(self, verifier: str, token: str) -> bool:

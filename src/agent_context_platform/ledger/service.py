@@ -16,12 +16,16 @@ event, ``(producer_id, idempotency_key)``, and a rejected batch commits
 nothing, so resubmitting the same batch is always safe: events that were
 already stored come back as ``existing`` and are never reinserted.
 
-An event is reported ``accepted`` only when this transaction created it. That is
-decided from PostgreSQL itself, not from a pre-read: a row is ours when its
-``xmin`` belongs to a still-open (our own) transaction. A pre-read cannot be
-race-free, because a concurrent identical batch can commit between the read and
-the append; the repository's per-key advisory locks turn that race into a wait,
-and afterwards the recovered row is committed, hence ``existing``.
+An event is reported ``accepted`` only when this transaction created it. The
+repository says so explicitly (``LedgerRepository.append_with_outcome``): it
+knows whether it inserted a row or recovered an earlier one, including when a
+concurrent identical batch commits first and the per-key advisory locks turn the
+race into a wait.
+
+On any rejection or transient outage the events already stored are still
+reported ``existing`` (a read-only lookup by ``(producer_id, idempotency_key)``
+in its own short transaction); only the new events are rejected, with
+``retryable=true`` for outages.
 
 Every public failure is content-free: responses carry event IDs, a stable
 ``error_code`` and ``retryable``, never request content or exception text.
@@ -42,7 +46,6 @@ from agent_context_sdk import (  # type: ignore[import-untyped, unused-ignore]
     RejectedEventV1,
     StoredEventV1,
 )
-from sqlalchemy import bindparam, text
 from sqlalchemy.exc import InterfaceError, OperationalError, SQLAlchemyError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -67,15 +70,6 @@ BATCH_REJECTED: Final = "batch_rejected"
 SERVICE_UNAVAILABLE: Final = "service_unavailable"
 
 _TRANSIENT_ERRORS: Final = (BlobStoreError, OperationalError, InterfaceError, PoolTimeoutError)
-
-# Rows this transaction inserted (including inside savepoints) still carry an
-# in-progress xmin; every row another transaction wrote is committed. The xid is
-# widened with the current epoch so the check survives 32-bit xid wraparound.
-_CREATED_HERE: Final = text(
-    "SELECT event_id FROM ledger.events WHERE event_id IN :event_ids AND "
-    "pg_xact_status((((pg_current_xact_id()::text::bigint) & -4294967296) "
-    "| (xmin::text::bigint))::text::xid8) = 'in progress'"
-).bindparams(bindparam("event_ids", expanding=True))
 
 _TRANSIENT_RETRY_AFTER_SECONDS: Final = 5
 
@@ -121,7 +115,13 @@ class IngestionService:
             }
             return await self._reject(batch, 409, STREAM_QUARANTINED, offenders)
         except _TRANSIENT_ERRORS:
-            return self._unavailable(batch)
+            return await self._reject(
+                batch,
+                503,
+                SERVICE_UNAVAILABLE,
+                retryable=True,
+                retry_after=_TRANSIENT_RETRY_AFTER_SECONDS,
+            )
 
     async def _commit(
         self, batch: IngestBatchRequestV1, prepared: PreparedContent
@@ -129,15 +129,14 @@ class IngestionService:
         async with self._session_factory() as session, session.begin():
             await self._content.attach(session, prepared)
             resolved = [_resolve(event, prepared) for event in batch.events]
-            stored = await LedgerRepository.append(session, resolved)
-            created = await _created_in_transaction(session, [event.event_id for event in stored])
+            outcomes = await LedgerRepository.append_with_outcome(session, resolved)
         accepted = tuple(
             AcceptedEventV1(
-                event_id=event.event_id,
-                status="accepted" if event.event_id in created else "existing",
-                stream_sequence=event.stream_sequence,
+                event_id=outcome.stored.event_id,
+                status="accepted" if outcome.created else "existing",
+                stream_sequence=outcome.stored.stream_sequence,
             )
-            for event in stored
+            for outcome in outcomes
         )
         return IngestOutcome(200, IngestBatchResponseV1(batch_id=batch.batch_id, accepted=accepted))
 
@@ -147,6 +146,9 @@ class IngestionService:
         http_status: int,
         error_code: str,
         offenders: Collection[UUID] | None = None,
+        *,
+        retryable: bool = False,
+        retry_after: int | None = None,
     ) -> IngestOutcome:
         """Reject the whole batch; events already stored stay reported as ``existing``.
 
@@ -173,13 +175,14 @@ class IngestionService:
                 error_code if offenders is None or event.event_id in offenders else BATCH_REJECTED
             )
             rejected.append(
-                RejectedEventV1(event_id=event.event_id, error_code=code, retryable=False)
+                RejectedEventV1(event_id=event.event_id, error_code=code, retryable=retryable)
             )
         return IngestOutcome(
             http_status,
             IngestBatchResponseV1(
                 batch_id=batch.batch_id, accepted=tuple(accepted), rejected=tuple(rejected)
             ),
+            retry_after_seconds=retry_after,
         )
 
     async def _existing_events(self, events: Sequence[EventDraftV1]) -> dict[UUID, StoredEventV1]:
@@ -202,18 +205,6 @@ class IngestionService:
                 matches[event.event_id] = stored
         return matches
 
-    @staticmethod
-    def _unavailable(batch: IngestBatchRequestV1) -> IngestOutcome:
-        rejected = tuple(
-            RejectedEventV1(event_id=event.event_id, error_code=SERVICE_UNAVAILABLE, retryable=True)
-            for event in batch.events
-        )
-        return IngestOutcome(
-            503,
-            IngestBatchResponseV1(batch_id=batch.batch_id, rejected=rejected),
-            retry_after_seconds=_TRANSIENT_RETRY_AFTER_SECONDS,
-        )
-
 
 def _has_duplicate_idempotency_key(events: Sequence[EventDraftV1]) -> bool:
     keys = [(event.producer.producer_id, event.idempotency_key) for event in events]
@@ -230,11 +221,6 @@ def _resolve(event: EventDraftV1, prepared: PreparedContent) -> ResolvedEvent:
             ref.content_id: prepared.report_for(ref.content_id) for ref in content_refs
         },
     )
-
-
-async def _created_in_transaction(session: AsyncSession, event_ids: Sequence[UUID]) -> set[UUID]:
-    rows = await session.execute(_CREATED_HERE, {"event_ids": list(event_ids)})
-    return {row[0] for row in rows}
 
 
 _IDENTITY_FIELDS: Final = frozenset(

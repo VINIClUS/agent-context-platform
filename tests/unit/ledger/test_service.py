@@ -3,7 +3,6 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 from datetime import UTC, datetime
-from typing import Any
 from uuid import UUID
 
 import pytest
@@ -20,12 +19,13 @@ from agent_context_sdk import (
 from agent_context_sdk.ids import new_uuid7
 from sqlalchemy.exc import OperationalError
 
-from agent_context_platform.content.blob_store import BlobNotFoundError
+from agent_context_platform.content.blob_store import BlobNotFoundError, BlobStoreError
 from agent_context_platform.content.service import (
     ContentRequiresRedactionError,
     ContentResolutionError,
 )
 from agent_context_platform.ledger.repository import (
+    AppendOutcome,
     IdempotencyConflictError,
     LedgerRepository,
     ResolvedEvent,
@@ -88,9 +88,6 @@ class FakeSession:
     def begin(self) -> FakeTransaction:
         return FakeTransaction(self)
 
-    async def execute(self, _statement: object, parameters: dict[str, Any]) -> list[tuple[UUID]]:
-        return [(event_id,) for event_id in parameters["event_ids"] if event_id in self._created]
-
 
 class FakeContent:
     def __init__(self, log: list[str], prepare_error: Exception | None = None) -> None:
@@ -136,17 +133,20 @@ def harness(monkeypatch: pytest.MonkeyPatch) -> Harness:
 
 
 def _install(state: Harness, monkeypatch: pytest.MonkeyPatch) -> Harness:
-    async def append(_session: object, resolved: Sequence[ResolvedEvent]) -> list[StoredEventV1]:
+    async def append(_session: object, resolved: Sequence[ResolvedEvent]) -> list[AppendOutcome]:
         state.log.append("append")
         if isinstance(state.append_result, Exception):
             raise state.append_result
-        return state.append_result
+        return [
+            AppendOutcome(stored, created=stored.event_id in state.created)
+            for stored in state.append_result
+        ]
 
     async def lookup(_session: object, _keys: object) -> dict[tuple[str, str], StoredEventV1]:
         state.log.append("lookup")
         return state.existing
 
-    monkeypatch.setattr(LedgerRepository, "append", staticmethod(append))
+    monkeypatch.setattr(LedgerRepository, "append_with_outcome", staticmethod(append))
     monkeypatch.setattr(LedgerRepository, "get_by_idempotency_keys", staticmethod(lookup))
     return state
 
@@ -306,3 +306,25 @@ def test_same_event_ignores_event_id_and_claim_order_but_not_content() -> None:
         content_id="c", content_sha256="a" * 64, media_type="text/plain", uncompressed_bytes=1
     )
     assert not _same_event(_draft("k1", claims=(claim,)), stored)
+
+
+def test_blob_store_outage_on_partial_replay_keeps_existing_and_retries_only_new(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _install(Harness(prepare_error=BlobStoreError("s3 down")), monkeypatch)
+    old, new = _draft("k1"), _draft("k2")
+    harness.existing = {("p1", "k1"): _stored(old, 1, event_id=new_uuid7())}
+
+    outcome = _run(harness, _batch(old, new))
+
+    assert outcome.http_status == 503
+    assert outcome.retry_after_seconds == 5
+    [existing] = outcome.response.accepted
+    assert (existing.status, existing.stream_sequence) == ("existing", 1)
+    [rejected] = outcome.response.rejected
+    assert (rejected.event_id, rejected.error_code, rejected.retryable) == (
+        new.event_id,
+        "service_unavailable",
+        True,
+    )
+    assert "begin" not in harness.log

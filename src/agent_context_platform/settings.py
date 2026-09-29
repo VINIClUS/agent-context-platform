@@ -149,6 +149,8 @@ class IngestionSettings(BaseModel):
     argon2_parallelism: int = Field(default=4, gt=0)
     # Bounds concurrent Argon2 verifications (each holds memory_cost KiB).
     argon2_max_concurrency: int = Field(default=4, gt=0)
+    # Verifications allowed to wait for a slot; beyond it requests fail fast with 503.
+    argon2_max_queue_depth: int = Field(default=16, gt=0)
 
 
 class Settings(BaseSettings):

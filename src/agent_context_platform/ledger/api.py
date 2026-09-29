@@ -74,6 +74,7 @@ _MESSAGES: Final[Mapping[str, str]] = {
     "insufficient_scope": "The credential may not ingest events.",
     "producer_mismatch": "Every event must name the credential's producer.",
     "ingestion_unavailable": "Ingestion is not available.",
+    "auth_overloaded": "Authentication is busy; retry later.",
     "service_unavailable": "The service is temporarily unavailable.",
     "internal_error": "The request could not be processed.",
 }
@@ -189,14 +190,12 @@ def _log(request: Request, event: str, **fields: Any) -> None:
     """Log IDs, counts and error codes only; ``fields`` must never hold request content."""
     request_id = request.state.request_id
     trace_id = request.state.trace_id
-    details = " ".join(f"{name}={value}" for name, value in fields.items())
     logger.info(
-        "%s request_id=%s trace_id=%s %s",
+        "%s request_id=%s trace_id=%s",
         event,
         request_id,
         trace_id or "-",
-        details,
-        extra={"request_id": request_id, "trace_id": trace_id},
+        extra={"request_id": request_id, "trace_id": trace_id, **fields},
     )
 
 
@@ -264,6 +263,8 @@ async def _handle(request: Request, runtime: IngestionRuntime) -> Response:
     except AuthError as error:
         _log(request, "ingestion_rejected", status=error.status_code, error_code=error.code)
         headers = {"WWW-Authenticate": "Bearer"} if error.status_code == 401 else None
+        if error.status_code == 503:
+            headers = {"Retry-After": str(_RETRY_AFTER_SECONDS)}
         return _error(request, error.status_code, error.code, headers)
 
     idempotency_key = request.headers.get("idempotency-key")

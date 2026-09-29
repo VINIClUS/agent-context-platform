@@ -123,7 +123,9 @@ def stack(
     runtime = IngestionRuntime(
         authenticator=ProducerAuthenticator(
             SqlProducerLookup(sessions),
-            Argon2Verifier(time_cost=1, memory_cost_kib=8, parallelism=1, max_concurrency=2),
+            Argon2Verifier(
+                time_cost=1, memory_cost_kib=8, parallelism=1, max_concurrency=2, max_queue_depth=8
+            ),
         ),
         service=IngestionService(ContentService(blob_store, RedactionPolicyV1()), sessions),
         max_request_body_bytes=8_000_000,
@@ -452,3 +454,44 @@ def test_content_requiring_redaction_rejects_the_batch_without_leaking_it(
     assert CANARY not in caplog.text
     assert "a" * 43 not in caplog.text
     assert "AKIAIOSFODNN7EXAMPLE" not in caplog.text
+
+
+def test_append_with_outcome_reports_created_only_for_rows_it_inserted(stack: Stack) -> None:
+    from agent_context_platform.ledger.repository import LedgerRepository, ResolvedEvent
+
+    run = uuid4().hex
+    first = _draft(f"k1-{run}", stream_id=f"s-{run}")
+    second = _draft(f"k2-{run}", stream_id=f"s-{run}")
+    replay = _draft(f"k1-{run}", stream_id=f"s-{run}")  # same key, fresh event_id
+
+    async def exercise() -> None:
+        async with stack.owner.connect() as connection:
+            from sqlalchemy.ext.asyncio import AsyncSession
+
+            async with AsyncSession(bind=connection) as session, session.begin():
+                fresh = await LedgerRepository.append_with_outcome(
+                    session, [ResolvedEvent(draft=first), ResolvedEvent(draft=second)]
+                )
+                assert [outcome.created for outcome in fresh] == [True, True]
+
+                # Same transaction: a repeat is a replay, not a creation.
+                again = await LedgerRepository.append_with_outcome(
+                    session, [ResolvedEvent(draft=replay), ResolvedEvent(draft=second)]
+                )
+                assert [outcome.created for outcome in again] == [False, False]
+                assert again[0].stored.event_id == first.event_id
+
+            async with AsyncSession(bind=connection) as session, session.begin():
+                mixed = await LedgerRepository.append_with_outcome(
+                    session,
+                    [
+                        ResolvedEvent(draft=replay),
+                        ResolvedEvent(draft=_draft(f"k3-{run}", stream_id=f"s-{run}")),
+                    ],
+                )
+                assert [outcome.created for outcome in mixed] == [False, True]
+                # The plain ``append`` keeps returning bare stored events.
+                plain = await LedgerRepository.append(session, [ResolvedEvent(draft=second)])
+                assert plain[0].event_id == second.event_id
+
+    _run(exercise())

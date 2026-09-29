@@ -295,6 +295,7 @@ def test_ingestion_settings_load_from_environment(monkeypatch: pytest.MonkeyPatc
         "argon2_memory_cost_kib",
         "argon2_parallelism",
         "argon2_max_concurrency",
+        "argon2_max_queue_depth",
     ],
 )
 def test_ingestion_settings_reject_non_positive_values(field: str) -> None:

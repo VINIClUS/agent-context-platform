@@ -68,7 +68,9 @@ class Harness:
         self.owner = owner
         self.authenticator = ProducerAuthenticator(
             SqlProducerLookup(session_factory(api)),
-            Argon2Verifier(time_cost=1, memory_cost_kib=8, parallelism=1, max_concurrency=2),
+            Argon2Verifier(
+                time_cost=1, memory_cost_kib=8, parallelism=1, max_concurrency=2, max_queue_depth=8
+            ),
         )
         self.service = StubService()
         runtime = IngestionRuntime(self.authenticator, self.service, 1_000_000)  # type: ignore[arg-type]

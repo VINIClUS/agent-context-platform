@@ -603,10 +603,11 @@ def test_insert_or_recover_happy_path_advances_stream_state() -> None:
         _insert_or_recover(session, resolved, canonical_draft, stream_state, touched)
     )
 
-    assert isinstance(result, StoredEventV1)
-    assert result.stream_sequence == 1
+    assert isinstance(result.stored, StoredEventV1)
+    assert result.created is True
+    assert result.stored.stream_sequence == 1
     assert stream_state["stream-a"].sequence == 1
-    assert stream_state["stream-a"].head_event_id == result.event_id
+    assert stream_state["stream-a"].head_event_id == result.stored.event_id
     assert touched == {"stream-a"}
     assert session.add.call_count == 2  # event row + outbox row
     assert session.add_all.call_count == 2  # content refs + redaction reports
@@ -632,7 +633,8 @@ def test_insert_or_recover_recovers_on_idempotency_conflict() -> None:
         _insert_or_recover(session, resolved, canonical_draft, stream_state, touched)
     )
 
-    assert result.event_id == existing_sealed.event_id
+    assert result.stored.event_id == existing_sealed.event_id
+    assert result.created is False
     # No sequence allocated for the recovered duplicate.
     assert stream_state["stream-a"].sequence == 0
     assert touched == set()
@@ -662,7 +664,8 @@ def test_insert_or_recover_recovers_on_event_id_primary_key_conflict() -> None:
         _insert_or_recover(session, resolved, canonical_draft, stream_state, touched)
     )
 
-    assert result.event_id == existing_sealed.event_id
+    assert result.stored.event_id == existing_sealed.event_id
+    assert result.created is False
     assert stream_state["stream-a"].sequence == 0
     assert touched == set()
 
