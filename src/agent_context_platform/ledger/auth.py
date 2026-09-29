@@ -19,8 +19,9 @@ Nothing here logs or echoes token material; failures carry a fixed code only.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import re
-from collections.abc import Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from dataclasses import dataclass, field
 from datetime import UTC, datetime
 from typing import ClassVar, Final
@@ -176,17 +177,27 @@ class Argon2Verifier:
         self._capacity = max_concurrency + max_queue_depth
         self._pending = 0
 
-    async def verify(self, verifier: str | None, token: str) -> bool:
-        """Verify ``token``; ``verifier=None`` runs the dummy-hash path and is always False."""
+    @contextlib.asynccontextmanager
+    async def admission(self) -> AsyncIterator[None]:
+        """Admit one whole authentication (lookup and verify) or fail fast.
+
+        Holds one of ``max_concurrency`` slots; at most ``max_queue_depth`` more
+        callers wait, and any beyond that raise ``AuthOverloadedError`` before
+        touching the database.
+        """
         if self._pending >= self._capacity:
             raise AuthOverloadedError
-        expected = self._dummy_verifier if verifier is None else verifier
         self._pending += 1
         try:
             async with self._slots:
-                matched = await asyncio.to_thread(self._verify_blocking, expected, token)
+                yield
         finally:
             self._pending -= 1
+
+    async def verify(self, verifier: str | None, token: str) -> bool:
+        """Verify ``token``; ``verifier=None`` runs the dummy-hash path and is always False."""
+        expected = self._dummy_verifier if verifier is None else verifier
+        matched = await asyncio.to_thread(self._verify_blocking, expected, token)
         return matched and verifier is not None
 
     def _verify_blocking(self, verifier: str, token: str) -> bool:
@@ -217,11 +228,13 @@ class ProducerAuthenticator:
         if bearer is None:
             raise InvalidCredentialError
 
-        registration = await self._lookup(bearer.prefix)
-        # Always run one Argon2 verification, so an unknown prefix is not faster.
-        verified = await self._verifier.verify(
-            None if registration is None else registration.token_verifier, bearer.token
-        )
+        # One gate covers lookup and verify, so a flood cannot exhaust the DB pool.
+        async with self._verifier.admission():
+            registration = await self._lookup(bearer.prefix)
+            # Always run one Argon2 verification, so an unknown prefix is not faster.
+            verified = await self._verifier.verify(
+                None if registration is None else registration.token_verifier, bearer.token
+            )
         if registration is None or not verified:
             raise InvalidCredentialError
 

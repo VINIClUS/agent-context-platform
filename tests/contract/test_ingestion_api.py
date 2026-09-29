@@ -8,6 +8,7 @@ integration tests). No sockets and no services are needed.
 from __future__ import annotations
 
 import base64
+import contextlib
 import hashlib
 import logging
 from collections.abc import AsyncIterator
@@ -481,10 +482,12 @@ async def test_database_outage_is_a_retryable_503(harness: Harness) -> None:
 async def test_auth_queue_overload_is_a_content_free_503_with_retry_after(
     harness: Harness, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    async def overloaded(_verifier: str | None, _token: str) -> bool:
+    @contextlib.asynccontextmanager
+    async def overloaded() -> AsyncIterator[None]:
         raise AuthOverloadedError
+        yield
 
-    monkeypatch.setattr(harness.runtime.authenticator._verifier, "verify", overloaded)
+    monkeypatch.setattr(harness.runtime.authenticator._verifier, "admission", overloaded)
 
     response = await _post(harness, _batch())
 
@@ -492,6 +495,7 @@ async def test_auth_queue_overload_is_a_content_free_503_with_retry_after(
     assert response.json()["error"]["code"] == "auth_overloaded"
     assert "retry-after" in response.headers
     assert harness.service.batches == []
+    assert harness.lookups == []
 
 
 async def test_unexpected_failure_is_a_fixed_500_that_leaks_nothing(

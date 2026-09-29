@@ -211,20 +211,27 @@ def test_verifier_bounds_concurrent_worker_threads(monkeypatch: pytest.MonkeyPat
     monkeypatch.setattr(verifier, "_verify_blocking", slow)
 
     async def run() -> None:
-        await asyncio.gather(*(verifier.verify(VERIFIER, TOKEN) for _ in range(8)))
+        async def admitted() -> bool:
+            async with verifier.admission():
+                return await verifier.verify(VERIFIER, TOKEN)
+
+        await asyncio.gather(*(admitted() for _ in range(8)))
 
     asyncio.run(run())
 
     assert peak == 2
 
 
-def test_verifier_sheds_load_beyond_the_queue_depth(monkeypatch: pytest.MonkeyPatch) -> None:
+def test_saturated_gate_sheds_load_before_the_prefix_lookup(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     import threading
 
     from agent_context_platform.ledger.auth import AuthOverloadedError
 
     verifier = _verifier(max_concurrency=1, max_queue_depth=2)
     release = threading.Event()
+    lookups: list[str] = []
 
     def blocked(_verifier: str, _token: str) -> bool:
         release.wait(timeout=5)
@@ -232,15 +239,27 @@ def test_verifier_sheds_load_beyond_the_queue_depth(monkeypatch: pytest.MonkeyPa
 
     monkeypatch.setattr(verifier, "_verify_blocking", blocked)
 
-    async def run() -> list[object]:
-        tasks = [asyncio.ensure_future(verifier.verify(VERIFIER, TOKEN)) for _ in range(5)]
+    async def lookup(prefix: str) -> ProducerRegistration | None:
+        lookups.append(prefix)
+        return _registration()
+
+    authenticator = ProducerAuthenticator(lookup, verifier, clock=lambda: NOW)
+
+    async def run() -> tuple[list[object], int]:
+        tasks = [
+            asyncio.ensure_future(authenticator.authenticate(f"Bearer {TOKEN}")) for _ in range(3)
+        ]
         await asyncio.sleep(0.1)
+        seen = len(lookups)  # one running holds the slot; two queued have not looked up
+        with pytest.raises(AuthOverloadedError):
+            await authenticator.authenticate(f"Bearer {TOKEN}")
+        assert len(lookups) == seen  # the shed request never reached the database
         release.set()
-        return await asyncio.gather(*tasks, return_exceptions=True)
+        return await asyncio.gather(*tasks, return_exceptions=True), seen
 
-    results = asyncio.run(run())
+    results, seen = asyncio.run(run())
 
-    assert results.count(True) == 3  # one running, two queued
-    assert sum(isinstance(result, AuthOverloadedError) for result in results) == 2
+    assert seen == 1
+    assert all(not isinstance(result, Exception) for result in results)
     assert verifier._pending == 0
     assert AuthOverloadedError.status_code == 503
