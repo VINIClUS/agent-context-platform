@@ -1350,3 +1350,129 @@ def test_symlink_read_is_skipped_once_budget_is_zero(tmp_path: Path) -> None:
     assert empty.skipped is SkipReason.BUDGET_EXHAUSTED and empty.consumed == 0
     assert calls == ["x"]  # only the call with budget left
     assert some.skipped is None
+
+
+def _victim_with_objects(make_repo: MakeRepo, name: str) -> tuple[RepoBuilder, str]:
+    victim = make_repo(name)
+    victim.write("victim-secret-path.txt", "victim tree\n")
+    head = victim.commit("victim")
+    return victim, head
+
+
+def _fanout_of(repo: RepoBuilder, oid: str) -> Path:
+    return repo.root / ".git" / "objects" / oid[:2]
+
+
+def test_symlinked_fanout_directory_is_refused(repo: RepoBuilder, make_repo: MakeRepo) -> None:
+    victim, victim_head = _victim_with_objects(make_repo, "victim-fanout")
+    fanout = repo.root / ".git" / "objects" / victim_head[:2]
+    fanout.symlink_to(_fanout_of(victim, victim_head))
+
+    with pytest.raises(ScanError) as caught:
+        scan_repository(repo.root)
+
+    assert caught.value.reason is ScanFailure.UNSUPPORTED_REPOSITORY
+    assert victim_head not in repr(caught.value)
+
+
+def test_symlinked_loose_object_file_is_refused(repo: RepoBuilder, make_repo: MakeRepo) -> None:
+    victim, victim_head = _victim_with_objects(make_repo, "victim-loose")
+    fanout = repo.root / ".git" / "objects" / victim_head[:2]
+    fanout.mkdir(exist_ok=True)
+    (fanout / victim_head[2:]).symlink_to(_fanout_of(victim, victim_head) / victim_head[2:])
+
+    assert failure_of(repo.root) is ScanFailure.UNSUPPORTED_REPOSITORY
+
+
+def test_symlinked_packfile_is_refused(repo: RepoBuilder, make_repo: MakeRepo) -> None:
+    victim, _ = _victim_with_objects(make_repo, "victim-pack")
+    victim.git("gc", "-q")
+    packs = sorted((victim.root / ".git" / "objects" / "pack").glob("*.pack"))
+    assert packs
+    pack_dir = repo.root / ".git" / "objects" / "pack"
+    pack_dir.mkdir(exist_ok=True)
+    (pack_dir / packs[0].name).symlink_to(packs[0])
+
+    assert failure_of(repo.root) is ScanFailure.UNSUPPORTED_REPOSITORY
+
+
+def test_repository_with_loose_objects_and_packs_still_scans(repo: RepoBuilder) -> None:
+    repo.git("gc", "-q")
+    repo.write("later.txt", "loose object after gc\n")
+    repo.commit("later")
+
+    result = scan_repository(repo.root)
+
+    assert not result.workspace.is_dirty
+    assert result.workspace.head_commit is not None
+
+
+def test_object_store_entry_cap_refuses_huge_stores(
+    repo: RepoBuilder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(scanner, "_OBJECT_STORE_MAX_ENTRIES", 1)
+
+    assert failure_of(repo.root) is ScanFailure.UNSUPPORTED_REPOSITORY
+
+
+def test_git_dir_swapped_for_a_symlink_after_bootstrap_fails_closed(
+    repo: RepoBuilder, make_repo: MakeRepo, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    victim, victim_head = _victim_with_objects(make_repo, "victim-swap")
+    real = scanner._validate_repository_files
+
+    def swap_then_validate(*args: Any, **kwargs: Any) -> Any:
+        if not (repo.root / ".git-original").exists():
+            (repo.root / ".git").rename(repo.root / ".git-original")
+            (repo.root / ".git").symlink_to(victim.root / ".git")
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(scanner, "_validate_repository_files", swap_then_validate)
+
+    with pytest.raises(ScanError) as caught:
+        scan_repository(repo.root)
+
+    assert caught.value.reason is ScanFailure.ROOT_MISMATCH
+    assert victim_head not in repr(caught.value)
+
+
+def test_git_children_receive_pinned_descriptors(
+    repo: RepoBuilder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    seen: list[dict[str, str]] = []
+    real = scanner._run_git
+
+    def spy(*args: Any, **kwargs: Any) -> Any:
+        if kwargs.get("pass_fds"):
+            seen.append(dict(kwargs["env"]))
+        return real(*args, **kwargs)
+
+    monkeypatch.setattr(scanner, "_run_git", spy)
+
+    scan_repository(repo.root)
+
+    assert seen
+    for env in seen:
+        assert env["GIT_WORK_TREE"].startswith("/proc/self/fd/")
+        assert env["GIT_OBJECT_DIRECTORY"].startswith("/proc/self/fd/")
+    assert any(env["GIT_DIR"].startswith("/proc/self/fd/") for env in seen)
+
+
+def test_regular_file_is_not_read_when_budget_is_zero(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    root = tmp_path / "w"
+    root.mkdir()
+    (root / "f").write_bytes(b"")  # an empty file is the case a size check lets through
+    reads: list[int] = []
+    real_read = os.read
+    monkeypatch.setattr(scanner.os, "read", lambda fd, n: reads.append(n) or real_read(fd, n))
+    fd = os.open(root, os.O_RDONLY | os.O_DIRECTORY)
+    try:
+        seen = scanner._observe_leaf(fd, "f", file_cap=100, budget=0)
+    finally:
+        os.close(fd)
+
+    assert seen.skipped is SkipReason.BUDGET_EXHAUSTED
+    assert seen.consumed == 0
+    assert reads == []

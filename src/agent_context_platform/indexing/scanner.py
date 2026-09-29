@@ -271,6 +271,30 @@ class _Repo:
     common_dir: Path
     object_format: ObjectFormat
     root_identity: tuple[int, int]
+    # Directory descriptors pinned (no-follow, dev/ino verified) at bootstrap.
+    # Every later access goes through them, and git children receive them as
+    # ``/proc/self/fd/<n>`` so no mutable path is re-resolved. Linux only.
+    root_fd: int = -1
+    git_fd: int = -1
+    common_fd: int = -1
+    objects_fd: int = -1
+
+    @property
+    def fds(self) -> tuple[int, ...]:
+        return (self.root_fd, self.git_fd, self.common_fd, self.objects_fd)
+
+    @property
+    def cwd(self) -> Path:
+        return _pinned(self.root_fd)
+
+    def close(self) -> None:
+        for fd in self.fds:
+            if fd >= 0:
+                os.close(fd)
+
+
+def _pinned(fd: int) -> Path:
+    return Path(f"/proc/self/fd/{fd}")
 
 
 def _resolve_git(root: Path) -> str:
@@ -313,6 +337,7 @@ def _run_git(
     limits: ScanLimits,
     max_bytes: int,
     ok_codes: tuple[int, ...] = (0,),
+    pass_fds: Sequence[int] = (),
 ) -> tuple[int, bytes]:
     argv = [
         repo_git,
@@ -334,6 +359,7 @@ def _run_git(
             stdout=subprocess.PIPE,
             stderr=subprocess.DEVNULL,
             shell=False,
+            pass_fds=tuple(pass_fds),
         )
     except FileNotFoundError:
         raise ScanError(ScanFailure.GIT_UNAVAILABLE) from None
@@ -396,8 +422,10 @@ def _is_oid(value: str) -> bool:
 
 def _real_env(repo: _Repo) -> dict[str, str]:
     env = _base_env(repo.git, repo.root)
-    env["GIT_DIR"] = str(repo.git_dir)
-    env["GIT_WORK_TREE"] = str(repo.root)
+    env["GIT_DIR"] = str(_pinned(repo.git_fd))
+    env["GIT_COMMON_DIR"] = str(_pinned(repo.common_fd))
+    env["GIT_OBJECT_DIRECTORY"] = str(_pinned(repo.objects_fd))
+    env["GIT_WORK_TREE"] = str(_pinned(repo.root_fd))
     return env
 
 
@@ -437,34 +465,128 @@ def _bootstrap(root: Path, limits: ScanLimits) -> _Repo:
     # ``core.worktree`` or a gitfile must not move the scan to another tree.
     if Path(toplevel).resolve() != root:
         raise ScanError(ScanFailure.ROOT_MISMATCH)
-    if not _owns_git_dir(git, root, Path(git_dir), Path(common_dir), limits):
+    git_path = Path(git_dir).resolve()
+    common_path = Path(common_dir).resolve()
+    if not _owns_git_dir(git, root, git_path, common_path, limits):
         raise ScanError(ScanFailure.ROOT_MISMATCH)
     info = os.stat(root)
-    return _Repo(
-        git=git,
-        root=root,
-        git_dir=Path(git_dir),
-        common_dir=Path(common_dir),
-        object_format="sha256" if object_format == "sha256" else "sha1",
-        root_identity=(info.st_dev, info.st_ino),
+    identity = (info.st_dev, info.st_ino)
+    return _pin_repository(
+        git,
+        root,
+        git_path,
+        common_path,
+        "sha256" if object_format == "sha256" else "sha1",
+        identity,
     )
 
 
-def _open_below(base: Path, parts: Sequence[str]) -> int | None:
-    """Open ``base/parts...`` as a regular file without following any symlink.
-
-    ``base`` is an already validated directory (it is resolved once); every
-    component below it is opened with ``O_NOFOLLOW`` relative to its parent,
-    so nothing under it can redirect the read to another repository. Returns
-    ``None`` when a component is absent, otherwise a file descriptor. Anything
-    else unusual (a symlink, a non-directory parent, a non-regular file) raises
-    ``ROOT_MISMATCH`` without revealing content.
-    """
-    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+def _open_dir_nofollow(path: Path) -> int:
+    """Open an absolute directory path component by component, never following a link."""
+    flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    parts = path.parts
     try:
-        current = os.open(base.resolve(), dir_flags)
+        fd = os.open(parts[0], flags)
     except OSError:
         raise ScanError(ScanFailure.ROOT_MISMATCH) from None
+    try:
+        for name in parts[1:]:
+            child = os.open(name, flags, dir_fd=fd)
+            os.close(fd)
+            fd = child
+    except OSError:
+        os.close(fd)
+        raise ScanError(ScanFailure.ROOT_MISMATCH) from None
+    return fd
+
+
+def _fd_identity(fd: int) -> tuple[int, int]:
+    info = os.fstat(fd)
+    return (info.st_dev, info.st_ino)
+
+
+def _pin_repository(
+    git: str,
+    root: Path,
+    git_path: Path,
+    common_path: Path,
+    object_format: ObjectFormat,
+    root_identity: tuple[int, int],
+) -> _Repo:
+    """Pin root, git dir, common dir and object store as verified descriptors."""
+    if not os.path.isdir("/proc/self/fd"):
+        # Pinned paths are handed to git as /proc/self/fd/<n>: Linux only.
+        raise ScanError(ScanFailure.UNSUPPORTED_REPOSITORY)
+    opened: list[int] = []
+    try:
+        root_fd = _open_pinned_root(root, root_identity)
+        opened.append(root_fd)
+        git_fd = _open_dir_nofollow(git_path)
+        opened.append(git_fd)
+        common_fd = _open_dir_nofollow(common_path)
+        opened.append(common_fd)
+        try:
+            objects_fd = os.open(
+                "objects",
+                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                dir_fd=common_fd,
+            )
+        except OSError:
+            raise ScanError(ScanFailure.ROOT_MISMATCH) from None
+        opened.append(objects_fd)
+        # What was validated by path is what is now pinned.
+        if (
+            _fd_identity(git_fd) != _dir_identity(git_path)
+            or _fd_identity(common_fd) != _dir_identity(common_path)
+            or _fd_identity(root_fd) != root_identity
+        ):
+            raise ScanError(ScanFailure.ROOT_MISMATCH)
+    except BaseException:
+        for fd in opened:
+            os.close(fd)
+        raise
+    return _Repo(
+        git=git,
+        root=root,
+        git_dir=git_path,
+        common_dir=common_path,
+        object_format=object_format,
+        root_identity=root_identity,
+        root_fd=root_fd,
+        git_fd=git_fd,
+        common_fd=common_fd,
+        objects_fd=objects_fd,
+    )
+
+
+def _recheck_pins(repo: _Repo) -> None:
+    """Defense in depth: the pinned directories must still sit at their paths."""
+    for path, fd in (
+        (repo.root, repo.root_fd),
+        (repo.git_dir, repo.git_fd),
+        (repo.common_dir, repo.common_fd),
+        (repo.common_dir / "objects", repo.objects_fd),
+    ):
+        fresh = _open_dir_nofollow(path)
+        try:
+            if _fd_identity(fresh) != _fd_identity(fd):
+                raise ScanError(ScanFailure.ROOT_MISMATCH)
+        finally:
+            os.close(fresh)
+
+
+def _open_below(base_fd: int, parts: Sequence[str]) -> int | None:
+    """Open ``parts`` below the pinned directory ``base_fd`` as a regular file.
+
+    Every component is opened with ``O_NOFOLLOW`` relative to its parent, so
+    nothing below the base can redirect the read to another repository.
+    Returns ``None`` when a component is absent, otherwise a file descriptor.
+    Anything else unusual (a symlink, a non-directory parent, a non-regular
+    file) raises ``ROOT_MISMATCH`` without revealing content.
+    """
+    dir_flags = os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC | os.O_NOFOLLOW
+    current = base_fd
+    owned = False
     try:
         for name in parts[:-1]:
             try:
@@ -473,8 +595,10 @@ def _open_below(base: Path, parts: Sequence[str]) -> int | None:
                 return None
             except OSError:
                 raise ScanError(ScanFailure.ROOT_MISMATCH) from None
-            os.close(current)
+            if owned:
+                os.close(current)
             current = nxt
+            owned = True
         try:
             fd = os.open(
                 parts[-1],
@@ -486,19 +610,20 @@ def _open_below(base: Path, parts: Sequence[str]) -> int | None:
         except OSError:
             raise ScanError(ScanFailure.ROOT_MISMATCH) from None
     finally:
-        os.close(current)
+        if owned:
+            os.close(current)
     if not stat.S_ISREG(os.fstat(fd).st_mode):
         os.close(fd)
         raise ScanError(ScanFailure.ROOT_MISMATCH)
     return fd
 
 
-def _read_below(base: Path, parts: Sequence[str], cap: int = _METADATA_FILE_CAP) -> bytes | None:
-    """Read a small metadata file below ``base``: no symlinks, bounded, content-free errors.
+def _read_below(base_fd: int, parts: Sequence[str], cap: int = _METADATA_FILE_CAP) -> bytes | None:
+    """Read a small metadata file below ``base_fd``: no symlinks, bounded, content-free errors.
 
     At most ``cap + 1`` bytes are ever read; more than ``cap`` fails closed.
     """
-    fd = _open_below(base, parts)
+    fd = _open_below(base_fd, parts)
     if fd is None:
         return None
     try:
@@ -519,13 +644,17 @@ def _read_below(base: Path, parts: Sequence[str], cap: int = _METADATA_FILE_CAP)
 
 
 def _read_metadata(path: Path, cap: int = _METADATA_FILE_CAP) -> bytes | None:
-    """Read one file directly inside a validated directory (see ``_read_below``)."""
-    return _read_below(path.parent, (path.name,), cap)
+    """Read one file directly inside a directory (bootstrap-time, path based)."""
+    base = _open_dir_nofollow(path.parent.resolve())
+    try:
+        return _read_below(base, (path.name,), cap)
+    finally:
+        os.close(base)
 
 
-def _copy_bounded(base: Path, parts: Sequence[str], destination: Path, cap: int) -> bool:
-    """Stream ``base/parts`` into ``destination`` (no symlinks, at most ``cap`` bytes)."""
-    fd = _open_below(base, parts)
+def _copy_bounded(base_fd: int, parts: Sequence[str], destination: Path, cap: int) -> bool:
+    """Stream ``parts`` below ``base_fd`` into ``destination`` (no symlinks, at most ``cap`` bytes)."""
+    fd = _open_below(base_fd, parts)
     if fd is None:
         return False
     copied = 0
@@ -547,47 +676,81 @@ def _copy_bounded(base: Path, parts: Sequence[str], destination: Path, cap: int)
     return True
 
 
+_OBJECT_STORE_MAX_ENTRIES = 2_000_000
+_OBJECT_STORE_MAX_DEPTH = 4
+
+
+def _sweep_object_store(objects_fd: int) -> None:
+    """Refuse an object store holding anything but real files and directories.
+
+    Git follows symlinks below ``objects/`` (fanout directories, loose object
+    files, pack and idx files), so a hostile store could borrow another
+    repository's objects. Every entry, at every level, is checked without
+    following links; these are metadata reads and cost no byte budget.
+    """
+    remaining = _OBJECT_STORE_MAX_ENTRIES
+
+    def walk(directory_fd: int, depth: int) -> None:
+        nonlocal remaining
+        if depth > _OBJECT_STORE_MAX_DEPTH:
+            raise ScanError(ScanFailure.UNSUPPORTED_REPOSITORY)
+        subdirectories: list[str] = []
+        with os.scandir(directory_fd) as entries:
+            for entry in entries:
+                remaining -= 1
+                if remaining < 0:
+                    raise ScanError(ScanFailure.UNSUPPORTED_REPOSITORY)
+                if entry.is_symlink():
+                    raise ScanError(ScanFailure.UNSUPPORTED_REPOSITORY)
+                if entry.is_dir(follow_symlinks=False):
+                    subdirectories.append(entry.name)
+                elif not entry.is_file(follow_symlinks=False):
+                    raise ScanError(ScanFailure.UNSUPPORTED_REPOSITORY)
+        for name in subdirectories:
+            try:
+                child = os.open(
+                    name,
+                    os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
+                    dir_fd=directory_fd,
+                )
+            except OSError:
+                raise ScanError(ScanFailure.UNSUPPORTED_REPOSITORY) from None
+            try:
+                walk(child, depth + 1)
+            finally:
+                os.close(child)
+
+    try:
+        walk(objects_fd, 0)
+    except OSError:
+        raise ScanError(ScanFailure.UNSUPPORTED_REPOSITORY) from None
+
+
 def _validate_repository_files(repo: _Repo, head_ref: str | None) -> None:
     """Refuse a repository whose files git would read from somewhere else.
 
     Every path handed to git, by environment variable or through git's own
     lookups, must be a regular file or real directory directly inside the
-    accepted git dir or common dir, or be copied through the no-follow reader.
+    pinned git dir or common dir, or be copied through the no-follow reader.
     """
-    # ``objects`` itself must be a real directory in the common dir.
-    try:
-        parent = os.open(repo.common_dir.resolve(), os.O_RDONLY | os.O_DIRECTORY | os.O_CLOEXEC)
-    except OSError:
-        raise ScanError(ScanFailure.ROOT_MISMATCH) from None
-    try:
-        os.close(
-            os.open(
-                "objects",
-                os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC,
-                dir_fd=parent,
-            )
-        )
-    except OSError:
-        raise ScanError(ScanFailure.ROOT_MISMATCH) from None
-    finally:
-        os.close(parent)
     for name in ("alternates", "http-alternates"):
-        data = _read_below(repo.common_dir, ("objects", "info", name))
+        data = _read_below(repo.objects_fd, ("info", name))
         if data is not None and data.strip():
             # Alternates would let git read another object store.
             raise ScanError(ScanFailure.UNSUPPORTED_REPOSITORY)
+    _sweep_object_store(repo.objects_fd)
     for base, name in (
-        (repo.git_dir, "index"),
-        (repo.git_dir, "config.worktree"),
-        (repo.common_dir, "config"),
-        (repo.common_dir, "packed-refs"),
-        (repo.common_dir, "shallow"),
+        (repo.git_fd, "index"),
+        (repo.git_fd, "config.worktree"),
+        (repo.common_fd, "config"),
+        (repo.common_fd, "packed-refs"),
+        (repo.common_fd, "shallow"),
     ):
         descriptor = _open_below(base, (name,))
         if descriptor is not None:
             os.close(descriptor)
     if head_ref is not None and head_ref.startswith("refs/"):
-        descriptor = _open_below(repo.common_dir, head_ref.split("/"))
+        descriptor = _open_below(repo.common_fd, head_ref.split("/"))
         if descriptor is not None:
             os.close(descriptor)
 
@@ -699,11 +862,12 @@ def _read_head(repo: _Repo, limits: ScanLimits) -> _Head:
     code, out = _run_git(
         repo.git,
         ["symbolic-ref", "-q", "HEAD"],
-        cwd=repo.root,
+        cwd=repo.cwd,
         env=env,
         limits=limits,
         max_bytes=_METADATA_OUTPUT_CAP,
         ok_codes=(0, 1),
+        pass_fds=repo.fds,
     )
     ref = out.decode("utf-8", errors="replace").strip() if code == 0 else None
     if ref == "":
@@ -711,11 +875,12 @@ def _read_head(repo: _Repo, limits: ScanLimits) -> _Head:
     code, out = _run_git(
         repo.git,
         ["rev-parse", "--verify", "-q", "HEAD^{commit}"],
-        cwd=repo.root,
+        cwd=repo.cwd,
         env=env,
         limits=limits,
         max_bytes=_METADATA_OUTPUT_CAP,
         ok_codes=(0, 1),
+        pass_fds=repo.fds,
     )
     oid: str | None = None
     if code == 0:
@@ -759,10 +924,11 @@ def _safe_config(repo: _Repo, limits: ScanLimits) -> str:
     _, out = _run_git(
         repo.git,
         ["config", "--local", "--null", "--list"],
-        cwd=repo.root,
+        cwd=repo.cwd,
         env=_real_env(repo),
         limits=limits,
         max_bytes=_METADATA_OUTPUT_CAP,
+        pass_fds=repo.fds,
     )
     values: dict[str, str] = {}
     for token in _split_z(out):
@@ -806,9 +972,9 @@ def _safe_config(repo: _Repo, limits: ScanLimits) -> str:
     return "\n".join(lines) + "\n"
 
 
-def _copy_info_file(common_dir: Path, name: str, destination: Path) -> None:
+def _copy_info_file(common_fd: int, name: str, destination: Path) -> None:
     try:
-        data = _read_below(common_dir, ("info", name), _INFO_COPY_CAP)
+        data = _read_below(common_fd, ("info", name), _INFO_COPY_CAP)
     except ScanError:
         raise ScanError(ScanFailure.UNSUPPORTED_REPOSITORY) from None
     if data is None:
@@ -827,8 +993,9 @@ class _GitOutput:
 
 def _run_in_private_view(repo: _Repo, head: _Head, limits: ScanLimits) -> _GitOutput:
     """Run ``ls-files``, ``ls-tree`` and ``status`` without reading repo config."""
-    if any(repo.git_dir.glob("sharedindex.*")):
-        raise ScanError(ScanFailure.UNSUPPORTED_REPOSITORY)
+    with os.scandir(repo.git_fd) as entries:
+        if any(entry.name.startswith("sharedindex.") for entry in entries):
+            raise ScanError(ScanFailure.UNSUPPORTED_REPOSITORY)
     config_text = _safe_config(repo, limits)
     private = Path(tempfile.mkdtemp(prefix="agent-context-scan-"))
     try:
@@ -838,25 +1005,26 @@ def _run_in_private_view(repo: _Repo, head: _Head, limits: ScanLimits) -> _GitOu
         (private / "HEAD").write_text(head_text, encoding="ascii")
         (private / "config").write_text(config_text, encoding="utf-8")
         for name in ("exclude", "attributes"):
-            _copy_info_file(repo.common_dir, name, private / "info" / name)
+            _copy_info_file(repo.common_fd, name, private / "info" / name)
         # git reads and may lock the index it is given, and follows a symlinked
         # one: hand it a private copy taken through the no-follow reader.
-        _copy_bounded(repo.git_dir, ("index",), private / "index", _INDEX_COPY_CAP)
+        _copy_bounded(repo.git_fd, ("index",), private / "index", _INDEX_COPY_CAP)
 
         env = _base_env(repo.git, repo.root)
         env["GIT_DIR"] = str(private)
-        env["GIT_WORK_TREE"] = str(repo.root)
+        env["GIT_WORK_TREE"] = str(_pinned(repo.root_fd))
         env["GIT_INDEX_FILE"] = str(private / "index")
-        env["GIT_OBJECT_DIRECTORY"] = str(repo.common_dir / "objects")
+        env["GIT_OBJECT_DIRECTORY"] = str(_pinned(repo.objects_fd))
 
         def run(args: Sequence[str]) -> bytes:
             return _run_git(
                 repo.git,
                 args,
-                cwd=repo.root,
+                cwd=repo.cwd,
                 env=env,
                 limits=limits,
                 max_bytes=limits.max_command_output_bytes,
+                pass_fds=repo.fds,
             )[1]
 
         index = run(["ls-files", "--stage", "-z"])
@@ -1174,6 +1342,9 @@ def _observe_leaf(
         )
     if not stat.S_ISREG(info.st_mode):
         return _skipped(SkipReason.UNREADABLE, FileKind.OTHER)
+    if budget <= 0:
+        # Nothing left to spend: never issue a read.
+        return _skipped(SkipReason.BUDGET_EXHAUSTED, FileKind.FILE, info.st_size)
     over = _over_cap(info.st_size, file_cap, budget, FileKind.FILE)
     if over is not None:
         return over
@@ -1241,7 +1412,7 @@ def _kind_for_mode(mode: str) -> FileKind:
 
 def _scan(root: Path, limits: ScanLimits) -> RepositoryScan:
     repo = _bootstrap(root, limits)
-    root_fd = _open_pinned_root(root, repo.root_identity)
+    root_fd = repo.root_fd
     try:
         _validate_repository_files(repo, None)
         head = _read_head(repo, limits)
@@ -1355,8 +1526,10 @@ def _scan(root: Path, limits: ScanLimits) -> RepositoryScan:
                     seen.link_target,
                 )
             )
+        # Defense in depth: nothing may have been swapped under the pins.
+        _recheck_pins(repo)
     finally:
-        os.close(root_fd)
+        repo.close()
 
     omitted = len(omitted_tracked) + len(omitted_untracked)
     if omitted:
