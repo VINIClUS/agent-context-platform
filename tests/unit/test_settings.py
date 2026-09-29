@@ -265,3 +265,41 @@ def test_mcp_guard_settings_load_from_environment(monkeypatch: pytest.MonkeyPatc
 def test_mcp_rejects_non_positive_body_limit(value: int) -> None:
     with pytest.raises(ValidationError):
         Settings(mcp={"max_request_body_bytes": value})
+
+
+def test_ingestion_settings_default_to_bounded_body_and_argon2_cost() -> None:
+    ingestion = Settings().ingestion
+
+    assert ingestion.max_request_body_bytes == 33_554_432
+    assert ingestion.argon2_time_cost >= 2
+    assert ingestion.argon2_memory_cost_kib >= 19_456
+    assert ingestion.argon2_parallelism >= 1
+    assert ingestion.argon2_max_concurrency >= 1
+
+
+def test_ingestion_settings_load_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENT_CONTEXT_INGESTION__MAX_REQUEST_BODY_BYTES", "1024")
+    monkeypatch.setenv("AGENT_CONTEXT_INGESTION__ARGON2_MAX_CONCURRENCY", "2")
+
+    ingestion = Settings().ingestion
+
+    assert ingestion.max_request_body_bytes == 1024
+    assert ingestion.argon2_max_concurrency == 2
+
+
+@pytest.mark.parametrize(
+    "field",
+    [
+        "max_request_body_bytes",
+        "argon2_time_cost",
+        "argon2_memory_cost_kib",
+        "argon2_parallelism",
+        "argon2_max_concurrency",
+        "argon2_max_queue_depth",
+    ],
+)
+def test_ingestion_settings_reject_non_positive_values(field: str) -> None:
+    from agent_context_platform.settings import IngestionSettings
+
+    with pytest.raises(ValidationError):
+        IngestionSettings(**{field: 0})

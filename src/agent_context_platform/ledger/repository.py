@@ -86,6 +86,19 @@ class ResolvedEvent:
     redaction_reports: Mapping[str, RedactionReportV1] = field(default_factory=dict)
 
 
+@dataclass(frozen=True, slots=True)
+class AppendOutcome:
+    """One appended event and whether this call inserted it.
+
+    ``created`` is ``False`` when the event was recovered from an earlier
+    append (idempotent replay) or is a repeat of an earlier draft in the same
+    batch.
+    """
+
+    stored: StoredEventV1
+    created: bool
+
+
 class IdempotencyConflictError(ValueError):
     """Raised when an idempotency key is reused by a materially different draft.
 
@@ -497,7 +510,7 @@ async def _insert_or_recover(
     canonical_draft: EventDraftV1,
     stream_state: dict[str, _StreamState],
     touched_streams: set[str],
-) -> StoredEventV1:
+) -> AppendOutcome:
     state = stream_state[canonical_draft.stream_id]
     sequence = state.sequence + 1
     previous_hash = state.head_sha256
@@ -527,16 +540,17 @@ async def _insert_or_recover(
     except IntegrityError as error:
         constraint = _violated_constraint_name(error)
         if constraint == _IDEMPOTENCY_CONSTRAINT:
-            return await _recover_existing(session, canonical_draft)
+            return AppendOutcome(await _recover_existing(session, canonical_draft), created=False)
         if constraint == _EVENT_PK_CONSTRAINT:
-            return await _recover_existing(session, canonical_draft, event_id=sealed.event_id)
+            recovered = await _recover_existing(session, canonical_draft, event_id=sealed.event_id)
+            return AppendOutcome(recovered, created=False)
         raise
 
     state.sequence = sequence
     state.head_event_id = sealed.event_id
     state.head_sha256 = sealed.integrity.event_sha256
     touched_streams.add(canonical_draft.stream_id)
-    return sealed
+    return AppendOutcome(sealed, created=True)
 
 
 async def _update_stream_head(session: AsyncSession, stream_id: str, state: _StreamState) -> None:
@@ -563,10 +577,12 @@ class LedgerRepository:
     """
 
     @staticmethod
-    async def append(
+    async def append_with_outcome(
         session: AsyncSession, resolved_events: Sequence[ResolvedEvent]
-    ) -> list[StoredEventV1]:
-        """Append events, allocating per-stream sequence numbers atomically.
+    ) -> list[AppendOutcome]:
+        """Append events like ``append``, also reporting which ones this call inserted.
+
+        Allocating per-stream sequence numbers atomically.
 
         Stored events carry content refs in canonical content_id order:
         before sealing, each draft's ``content_claims`` are replaced with the
@@ -600,10 +616,12 @@ class LedgerRepository:
         )
 
         touched_streams: set[str] = set()
-        results: list[StoredEventV1 | None] = [None] * len(resolved_events)
+        results: list[AppendOutcome | None] = [None] * len(resolved_events)
         for i, resolved in enumerate(resolved_events):
             if plan[i] != i:
-                results[i] = results[plan[i]]
+                first = results[plan[i]]
+                assert first is not None
+                results[i] = AppendOutcome(first.stored, created=False)
                 continue
             canonical_draft = _canonicalize_draft(resolved.draft)
             results[i] = await _insert_or_recover(
@@ -613,7 +631,18 @@ class LedgerRepository:
         for stream_id in touched_streams:
             await _update_stream_head(session, stream_id, stream_state[stream_id])
 
-        return cast(list[StoredEventV1], results)
+        return cast(list[AppendOutcome], results)
+
+    @staticmethod
+    async def append(
+        session: AsyncSession, resolved_events: Sequence[ResolvedEvent]
+    ) -> list[StoredEventV1]:
+        """Append events; see ``append_with_outcome`` for the semantics.
+
+        Results are positional: ``results[i]`` corresponds to ``resolved_events[i]``.
+        """
+        outcomes = await LedgerRepository.append_with_outcome(session, resolved_events)
+        return [outcome.stored for outcome in outcomes]
 
     @staticmethod
     async def get_event(session: AsyncSession, event_id: PythonUUID) -> StoredEventV1 | None:
