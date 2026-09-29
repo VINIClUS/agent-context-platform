@@ -8,6 +8,7 @@ from agent_context_platform.projection.neo4j import (
     Neo4jTransaction,
 )
 from agent_context_platform.projection.runtime import (
+    EventIntegrityError,
     OrphanedOutboxRowError,
     ProjectionRunner,
     ProjectionRunReport,
@@ -17,6 +18,7 @@ from agent_context_platform.projection.schema import ensure_schema
 
 __all__ = [
     "CheckpointRepository",
+    "EventIntegrityError",
     "Neo4jHealth",
     "Neo4jReadFacade",
     "Neo4jStore",

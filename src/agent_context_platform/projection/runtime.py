@@ -9,7 +9,7 @@ from datetime import UTC, datetime, timedelta
 from typing import Literal, Protocol, runtime_checkable
 from uuid import UUID
 
-from agent_context_sdk import StoredEventV1
+from agent_context_sdk import StoredEventV1, verify_event
 from sqlalchemy import and_, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -59,6 +59,16 @@ class OrphanedOutboxRowError(LookupError):
     handled defensively (retried, then dead-lettered) rather than allowed to
     crash the whole run, so one corrupt row cannot block every other claimed
     row in the same batch.
+    """
+
+
+class EventIntegrityError(ValueError):
+    """A stored event no longer matches its own payload/envelope digests.
+
+    Projection of the event is blocked: the failure goes through the bounded
+    retries into the dead-letter queue, and the event never reaches the graph.
+    Quarantining the stream is the integrity verifier's job (PLATFORM-039); the
+    projector role cannot write stream state.
     """
 
 
@@ -129,6 +139,8 @@ async def _load_event(session: AsyncSession, event_id: UUID) -> StoredEventV1:
     event = await ledger_repository.LedgerRepository.get_event(session, event_id)
     if event is None:
         raise OrphanedOutboxRowError(f"ledger event missing for outbox claim: {event_id}")
+    if not verify_event(event):
+        raise EventIntegrityError(f"stored event failed integrity verification: {event_id}")
     return event
 
 

@@ -706,7 +706,7 @@ def test_load_event_reconstructs_the_stored_event_without_content_refs() -> None
     assert reconstructed.integrity.event_sha256 == sealed.integrity.event_sha256
 
 
-def test_load_event_reconstructs_content_refs_when_present() -> None:
+def test_load_event_rejects_a_content_ref_that_was_not_sealed() -> None:
     sealed = build_stored_event()
     event_row = _event_row_from(sealed)
     content_ref_row = EventContentRefRow(
@@ -725,12 +725,9 @@ def test_load_event_reconstructs_content_refs_when_present() -> None:
         get_results=[event_row], scalars_results=[FakeScalarResult([content_ref_row])]
     )
 
-    reconstructed = asyncio.run(runtime._load_event(session, sealed.event_id))  # type: ignore[arg-type]
-
-    [ref] = reconstructed.content_refs
-    assert ref.content_id == "artifact-1"
-    assert ref.storage.value == "inline"
-    assert ref.disposition.value == "sanitized"
+    # The row was never part of the sealed event, so its presence is tampering.
+    with pytest.raises(runtime.EventIntegrityError):
+        asyncio.run(runtime._load_event(session, sealed.event_id))  # type: ignore[arg-type]
 
 
 def test_load_event_orders_content_refs_by_code_point_not_sql_collation() -> None:
@@ -962,3 +959,13 @@ def test_retry_delay_is_capped_and_never_overflows() -> None:
     assert ProjectionRunner._retry_delay(base, 3, cap) == base * 4
     assert ProjectionRunner._retry_delay(base, 48, cap) == cap
     assert ProjectionRunner._retry_delay(base, 10_000, cap) == cap
+
+
+def test_load_event_blocks_an_event_that_fails_integrity_verification() -> None:
+    sealed = build_stored_event(event_type="graph.node.created", payload={"key": "value"})
+    tampered_row = _event_row_from(sealed)
+    tampered_row.payload = {"key": "tampered"}
+    session = FakeSession(get_results=[tampered_row], scalars_results=[FakeScalarResult([])])
+
+    with pytest.raises(runtime.EventIntegrityError):
+        asyncio.run(runtime._load_event(session, sealed.event_id))  # type: ignore[arg-type]
