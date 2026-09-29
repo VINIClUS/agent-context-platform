@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import asyncio
+import hashlib
 import re
 import subprocess
 import sys
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -29,6 +31,7 @@ EXPECTED_TABLES = {
         "project_repositories",
         "checkouts",
         "content_objects",
+        "inline_contents",
     },
     "ledger": {
         "event_streams",
@@ -84,6 +87,14 @@ EXPECTED_COLUMNS = {
         "id",
         "created_at",
         "observed_at",
+    },
+    "catalog.inline_contents": {
+        "inline_id",
+        "content_sha256",
+        "media_type",
+        "uncompressed_bytes",
+        "data",
+        "created_at",
     },
     "ledger.event_streams": {
         "stream_id",
@@ -227,8 +238,13 @@ EXPECTED_COLUMNS = {
 
 
 def test_alembic_configuration_exposes_one_initial_head() -> None:
+    # Use `history`, not `heads`, so this keeps checking that the whole
+    # migration chain still resolves to a single head and still traces
+    # back to the original "initial ledger" revision, even as later
+    # revisions (whose own docstrings will not mention "initial ledger")
+    # are appended on top of it.
     result = subprocess.run(
-        [sys.executable, "-m", "alembic", "heads", "--verbose"],
+        [sys.executable, "-m", "alembic", "history", "--verbose"],
         cwd=PROJECT_ROOT,
         check=False,
         capture_output=True,
@@ -273,6 +289,125 @@ async def _exercise_migration(dsn: str) -> None:
                 await connection.commit()
     finally:
         await engine.dispose()
+
+
+_PRE_CONTENT_REVISION = "20260823_0001"
+_LEGACY_DIGEST = hashlib.sha256(b"legacy-content-that-was-never-stored").hexdigest()
+
+
+@pytest.mark.parametrize(
+    ("storage", "expected_counts"),
+    [
+        ("inline", "inline=1, object=0, object_digest=0"),
+        ("object", "inline=0, object=1, object_digest=0"),
+        # The key resolves to a row, but that row carries a different digest.
+        ("object_digest", "inline=0, object=0, object_digest=1"),
+    ],
+)
+def test_content_persistence_upgrade_refuses_legacy_refs_without_stored_content(
+    postgres_dsn: str, storage: str, expected_counts: str
+) -> None:
+    """The new FKs cannot be added while legacy refs point at content that never existed.
+
+    Legacy rows predate ``catalog.inline_contents`` (and any guarantee that a
+    ``content_objects`` row exists), so their bytes cannot be backfilled. The
+    migration must fail up front with a clear, content-free error and leave the
+    database exactly as it found it, not half-migrated.
+    """
+    asyncio.run(_exercise_legacy_refs(postgres_dsn, storage, expected_counts))
+
+
+async def _exercise_legacy_refs(dsn: str, storage: str, expected_counts: str) -> None:
+    engine = create_async_engine(dsn, poolclass=NullPool)
+    try:
+        async with engine.connect() as connection:
+            try:
+                await _run_alembic(connection, command.upgrade, _PRE_CONTENT_REVISION)
+                await connection.commit()
+                await _seed_legacy_ref(connection, storage)
+                await connection.commit()
+
+                with pytest.raises(RuntimeError) as failure:
+                    await _run_alembic(connection, command.upgrade, "head")
+                await connection.rollback()
+
+                message = str(failure.value)
+                assert expected_counts in message
+                assert "remediation" in message.lower()
+                assert _LEGACY_DIGEST not in message
+                assert await connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+                    _PRE_CONTENT_REVISION
+                )
+                assert (
+                    await connection.scalar(text("SELECT to_regclass('catalog.inline_contents')"))
+                    is None
+                )
+
+                await connection.execute(text("DELETE FROM ledger.event_content_refs"))
+                await connection.execute(text("DELETE FROM catalog.content_objects"))
+                await connection.commit()
+                await _run_alembic(connection, command.upgrade, "head")
+                await connection.commit()
+                assert await connection.scalar(text("SELECT version_num FROM alembic_version")) == (
+                    "20260928_0001"
+                )
+            finally:
+                await connection.rollback()
+                await _run_alembic(connection, command.downgrade, "base")
+                await connection.commit()
+    finally:
+        await engine.dispose()
+
+
+async def _seed_legacy_ref(connection: AsyncConnection, storage: str) -> None:
+    stream_id = f"legacy-{uuid.uuid4().hex}"
+    event_id = uuid.uuid4()
+    digest = hashlib.sha256(event_id.bytes).hexdigest()
+    await connection.execute(
+        text(
+            "INSERT INTO ledger.event_streams (stream_id, last_sequence, status, created_at, "
+            "updated_at) VALUES (:stream_id, 0, 'active', now(), now())"
+        ),
+        {"stream_id": stream_id},
+    )
+    await connection.execute(
+        text(
+            "INSERT INTO ledger.events (event_id, event_type, schema_version, stream_id, "
+            "stream_sequence, producer_id, idempotency_key, occurred_at, observed_at, "
+            "recorded_at, producer, context, payload, redaction, payload_sha256, "
+            "previous_event_sha256, event_sha256) VALUES (:event_id, 'test.legacy.v1', "
+            "'1.0.0', :stream_id, 1, 'legacy-producer', 'legacy-key', now(), now(), now(), "
+            "'{}'::jsonb, '{}'::jsonb, '{}'::jsonb, '{}'::jsonb, :digest, NULL, :digest)"
+        ),
+        {"event_id": event_id, "stream_id": stream_id, "digest": digest},
+    )
+    object_key = f"sha256/{_LEGACY_DIGEST[:2]}/{_LEGACY_DIGEST[2:4]}/{_LEGACY_DIGEST}.zst"
+    if storage == "object_digest":
+        await connection.execute(
+            text(
+                "INSERT INTO catalog.content_objects (content_sha256, object_key, media_type, "
+                "compressed_bytes, uncompressed_bytes) "
+                "VALUES (:other, :object_key, 'text/plain', 5, 10)"
+            ),
+            {"other": hashlib.sha256(b"a-different-digest").hexdigest(), "object_key": object_key},
+        )
+        storage = "object"
+    await connection.execute(
+        text(
+            "INSERT INTO ledger.event_content_refs (event_id, content_id, content_sha256, "
+            "media_type, uncompressed_bytes, disposition, storage, inline_id, object_key, "
+            "encoding) VALUES (:event_id, 'legacy', :digest, 'text/plain', 10, 'sanitized', "
+            ":storage, :inline_id, :object_key, :encoding)"
+        ),
+        {
+            "event_id": event_id,
+            "digest": _LEGACY_DIGEST,
+            "storage": storage,
+            "inline_id": _LEGACY_DIGEST if storage == "inline" else None,
+            "object_key": object_key if storage == "object" else None,
+            "encoding": "zstd" if storage == "object" else None,
+        },
+    )
 
 
 async def _run_alembic(
@@ -415,6 +550,8 @@ async def _assert_constraint_contract(connection: AsyncConnection) -> None:
         "fk_event_streams_last_event_id_events": "a",
         "fk_events_stream_id_event_streams": "a",
         "fk_event_content_refs_event_id_events": "a",
+        "fk_event_content_refs_inline_id_inline_contents": "a",
+        "fk_event_content_refs_object_key_content_objects": "a",
         "fk_redaction_reports_event_id_event_content_refs": "a",
         "fk_outbox_event_id_events": "a",
         "fk_projection_checkpoints_last_outbox_id_outbox": "a",
@@ -492,12 +629,12 @@ async def _assert_role_contract(connection: AsyncConnection) -> None:
             text("SELECT has_schema_privilege('agent_context_api', :schema, 'CREATE')"),
             {"schema": schema},
         )
-    for schema in {"ledger", "projection"}:
+    for schema in {"ledger", "projection", "catalog"}:
         assert await connection.scalar(
             text("SELECT has_schema_privilege('agent_context_projector', :schema, 'USAGE')"),
             {"schema": schema},
         )
-    for schema in {"catalog", "operations"}:
+    for schema in {"operations"}:
         assert not await connection.scalar(
             text("SELECT has_schema_privilege('agent_context_projector', :schema, 'USAGE')"),
             {"schema": schema},
@@ -604,8 +741,15 @@ EXPECTED_CONSTRAINT_NAMES = {
     "uq_content_objects_object_key",
     "ck_content_objects_content_sha256_format",
     "ck_content_objects_object_key_not_empty",
+    "ck_content_objects_object_key_matches_digest",
     "ck_content_objects_compressed_bytes_nonnegative",
     "ck_content_objects_uncompressed_bytes_nonnegative",
+    "pk_inline_contents",
+    "uq_inline_contents_content_sha256",
+    "ck_inline_contents_content_sha256_format",
+    "ck_inline_contents_inline_id_matches_digest",
+    "ck_inline_contents_uncompressed_bytes_bound",
+    "ck_inline_contents_data_length_matches",
     "pk_event_streams",
     "fk_event_streams_last_event_id_events",
     "ck_event_streams_non_negative_last_sequence",
@@ -624,10 +768,13 @@ EXPECTED_CONSTRAINT_NAMES = {
     "ck_events_previous_hash_matches_sequence",
     "pk_event_content_refs",
     "fk_event_content_refs_event_id_events",
+    "fk_event_content_refs_inline_id_inline_contents",
+    "fk_event_content_refs_object_key_content_objects",
     "ck_event_content_refs_content_sha256_lower_hex",
     "ck_event_content_refs_non_negative_uncompressed_bytes",
     "ck_event_content_refs_storage_form",
     "ck_event_content_refs_object_key_matches_digest",
+    "ck_event_content_refs_inline_id_matches_digest",
     "ck_event_content_refs_content_disposition",
     "ck_event_content_refs_content_storage",
     "pk_redaction_reports",
@@ -733,6 +880,7 @@ EXPECTED_TABLE_GRANTS = (
         {"SELECT", "INSERT"},
     )
     | _table_grants("agent_context_projector", LEDGER_TABLES, {"SELECT"})
+    | _table_grants("agent_context_projector", {"catalog.inline_contents"}, {"SELECT"})
     | _table_grants("agent_context_projector", {"projection.outbox"}, {"SELECT"})
     | _table_grants(
         "agent_context_projector",

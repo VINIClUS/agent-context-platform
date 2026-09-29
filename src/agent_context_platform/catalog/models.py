@@ -145,6 +145,11 @@ class ContentObjectRow(CatalogRowMixin, CatalogBase):
         UniqueConstraint("object_key"),
         CheckConstraint("content_sha256 ~ '^[0-9a-f]{64}$'", name="content_sha256_format"),
         CheckConstraint("length(object_key) > 0", name="object_key_not_empty"),
+        CheckConstraint(
+            "object_key = 'sha256/' || substr(content_sha256, 1, 2) || '/' || "
+            "substr(content_sha256, 3, 2) || '/' || content_sha256 || '.zst'",
+            name="object_key_matches_digest",
+        ),
         CheckConstraint("compressed_bytes >= 0", name="compressed_bytes_nonnegative"),
         CheckConstraint("uncompressed_bytes >= 0", name="uncompressed_bytes_nonnegative"),
     )

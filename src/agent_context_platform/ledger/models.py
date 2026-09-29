@@ -20,6 +20,8 @@ from sqlalchemy import (
 from sqlalchemy.dialects.postgresql import JSONB, UUID
 from sqlalchemy.orm import Mapped, mapped_column
 
+from agent_context_platform.catalog.models import ContentObjectRow
+from agent_context_platform.content.models import InlineContentRow
 from agent_context_platform.db import Base
 
 
@@ -143,6 +145,10 @@ class EventContentRefRow(Base):
             name="storage_form",
         ),
         CheckConstraint(
+            "storage <> 'inline' OR inline_id = content_sha256",
+            name="inline_id_matches_digest",
+        ),
+        CheckConstraint(
             "storage <> 'object' OR object_key = "
             "'sha256/' || substr(content_sha256, 1, 2) || '/' || "
             "substr(content_sha256, 3, 2) || '/' || content_sha256 || '.zst'",
@@ -178,8 +184,12 @@ class EventContentRefRow(Base):
         ),
         nullable=False,
     )
-    inline_id: Mapped[str | None] = mapped_column(String(512), nullable=True)
-    object_key: Mapped[str | None] = mapped_column(String(512), nullable=True)
+    inline_id: Mapped[str | None] = mapped_column(
+        String(512), ForeignKey(InlineContentRow.inline_id), nullable=True
+    )
+    object_key: Mapped[str | None] = mapped_column(
+        String(512), ForeignKey(ContentObjectRow.object_key), nullable=True
+    )
     encoding: Mapped[str | None] = mapped_column(String(16), nullable=True)
 
 

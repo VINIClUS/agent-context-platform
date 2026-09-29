@@ -6,9 +6,11 @@ from sqlalchemy import Connection
 from sqlalchemy.schema import SchemaItem
 
 from agent_context_platform.catalog.models import CatalogBase
-from agent_context_platform.db import Base, create_engine
 
-# Importing the modules registers every table on Base.metadata.
+# Importing the modules registers every table on Base.metadata
+# (or, for content, on CatalogBase.metadata).
+from agent_context_platform.content import models as content_models  # noqa: F401
+from agent_context_platform.db import Base, create_engine
 from agent_context_platform.ledger import models as ledger_models  # noqa: F401
 from agent_context_platform.operations import models as operations_models  # noqa: F401
 from agent_context_platform.projection import models as projection_models  # noqa: F401
@@ -22,6 +24,7 @@ MANAGED_TABLES = {
     "catalog.project_repositories",
     "catalog.checkouts",
     "catalog.content_objects",
+    "catalog.inline_contents",
     "ledger.event_streams",
     "ledger.events",
     "ledger.event_content_refs",
