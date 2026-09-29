@@ -988,3 +988,30 @@ def test_a_concurrent_run_does_not_sweep_a_supervisor_being_registered(
     thread.join()
     assert isinstance(other, ParsedModule)
     assert isinstance(results[0], ParsedModule)
+
+
+def test_disambiguator_groups_by_name_and_kind_so_a_variable_does_not_shift_a_function() -> None:
+    from agent_context_platform.indexing.identity import symbol_fallback_id
+
+    src = b"x = 1\ndef x(): pass\n"
+    at = src.index(b"def x")
+    var = symbol(
+        qualified_name="pkg.mod.x", kind="variable", start_byte=0, end_byte=5, signature="x = 1"
+    )
+    func = symbol(
+        ref="2", qualified_name="pkg.mod.x", start_byte=at, end_byte=len(src), signature="def x()"
+    )
+    both = validate_module(
+        request(src), module([var, func]), expected_fingerprint=FINGERPRINT
+    ).files[0]
+    alone = validate_module(request(src), module([func]), expected_fingerprint=FINGERPRINT).files[0]
+    with_var = both.symbols[1]
+    without = alone.symbols[0]
+    assert with_var.disambiguator == "0"
+
+    def logical(item: Any) -> Any:
+        return symbol_fallback_id(
+            "repo", "python", uuid.UUID(int=1), item.qualified_name, item.kind, item.disambiguator
+        )
+
+    assert logical(with_var) == logical(without)

@@ -41,7 +41,7 @@ errors, never the offending value):
   * ``ref`` and ``disambiguator`` never come from the adapter: ``ref`` is rewritten to the
     symbol's index in the file (relations are remapped, at most
     ``MAX_RELATIONS_PER_SYMBOL`` per source), and ``disambiguator`` is derived as the
-    0..n-1 ordinal among symbols with the same qualified name, ordered by
+    0..n-1 ordinal among symbols with the same (qualified name, kind), ordered by
     ``(start_byte, end_byte, kind)``. The adapter's values (numeric, at most 6 digits) are
     ignored beyond uniqueness of refs. ``kind`` and the relation ``kind`` are closed
     enums; ``language`` must equal the input's.
@@ -408,10 +408,10 @@ def _finish(
             n,
         ),
     )
-    ordinals: dict[str, int] = {}
+    ordinals: dict[tuple[str, str], int] = {}
     disambiguators = [""] * len(parsed.symbols)
     for number in order:
-        name = parsed.symbols[number].qualified_name
+        name = (parsed.symbols[number].qualified_name, parsed.symbols[number].kind)
         disambiguators[number] = str(ordinals.get(name, 0))
         ordinals[name] = ordinals.get(name, 0) + 1
     symbols = tuple(
