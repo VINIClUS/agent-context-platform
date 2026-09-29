@@ -957,9 +957,11 @@ def _observe_leaf(parent: int, name: str, *, file_cap: int, budget: int) -> _Obs
         cap = min(file_cap, budget)
         while True:
             try:
-                chunk = os.read(fd, _CHUNK_SIZE)
+                # Never ask for more than the allowance plus one byte, which
+                # is what detects a file that grew past it.
+                chunk = os.read(fd, min(_CHUNK_SIZE, cap - total + 1))
             except OSError:
-                return _skipped(SkipReason.UNREADABLE, FileKind.FILE)
+                return replace(_skipped(SkipReason.UNREADABLE, FileKind.FILE), consumed=total)
             if not chunk:
                 break
             total += len(chunk)
@@ -968,7 +970,8 @@ def _observe_leaf(parent: int, name: str, *, file_cap: int, budget: int) -> _Obs
                 over = _over_cap(total, file_cap, budget, FileKind.FILE) or _skipped(
                     SkipReason.TOO_LARGE, FileKind.FILE
                 )
-                return replace(over, consumed=total)
+                # The detection byte is not charged: the ceiling stays hard.
+                return replace(over, consumed=min(total, budget))
             if len(sniff) < _BINARY_SNIFF_BYTES:
                 sniff += chunk[: _BINARY_SNIFF_BYTES - len(sniff)]
             digest.update(chunk)

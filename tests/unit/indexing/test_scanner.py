@@ -954,3 +954,81 @@ def test_omitted_tracked_paths_are_bound_into_scan_digest(
     assert [f.path for f in before.files] == [f.path for f in after.files]
     assert before.omitted_files == after.omitted_files == 2
     assert before.scan_sha256 != after.scan_sha256
+
+
+class _FileInfo:
+    st_mode = 0o100644
+    st_size = 1
+    st_dev = 1
+    st_ino = 2
+
+
+def _fake_file(monkeypatch: pytest.MonkeyPatch, read: Callable[[int, int], bytes]) -> None:
+    monkeypatch.setattr(scanner.os, "stat", lambda *a, **k: _FileInfo())
+    monkeypatch.setattr(scanner.os, "open", lambda *a, **k: 99)
+    monkeypatch.setattr(scanner.os, "fstat", lambda fd: _FileInfo())
+    monkeypatch.setattr(scanner.os, "close", lambda fd: None)
+    monkeypatch.setattr(scanner.os, "read", read)
+
+
+def test_read_error_after_partial_read_charges_consumed_bytes(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    calls = [b"x" * 20]
+
+    def read(fd: int, size: int) -> bytes:
+        if calls:
+            return calls.pop()
+        raise OSError
+
+    _fake_file(monkeypatch, read)
+
+    seen = scanner._observe_leaf(3, "f", file_cap=100, budget=100)
+
+    assert seen.skipped is SkipReason.UNREADABLE
+    assert seen.consumed == 20
+
+
+def test_read_requests_never_exceed_remaining_allowance(monkeypatch: pytest.MonkeyPatch) -> None:
+    requested: list[int] = []
+
+    def read(fd: int, size: int) -> bytes:
+        requested.append(size)
+        return b"x" * size
+
+    _fake_file(monkeypatch, read)
+
+    seen = scanner._observe_leaf(3, "f", file_cap=100, budget=7)
+
+    assert seen.skipped is SkipReason.BUDGET_EXHAUSTED
+    assert sum(requested) <= 8
+    assert seen.consumed <= 7
+
+
+def test_growing_file_with_little_budget_left_never_exceeds_total(
+    repo: RepoBuilder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    repo.write("grow.txt", b"x")
+    real_read = os.read
+    real_open = os.open
+    worktree_fds: set[int] = set()
+
+    def tracking_open(path: str, flags: int, *args: object, **kwargs: object) -> int:
+        fd = real_open(path, flags, *args, **kwargs)  # type: ignore[arg-type]
+        if kwargs.get("dir_fd") is not None and flags & os.O_NONBLOCK:
+            worktree_fds.add(fd)
+        return fd
+
+    def greedy_read(fd: int, size: int) -> bytes:
+        # A worktree file that keeps growing: always more to give than asked.
+        data = real_read(fd, size)
+        return data or b"y" * size if fd in worktree_fds else data
+
+    monkeypatch.setattr(scanner.os, "open", tracking_open)
+    monkeypatch.setattr(scanner.os, "read", greedy_read)
+    limits = ScanLimits(max_total_bytes=500, max_file_bytes=1_000_000)
+
+    result = scan_repository(repo.root, limits)
+
+    assert result.bytes_read <= limits.max_total_bytes
+    assert TruncationReason.MAX_TOTAL_BYTES in result.truncation_reasons
