@@ -58,6 +58,12 @@ def ingestion_openapi() -> dict[str, Any]:
         component = components[kind][name]
         selected.setdefault(kind, {})[name] = component
         pending |= _references(component)
+    for operation in (op for item in paths.values() for op in item.values()):
+        for requirement in operation.get("security", []):
+            for name in requirement:
+                selected.setdefault("securitySchemes", {})[name] = components["securitySchemes"][
+                    name
+                ]
     return {
         "openapi": full["openapi"],
         "info": {"title": "Agent Context Ingestion API", "version": "v1"},

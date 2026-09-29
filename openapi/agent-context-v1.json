@@ -681,6 +681,13 @@
         "title": "TraceContextV1",
         "type": "object"
       }
+    },
+    "securitySchemes": {
+      "ProducerBearer": {
+        "description": "Producer token of the form `<prefix>.<secret>`, registered with scope `events:ingest`. Sent as `Authorization: Bearer <token>`.",
+        "scheme": "bearer",
+        "type": "http"
+      }
     }
   },
   "info": {
@@ -723,7 +730,15 @@
                 }
               }
             },
-            "description": "Successful Response"
+            "description": "Every event is `accepted` (created now) or `existing` (already stored).",
+            "headers": {
+              "x-request-id": {
+                "description": "Request ID: echoed when a short safe token, otherwise generated.",
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
           },
           "400": {
             "content": {
@@ -898,6 +913,11 @@
             }
           }
         },
+        "security": [
+          {
+            "ProducerBearer": []
+          }
+        ],
         "summary": "Ingest Batch",
         "tags": [
           "ingestion"

@@ -57,6 +57,15 @@ from agent_context_platform.ledger.service import IngestionService
 
 logger = logging.getLogger("agent_context_platform.ledger.api")
 
+SECURITY_SCHEME_NAME: Final = "ProducerBearer"
+SECURITY_SCHEME: Final[dict[str, Any]] = {
+    "type": "http",
+    "scheme": "bearer",
+    "description": (
+        "Producer token of the form `<prefix>.<secret>`, registered with scope `events:ingest`. "
+        "Sent as `Authorization: Bearer <token>`."
+    ),
+}
 INGESTION_PATH: Final = "/v1/ingestion/batches"
 REQUEST_SCHEMA_NAME: Final = "IngestBatchRequestV1"
 REQUEST_REF_TEMPLATE: Final = "#/components/schemas/{model}"
@@ -228,6 +237,11 @@ _BATCH_OR_ERROR: Final = IngestBatchResponseV1 | ErrorResponseV1
 # OpenAPI metadata only: mirrors the status mapping in the module docstring. The
 # ingestion snapshot (``openapi/agent-context-v1.json``) freezes this table.
 _RESPONSES: Final[dict[int | str, dict[str, Any]]] = {
+    200: {
+        "model": IngestBatchResponseV1,
+        "description": "Every event is `accepted` (created now) or `existing` (already stored).",
+        "headers": {"x-request-id": _REQUEST_ID_HEADER_DOC},
+    },
     400: {
         "model": ErrorResponseV1,
         "description": "Idempotency-Key header absent: `idempotency_key_required`.",
@@ -306,6 +320,7 @@ router = APIRouter(prefix="/v1/ingestion", tags=["ingestion"])
     response_model=IngestBatchResponseV1,
     responses=_RESPONSES,
     openapi_extra={
+        "security": [{SECURITY_SCHEME_NAME: []}],
         "requestBody": {
             "required": True,
             "content": {

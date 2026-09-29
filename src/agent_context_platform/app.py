@@ -13,6 +13,8 @@ from agent_context_platform.content.blob_store import S3BlobStore
 from agent_context_platform.content.service import ContentService
 from agent_context_platform.db import create_engine, session_factory
 from agent_context_platform.ledger.api import (
+    SECURITY_SCHEME,
+    SECURITY_SCHEME_NAME,
     IngestionRuntime,
     RequestContextMiddleware,
     request_schema_components,
@@ -153,6 +155,9 @@ def create_app(
         for name, component in request_schema_components().items():
             if schemas.setdefault(name, component) != component:
                 raise RuntimeError(f"OpenAPI component {name} conflicts with the request schema")
+        schema["components"].setdefault("securitySchemes", {})[SECURITY_SCHEME_NAME] = (
+            SECURITY_SCHEME
+        )
         return schema
 
     application.openapi = openapi  # type: ignore[method-assign]

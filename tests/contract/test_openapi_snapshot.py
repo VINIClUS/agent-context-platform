@@ -104,6 +104,18 @@ def test_snapshot_declares_every_frozen_status_with_its_schema() -> None:
     assert "WWW-Authenticate" in responses["401"]["headers"]
 
 
+def test_snapshot_documents_bearer_auth_and_success_headers() -> None:
+    document: dict[str, Any] = json.loads(SNAPSHOT.read_bytes())
+    operation = document["paths"]["/v1/ingestion/batches"]["post"]
+
+    assert operation["security"] == [{"ProducerBearer": []}]
+    scheme = document["components"]["securitySchemes"]["ProducerBearer"]
+    assert (scheme["type"], scheme["scheme"]) == ("http", "bearer")
+    assert "events:ingest" in scheme["description"]
+    assert "x-request-id" in operation["responses"]["200"]["headers"]
+    assert "201" not in operation["responses"] and "202" not in operation["responses"]
+
+
 def test_documented_request_schema_is_the_sdk_schema() -> None:
     document: dict[str, Any] = json.loads(SNAPSHOT.read_bytes())
     schemas = document["components"]["schemas"]
