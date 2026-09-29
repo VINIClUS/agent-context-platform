@@ -99,6 +99,14 @@ _ADVISORY_LOCK_NAMESPACE: Final[int] = 0x434F_4E54  # b"CONT"
 _JSON_MEDIA_TYPE: Final[str] = "application/json"
 _TEXT_MEDIA_TYPE: Final[str] = "text/plain"
 
+#: Ceiling on JSON nesting depth enforced by ``_parse_json_strict``, independent
+#: of ``json.loads``'s own ``RecursionError`` guard (see that function's
+#: docstring). Matches ``agent_context_sdk.RedactionPolicyV1.max_depth``'s own
+#: upper bound (``le=256``), so this can never be the reason a caller-configured
+#: policy's otherwise-legitimate content is rejected: nothing a valid policy
+#: would accept is deeper than this.
+_MAX_JSON_DEPTH: Final[int] = 256
+
 #: Fixed, content-free media type used for *every* object-storage upload,
 #: regardless of the claimed media type. See "Object-storage media type is
 #: a fixed constant" in the module docstring.
@@ -191,7 +199,40 @@ def _reject_non_finite_constant(constant: str) -> float:
     raise _NonFiniteJsonConstantError(constant)
 
 
+def _exceeds_max_json_depth(value: JsonValue, *, max_depth: int) -> bool:
+    """Return whether ``value`` nests deeper than ``max_depth``.
+
+    Walks depth-first using an explicit stack, never Python recursion, so
+    arbitrarily deep input costs heap, not call-stack, to check -- see
+    ``_parse_json_strict``'s docstring for why that distinction matters.
+    """
+    stack: list[tuple[JsonValue, int]] = [(value, 0)]
+    while stack:
+        current, depth = stack.pop()
+        if depth > max_depth:
+            return True
+        if type(current) is list:
+            stack.extend((item, depth + 1) for item in current)
+        elif type(current) is dict:
+            stack.extend((item, depth + 1) for item in current.values())
+    return False
+
+
 def _parse_json_strict(text_value: str) -> JsonValue:
+    """Parse ``text_value`` as JSON, rejecting anything not safe to process further.
+
+    ``json.loads`` uses CPython's C-accelerated scanner here, which recurses
+    in C, not Python, to walk nested arrays/objects. Since CPython 3.12 the
+    guard against runaway C recursion is sized from the actual C stack
+    available, not a fixed frame count -- so on a platform or thread with
+    enough stack, ``json.loads`` can fully parse input many callers would
+    consider pathologically deep instead of raising ``RecursionError`` (this
+    was reproduced with pytest passing locally while CI's Python 3.14 job,
+    matching platform and interpreter patch version, failed on the exact
+    same 50,000-deep fixture). The explicit, iterative ``_exceeds_max_json_depth``
+    check below is what makes rejection deterministic across every platform:
+    it runs whether or not ``json.loads`` itself happened to raise.
+    """
     try:
         parsed = json.loads(
             text_value,
@@ -208,6 +249,8 @@ def _parse_json_strict(text_value: str) -> JsonValue:
         raise InvalidContentEncodingError("content is nested too deeply to parse") from None
     except json.JSONDecodeError:
         raise InvalidContentEncodingError("content is not valid JSON") from None
+    if _exceeds_max_json_depth(parsed, max_depth=_MAX_JSON_DEPTH):
+        raise InvalidContentEncodingError("content is nested too deeply to parse") from None
     return cast(JsonValue, parsed)
 
 
@@ -381,7 +424,13 @@ class ContentService:
 
         try:
             result = redact_json(value, self._policy)
-        except RedactionError:
+        except (RedactionError, RecursionError):
+            # RecursionError is a defense-in-depth backstop, not a reachable
+            # path today: _parse_json_strict's _exceeds_max_json_depth check
+            # already bounds `value` to _MAX_JSON_DEPTH (<= any valid
+            # policy.max_depth) before this call. Caught here too in case a
+            # future caller reaches this method with unvalidated depth, or a
+            # future SDK release changes redact_json's own guard.
             raise InvalidContentEncodingError(
                 "content could not be processed by the redaction policy"
             ) from None

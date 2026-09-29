@@ -36,6 +36,7 @@ from sqlalchemy import TextClause
 from agent_context_platform.content.blob_store import BlobNotFoundError, StoredBlob
 from agent_context_platform.content.models import INLINE_MAX_BYTES
 from agent_context_platform.content.service import (
+    _MAX_JSON_DEPTH,
     _OBJECT_STORAGE_MEDIA_TYPE,
     ContentRequiresRedactionError,
     ContentResolutionError,
@@ -128,6 +129,28 @@ def _json_item(
     return _item(
         content_id, canonical_json_bytes(value), media_type="application/json", report=report
     )
+
+
+def _nested_json_text(depth: int) -> str:
+    """Raw JSON text for a value whose deepest node sits at ``depth`` (root = 0).
+
+    Mirrors ``_exceeds_max_json_depth``'s own depth convention exactly: an
+    empty list is depth 0, and each extra wrapping ``[...]`` adds one.
+    """
+    brackets = depth + 1
+    return "[" * brackets + "]" * brackets
+
+
+def _nested_value(depth: int) -> Any:
+    """A Python structure whose deepest node sits at ``depth`` (root = 0).
+
+    Same depth convention as ``_nested_json_text``, but as a Python object
+    ready for ``_json_item``/``canonical_json_bytes`` rather than raw text.
+    """
+    value: Any = []
+    for _ in range(depth):
+        value = [value]
+    return value
 
 
 def _run(coro: Any) -> Any:
@@ -242,6 +265,28 @@ def test_parse_json_strict_rejects_deeply_nested_json() -> None:
         _parse_json_strict(nested)
 
 
+def test_parse_json_strict_accepts_json_at_the_max_depth() -> None:
+    """The boundary itself is not rejected -- only content deeper than it.
+
+    Regression test for a CI-only failure: ``json.loads``'s C scanner
+    recurses in C, and CPython 3.12+ sizes its C-recursion guard from the
+    actual C stack available, not a fixed frame count. 50,000-deep input
+    (the fixture above) raised ``RecursionError`` during parsing on every
+    platform this suite has run on so far except one -- a GitHub Actions
+    Python 3.14 runner with more stack headroom than this repo's local dev
+    environment, despite both running the identical 3.14.6 patch release.
+    ``_exceeds_max_json_depth`` is what makes rejection deterministic
+    regardless: it runs whether or not ``json.loads`` itself raised.
+    """
+    parsed = _parse_json_strict(_nested_json_text(_MAX_JSON_DEPTH))
+    assert parsed == _nested_value(_MAX_JSON_DEPTH)
+
+
+def test_parse_json_strict_rejects_json_one_level_past_the_max_depth() -> None:
+    with pytest.raises(InvalidContentEncodingError):
+        _parse_json_strict(_nested_json_text(_MAX_JSON_DEPTH + 1))
+
+
 def test_parse_json_strict_rejects_invalid_json() -> None:
     with pytest.raises(InvalidContentEncodingError):
         _parse_json_strict("{not json")
@@ -344,6 +389,66 @@ def test_prepare_rejects_content_when_policy_raises_redaction_error() -> None:
         strict_policy = RedactionPolicyV1(max_depth=1)
         service = ContentService(FakeBlobStore(), strict_policy)
         item = _json_item("too-deep", {"a": {"b": "c"}})
+        with pytest.raises(InvalidContentEncodingError):
+            await service.prepare([item])
+
+    _run(exercise())
+
+
+def test_prepare_accepts_json_at_the_max_depth_end_to_end() -> None:
+    """``_MAX_JSON_DEPTH`` never rejects content a valid policy would accept.
+
+    ``RedactionPolicyV1.max_depth`` is bounded at 256 for every caller
+    (``agent_context_sdk``'s own field constraint), so pairing the service
+    with a policy configured at that same ceiling proves the parse-level
+    gate and the redaction-level gate agree at the boundary, not just each
+    in isolation.
+    """
+
+    async def exercise() -> None:
+        policy = RedactionPolicyV1(max_depth=_MAX_JSON_DEPTH)
+        service = ContentService(FakeBlobStore(), policy)
+        item = _json_item("at-the-limit", _nested_value(_MAX_JSON_DEPTH))
+        prepared = await service.prepare([item])
+        assert prepared.content_ids == ("at-the-limit",)
+
+    _run(exercise())
+
+
+def test_prepare_rejects_json_one_level_past_the_max_depth_end_to_end() -> None:
+    """Content past ``_MAX_JSON_DEPTH`` never reaches ``redact_json`` at all.
+
+    Uses the default policy deliberately: rejection here comes from
+    ``_parse_json_strict`` itself, before ``self._policy.max_depth`` is ever
+    consulted, so the policy in effect cannot change this outcome.
+    """
+
+    async def exercise() -> None:
+        service = ContentService(FakeBlobStore(), _POLICY)
+        item = _json_item("past-the-limit", _nested_value(_MAX_JSON_DEPTH + 1))
+        with pytest.raises(InvalidContentEncodingError):
+            await service.prepare([item])
+
+    _run(exercise())
+
+
+def test_prepare_wraps_recursion_error_from_redact_json(monkeypatch: pytest.MonkeyPatch) -> None:
+    """Defense-in-depth backstop: a bare ``RecursionError`` from ``redact_json``
+    is still reported as ``InvalidContentEncodingError``, not left to escape
+    ``prepare()`` uncaught. Not reachable through real input today -- content
+    is already depth-bounded by ``_parse_json_strict`` before this call -- so
+    exercised directly via monkeypatch, mirroring
+    ``test_canonicalize_or_reject_wraps_unexpected_errors``.
+    """
+
+    def _boom(value: Any, policy: Any) -> Any:
+        raise RecursionError("simulated redact_json stack exhaustion")
+
+    monkeypatch.setattr("agent_context_platform.content.service.redact_json", _boom)
+
+    async def exercise() -> None:
+        service = ContentService(FakeBlobStore(), _POLICY)
+        item = _json_item("triggers-backstop", {"a": 1})
         with pytest.raises(InvalidContentEncodingError):
             await service.prepare([item])
 
