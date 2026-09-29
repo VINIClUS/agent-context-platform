@@ -26,8 +26,8 @@ ENV UV_COMPILE_BYTECODE=1 \
 RUN pip install --no-cache-dir uv==0.11.28
 
 WORKDIR /app
-# Keep the wheel name in step with [tool.uv.sources] in pyproject.toml.
-COPY build/sdk/agent_context_sdk-0.3.2-py3-none-any.whl build/sdk/
+# The private SDK wheel(s) that [tool.uv.sources] in pyproject.toml points at (any version).
+COPY build/sdk build/sdk
 COPY pyproject.toml uv.lock README.md ./
 COPY src src
 RUN uv sync --frozen --no-dev --no-editable --python /usr/local/bin/python

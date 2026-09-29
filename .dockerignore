@@ -3,5 +3,5 @@
 !uv.lock
 !README.md
 !src
-!build/sdk/agent_context_sdk-0.3.2-py3-none-any.whl
+!build/sdk/*.whl
 **/__pycache__
