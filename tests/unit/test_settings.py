@@ -325,3 +325,26 @@ def test_mcp_token_hmac_key_must_be_long_and_never_leak() -> None:
 def test_mcp_cache_and_rate_limit_are_bounded(override: dict[str, float]) -> None:
     with pytest.raises(ValidationError):
         Settings(mcp=override)
+
+
+def test_indexer_confinement_settings_default_closed_and_load_from_environment(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    settings = Settings()
+    assert settings.indexer_allow_unconfined_adapters is False
+    assert settings.indexer_checkout_roots == ("/work",)
+
+    monkeypatch.setenv("AGENT_CONTEXT_INDEXER_ALLOW_UNCONFINED_ADAPTERS", "true")
+    monkeypatch.setenv("AGENT_CONTEXT_INDEXER_CHECKOUT_ROOTS", '["/work"]')
+    settings = Settings()
+    assert settings.indexer_allow_unconfined_adapters is True
+    assert settings.indexer_checkout_roots == ("/work",)
+
+    monkeypatch.setenv("AGENT_CONTEXT_INDEXER_CHECKOUT_ROOTS", "[]")
+    with pytest.raises(ValidationError):
+        Settings()
+
+    monkeypatch.setenv("AGENT_CONTEXT_INDEXER_CHECKOUT_ROOTS", '["/work"]')
+    monkeypatch.setenv("AGENT_CONTEXT_INDEXER_ALLOW_UNCONFINED_ADAPTERS", "maybe")
+    with pytest.raises(ValidationError):
+        Settings()

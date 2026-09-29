@@ -178,3 +178,54 @@ def test_killing_the_supervisor_does_not_wedge_nproc(image: str) -> None:
     )
     result = _run(image, code)
     assert result.stdout.split() == ["benign-ok", "0", "0"], result.stderr[-500:]
+
+
+_PEEK = (
+    "import os\n"
+    "for attempt in (lambda: open('/work/secret.txt', 'rb').read(1), lambda: os.listdir('/work')):\n"
+    "    try:\n"
+    "        attempt()\n"
+    "        print('READ')\n"
+    "    except OSError as error:\n"
+    "        print(error.errno)\n"
+)
+
+
+def test_landlock_is_available_under_the_default_seccomp_profile(image: str) -> None:
+    """Docker's default profile allows landlock_*; if it ever does not, INFRA-040 must add them."""
+    code = (
+        "from agent_context_platform.indexing.tree_sitter import landlock\n"
+        "print(landlock.abi_version() >= 1)\n"
+    )
+    result = _run(image, code)
+    assert result.stdout.strip() == "True", (
+        "Landlock unavailable in the container: the host kernel lacks it or seccomp blocks "
+        "landlock_create_ruleset/landlock_add_rule/landlock_restrict_self. " + result.stderr[-300:]
+    )
+
+
+def test_hostile_adapter_cannot_open_the_mounted_checkout(image: str, tmp_path: Path) -> None:
+    """The adapter runs as the same UID and the checkout is mounted read-only and readable.
+
+    The control (the same code, no runner) proves the mount is readable by UID 10001, so
+    the EACCES (13) of the confined run comes from Landlock, not from file permissions.
+    """
+    checkout = tmp_path / "checkout"
+    checkout.mkdir()
+    (checkout / "secret.txt").write_text("TOKEN=hunter2\n")
+    checkout.chmod(0o755)
+    (checkout / "secret.txt").chmod(0o644)
+    mount = ("--mount", f"type=bind,src={checkout},dst=/work,readonly")
+
+    control = _run(image, _PEEK, *mount)
+    assert control.stdout.split() == ["READ", "READ"], control.stderr[-500:]
+
+    confined = (
+        "from agent_context_platform.indexing.tree_sitter.runner import Limits, _run\n"
+        f"peek = {_PEEK!r}\n"
+        "out = _run(['/usr/local/bin/python', '-c', peek], b'', "
+        "Limits(checkout_roots=('/work',)), {})\n"
+        "print(out.decode())\n"
+    )
+    result = _run(image, confined, *mount)
+    assert result.stdout.split() == ["13", "13"], result.stderr[-500:]
