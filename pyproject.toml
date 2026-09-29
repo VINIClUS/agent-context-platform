@@ -49,6 +49,7 @@ addopts = [
 ]
 testpaths = ["tests"]
 markers = [
+    "container: builds the indexer image and runs it with the documented flags (needs Docker)",
     "unit: isolated tests without external services",
     "integration: tests that cross process or datastore boundaries",
     "contract: tests for public API and schema compatibility",
