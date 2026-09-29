@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import time
 import uuid
 from pathlib import Path
 
@@ -14,6 +15,7 @@ from agent_context_platform.indexing.scip import (
     SemanticIndex,
     evidence_outranks,
     import_scip,
+    is_valid_symbol,
 )
 from agent_context_platform.indexing.scip_pb import scip_pb2
 
@@ -387,3 +389,127 @@ def test_ranking_rejects_kinds_outside_semantic_evidence() -> None:
         evidence_outranks("git", 1.0, "scip", 1.0)
     with pytest.raises(ValueError, match="confidence"):
         evidence_outranks("scip", 1.5, "tree_sitter", 0.5)
+
+
+def test_symbols_of_the_real_index_follow_the_grammar() -> None:
+    index = scip_pb2.Index()
+    index.ParseFromString(fixture("scip-python-basic.scip"))
+    symbols = {o.symbol for d in index.documents for o in d.occurrences if o.symbol}
+    symbols |= {i.symbol for d in index.documents for i in d.symbols}
+    symbols |= {i.symbol for i in index.external_symbols}
+
+    assert len(symbols) > 15
+    assert all(is_valid_symbol(symbol) for symbol in symbols)
+
+
+@pytest.mark.parametrize(
+    "symbol",
+    [
+        "scip-python python pkg 1.0 a/f().",
+        "scip-python python pkg 1.0 `a b`/C#m(x).(p)",
+        "scheme  with  spaces mgr  x . 1 a/b.[T]",
+        "s . . . `a``b`.",
+        "s m n v ns/Type#term.meta:macro!",
+        "local 12",
+    ],
+)
+def test_valid_symbols(symbol: str) -> None:
+    assert is_valid_symbol(symbol)
+
+
+@pytest.mark.parametrize(
+    "symbol",
+    [
+        "garbage",
+        "",
+        "s m n v ",  # missing descriptor
+        "s m n",
+        "local",
+        "local a b",
+        "localx m n v a/",  # scheme must not start with local
+        "s m n v `a`b`/",  # bad escape: lone backtick inside an escaped name
+        "s m n v `unterminated/",
+        "s m n v ``/",  # empty escaped name
+        "s m n v f(x/",  # unbalanced parentheses
+        "s m n v f(.",
+        "s m n v (x.",
+        "s m n v [T.",
+        "s m n v f()",  # method needs the trailing dot
+        "s m n v name",  # no descriptor suffix
+        "s m n v a/\x00",
+    ],
+)
+def test_invalid_symbols(symbol: str) -> None:
+    assert not is_valid_symbol(symbol)
+
+
+@pytest.mark.parametrize(
+    "symbol",
+    [
+        "s m n v " + "(" * 1_000_000,
+        "s m n v " + "`" * 1_000_001,
+        "s m n v " + "a(" * 500_000,
+        " " * 1_000_000,
+        "s" + " " * 1_000_000,
+        "s m n v " + "a/" * 500_000 + "b",
+        "s m n v " + "``" * 500_000,
+    ],
+)
+def test_symbol_parsing_is_bounded_in_time(symbol: str) -> None:
+    started = time.perf_counter()
+    is_valid_symbol(symbol)
+    assert time.perf_counter() - started < 1.0
+
+
+def test_import_drops_ungrammatical_global_symbols() -> None:
+    doc = document(text="abc")
+    add(doc, [0, 0, 1], symbol="garbage", roles=1)
+    add(doc, [0, 0, 1], symbol="s m n v f(x/")
+    info = doc.symbols.add()
+    info.symbol = "garbage"
+    related = doc.symbols.add()
+    related.symbol = GLOBAL
+    related.relationships.add().symbol = "garbage"
+    result = run(build(doc))
+
+    assert result.documents[0].occurrences == ()
+    assert [s.symbol for s in result.documents[0].symbols] == [GLOBAL]
+    assert result.documents[0].symbols[0].relationships == ()
+    assert codes(result) == ["invalid_symbol"] * 4
+
+
+def test_local_relationship_target_uses_the_declared_kind() -> None:
+    doc = document(text="abc")
+    add(doc, [0, 0, 1], symbol="local 1", roles=1)
+    local = doc.symbols.add()
+    local.symbol = "local 1"
+    local.kind = scip_pb2.SymbolInformation.Class
+    owner = doc.symbols.add()
+    owner.symbol = GLOBAL
+    owner.relationships.add().symbol = "local 1"
+    file_ids = {"src/a.py": uuid.UUID(int=9)}
+    result = run(build(doc), file_logical_ids=file_ids)
+
+    kept = result.documents[0]
+    by_symbol = {s.symbol: s for s in kept.symbols}
+    (edge,) = by_symbol[GLOBAL].relationships
+    node_id = by_symbol["local 1"].symbol_id
+    assert by_symbol["local 1"].kind == "Class"
+    assert edge.target_id == node_id == kept.occurrences[0].symbol_id
+    assert node_id == identity.symbol_fallback_id(
+        REPO, "python", file_ids["src/a.py"], "local 1", "Class"
+    )
+
+
+def test_empty_source_text_has_no_valid_range() -> None:
+    doc = document(text="unused")
+    add(doc, [0, 0, 0])
+    add(doc, [0, 0, 1])
+    result = run(build(doc), sources={"src/a.py": ""})
+
+    assert result.documents[0].occurrences == ()
+    assert codes(result) == ["out_of_document_range"] * 2
+    # No text at all (neither supplied nor in the index) means structure only.
+    absent = document(text="")
+    add(absent, [0, 0, 0])
+    assert codes(run(build(absent))) == []

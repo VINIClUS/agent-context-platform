@@ -359,6 +359,8 @@ class _Importer:
         self._file_ids = file_ids
         self._sources = sources
         self.diagnostics: list[ImportDiagnostic] = []
+        # The one resolver of local fallback IDs: kinds declared by the current document.
+        self._declared_kinds: dict[str, str] = {}
         self._ids: dict[tuple[str, uuid.UUID | None, str], uuid.UUID] = {}
 
     def diagnose(self, code: DiagnosticCode, path: str | None, index: int | None = None) -> None:
@@ -371,11 +373,14 @@ class _Importer:
         if len(document.symbols) > limits.max_symbols_per_document:
             raise ScipImportError("too_many_symbols")
         file_id = self._file_ids.get(path)
-        kinds = {info.symbol: _kind_name(info) for info in document.symbols}
-        bounds = _Bounds(self._sources.get(path, document.text), document.position_encoding)
+        self._declared_kinds = {info.symbol: _kind_name(info) for info in document.symbols}
+        # Only a caller-supplied source or non-empty Document.text is known text; proto3
+        # cannot tell an absent Document.text from an empty one.
+        text = self._sources.get(path, document.text or None)
+        bounds = _Bounds(text, document.position_encoding)
         occurrences: list[SemanticOccurrence] = []
         for position, occurrence in enumerate(document.occurrences):
-            item = self._occurrence(occurrence, position, path, document, file_id, kinds, bounds)
+            item = self._occurrence(occurrence, position, path, document, file_id, bounds)
             if item is not None:
                 occurrences.append(item)
         symbols = tuple(
@@ -399,7 +404,6 @@ class _Importer:
         path: str,
         document: scip_pb2.Document,
         file_id: uuid.UUID | None,
-        kinds: Mapping[str, str],
         bounds: _Bounds,
     ) -> SemanticOccurrence | None:
         located = _range(occurrence)
@@ -419,7 +423,6 @@ class _Importer:
             occurrence.symbol,
             document.language,
             file_id,
-            kinds.get(occurrence.symbol, _UNKNOWN_KIND),
             path,
             position,
         )
@@ -440,16 +443,16 @@ class _Importer:
         symbol: str,
         language: str,
         file_id: uuid.UUID | None,
-        kind: str,
         path: str | None,
         position: int | None,
     ) -> uuid.UUID | None:
         """Logical ID of ``symbol``, or None (with a diagnostic) when it cannot be identified."""
-        if not _valid_symbol(symbol):
-            self.diagnose("invalid_symbol", path, position)
-            return None
         if len(symbol.encode("utf-8")) > self._limits.max_symbol_length:
             raise ScipImportError("symbol_too_long")
+        if not is_valid_symbol(symbol):
+            self.diagnose("invalid_symbol", path, position)
+            return None
+        kind = self._declared_kinds.get(symbol, _UNKNOWN_KIND)
         if symbol.startswith("local ") and file_id is None:
             if path is None:  # external symbols are global by definition
                 self.diagnose("invalid_symbol", path, position)
@@ -479,12 +482,12 @@ class _Importer:
         if len(info.relationships) > self._limits.max_relationships_per_symbol:
             raise ScipImportError("too_many_relationships")
         kind = _kind_name(info)
-        symbol_id = self._identify(info.symbol, language, file_id, kind, path, None)
+        symbol_id = self._identify(info.symbol, language, file_id, path, None)
         if symbol_id is None:
             return None
         relationships: list[SemanticRelationship] = []
         for related in info.relationships:
-            target_id = self._identify(related.symbol, language, file_id, _UNKNOWN_KIND, path, None)
+            target_id = self._identify(related.symbol, language, file_id, path, None)
             if target_id is None:
                 continue
             kinds = _relationship_kinds(related)
@@ -524,11 +527,88 @@ def _signature(info: scip_pb2.SymbolInformation) -> tuple[str, str]:
     return str(signature.language), str(signature.text)  # type: ignore[attr-defined]
 
 
-def _valid_symbol(symbol: str) -> bool:
+_IDENT_CHARS: Final = frozenset(
+    "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789_+-$"
+)
+_SUFFIXES: Final = frozenset("/#.:!")
+
+
+def is_valid_symbol(symbol: str) -> bool:
+    """Whether ``symbol`` follows the SCIP symbol grammar of the vendored ``scip.proto``.
+
+    ``local <simple-identifier>``, or ``<scheme> <manager> <name> <version>
+    <descriptor>+`` where a space inside a field is written as two spaces.
+    Single left-to-right pass, so time is linear in the length and input cannot
+    force backtracking.
+    """
     if not symbol or any(ord(c) < 32 or ord(c) == 127 for c in symbol):
         return False
     if symbol.startswith("local "):
-        return _LOCAL_ID.fullmatch(symbol[len("local ") :]) is not None
+        return _LOCAL_ID.fullmatch(symbol, len("local ")) is not None
+    position = 0
+    for field in range(4):  # scheme, manager, package name, version
+        start = position
+        while position < len(symbol):
+            if symbol[position] != " ":
+                position += 1
+            elif symbol.startswith("  ", position):
+                position += 2
+            else:
+                break
+        if position == start or position >= len(symbol):
+            return False
+        if field == 0 and symbol.startswith("local", start):
+            return False
+        position += 1  # the single separating space
+    return _valid_descriptors(symbol, position)
+
+
+def _name_end(symbol: str, position: int) -> int:
+    """End of an identifier at ``position`` (simple or backtick-escaped), or -1."""
+    size = len(symbol)
+    if position < size and symbol[position] == "`":
+        position += 1
+        start = position
+        while position < size:
+            if symbol[position] == "`":
+                if symbol.startswith("``", position):
+                    position += 2
+                    continue
+                return position + 1 if position > start else -1
+            position += 1
+        return -1
+    start = position
+    while position < size and symbol[position] in _IDENT_CHARS:
+        position += 1
+    return position if position > start else -1
+
+
+def _valid_descriptors(symbol: str, position: int) -> bool:
+    size = len(symbol)
+    if position >= size:
+        return False
+    while position < size:
+        opener = symbol[position]
+        if opener in "([":
+            end = _name_end(symbol, position + 1)
+            if end < 0 or end >= size or symbol[end] != (")" if opener == "(" else "]"):
+                return False
+            position = end + 1
+            continue
+        end = _name_end(symbol, position)
+        if end < 0 or end >= size:
+            return False
+        if symbol[end] in _SUFFIXES:
+            position = end + 1
+        elif symbol[end] == "(":  # method: (<disambiguator>?).
+            close = end + 1
+            while close < size and symbol[close] in _IDENT_CHARS:
+                close += 1
+            if not symbol.startswith(").", close):
+                return False
+            position = close + 2
+        else:
+            return False
     return True
 
 
@@ -604,8 +684,15 @@ def _checked(
 class _Bounds:
     """Whether a range lies inside the document, when its text is known."""
 
-    def __init__(self, text: str, encoding: int) -> None:
-        self._lines = [line.removesuffix("\r") for line in text.split("\n")] if text else None
+    def __init__(self, text: str | None, encoding: int) -> None:
+        # None: text unknown, structure only. "": an empty file has no valid position.
+        self._lines = (
+            None
+            if text is None
+            else [line.removesuffix("\r") for line in text.split("\n")]
+            if text
+            else []
+        )
         self._encoding = encoding
         self._widths: dict[int, int] = {}
 
