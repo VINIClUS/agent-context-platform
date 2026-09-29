@@ -83,15 +83,21 @@ class Clock:
 
     def __init__(self, now: datetime = NOW) -> None:
         self.now = now
+        self._monotonic = 1000.0
 
     def __call__(self) -> datetime:
         return self.now
 
     def advance(self, seconds: float) -> None:
         self.now += timedelta(seconds=seconds)
+        self._monotonic += seconds
+
+    def step_wall_back(self, seconds: float) -> None:
+        """Move only the wall clock backwards (e.g. an NTP step); monotonic time is unaffected."""
+        self.now -= timedelta(seconds=seconds)
 
     def monotonic(self) -> float:
-        return self.now.timestamp()
+        return self._monotonic
 
 
 def token_record(token: str = TOKEN, **overrides: Any) -> McpTokenRecord:
@@ -144,7 +150,11 @@ class AuthHarness:
             max_queue_depth=max_queue_depth,
         )
         self.cache = PrincipalCache(
-            HMAC_KEY, ttl=timedelta(seconds=ttl_seconds), max_entries=8, clock=self.clock
+            HMAC_KEY,
+            ttl=timedelta(seconds=ttl_seconds),
+            max_entries=8,
+            clock=self.clock,
+            monotonic=self.clock.monotonic,
         )
         return McpAuthRuntime(
             authenticator=McpAuthenticator(

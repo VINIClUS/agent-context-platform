@@ -125,7 +125,11 @@ class SqlMcpTokenLookup:
 
 
 class PrincipalCache:
-    """Short-lived, bounded cache of verified principals keyed by ``HMAC(server key, token)``."""
+    """Short-lived, bounded cache of verified principals keyed by ``HMAC(server key, token)``.
+
+    The TTL runs on a monotonic deadline, so a wall-clock step backwards cannot stretch the
+    revocation bound. The token's absolute ``expires_at`` is still compared with wall time.
+    """
 
     def __init__(
         self,
@@ -134,12 +138,14 @@ class PrincipalCache:
         ttl: timedelta,
         max_entries: int,
         clock: Callable[[], datetime],
+        monotonic: Callable[[], float] = time.monotonic,
     ) -> None:
         self._key = key
-        self._ttl = ttl
+        self._ttl_seconds = ttl.total_seconds()
         self._max_entries = max_entries
         self._clock = clock
-        self._entries: dict[bytes, tuple[McpPrincipal, datetime]] = {}
+        self._monotonic = monotonic
+        self._entries: dict[bytes, tuple[McpPrincipal, float]] = {}
 
     def key_for(self, token: str) -> bytes:
         return hmac.new(self._key, token.encode("ascii"), hashlib.sha256).digest()
@@ -148,25 +154,29 @@ class PrincipalCache:
         entry = self._entries.get(cache_key)
         if entry is None:
             return None
-        principal, valid_until = entry
-        if self._clock() >= valid_until:
+        principal, deadline = entry
+        if self._monotonic() >= deadline or self._clock() >= principal.expires_at:
             del self._entries[cache_key]
             return None
         return principal
 
     def put(self, cache_key: bytes, principal: McpPrincipal) -> None:
-        """Cache until ``min(now + ttl, token expiry)``; only successes are ever passed here."""
-        now = self._clock()
-        valid_until = min(now + self._ttl, principal.expires_at)
-        if valid_until <= now:
+        """Cache for ``ttl`` (or until the token expires); only successes are ever passed here."""
+        if self._clock() >= principal.expires_at:
             return
+        now = self._monotonic()
         if len(self._entries) >= self._max_entries and cache_key not in self._entries:
             # Drop expired entries first, then the oldest insertion.
-            for stale in [k for k, (_, until) in self._entries.items() if until <= now]:
+            wall = self._clock()
+            for stale in [
+                k
+                for k, (cached, deadline) in self._entries.items()
+                if deadline <= now or cached.expires_at <= wall
+            ]:
                 del self._entries[stale]
             if len(self._entries) >= self._max_entries:
                 del self._entries[next(iter(self._entries))]
-        self._entries[cache_key] = (principal, valid_until)
+        self._entries[cache_key] = (principal, now + self._ttl_seconds)
 
 
 class TokenBucketLimiter:

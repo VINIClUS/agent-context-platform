@@ -200,6 +200,16 @@ async def test_revocation_takes_effect_within_the_ttl(harness: AuthHarness) -> N
         assert (await discover(client)).status_code == 401  # ttl elapsed: re-verified
 
 
+async def test_wall_clock_stepping_backwards_cannot_extend_the_ttl(harness: AuthHarness) -> None:
+    async with mcp_client(runtime=harness.runtime(ttl_seconds=30)) as client:
+        assert (await discover(client)).status_code == 200
+        harness.records.clear()  # the token is revoked at the source
+
+        harness.clock.advance(31)  # monotonic passes the TTL ...
+        harness.clock.step_wall_back(3600)  # ... while the wall clock jumps an hour back
+        assert (await discover(client)).status_code == 401
+
+
 async def test_cache_never_outlives_token_expiry() -> None:
     harness = AuthHarness()
     harness.add(expires_at=NOW + timedelta(seconds=5))
