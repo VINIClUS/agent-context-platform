@@ -35,7 +35,7 @@ from agent_context_platform.projection.projectors import (
     advance_status,
     assert_link,
     event_order,
-    lock_nodes,
+    lock_event_nodes,
     min_non_null,
     newest_wins,
     node_statement,
@@ -156,17 +156,6 @@ def _base(event: StoredEventV1, status: str) -> dict[str, object]:
 
 async def _session_started(tx: Neo4jTransaction, event: StoredEventV1) -> None:
     payload = SessionStartedV1.model_validate(dict(event.payload))
-    await lock_nodes(
-        tx,
-        [
-            ("Session", session_node_id(payload.session_id)),
-            *(
-                [("Checkout", event.context.checkout_id)]
-                if event.context.checkout_id is not None
-                else []
-            ),
-        ],
-    )
     await tx.run(
         _SESSION_STARTED,
         parameters={
@@ -184,17 +173,6 @@ async def _session_started(tx: Neo4jTransaction, event: StoredEventV1) -> None:
 
 async def _session_ended(tx: Neo4jTransaction, event: StoredEventV1) -> None:
     payload = SessionEndedV1.model_validate(dict(event.payload))
-    await lock_nodes(
-        tx,
-        [
-            ("Session", session_node_id(payload.session_id)),
-            *(
-                [("Checkout", event.context.checkout_id)]
-                if event.context.checkout_id is not None
-                else []
-            ),
-        ],
-    )
     await tx.run(
         _SESSION_ENDED,
         parameters={
@@ -224,13 +202,6 @@ async def _has_turn(
 
 async def _turn_started(tx: Neo4jTransaction, event: StoredEventV1) -> None:
     payload = TurnStartedV1.model_validate(dict(event.payload))
-    await lock_nodes(
-        tx,
-        [
-            ("Session", session_node_id(payload.session_id)),
-            ("Turn", turn_node_id(payload.session_id, payload.turn_id)),
-        ],
-    )
     await tx.run(
         _TURN_STARTED,
         parameters={
@@ -249,13 +220,6 @@ async def _turn_started(tx: Neo4jTransaction, event: StoredEventV1) -> None:
 
 async def _turn_stopped(tx: Neo4jTransaction, event: StoredEventV1) -> None:
     payload = TurnStoppedV1.model_validate(dict(event.payload))
-    await lock_nodes(
-        tx,
-        [
-            ("Session", session_node_id(payload.session_id)),
-            ("Turn", turn_node_id(payload.session_id, payload.turn_id)),
-        ],
-    )
     await tx.run(
         _TURN_STOPPED,
         parameters={
@@ -272,13 +236,6 @@ async def _turn_stopped(tx: Neo4jTransaction, event: StoredEventV1) -> None:
 
 async def _turn_completed(tx: Neo4jTransaction, event: StoredEventV1) -> None:
     payload = TurnCompletedV1.model_validate(dict(event.payload))
-    await lock_nodes(
-        tx,
-        [
-            ("Session", session_node_id(payload.session_id)),
-            ("Turn", turn_node_id(payload.session_id, payload.turn_id)),
-        ],
-    )
     await tx.run(
         _TURN_COMPLETED,
         parameters={
@@ -309,13 +266,6 @@ async def _invoked(
 
 async def _tool_call_started(tx: Neo4jTransaction, event: StoredEventV1) -> None:
     payload = ToolCallStartedV1.model_validate(dict(event.payload))
-    await lock_nodes(
-        tx,
-        [
-            ("Turn", turn_node_id(payload.session_id, payload.turn_id)),
-            ("ToolCall", tool_call_node_id(payload.session_id, payload.tool_call_id)),
-        ],
-    )
     await tx.run(
         _TOOL_CALL_STARTED,
         parameters={
@@ -333,13 +283,6 @@ async def _tool_call_started(tx: Neo4jTransaction, event: StoredEventV1) -> None
 
 async def _tool_call_output_observed(tx: Neo4jTransaction, event: StoredEventV1) -> None:
     payload = ToolCallOutputObservedV1.model_validate(dict(event.payload))
-    await lock_nodes(
-        tx,
-        [
-            ("Turn", turn_node_id(payload.session_id, payload.turn_id)),
-            ("ToolCall", tool_call_node_id(payload.session_id, payload.tool_call_id)),
-        ],
-    )
     await tx.run(
         _TOOL_CALL_OUTPUT_OBSERVED,
         parameters={
@@ -358,13 +301,6 @@ async def _tool_call_output_observed(tx: Neo4jTransaction, event: StoredEventV1)
 
 async def _tool_call_completed(tx: Neo4jTransaction, event: StoredEventV1) -> None:
     payload = ToolCallCompletedV1.model_validate(dict(event.payload))
-    await lock_nodes(
-        tx,
-        [
-            ("Turn", turn_node_id(payload.session_id, payload.turn_id)),
-            ("ToolCall", tool_call_node_id(payload.session_id, payload.tool_call_id)),
-        ],
-    )
     await tx.run(
         _TOOL_CALL_COMPLETED,
         parameters={
@@ -397,6 +333,35 @@ _HANDLERS: Final[dict[str, Callable[[Neo4jTransaction, StoredEventV1], Awaitable
 
 AGENT_EVENT_TYPES: Final = frozenset(_HANDLERS)
 
+_PAYLOADS: Final = {
+    "agent.session.started": SessionStartedV1,
+    "agent.session.ended": SessionEndedV1,
+    "agent.turn.started": TurnStartedV1,
+    "agent.turn.stopped": TurnStoppedV1,
+    "agent.turn.completed": TurnCompletedV1,
+    "agent.tool_call.started": ToolCallStartedV1,
+    "agent.tool_call.output_observed": ToolCallOutputObservedV1,
+    "agent.tool_call.completed": ToolCallCompletedV1,
+}
+
+
+def lock_keys(event: StoredEventV1) -> list[tuple[str, str]]:
+    """Nodes `AgentProjector` touches for `event`, from the same ID helpers it writes with."""
+    kind = event.event_type
+    if kind not in _PAYLOADS:
+        return []
+    payload = _PAYLOADS[kind].model_validate(dict(event.payload))
+    session = payload.session_id
+    if isinstance(payload, SessionStartedV1 | SessionEndedV1):
+        keys = [("Session", session_node_id(session))]
+        if event.context.checkout_id is not None:
+            keys.append(("Checkout", event.context.checkout_id))
+        return keys
+    turn = turn_node_id(session, payload.turn_id)
+    if isinstance(payload, ToolCallStartedV1 | ToolCallOutputObservedV1 | ToolCallCompletedV1):
+        return [("Turn", turn), ("ToolCall", tool_call_node_id(session, payload.tool_call_id))]
+    return [("Session", session_node_id(session)), ("Turn", turn)]
+
 
 class AgentProjector:
     """Projects session, turn and tool-call events by native identifiers."""
@@ -408,4 +373,5 @@ class AgentProjector:
         return event_type in _HANDLERS
 
     async def project(self, tx: Neo4jTransaction, event: StoredEventV1) -> None:
+        await lock_event_nodes(tx, event)
         await _HANDLERS[event.event_type](tx, event)

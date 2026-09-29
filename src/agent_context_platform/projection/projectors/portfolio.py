@@ -16,7 +16,7 @@ from agent_context_platform.projection.neo4j import Neo4jTransaction
 from agent_context_platform.projection.projectors import (
     assert_link,
     event_order,
-    lock_nodes,
+    lock_event_nodes,
     min_non_null,
     newest_wins,
     node_statement,
@@ -54,6 +54,24 @@ _USES_REPOSITORY: Final = relationship_statement(
 )
 
 
+def _repositories(event: StoredEventV1) -> list[str]:
+    ids = {event.context.repository_id}
+    payload_repository = event.payload.get("repository_id")
+    if isinstance(payload_repository, str):
+        ids.add(payload_repository)
+    return sorted(id_ for id_ in ids if id_ is not None)
+
+
+def lock_keys(event: StoredEventV1) -> list[tuple[str, str]]:
+    """Nodes `PortfolioProjector` touches for `event`."""
+    keys = [("Repository", repository_id) for repository_id in _repositories(event)]
+    if event.context.workspace_id is not None:
+        keys.append(("Workspace", event.context.workspace_id))
+    if event.context.project_id is not None:
+        keys.append(("Project", event.context.project_id))
+    return keys if event.event_type in _HANDLED else []
+
+
 class PortfolioProjector:
     """Projects workspace, project and repository from event context."""
 
@@ -64,20 +82,10 @@ class PortfolioProjector:
         return event_type in _HANDLED
 
     async def project(self, tx: Neo4jTransaction, event: StoredEventV1) -> None:
+        await lock_event_nodes(tx, event)
         workspace_id = event.context.workspace_id
         project_id = event.context.project_id
-        repository_ids = {event.context.repository_id}
-        payload_repository = event.payload.get("repository_id")
-        if isinstance(payload_repository, str):
-            repository_ids.add(payload_repository)
-        repositories = sorted(id_ for id_ in repository_ids if id_ is not None)
-
-        locked = [("Repository", repository_id) for repository_id in repositories]
-        if workspace_id is not None:
-            locked.append(("Workspace", workspace_id))
-        if project_id is not None:
-            locked.append(("Project", project_id))
-        await lock_nodes(tx, locked)
+        repositories = _repositories(event)
 
         if event.event_type == _REPOSITORY_OBSERVED_TYPE:
             observed = RepositoryObservedV1.model_validate(dict(event.payload))

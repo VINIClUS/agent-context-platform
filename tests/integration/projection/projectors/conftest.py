@@ -103,8 +103,13 @@ def build_event(
 TRANSACTION_ATTEMPTS = [0]
 
 
-async def project_event(store: Neo4jStore, event: StoredEventV1) -> None:
+async def project_event(
+    store: Neo4jStore, event: StoredEventV1, projectors: Sequence[Projector] = PROJECTORS
+) -> None:
     """Apply one event in its own write transaction, as the runtime does.
+
+    The matching `projectors` run in the given order inside that one transaction,
+    like `ProjectionRunner` running them in registration order.
 
     `TRANSACTION_ATTEMPTS` counts callback runs; the driver re-runs a callback
     only after a transient failure such as a deadlock, so attempts beyond one
@@ -113,7 +118,7 @@ async def project_event(store: Neo4jStore, event: StoredEventV1) -> None:
 
     async def run(tx: Neo4jTransaction) -> None:
         TRANSACTION_ATTEMPTS[0] += 1
-        for projector in PROJECTORS:
+        for projector in projectors:
             if projector.handles(event.event_type):
                 await projector.project(tx, event)
 

@@ -55,6 +55,26 @@ async def lock_nodes(tx: Neo4jTransaction, nodes: Iterable[tuple[str, str]]) -> 
         await tx.run(_LOCK_STATEMENTS[label], parameters={"node_id": node_id})
 
 
+def event_lock_keys(event: StoredEventV1) -> list[tuple[str, str]]:
+    """Sorted `(label, id)` union of the nodes ANY projector touches for `event`.
+
+    `ProjectionRunner` runs the matching projectors in the caller's registration
+    order inside one transaction. Each projector locks this full union first, so
+    the global lock order holds whichever runs first (later locks are no-ops).
+    Each projector derives its part from the same ID helpers it writes with.
+    """
+    # Imported here: the projector modules import this package.
+    from agent_context_platform.projection.projectors import agent, git, portfolio
+
+    keys = {*agent.lock_keys(event), *git.lock_keys(event), *portfolio.lock_keys(event)}
+    return sorted(keys)
+
+
+async def lock_event_nodes(tx: Neo4jTransaction, event: StoredEventV1) -> None:
+    """Lock the union node set of `event`; every projector calls this before writing."""
+    await lock_nodes(tx, event_lock_keys(event))
+
+
 # Appended after `MERGE (...)-[r:TYPE]->(...)`; requires `$event_id`. Both endpoints
 # are already locked by `lock_nodes`, which serializes writers of `r`.
 _ASSERT_RELATIONSHIP: LiteralString = (

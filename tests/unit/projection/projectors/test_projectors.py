@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 from datetime import UTC, datetime, timedelta
 from typing import Any
 from uuid import UUID
@@ -22,6 +23,7 @@ from agent_context_sdk.content import ContentDisposition
 from agent_context_platform.projection.projectors import (
     STATUS_RANKS,
     advance_status,
+    event_lock_keys,
     event_order,
     fill_once,
     min_non_null,
@@ -29,17 +31,20 @@ from agent_context_platform.projection.projectors import (
     relationship_statement,
 )
 from agent_context_platform.projection.projectors.agent import (
+    AGENT_EVENT_TYPES,
     AgentProjector,
     session_node_id,
     tool_call_node_id,
     turn_node_id,
 )
 from agent_context_platform.projection.projectors.git import (
+    GIT_EVENT_TYPES,
     GitProjector,
     branch_node_id,
     commit_node_id,
 )
 from agent_context_platform.projection.projectors.portfolio import PortfolioProjector
+from agent_context_platform.projection.runtime import Projector
 
 PROJECTORS = (PortfolioProjector(), AgentProjector(), GitProjector())
 MOMENT = datetime(2026, 8, 13, 13, 0, 0, 123456, tzinfo=UTC)
@@ -206,3 +211,137 @@ def test_the_graph_only_receives_content_ids() -> None:
     )
     values = {v for _, parameters in _project(event) for v in parameters.values()}
     assert "msg_1" in values
+
+
+_OID_A = "a" * 40
+_OID_B = "b" * 40
+_OID_C = "c" * 40
+_FULL_CONTEXT = {
+    "workspace_id": "ws_1",
+    "project_id": "prj_1",
+    "repository_id": "repo_1",
+    "checkout_id": "co_1",
+    "session_id": "sess_1",
+}
+_IDS = {"session_id": "sess_1", "turn_id": "turn_1"}
+_CALL = {**_IDS, "tool_call_id": "call_1", "tool_name": "Bash"}
+_REPRESENTATIVE_EVENTS = [
+    _event(
+        "git.repository.observed",
+        {"repository_id": "repo_x", "object_format": "sha1", "remote_identities": ["h/o/r"]},
+        context={"workspace_id": "ws_1", "project_id": "prj_1"},
+    ),
+    _event(
+        "git.checkout.observed",
+        {
+            "repository_id": "repo_1",
+            "checkout_id": "co_1",
+            "object_format": "sha1",
+            "head_commit": _OID_A,
+            "branch": "main",
+            "detached": False,
+        },
+        context=_FULL_CONTEXT,
+    ),
+    _event(
+        "git.commit.observed",
+        {
+            "repository_id": "repo_1",
+            "checkout_id": "co_1",
+            "commit_id": _OID_B,
+            "tree_id": _OID_C,
+            "parent_commit_ids": [_OID_A, _OID_C],
+            "authored_at": "2026-08-13T13:00:10Z",
+            "committed_at": "2026-08-13T13:00:11Z",
+            "message_content_id": "msg_1",
+        },
+        context=_FULL_CONTEXT,
+    ),
+    _event(
+        "git.workspace_snapshot.captured",
+        {
+            "snapshot_id": "snap_1",
+            "repository_id": "repo_1",
+            "checkout_id": "co_1",
+            "base_commit": _OID_B,
+            "dirty_patch_sha256": "d" * 64,
+            "modified_content_sha256": ["d" * 64],
+            "untracked_paths": ["notes.md"],
+        },
+        context=_FULL_CONTEXT,
+    ),
+    _event(
+        "agent.session.started",
+        {"source": "codex_hook", "session_id": "sess_1"},
+        context=_FULL_CONTEXT,
+    ),
+    _event(
+        "agent.session.ended",
+        {"source": "codex_hook", "session_id": "sess_1"},
+        context=_FULL_CONTEXT,
+    ),
+    _event("agent.turn.started", {"source": "codex_hook", **_IDS}, context=_FULL_CONTEXT),
+    _event(
+        "agent.turn.stopped",
+        {"source": "codex_hook", **_IDS, "stop_hook_active": False},
+        context=_FULL_CONTEXT,
+    ),
+    _event(
+        "agent.turn.completed",
+        {"source": "codex_otel", **_IDS, "success": True},
+        context=_FULL_CONTEXT,
+    ),
+    _event("agent.tool_call.started", {"source": "codex_hook", **_CALL}, context=_FULL_CONTEXT),
+    _event(
+        "agent.tool_call.output_observed",
+        {"source": "codex_hook", **_CALL, "output_content_id": "out_1"},
+        context=_FULL_CONTEXT,
+    ),
+    _event(
+        "agent.tool_call.completed",
+        {"source": "codex_otel", **_CALL, "success": True, "output_content_id": "out_1"},
+        context=_FULL_CONTEXT,
+    ),
+]
+_MERGED_NODE = re.compile(r"\(\w+:(\w+) \{\w+: \$(\w+)\}\)")
+
+
+def _written_nodes(event: StoredEventV1, projector: Projector) -> set[tuple[str, str]]:
+    """Every `(label, id)` a projector's statements MERGE, read off the recorded Cypher."""
+    tx = RecordingTransaction()
+    asyncio.run(projector.project(tx, event))  # type: ignore[arg-type]
+    return {
+        (label, parameters[param])
+        for query, parameters in tx.statements
+        if "_lock" not in query
+        for label, param in _MERGED_NODE.findall(query)
+    }
+
+
+def test_representative_events_cover_every_projected_event_type() -> None:
+    types = {event.event_type for event in _REPRESENTATIVE_EVENTS}
+    assert types == AGENT_EVENT_TYPES | GIT_EVENT_TYPES | {"git.repository.observed"}
+
+
+@pytest.mark.parametrize("event", _REPRESENTATIVE_EVENTS, ids=lambda e: e.event_type)
+def test_event_lock_keys_cover_every_node_each_projector_writes(event: StoredEventV1) -> None:
+    locked = event_lock_keys(event)
+    assert locked == sorted(set(locked))
+    handlers = [projector for projector in PROJECTORS if projector.handles(event.event_type)]
+    assert handlers
+    for projector in handlers:
+        written = _written_nodes(event, projector)
+        assert written <= set(locked), (projector.name, written - set(locked))
+
+
+@pytest.mark.parametrize("event", _REPRESENTATIVE_EVENTS, ids=lambda e: e.event_type)
+def test_every_projector_locks_the_same_full_set_first(event: StoredEventV1) -> None:
+    locked = event_lock_keys(event)
+    for projector in PROJECTORS:
+        if not projector.handles(event.event_type):
+            continue
+        tx = RecordingTransaction()
+        asyncio.run(projector.project(tx, event))  # type: ignore[arg-type]
+        first = [p["node_id"] for q, p in tx.statements[: len(locked)]]
+        assert all("_lock" in q for q, _ in tx.statements[: len(locked)]), projector.name
+        assert first == [node_id for _, node_id in locked], projector.name

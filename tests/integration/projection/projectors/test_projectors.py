@@ -14,6 +14,10 @@ from agent_context_sdk import StoredEventV1
 
 from agent_context_platform.projection.neo4j import Neo4jStore, Neo4jTransaction
 from agent_context_platform.projection.projectors import lock_nodes
+from agent_context_platform.projection.projectors.agent import AgentProjector
+from agent_context_platform.projection.projectors.git import GitProjector
+from agent_context_platform.projection.projectors.portfolio import PortfolioProjector
+from agent_context_platform.projection.runtime import Projector
 
 from ..conftest import neo4j_integration_settings
 from .conftest import (
@@ -103,13 +107,23 @@ def test_any_delivery_order_and_duplicates_give_the_same_digest() -> None:
     with_graph(body)
 
 
-def test_concurrent_workers_converge_on_the_same_digest() -> None:
+REGISTRATION_ORDERS = {
+    "portfolio-agent-git": (PortfolioProjector(), AgentProjector(), GitProjector()),
+    "git-portfolio-agent": (GitProjector(), PortfolioProjector(), AgentProjector()),
+    "agent-git-portfolio": (AgentProjector(), GitProjector(), PortfolioProjector()),
+}
+
+
+@pytest.mark.parametrize("order", REGISTRATION_ORDERS.values(), ids=REGISTRATION_ORDERS.keys())
+def test_concurrent_workers_converge_without_deadlocks_in_any_registration_order(
+    order: tuple[Projector, ...],
+) -> None:
     async def body(store: Neo4jStore) -> None:
         events = session_events()
         expected = digest(await state_after(store, events))
         await wipe_projected_graph(store)
         TRANSACTION_ATTEMPTS[0] = 0
-        await asyncio.gather(*(project_event(store, event) for event in events * 3))
+        await asyncio.gather(*(project_event(store, event, order) for event in events * 3))
         assert TRANSACTION_ATTEMPTS[0] == len(events) * 3, "a transaction was retried (deadlock)"
         assert digest(await graph_state(store)) == expected
 

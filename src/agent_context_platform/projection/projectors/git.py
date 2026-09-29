@@ -28,7 +28,7 @@ from agent_context_platform.projection.projectors import (
     assert_link,
     event_order,
     fill_once,
-    lock_nodes,
+    lock_event_nodes,
     min_non_null,
     newest_wins,
     node_statement,
@@ -99,11 +99,6 @@ _SESSION_PRODUCED_COMMIT: Final = relationship_statement(
 )
 
 
-def _session_node(event: StoredEventV1) -> list[tuple[str, str]]:
-    session_id = event.context.session_id
-    return [] if session_id is None else [("Session", session_id)]
-
-
 async def _checkout_observed(tx: Neo4jTransaction, event: StoredEventV1) -> None:
     payload = CheckoutObservedV1.model_validate(dict(event.payload))
     checkout = payload.checkout_id
@@ -111,20 +106,6 @@ async def _checkout_observed(tx: Neo4jTransaction, event: StoredEventV1) -> None
         branch_node_id(payload.repository_id, payload.branch)
         if payload.branch is not None
         else None
-    )
-    head = (
-        commit_node_id(payload.repository_id, payload.head_commit)
-        if payload.head_commit is not None
-        else None
-    )
-    await lock_nodes(
-        tx,
-        [
-            ("Checkout", checkout),
-            ("Repository", payload.repository_id),
-            *([("Branch", branch)] if branch is not None else []),
-            *([("Commit", head)] if head is not None else []),
-        ],
     )
     await tx.run(
         _CHECKOUT_OBSERVED,
@@ -171,16 +152,6 @@ async def _stub_commit(
 async def _commit_observed(tx: Neo4jTransaction, event: StoredEventV1) -> None:
     payload = CommitObservedV1.model_validate(dict(event.payload))
     commit = commit_node_id(payload.repository_id, payload.commit_id)
-    parents = [commit_node_id(payload.repository_id, oid) for oid in payload.parent_commit_ids]
-    await lock_nodes(
-        tx,
-        [
-            ("Commit", commit),
-            ("Repository", payload.repository_id),
-            *(("Commit", parent) for parent in parents),
-            *_session_node(event),
-        ],
-    )
     await tx.run(
         _COMMIT_OBSERVED,
         parameters={
@@ -204,20 +175,6 @@ async def _commit_observed(tx: Neo4jTransaction, event: StoredEventV1) -> None:
 async def _snapshot_captured(tx: Neo4jTransaction, event: StoredEventV1) -> None:
     payload = WorkspaceSnapshotCapturedV1.model_validate(dict(event.payload))
     snapshot = payload.snapshot_id
-    await lock_nodes(
-        tx,
-        [
-            ("WorkspaceSnapshot", snapshot),
-            ("Checkout", payload.checkout_id),
-            ("Repository", payload.repository_id),
-            *(
-                [("Commit", commit_node_id(payload.repository_id, payload.base_commit))]
-                if payload.base_commit is not None
-                else []
-            ),
-            *_session_node(event),
-        ],
-    )
     await tx.run(
         _SNAPSHOT,
         parameters={
@@ -247,6 +204,43 @@ _HANDLERS: Final[dict[str, Callable[[Neo4jTransaction, StoredEventV1], Awaitable
 GIT_EVENT_TYPES: Final = frozenset(_HANDLERS)
 
 
+def lock_keys(event: StoredEventV1) -> list[tuple[str, str]]:
+    """Nodes `GitProjector` touches for `event`, from the same ID helpers it writes with."""
+    kind = event.event_type
+    session = event.context.session_id
+    keys = [] if session is None else [("Session", session)]
+    if kind == "git.checkout.observed":
+        checkout = CheckoutObservedV1.model_validate(dict(event.payload))
+        repository = checkout.repository_id
+        keys += [("Checkout", checkout.checkout_id), ("Repository", repository)]
+        if checkout.branch is not None:
+            keys.append(("Branch", branch_node_id(repository, checkout.branch)))
+        if checkout.head_commit is not None:
+            keys.append(("Commit", commit_node_id(repository, checkout.head_commit)))
+        return keys
+    if kind == "git.commit.observed":
+        commit = CommitObservedV1.model_validate(dict(event.payload))
+        repository = commit.repository_id
+        keys += [
+            ("Commit", commit_node_id(repository, commit.commit_id)),
+            ("Repository", repository),
+        ]
+        keys += [("Commit", commit_node_id(repository, oid)) for oid in commit.parent_commit_ids]
+        return keys
+    if kind == "git.workspace_snapshot.captured":
+        snapshot = WorkspaceSnapshotCapturedV1.model_validate(dict(event.payload))
+        repository = snapshot.repository_id
+        keys += [
+            ("WorkspaceSnapshot", snapshot.snapshot_id),
+            ("Checkout", snapshot.checkout_id),
+            ("Repository", repository),
+        ]
+        if snapshot.base_commit is not None:
+            keys.append(("Commit", commit_node_id(repository, snapshot.base_commit)))
+        return keys
+    return []
+
+
 class GitProjector:
     """Projects checkout, workspace snapshot and commit events."""
 
@@ -257,4 +251,5 @@ class GitProjector:
         return event_type in _HANDLERS
 
     async def project(self, tx: Neo4jTransaction, event: StoredEventV1) -> None:
+        await lock_event_nodes(tx, event)
         await _HANDLERS[event.event_type](tx, event)
