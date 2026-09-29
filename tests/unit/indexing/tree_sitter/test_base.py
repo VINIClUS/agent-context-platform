@@ -3,11 +3,15 @@
 from __future__ import annotations
 
 import base64
+import contextlib
 import io
 import json
 import os
+import resource
+import signal
 import sys
 import time
+import uuid
 from collections.abc import Callable
 from pathlib import Path
 from typing import Any
@@ -124,6 +128,8 @@ def test_required_symbol_fields(missing: str) -> None:
         {"signature": "s" * (base.MAX_SIGNATURE_BYTES + 1)},
         {"signature": "é" * base.MAX_SIGNATURE_BYTES},
         {"disambiguator": "d" * (base.MAX_DISAMBIGUATOR_BYTES + 1)},
+        {"disambiguator": "a b"},
+        {"disambiguator": "/etc/passwd"},
         {"kind": "Function"},
         {"kind": "function\n"},
         {"signature_digest": "ABC"},
@@ -222,7 +228,7 @@ def test_dangling_relation_endpoints() -> None:
     refused(StructuralErrorCode.DANGLING_RELATION, module(relations=[relation("a", "ghost")]))
     refused(StructuralErrorCode.DANGLING_RELATION, module(relations=[relation("ghost", "a")]))
     ok = module(
-        [symbol(), symbol(ref="b", qualified_name="pkg.mod.b")], relations=[relation("a", "b")]
+        [symbol(), symbol(ref="b", qualified_name="pkg.mod.return")], relations=[relation("a", "b")]
     )
     assert validate_module(request(), ok, expected_fingerprint=FINGERPRINT)
 
@@ -230,7 +236,8 @@ def test_dangling_relation_endpoints() -> None:
 def test_duplicate_symbols_are_refused() -> None:
     refused(StructuralErrorCode.DUPLICATE_SYMBOL, module([symbol(), symbol(ref="b")]))
     refused(
-        StructuralErrorCode.DUPLICATE_SYMBOL, module([symbol(), symbol(qualified_name="pkg.mod.b")])
+        StructuralErrorCode.DUPLICATE_SYMBOL,
+        module([symbol(), symbol(qualified_name="pkg.mod.return")]),
     )
     distinct = module([symbol(), symbol(ref="b", disambiguator="2")])
     assert validate_module(request(), distinct, expected_fingerprint=FINGERPRINT)
@@ -240,7 +247,7 @@ def test_count_bounds(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(base, "MAX_SYMBOLS_PER_FILE", 1)
     refused(
         StructuralErrorCode.COUNT_EXCEEDED,
-        module([symbol(), symbol(ref="b", qualified_name="pkg.mod.b")]),
+        module([symbol(), symbol(ref="b", qualified_name="pkg.mod.return")]),
     )
     monkeypatch.setattr(base, "MAX_RELATIONS_PER_FILE", 0)
     relation = {
@@ -496,3 +503,170 @@ def test_readonly_environment_falls_back_to_root_cwd(monkeypatch: pytest.MonkeyP
 
     monkeypatch.setattr(runner.tempfile, "mkdtemp", refuse)
     assert isinstance(outcome("ok"), ParsedModule)
+
+
+# --- output text confinement ------------------------------------------------------------
+
+PY_SOURCE = (
+    b"from typing import Any\n\n"
+    b"class Repo:\n"
+    b"    def fetch(self, key: str, default: Any = None) -> Any:\n"
+    b"        return default\n"
+)
+TS_SOURCE = (
+    b"export class Store<T> {\n"
+    b"  get(id: string,\n      fallback?: T): T | undefined {\n    return fallback;\n  }\n}\n"
+    b"namespace Util { export function wrap() {} }\n"
+)
+
+
+def confined(content: bytes, path: str, symbols: list[dict[str, Any]]) -> None:
+    candidate = module(symbols, path=path)
+    validate_module(request(content, path), candidate, expected_fingerprint=FINGERPRINT)
+
+
+def test_realistic_python_and_typescript_names_and_signatures_pass() -> None:
+    fetch = PY_SOURCE.index(b"def fetch")
+    end = PY_SOURCE.index(b"Any:\n", fetch) + 4
+    confined(
+        PY_SOURCE,
+        "src/repo/store.py",
+        [
+            symbol(
+                qualified_name="repo.store.Repo",
+                kind="class",
+                start_byte=PY_SOURCE.index(b"class"),
+                end_byte=len(PY_SOURCE),
+                signature="class Repo",
+            ),
+            symbol(
+                ref="m",
+                qualified_name="repo.store.Repo.fetch",
+                start_byte=fetch,
+                end_byte=end,
+                signature="def fetch(self, key: str, default: Any = None) -> Any",
+            ),
+        ],
+    )
+    start = TS_SOURCE.index(b"get(")
+    confined(
+        TS_SOURCE,
+        "lib/store.ts",
+        [
+            symbol(
+                qualified_name="store::Store#get",
+                start_byte=start,
+                end_byte=TS_SOURCE.index(b"{\n    return"),
+                signature="get(id: string, fallback?: T): T | undefined",
+            ),
+            symbol(
+                ref="w",
+                qualified_name="Util.wrap",
+                start_byte=TS_SOURCE.index(b"namespace"),
+                end_byte=len(TS_SOURCE) - 1,
+                signature="export function wrap()",
+            ),
+        ],
+    )
+
+
+@pytest.mark.parametrize(
+    "override",
+    [
+        {"qualified_name": "root:x:0:0:root"},
+        {"qualified_name": "pkg.mod.etc/passwd"},
+        {"qualified_name": "pkg.zzz_secret_token"},
+        {"signature": "DB_PASSWORD=hunter2"},
+        {"signature": "def a() # smuggled"},
+    ],
+)
+def test_text_not_in_the_parsed_file_is_refused(override: dict[str, Any]) -> None:
+    refused(StructuralErrorCode.TEXT_NOT_IN_SOURCE, module([symbol(**override)]))
+
+
+def test_signature_must_come_from_the_symbols_own_range() -> None:
+    other = b"def a():\n    pass\n\ndef zed(secretish: int) -> None:\n    pass\n"
+    zed = other.index(b"def zed")
+    inside = symbol(
+        qualified_name="pkg.mod.zed",
+        start_byte=zed,
+        end_byte=len(other),
+        signature="def zed(secretish: int) -> None",
+    )
+    confined(other, "pkg/mod.py", [inside])
+    outside = {**inside, "start_byte": 0, "end_byte": 8}
+    with pytest.raises(StructuralError) as caught:
+        validate_module(request(other), module([outside]), expected_fingerprint=FINGERPRINT)
+    assert caught.value.code is StructuralErrorCode.TEXT_NOT_IN_SOURCE
+
+
+def test_too_many_unverifiable_segments_fail_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(base, "MAX_UNCHECKED_SEGMENTS", 1)
+    refused(StructuralErrorCode.COUNT_EXCEEDED, module([symbol(qualified_name="pkg.mod.ef.:.ac")]))
+
+
+def test_text_segments_from_path_and_whitespace_only_signature() -> None:
+    ok = module([symbol(qualified_name="pkg.mod", signature="")])
+    assert validate_module(request(), ok, expected_fingerprint=FINGERPRINT)
+    spaced = module([symbol(signature="def   a()")])
+    assert validate_module(request(), spaced, expected_fingerprint=FINGERPRINT)
+
+
+# --- descendants ------------------------------------------------------------------------
+
+
+def _marked(marker: str) -> list[int]:
+    found = []
+    for entry in Path("/proc").iterdir():
+        if not entry.name.isdigit():
+            continue
+        try:
+            argv = (entry / "cmdline").read_bytes().split(b"\0")
+        except OSError:
+            continue
+        if marker.encode() in argv:
+            found.append(int(entry.name))
+    return found
+
+
+def roomy(wall: float = 4.0) -> Limits:
+    """Limits whose NPROC lets a test adapter fork (the dev machine's UID has many tasks)."""
+    hard = resource.getrlimit(resource.RLIMIT_NPROC)[1]
+    return Limits(
+        wall_seconds=wall, cpu_seconds=2, processes=1_000_000 if hard < 0 else min(hard, 1_000_000)
+    )
+
+
+@pytest.fixture
+def marker() -> Any:
+    tag = f"ac-marker-{uuid.uuid4().hex}"
+    yield tag
+    for pid in _marked(tag):
+        with contextlib.suppress(OSError):
+            os.kill(pid, signal.SIGKILL)
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="subreaper is Linux-only")
+@pytest.mark.parametrize("mode", ["setsid_child", "double_fork", "ignore_term"])
+def test_no_descendant_survives_a_successful_run(mode: str, marker: str) -> None:
+    assert isinstance(outcome(mode, marker, limits=roomy()), ParsedModule)
+    assert _marked(marker) == []
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="subreaper is Linux-only")
+def test_no_descendant_survives_a_timeout(marker: str) -> None:
+    result = outcome("hang_with_daemon", marker, limits=roomy(1.5))
+    assert result is StructuralErrorCode.TIMEOUT
+    assert _marked(marker) == []
+
+
+@pytest.mark.skipif(not sys.platform.startswith("linux"), reason="subreaper is Linux-only")
+def test_repeated_daemonizing_runs_leave_nothing(marker: str) -> None:
+    for _ in range(5):
+        assert isinstance(outcome("double_fork", marker, limits=roomy()), ParsedModule)
+    assert _marked(marker) == []
+
+
+def test_non_linux_fails_closed(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(runner.sys, "platform", "darwin")
+    assert outcome("ok") is StructuralErrorCode.SPAWN_FAILED

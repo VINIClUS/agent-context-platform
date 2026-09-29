@@ -21,7 +21,16 @@ errors, never the offending value):
   so identity derivation (``identity.py``) cannot collide;
 - relation endpoints are refs of that file's symbols;
 - every assertion says ``evidence_kind="tree_sitter"`` (design 9.3), no default;
-- counts are bounded.
+- counts are bounded;
+- every free-text field is confined to the parsed file itself, so an adapter that read
+  some other file (``/etc/passwd``, a ``.env``) cannot exfiltrate it through the output:
+  each ``qualified_name`` segment (split on ``.``, ``::``, ``/``, ``#``) occurs in the
+  file's bytes or is a component of its path, ``signature`` (whitespace runs collapsed)
+  is a contiguous run of the whitespace-collapsed text inside the symbol's own byte
+  range, ``disambiguator`` is ``[A-Za-z0-9:._-]{0,64}``, and every other text field
+  (ref, kind, language) is a restricted token. Read isolation is not something the
+  container gives (the adapter shares the indexer's filesystem view); this is the
+  confinement.
 
 Adapter output carries no source text beyond qualified names, ``kind``s,
 ``disambiguator``s and signatures. A signature is bounded to
@@ -37,6 +46,9 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import re
+from array import array
+from bisect import bisect_left
 from collections.abc import Mapping
 from enum import StrEnum
 from typing import Annotated, Any, Final, Literal, Protocol, Self, runtime_checkable
@@ -65,10 +77,12 @@ MAX_SYMBOLS_PER_FILE: Final = 10_000
 MAX_RELATIONS_PER_FILE: Final = 50_000
 MAX_NAME_BYTES: Final = 512
 MAX_SIGNATURE_BYTES: Final = 512
-MAX_DISAMBIGUATOR_BYTES: Final = 64
+MAX_DISAMBIGUATOR_BYTES: Final = 64  # mirrored by _DISAMBIGUATOR
+MAX_UNCHECKED_SEGMENTS: Final = 1024
 
 _DIGEST = r"^[0-9a-f]{64}$"
 _KIND = r"^[a-z][a-z0-9_]{0,31}$"
+_DISAMBIGUATOR = r"^[A-Za-z0-9:._-]{0,64}$"
 _REF = r"^[A-Za-z0-9_.:\-]{1,64}$"
 
 
@@ -91,6 +105,7 @@ class StructuralErrorCode(StrEnum):
     DANGLING_RELATION = "dangling_relation"
     DUPLICATE_SYMBOL = "duplicate_symbol"
     COUNT_EXCEEDED = "count_exceeded"
+    TEXT_NOT_IN_SOURCE = "text_not_in_source"
 
 
 class StructuralError(Exception):
@@ -185,9 +200,7 @@ class ParsedSymbol(BaseModel):
         Text, StringConstraints(min_length=1), AfterValidator(lambda v: _bounded(v, MAX_NAME_BYTES))
     ]
     kind: Kind
-    disambiguator: Annotated[
-        Text, AfterValidator(lambda v: _bounded(v, MAX_DISAMBIGUATOR_BYTES))
-    ] = ""
+    disambiguator: Annotated[str, StringConstraints(pattern=_DISAMBIGUATOR)] = ""
     start_byte: Annotated[int, Field(ge=0)]
     end_byte: Annotated[int, Field(ge=0)]
     signature: Annotated[Text, AfterValidator(lambda v: _bounded(v, MAX_SIGNATURE_BYTES))]
@@ -274,15 +287,72 @@ def validate_module(
             raise StructuralError(StructuralErrorCode.LANGUAGE_MISMATCH)
         if parsed.parser_fingerprint != expected_fingerprint:
             raise StructuralError(StructuralErrorCode.FINGERPRINT_MISMATCH)
-        _validate_file(parsed, len(source.content()))
+        _validate_file(parsed, source.content())
     if seen != set(sources):
         raise StructuralError(StructuralErrorCode.PATH_MISMATCH)
     return module
 
 
-def _validate_file(parsed: ParsedFile, size: int) -> None:
+_SEPARATORS = re.compile(r"::|[./#]")
+_TOKEN = re.compile(rb"[A-Za-z0-9_$\x80-\xff]+")
+_WHITESPACE = re.compile(rb"[ \t\r\n\f\v]+")
+
+
+class _SourceText:
+    """Confinement oracle for one file: what names and signatures may legitimately say."""
+
+    def __init__(self, path: str, content: bytes) -> None:
+        self._content = content
+        self._tokens = set(_TOKEN.findall(content))
+        self._path_parts = {
+            part.encode() for piece in path.split("/") for part in (piece, *piece.split("."))
+        }
+        self._known: set[bytes] = set()
+        self._unchecked = 0
+        # Whitespace-collapsed text, with the original offset of every collapsed byte.
+        pieces: list[bytes] = []
+        offsets = array("I")
+        last = 0
+        for match in _WHITESPACE.finditer(content):
+            self._append(pieces, offsets, content[last : match.start()], last)
+            self._append(pieces, offsets, b" ", match.start())
+            last = match.end()
+        self._append(pieces, offsets, content[last:], last)
+        self._collapsed = b"".join(pieces)
+        self._offsets = offsets
+
+    @staticmethod
+    def _append(pieces: list[bytes], offsets: array[int], chunk: bytes, origin: int) -> None:
+        pieces.append(chunk)
+        offsets.extend(range(origin, origin + len(chunk)))
+
+    def name_ok(self, qualified_name: str) -> bool:
+        for segment in _SEPARATORS.split(qualified_name):
+            raw = segment.encode()
+            if not raw or raw in self._known or raw in self._tokens or raw in self._path_parts:
+                continue
+            self._unchecked += 1
+            if self._unchecked > MAX_UNCHECKED_SEGMENTS:
+                raise StructuralError(StructuralErrorCode.COUNT_EXCEEDED)
+            if raw not in self._content:
+                return False
+            self._known.add(raw)
+        return True
+
+    def signature_ok(self, signature: str, start: int, end: int) -> bool:
+        needle = _WHITESPACE.sub(b" ", signature.encode()).strip()
+        if not needle:
+            return True
+        low = bisect_left(self._offsets, start)
+        high = bisect_left(self._offsets, end)
+        return self._collapsed.find(needle, low, high) != -1
+
+
+def _validate_file(parsed: ParsedFile, content: bytes) -> None:
+    size = len(content)
     if len(parsed.symbols) > MAX_SYMBOLS_PER_FILE or len(parsed.relations) > MAX_RELATIONS_PER_FILE:
         raise StructuralError(StructuralErrorCode.COUNT_EXCEEDED)
+    text = _SourceText(parsed.path, content)
     refs: set[str] = set()
     keys: set[tuple[str, str, str]] = set()
     for symbol in parsed.symbols:
@@ -290,6 +360,10 @@ def _validate_file(parsed: ParsedFile, size: int) -> None:
             raise StructuralError(StructuralErrorCode.LANGUAGE_MISMATCH)
         if symbol.end_byte > size:
             raise StructuralError(StructuralErrorCode.RANGE_OUT_OF_BOUNDS)
+        if not text.name_ok(symbol.qualified_name) or not text.signature_ok(
+            symbol.signature, symbol.start_byte, symbol.end_byte
+        ):
+            raise StructuralError(StructuralErrorCode.TEXT_NOT_IN_SOURCE)
         key = (symbol.qualified_name, symbol.kind, symbol.disambiguator)
         if symbol.ref in refs or key in keys:
             raise StructuralError(StructuralErrorCode.DUPLICATE_SYMBOL)

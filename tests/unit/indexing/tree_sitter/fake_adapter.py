@@ -30,7 +30,7 @@ def symbol(ref: str, name: str, start: int, end: int, **over: object) -> dict[st
         "disambiguator": "",
         "start_byte": start,
         "end_byte": end,
-        "signature": f"def {name}()",
+        "signature": "",
         "signature_digest": digest("sig" + name),
         "semantic_fingerprint": digest("body" + name),
         "evidence_kind": "tree_sitter",
@@ -44,6 +44,27 @@ def emit(document: object) -> None:
     sys.stdout.flush()
 
 
+def spawn_sleepers() -> None:
+    """Leave a sleeping descendant marked by ARG in its argv (escaping the process group)."""
+    ignore = MODE == "ignore_term"
+    if os.fork() != 0:
+        time.sleep(0.5)  # let the descendants exec before the adapter exits
+        return
+    try:
+        if MODE != "ignore_term":
+            os.setsid()
+        if MODE == "double_fork" and os.fork() != 0:
+            os._exit(0)
+        os.closerange(0, 3)
+        if ignore:
+            import signal
+
+            signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        os.execv(sys.executable, [sys.executable, "-c", "import time; time.sleep(600)", ARG])
+    finally:
+        os._exit(1)
+
+
 def main() -> int:
     if MODE == "no_read_hang":
         time.sleep(600)
@@ -54,7 +75,7 @@ def main() -> int:
     file = request["files"][0]
     size = len(base64.b64decode(file["content_b64"]))
     fingerprint = os.environ.get("FAKE_FINGERPRINT", "")
-    good = symbol("a", "pkg.a", 0, min(size, 4))
+    good = symbol("a", "pkg.a", 0, min(size, 8), signature="def a()")
     parsed: dict[str, object] = {
         "path": file["path"],
         "language": file["language"],
@@ -127,6 +148,10 @@ def main() -> int:
     elif MODE == "env":
         if "AGENT_CONTEXT_SECRET" in os.environ:
             return 6
+    elif MODE in ("setsid_child", "double_fork", "ignore_term", "hang_with_daemon"):
+        spawn_sleepers()
+        if MODE == "hang_with_daemon":
+            time.sleep(600)
     elif MODE == "crash":
         return 9
     emit(document)

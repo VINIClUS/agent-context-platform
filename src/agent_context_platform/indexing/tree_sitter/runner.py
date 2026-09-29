@@ -15,9 +15,13 @@ what only a container can provide:
 This runner, per adapter run:
 
 - spawns ``command`` (an absolute argv, never a shell, never untrusted text) as a
-  subprocess in its own session/process group, through an inline ``python -I -S``
-  trampoline that sets the rlimits and ``execv``s the adapter. ``preexec_fn`` is
-  avoided because it is unsafe in threaded parents;
+  subprocess in its own session/process group, under a per-run supervisor (an inline
+  ``python -I -S`` program, ``_SUPERVISOR``). The supervisor is a Linux child
+  subreaper (``PR_SET_CHILD_SUBREAPER``; other platforms fail closed): it forks the
+  adapter with the rlimits, and when the adapter exits, or on SIGTERM, it SIGKILLs and
+  reaps every descendant, including double-forked and ``setsid`` daemons that left
+  the process group, before exiting. ``PDEATHSIG`` is SIGTERM so it still cleans up if
+  the runner dies. ``preexec_fn`` is avoided because it is unsafe in threaded parents;
 - rlimits (``Limits``): ``RLIMIT_AS`` 512 MiB (``RLIMIT_RSS`` is a no-op on Linux),
   ``RLIMIT_CPU`` 10 s, ``RLIMIT_NOFILE`` 32, ``RLIMIT_FSIZE`` 0, ``RLIMIT_NPROC`` 16,
   ``RLIMIT_CORE`` 0 (a core would hold source text);
@@ -31,15 +35,30 @@ This runner, per adapter run:
   (``MAX_OUTPUT_BYTES``) and stderr is bounded and discarded (tracebacks carry
   source). Overflow kills the whole process group. Reads and the write are
   multiplexed, so an adapter that never reads its input cannot deadlock the runner;
-- on every exit path the process group is killed and the child reaped.
+- on every exit path (success, timeout, overflow, error) the supervisor is sent SIGTERM
+  and the process group SIGKILL, both before the supervisor is reaped (``waitid`` with
+  ``WNOWAIT``), so a recycled pgid can never be hit.
 
 Known limits (be honest about them):
 
 - ``RLIMIT_NPROC`` is per real UID and counts threads of every process of that UID.
   It is a fork-bomb brake, not an isolation boundary, and only meaningful for a
   non-root UID (root with ``CAP_SYS_RESOURCE`` ignores it, but the container drops
-  capabilities). With a low limit and a shared UID the adapter simply cannot fork,
-  which is the intent. The backstop is the compose ``pids_limit``.
+  capabilities). The count includes the indexer worker's own threads when they share
+  the UID: with the default of 16 the adapter can fork only while the UID has fewer
+  than 16 tasks, otherwise it simply cannot fork, which fails closed. Size it as
+  (worker threads + adapters in flight + a small margin) for the deployment, or give
+  the adapter runs a dedicated UID. Because the supervisor sweeps descendants,
+  survivors of earlier runs no longer accumulate against it. The backstop is the
+  compose ``pids_limit``.
+- The adapter runs as the same UID as the supervisor, so a compromised parser could
+  signal the supervisor (SIGKILL) and let daemons outlive the run; the container
+  lifecycle and ``pids_limit`` bound that, a distinct UID per run would remove it.
+- Read isolation is NOT provided by the container: the adapter shares the indexer's
+  filesystem view and could read any file the UID can (a ``.env``, ``/etc/passwd``).
+  Confinement is by output validation (``base.validate_module`` only accepts text that
+  occurs in the parsed file itself). PLATFORM-037 and INFRA-040 must still mount only
+  the checkout being indexed, read-only, and no secrets.
 - ``RLIMIT_FSIZE`` 0 stops data being written, yet creating empty files, unlinking
   or renaming is still possible where the filesystem allows it; only the read-only
   root filesystem and the read-only checkout mount prevent that. Outside the
@@ -91,14 +110,81 @@ _CHUNK: Final = 65_536
 _FALLBACK_CWD: Final = "/"
 _DEFAULT_ENV_ALLOWLIST: Final = ("LANG", "LC_ALL")
 
-# Applies the rlimits, then replaces itself with the adapter. Constant source; the
-# limits (JSON) and argv are passed as arguments, never interpolated.
-_TRAMPOLINE: Final = (
-    "import json,os,resource,sys\n"
-    "for name,value in json.loads(sys.argv[1]).items():\n"
-    "    resource.setrlimit(getattr(resource,name),(value,value))\n"
-    "os.execv(sys.argv[2],sys.argv[2:])\n"
-)
+# Per-run supervisor (constant source; limits JSON and argv arrive as arguments, never
+# interpolated). It becomes a child subreaper, so every descendant of the adapter that
+# is orphaned (double fork, setsid daemon) is re-parented to it instead of escaping;
+# forks the adapter with the rlimits; and, once the adapter exits or on SIGTERM, kills
+# and reaps every descendant before it exits itself. PDEATHSIG is SIGTERM (not SIGKILL)
+# so that the supervisor still runs that cleanup if the runner dies.
+_SUPERVISOR: Final = r"""
+import ctypes, json, os, resource, signal, sys, time
+libc = ctypes.CDLL(None, use_errno=True)
+if libc.prctl(36, 1, 0, 0, 0) != 0 or libc.prctl(1, int(signal.SIGTERM), 0, 0, 0) != 0:
+    os._exit(111)
+me = os.getpid()
+if os.getppid() != int(sys.argv[1]):  # runner already gone (PDEATHSIG race)
+    os._exit(111)
+main_status = [None]
+
+def children():
+    found = []
+    for name in os.listdir("/proc"):
+        if not name.isdigit():
+            continue
+        try:
+            with open("/proc/" + name + "/stat", "rb") as handle:
+                data = handle.read()
+        except OSError:
+            continue
+        if int(data[data.rindex(b")") + 2:].split()[1]) == me:
+            found.append(int(name))
+    return found
+
+def sweep():
+    while True:
+        for pid in children():
+            try:
+                os.kill(pid, signal.SIGKILL)
+            except OSError:
+                pass
+        try:
+            while True:
+                pid, status = os.waitpid(-1, os.WNOHANG)
+                if pid == 0:
+                    break
+                if pid == main_child:
+                    main_status[0] = status
+        except ChildProcessError:
+            return
+        time.sleep(0.005)
+
+def on_term(signum, frame):
+    sweep()
+    os._exit(143)
+
+signal.signal(signal.SIGTERM, on_term)
+limits = json.loads(sys.argv[2])
+command = sys.argv[3:]
+main_child = os.fork()
+if main_child == 0:
+    try:
+        for name, value in limits.items():
+            resource.setrlimit(getattr(resource, name), (value, value))
+        os.execv(command[0], command)
+    except BaseException:
+        os._exit(120)
+while True:
+    try:
+        _, status = os.waitpid(main_child, 0)
+        break
+    except InterruptedError:
+        continue
+main_status[0] = status
+sweep()
+code = os.waitstatus_to_exitcode(main_status[0])
+os._exit(code if code >= 0 else 128 - code)
+"""
+_TERM_GRACE_SECONDS: Final = 5.0
 
 
 @dataclass(frozen=True, slots=True)
@@ -190,6 +276,8 @@ def _child_env(extra: Mapping[str, str] | None) -> dict[str, str]:
 
 
 def _run(command: Sequence[str], payload: bytes, limits: Limits, env: dict[str, str]) -> bytes:
+    if not sys.platform.startswith("linux"):
+        raise StructuralError(StructuralErrorCode.SPAWN_FAILED)  # subreaper is Linux-only
     workdir = _make_workdir()
     try:
         argv = [
@@ -197,7 +285,8 @@ def _run(command: Sequence[str], payload: bytes, limits: Limits, env: dict[str, 
             "-I",
             "-S",
             "-c",
-            _TRAMPOLINE,
+            _SUPERVISOR,
+            str(os.getpid()),
             json.dumps(limits.rlimits()),
             *command,
         ]
@@ -217,17 +306,49 @@ def _run(command: Sequence[str], payload: bytes, limits: Limits, env: dict[str, 
         try:
             deadline = time.monotonic() + limits.wall_seconds
             output = _communicate(process, payload, limits, deadline)
-            status = process.wait(timeout=max(deadline - time.monotonic(), 0.01))
-        except subprocess.TimeoutExpired:
-            raise StructuralError(StructuralErrorCode.TIMEOUT) from None
+            if not _exited(process, deadline):
+                raise StructuralError(StructuralErrorCode.TIMEOUT)
         finally:
             _reap(process)
-        if status != 0:
+        if process.returncode != 0:
             raise StructuralError(StructuralErrorCode.NONZERO_EXIT)
         return output
     finally:
         if workdir != _FALLBACK_CWD:
             shutil.rmtree(workdir, ignore_errors=True)
+
+
+def _exited(process: subprocess.Popen[bytes], deadline: float) -> bool:
+    """Wait for the supervisor to exit *without reaping it*, so its pgid cannot be reused."""
+    while True:
+        try:
+            if os.waitid(os.P_PID, process.pid, os.WEXITED | os.WNOHANG | os.WNOWAIT) is not None:
+                return True
+        except ChildProcessError:
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.005)
+
+
+def _reap(process: subprocess.Popen[bytes]) -> None:
+    """Stop every process of the run on every exit path, then reap the supervisor.
+
+    SIGTERM goes to the supervisor alone (not the group) so it can sweep descendants that
+    left the process group; a group SIGKILL afterwards, before the supervisor is reaped,
+    is the fallback and cannot hit a recycled pgid.
+    """
+    if not _exited(process, time.monotonic()):
+        with contextlib.suppress(ProcessLookupError, PermissionError):
+            os.kill(process.pid, signal.SIGTERM)
+        _exited(process, time.monotonic() + _TERM_GRACE_SECONDS)
+    with contextlib.suppress(ProcessLookupError, PermissionError):
+        os.killpg(process.pid, signal.SIGKILL)
+    for stream in (process.stdin, process.stdout, process.stderr):
+        if stream is not None:
+            with contextlib.suppress(OSError):
+                stream.close()
+    process.wait()
 
 
 def _make_workdir() -> str:
@@ -236,17 +357,6 @@ def _make_workdir() -> str:
         return tempfile.mkdtemp(prefix="agent-context-sandbox-")
     except OSError:
         return _FALLBACK_CWD
-
-
-def _reap(process: subprocess.Popen[bytes]) -> None:
-    with contextlib.suppress(ProcessLookupError, PermissionError):
-        os.killpg(process.pid, signal.SIGKILL)
-    for stream in (process.stdin, process.stdout, process.stderr):
-        if stream is not None:
-            with contextlib.suppress(OSError):
-                stream.close()
-    with contextlib.suppress(subprocess.TimeoutExpired):
-        process.wait(timeout=5)
 
 
 def _communicate(

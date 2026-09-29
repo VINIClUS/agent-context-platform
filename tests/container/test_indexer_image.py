@@ -109,3 +109,33 @@ def test_runner_sandbox_works_inside_the_image(image: str) -> None:
         "    print(type(error).__name__, error)\n"
     )
     assert _run(image, code).stdout.split() == ["StructuralError", "nonzero_exit"]
+
+
+def test_daemonizing_adapters_do_not_exhaust_nproc(image: str) -> None:
+    """50 runs, each leaving a setsid daemon, all succeed and leave nothing behind.
+
+    Without the subreaper supervisor about 14 leftovers fill RLIMIT_NPROC=16 for UID 10001
+    and every later run fails with ``nonzero_exit``.
+    """
+    code = (
+        "import os\n"
+        "from agent_context_platform.indexing.tree_sitter.runner import Limits, _run\n"
+        "daemon = 'import os, sys, time\\n'"
+        "'if os.fork() == 0:\\n'"
+        "'    os.setsid(); os.closerange(0, 3); time.sleep(600)\\n'"
+        "'time.sleep(0.2)'\n"
+        "ok = 0\n"
+        "for _ in range(50):\n"
+        "    _run(['/usr/local/bin/python', '-c', daemon, 'ac-daemon-marker'], b'', Limits(), {})\n"
+        "    ok += 1\n"
+        "left = 0\n"
+        "for name in os.listdir('/proc'):\n"
+        "    if name.isdigit() and int(name) != os.getpid():\n"
+        "        try:\n"
+        "            left += b'ac-daemon-marker' in open(f'/proc/{name}/cmdline', 'rb').read()\n"
+        "        except OSError:\n"
+        "            pass\n"
+        "print(ok, left)\n"
+    )
+    result = _run(image, code)
+    assert result.stdout.split() == ["50", "0"], result.stderr[-500:]
