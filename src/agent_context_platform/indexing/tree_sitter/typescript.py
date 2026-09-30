@@ -33,7 +33,11 @@ References (``ParsedFile.references``), all unresolved names, never resolved sym
   qualifier and the second the target; with more than two it cannot be said in protocol 2 (a
   qualifier that is a whole literal must come with a name) and is reported as
   ``references_capped``, as are specifiers that are not dotted identifier paths (``lodash-es``,
-  ``node:fs``, ``./my-file``: a ``-`` or ``:`` is no separator the contract accepts);
+  ``node:fs``, ``./my-file``: a ``-`` or ``:`` is no separator the contract accepts).
+  The name an import binds in this file is ``alias`` (with its own range): ``{a as b}`` is
+  target ``a`` with ``alias="b"``, and a default import, ``* as ns`` and ``import x = require()``
+  are whole-module references carrying the local name as ``alias``. ``export ... from`` binds
+  nothing here, so it has none;
 - ``call`` (confidence ``heuristic``): a call or ``new`` whose callee is a name or a plain
   ``a.b.c`` chain that no same-file symbol answers (``require("x")`` is the name ``require``);
 - ``inherit`` (``syntactic``): an ``extends``/``implements`` target that no same-file class or
@@ -129,7 +133,7 @@ from agent_context_platform.indexing.tree_sitter.runner import Limits, Sandboxed
 LANGUAGE: Final = "typescript"
 ADAPTER_NAME: Final = "agent-context-typescript-tree-sitter"
 # Bump whenever the emitted structure or the fingerprint token stream changes.
-ADAPTER_VERSION: Final = "1"
+ADAPTER_VERSION: Final = "2"
 # Pinned in pyproject.toml/uv.lock; a test asserts these equal the installed distributions,
 # so the child never reads package metadata at run time.
 GRAMMAR_VERSIONS: Final = {
@@ -311,7 +315,7 @@ class _Walk:
     seen: set[tuple[str, str, int, int]] = field(default_factory=set)
     seen_sites: set[tuple[int, str, str]] = field(default_factory=set)
     imports: list[ParsedReference] = field(default_factory=list)
-    seen_imports: set[tuple[int, int, int]] = field(default_factory=set)
+    seen_imports: set[tuple[int, int, int, int]] = field(default_factory=set)
     decorators_at: int = -1
     declarations: dict[int, _Declaration] = field(default_factory=dict)
     wrappers: dict[int, tuple[bytes, ...]] = field(default_factory=dict)
@@ -721,11 +725,18 @@ def _enter_call(walk: _Walk, node: Node) -> None:
 
 
 def _reference(
-    walk: _Walk, name: str, start: int, end: int, qualifier: tuple[str, int, int] | None, level: int
+    walk: _Walk,
+    name: str,
+    start: int,
+    end: int,
+    qualifier: tuple[str, int, int] | None,
+    level: int,
+    alias: tuple[str, int, int] | None = None,
 ) -> None:
     """Module-level import reference; counted against the caps like every other reference."""
-    key = (start, end, -1 if qualifier is None else qualifier[1])
+    key = (start, end, -1 if qualifier is None else qualifier[1], -1 if alias is None else alias[1])
     size = len(name.encode()) + (0 if qualifier is None else len(qualifier[0].encode()))
+    size += 0 if alias is None else len(alias[0].encode())
     if key in walk.seen_imports:
         return
     if len(walk.imports) >= MAX_MODULE_REFERENCES or not walk.budget.take_reference(
@@ -745,10 +756,21 @@ def _reference(
             qualifier=None if qualifier is None else qualifier[0],
             qualifier_start_byte=None if qualifier is None else qualifier[1],
             qualifier_end_byte=None if qualifier is None else qualifier[2],
+            alias=None if alias is None else alias[0],
+            alias_start_byte=None if alias is None else alias[1],
+            alias_end_byte=None if alias is None else alias[2],
             evidence_kind=EVIDENCE_KIND,
             confidence="syntactic",
         )
     )
+
+
+def _local_name(walk: _Walk, node: Node | None) -> tuple[str, int, int] | None:
+    """The identifier that an import binds in this file, with its byte range."""
+    if node is None or node.type != "identifier":
+        return None
+    name = _identifier(walk, node)
+    return None if name is None else (name, node.start_byte, node.end_byte)
 
 
 @dataclass(frozen=True, slots=True)
@@ -795,7 +817,10 @@ def _specifier(walk: _Walk, literal: Node | None) -> _Specifier | None:
     return _Specifier(level, fragment.start_byte, fragment.end_byte, tuple(tokens))
 
 
-def _named_import(walk: _Walk, spec: _Specifier, name: Node | None) -> None:
+def _named_import(
+    walk: _Walk, spec: _Specifier, name: Node | None, alias: Node | None = None
+) -> None:
+    local = _local_name(walk, alias)
     simple = _identifier(walk, name) if name is not None and name.type == "identifier" else None
     if simple is None or name is None:
         return
@@ -807,22 +832,32 @@ def _named_import(walk: _Walk, spec: _Specifier, name: Node | None) -> None:
             name.end_byte,
             (".".join(token[0] for token in spec.tokens), spec.start, spec.end),
             spec.level,
+            local,
         )
     elif spec.level:
-        _reference(walk, simple, name.start_byte, name.end_byte, None, spec.level)
+        _reference(walk, simple, name.start_byte, name.end_byte, None, spec.level, local)
 
 
-def _module_import(walk: _Walk, spec: _Specifier) -> None:
-    """A whole-module import: the specifier itself is the target (see the module docstring)."""
+def _module_import(
+    walk: _Walk, spec: _Specifier, locals_: Sequence[tuple[str, int, int]] = ()
+) -> None:
+    """A whole-module import: the specifier itself is the target (see the module docstring).
+
+    One reference per local name the statement binds to the module (a default import, ``* as
+    ns``, ``import x = require()``); one without an alias for a side-effect import or
+    ``export * from``.
+    """
     tokens = spec.tokens
-    if len(tokens) == 1:
-        text, start, end = tokens[0]
-        _reference(walk, text, start, end, None, spec.level)
-    elif len(tokens) == 2:
-        (first, first_start, first_end), (text, start, end) = tokens
-        _reference(walk, text, start, end, (first, first_start, first_end), spec.level)
-    else:
+    if len(tokens) not in (1, 2):
         walk.capped += 1
+        return
+    for alias in locals_ or (None,):
+        if len(tokens) == 1:
+            text, start, end = tokens[0]
+            _reference(walk, text, start, end, None, spec.level, alias)
+        else:
+            (first, first_start, first_end), (text, start, end) = tokens
+            _reference(walk, text, start, end, (first, first_start, first_end), spec.level, alias)
 
 
 def _enter_module_statement(walk: _Walk, node: Node) -> None:
@@ -843,26 +878,42 @@ def _enter_module_statement(walk: _Walk, node: Node) -> None:
         walk.capped += 1
         return
     whole = True
+    locals_: list[tuple[str, int, int]] = []
     for child in node.children:
         if child.type == "import_clause":
             clause = child
+        elif child.type == "import_require_clause":  # ``import x = require("m")``
+            found = _local_name(walk, child.named_children[0] if child.named_children else None)
+            locals_.extend([found] if found else [])
         elif child.type == "export_clause":
             whole = False
-            for item in child.named_children:
+            for item in child.named_children:  # an export binds nothing here: no alias
                 if item.type == "export_specifier":
                     _named_import(walk, spec, item.child_by_field_name("name"))
     if clause is not None:
         for child in clause.children:
-            if child.type == "named_imports":
+            if child.type == "identifier":  # a default import
+                found = _local_name(walk, child)
+                locals_.extend([found] if found else [])
+            elif child.type == "namespace_import":  # ``* as ns``
+                ns = next((n for n in child.named_children if n.type == "identifier"), None)
+                found = _local_name(walk, ns)
+                locals_.extend([found] if found else [])
+            elif child.type == "named_imports":
                 for item in child.named_children:
                     if item.type == "import_specifier":
-                        _named_import(walk, spec, item.child_by_field_name("name"))
+                        _named_import(
+                            walk,
+                            spec,
+                            item.child_by_field_name("name"),
+                            item.child_by_field_name("alias"),
+                        )
         if any(child.type == "named_imports" for child in clause.children) and all(
             child.type not in ("identifier", "namespace_import") for child in clause.children
         ):
             whole = False
     if whole:
-        _module_import(walk, spec)
+        _module_import(walk, spec, locals_)
 
 
 def _enter(walk: _Walk, node: Node) -> bool:

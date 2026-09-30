@@ -372,6 +372,14 @@ def _shed(parsed: ParsedFile, field: str, dropped: int) -> ParsedFile:
 
 
 def _reference_view(item: ParsedReference, by_ref: dict[str, str]) -> dict[str, Any]:
+    view = _reference_fields(item, by_ref)
+    if item.alias is not None:  # absent when unset, so aliasless goldens stay as they are
+        view["alias"] = item.alias
+        view["alias_range"] = [item.alias_start_byte, item.alias_end_byte]
+    return view
+
+
+def _reference_fields(item: ParsedReference, by_ref: dict[str, str]) -> dict[str, Any]:
     return {
         "source": None if item.source is None else by_ref[item.source],
         "kind": item.kind,

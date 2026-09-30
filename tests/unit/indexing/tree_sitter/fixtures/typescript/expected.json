@@ -3,7 +3,7 @@
   {
    "diagnostics": [],
    "language": "typescript",
-   "parser_fingerprint": "929f06046f63eecf6d84648b76fbb1a3842b8cd2cc99c7bb7425f192f47732cf",
+   "parser_fingerprint": "c6c70b505bb89a65642bb33adfa6c0d22dc0c43562559cafa44fa0528dd5980e",
    "path": "src/esm.mjs",
    "references": [
     {
@@ -67,7 +67,7 @@
   {
    "diagnostics": [],
    "language": "typescript",
-   "parser_fingerprint": "929f06046f63eecf6d84648b76fbb1a3842b8cd2cc99c7bb7425f192f47732cf",
+   "parser_fingerprint": "c6c70b505bb89a65642bb33adfa6c0d22dc0c43562559cafa44fa0528dd5980e",
    "path": "src/index.ts",
    "references": [
     {
@@ -106,7 +106,7 @@
   {
    "diagnostics": [],
    "language": "typescript",
-   "parser_fingerprint": "929f06046f63eecf6d84648b76fbb1a3842b8cd2cc99c7bb7425f192f47732cf",
+   "parser_fingerprint": "c6c70b505bb89a65642bb33adfa6c0d22dc0c43562559cafa44fa0528dd5980e",
    "path": "src/legacy.cjs",
    "references": [
     {
@@ -142,9 +142,31 @@
   {
    "diagnostics": [],
    "language": "typescript",
-   "parser_fingerprint": "929f06046f63eecf6d84648b76fbb1a3842b8cd2cc99c7bb7425f192f47732cf",
+   "parser_fingerprint": "c6c70b505bb89a65642bb33adfa6c0d22dc0c43562559cafa44fa0528dd5980e",
    "path": "src/models.ts",
    "references": [
+    {
+     "alias": "Logger",
+     "alias_range": [
+      50,
+      56
+     ],
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "log",
+     "qualifier_range": [
+      66,
+      69
+     ],
+     "range": [
+      70,
+      76
+     ],
+     "relative_level": 2,
+     "source": null,
+     "target": "logger"
+    },
     {
      "confidence": "heuristic",
      "evidence_kind": "tree_sitter",
@@ -220,23 +242,6 @@
      "relative_level": 1,
      "source": null,
      "target": "Base"
-    },
-    {
-     "confidence": "syntactic",
-     "evidence_kind": "tree_sitter",
-     "kind": "import",
-     "qualifier": "log",
-     "qualifier_range": [
-      66,
-      69
-     ],
-     "range": [
-      70,
-      76
-     ],
-     "relative_level": 2,
-     "source": null,
-     "target": "logger"
     },
     {
      "confidence": "syntactic",
@@ -561,9 +566,91 @@
     }
    ],
    "language": "typescript",
-   "parser_fingerprint": "929f06046f63eecf6d84648b76fbb1a3842b8cd2cc99c7bb7425f192f47732cf",
+   "parser_fingerprint": "c6c70b505bb89a65642bb33adfa6c0d22dc0c43562559cafa44fa0528dd5980e",
    "path": "src/service.ts",
    "references": [
+    {
+     "alias": "b",
+     "alias_range": [
+      96,
+      97
+     ],
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "scope.pkg",
+     "qualifier_range": [
+      109,
+      119
+     ],
+     "range": [
+      91,
+      92
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "a"
+    },
+    {
+     "alias": "def",
+     "alias_range": [
+      84,
+      87
+     ],
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "scope",
+     "qualifier_range": [
+      110,
+      115
+     ],
+     "range": [
+      116,
+      119
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "pkg"
+    },
+    {
+     "alias": "fs",
+     "alias_range": [
+      7,
+      9
+     ],
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      16,
+      18
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "fs"
+    },
+    {
+     "alias": "legacy",
+     "alias_range": [
+      173,
+      179
+     ],
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      191,
+      197
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "legacy"
+    },
     {
      "confidence": "heuristic",
      "evidence_kind": "tree_sitter",
@@ -720,40 +807,6 @@
      "confidence": "syntactic",
      "evidence_kind": "tree_sitter",
      "kind": "import",
-     "qualifier": "scope",
-     "qualifier_range": [
-      110,
-      115
-     ],
-     "range": [
-      116,
-      119
-     ],
-     "relative_level": 0,
-     "source": null,
-     "target": "pkg"
-    },
-    {
-     "confidence": "syntactic",
-     "evidence_kind": "tree_sitter",
-     "kind": "import",
-     "qualifier": "scope.pkg",
-     "qualifier_range": [
-      109,
-      119
-     ],
-     "range": [
-      91,
-      92
-     ],
-     "relative_level": 0,
-     "source": null,
-     "target": "a"
-    },
-    {
-     "confidence": "syntactic",
-     "evidence_kind": "tree_sitter",
-     "kind": "import",
      "qualifier": "scope.pkg",
      "qualifier_range": [
       109,
@@ -766,34 +819,6 @@
      "relative_level": 0,
      "source": null,
      "target": "c"
-    },
-    {
-     "confidence": "syntactic",
-     "evidence_kind": "tree_sitter",
-     "kind": "import",
-     "qualifier": null,
-     "qualifier_range": null,
-     "range": [
-      16,
-      18
-     ],
-     "relative_level": 0,
-     "source": null,
-     "target": "fs"
-    },
-    {
-     "confidence": "syntactic",
-     "evidence_kind": "tree_sitter",
-     "kind": "import",
-     "qualifier": null,
-     "qualifier_range": null,
-     "range": [
-      191,
-      197
-     ],
-     "relative_level": 0,
-     "source": null,
-     "target": "legacy"
     },
     {
      "confidence": "syntactic",
@@ -946,7 +971,7 @@
   {
    "diagnostics": [],
    "language": "typescript",
-   "parser_fingerprint": "929f06046f63eecf6d84648b76fbb1a3842b8cd2cc99c7bb7425f192f47732cf",
+   "parser_fingerprint": "c6c70b505bb89a65642bb33adfa6c0d22dc0c43562559cafa44fa0528dd5980e",
    "path": "src/util.js",
    "references": [
     {
@@ -1126,9 +1151,28 @@
   {
    "diagnostics": [],
    "language": "typescript",
-   "parser_fingerprint": "929f06046f63eecf6d84648b76fbb1a3842b8cd2cc99c7bb7425f192f47732cf",
+   "parser_fingerprint": "c6c70b505bb89a65642bb33adfa6c0d22dc0c43562559cafa44fa0528dd5980e",
    "path": "src/view.tsx",
    "references": [
+    {
+     "alias": "React",
+     "alias_range": [
+      7,
+      12
+     ],
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      19,
+      24
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "react"
+    },
     {
      "confidence": "heuristic",
      "evidence_kind": "tree_sitter",
@@ -1142,20 +1186,6 @@
      "relative_level": 0,
      "source": "src.view.format#function#0",
      "target": "text.toUpperCase"
-    },
-    {
-     "confidence": "syntactic",
-     "evidence_kind": "tree_sitter",
-     "kind": "import",
-     "qualifier": null,
-     "qualifier_range": null,
-     "range": [
-      19,
-      24
-     ],
-     "relative_level": 0,
-     "source": null,
-     "target": "react"
     }
    ],
    "relations": [
