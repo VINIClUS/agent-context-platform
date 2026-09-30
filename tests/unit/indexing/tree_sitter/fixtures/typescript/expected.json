@@ -1,0 +1,1211 @@
+{
+ "files": [
+  {
+   "diagnostics": [],
+   "language": "typescript",
+   "parser_fingerprint": "929f06046f63eecf6d84648b76fbb1a3842b8cd2cc99c7bb7425f192f47732cf",
+   "path": "src/esm.mjs",
+   "references": [
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      80,
+      84
+     ],
+     "relative_level": 0,
+     "source": "src.esm.load#function#0",
+     "target": "read"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "util.js",
+     "qualifier_range": [
+      22,
+      31
+     ],
+     "range": [
+      9,
+      13
+     ],
+     "relative_level": 1,
+     "source": null,
+     "target": "read"
+    }
+   ],
+   "relations": [],
+   "symbols": [
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.esm#module#0",
+     "range": [
+      0,
+      94
+     ],
+     "semantic_fingerprint": "065a1605d6622bd224bbe01b6b8f733f43267735ecbfce183f5dab52812cb112",
+     "signature": "",
+     "signature_digest": "8275fa0191541e90edb42f489021660b0d599d301d3c67a2af0886b538ee5129"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.esm.load#function#0",
+     "range": [
+      34,
+      93
+     ],
+     "semantic_fingerprint": "79679b281657b1ad348bc331492a49d9dcdf72fbdd9155aaad6d49ef046afba7",
+     "signature": "export default function load(name)",
+     "signature_digest": "7ae1a977a97da40d4ade48996aa3412ab949883c8070ba70a9fb84c42198c889"
+    }
+   ]
+  },
+  {
+   "diagnostics": [],
+   "language": "typescript",
+   "parser_fingerprint": "929f06046f63eecf6d84648b76fbb1a3842b8cd2cc99c7bb7425f192f47732cf",
+   "path": "src/index.ts",
+   "references": [
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "service",
+     "qualifier_range": [
+      22,
+      31
+     ],
+     "range": [
+      9,
+      13
+     ],
+     "relative_level": 1,
+     "source": null,
+     "target": "main"
+    }
+   ],
+   "relations": [],
+   "symbols": [
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src#module#0",
+     "range": [
+      0,
+      34
+     ],
+     "semantic_fingerprint": "ec1d63a17e144ba464d6430929206c2f74151cd6bd17a34ba0af0515c4db2115",
+     "signature": "",
+     "signature_digest": "8275fa0191541e90edb42f489021660b0d599d301d3c67a2af0886b538ee5129"
+    }
+   ]
+  },
+  {
+   "diagnostics": [],
+   "language": "typescript",
+   "parser_fingerprint": "929f06046f63eecf6d84648b76fbb1a3842b8cd2cc99c7bb7425f192f47732cf",
+   "path": "src/legacy.cjs",
+   "references": [
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      40,
+      47
+     ],
+     "relative_level": 0,
+     "source": "src.legacy#module#0",
+     "target": "require"
+    }
+   ],
+   "relations": [],
+   "symbols": [
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.legacy#module#0",
+     "range": [
+      0,
+      72
+     ],
+     "semantic_fingerprint": "d9a6d9f60d830f437d792d6c000d95f5d3625fb854035030830e94cafdcf6828",
+     "signature": "",
+     "signature_digest": "8275fa0191541e90edb42f489021660b0d599d301d3c67a2af0886b538ee5129"
+    }
+   ]
+  },
+  {
+   "diagnostics": [],
+   "language": "typescript",
+   "parser_fingerprint": "929f06046f63eecf6d84648b76fbb1a3842b8cd2cc99c7bb7425f192f47732cf",
+   "path": "src/models.ts",
+   "references": [
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      386,
+      392
+     ],
+     "relative_level": 0,
+     "source": "src.models.Entity.log#field#0",
+     "target": "Logger"
+    },
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      560,
+      566
+     ],
+     "relative_level": 0,
+     "source": "src.models.Entity.label#property#0",
+     "target": "String"
+    },
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      943,
+      952
+     ],
+     "relative_level": 0,
+     "source": "src.models.helper#function#0",
+     "target": "text.trim"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "base",
+     "qualifier_range": [
+      34,
+      40
+     ],
+     "range": [
+      20,
+      25
+     ],
+     "relative_level": 1,
+     "source": null,
+     "target": "Shape"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "base",
+     "qualifier_range": [
+      34,
+      40
+     ],
+     "range": [
+      9,
+      13
+     ],
+     "relative_level": 1,
+     "source": null,
+     "target": "Base"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "log",
+     "qualifier_range": [
+      66,
+      69
+     ],
+     "range": [
+      70,
+      76
+     ],
+     "relative_level": 2,
+     "source": null,
+     "target": "logger"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "inherit",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      135,
+      140
+     ],
+     "relative_level": 0,
+     "source": "src.models.Tagged#interface#0",
+     "target": "Shape"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "inherit",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      294,
+      298
+     ],
+     "relative_level": 0,
+     "source": "src.models.Entity#class#0",
+     "target": "Base"
+    }
+   ],
+   "relations": [
+    {
+     "evidence_kind": "tree_sitter",
+     "kind": "inherits",
+     "range": [
+      310,
+      316
+     ],
+     "source": "src.models.Entity#class#0",
+     "target": "src.models.Tagged#interface#0"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "kind": "calls",
+     "range": [
+      444,
+      450
+     ],
+     "source": "src.models.Entity.handler#method#0",
+     "target": "src.models.Entity.record#method#0"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "kind": "calls",
+     "range": [
+      733,
+      739
+     ],
+     "source": "src.models.Entity.record#method#0",
+     "target": "src.models.helper#function#0"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "kind": "calls",
+     "range": [
+      757,
+      763
+     ],
+     "source": "src.models.Entity.record#method#0",
+     "target": "src.models.Entity.record#method#0"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "kind": "calls",
+     "range": [
+      1039,
+      1045
+     ],
+     "source": "src.models.shout#function#0",
+     "target": "src.models.helper#function#0"
+    }
+   ],
+   "symbols": [
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.models#module#0",
+     "range": [
+      0,
+      1084
+     ],
+     "semantic_fingerprint": "2af6a18ea7576a7af5f7ecfe3b9b02071ff0f6a684f430b9c922a330a37c5807",
+     "signature": "",
+     "signature_digest": "8275fa0191541e90edb42f489021660b0d599d301d3c67a2af0886b538ee5129"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.models.Tagged#interface#0",
+     "range": [
+      103,
+      181
+     ],
+     "semantic_fingerprint": "0099f782721d939ff4e521be2539d64f517dbcece2726a89486c2735356e1f7a",
+     "signature": "export interface Tagged extends Shape",
+     "signature_digest": "a31324b688bf6ec1589a17c29a6c873da71dda8adf8607ed7510f9d5e69341d1"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.models.Id#type#0",
+     "range": [
+      183,
+      216
+     ],
+     "semantic_fingerprint": "ecb7dec7c3d10d525b38725e455ff8dea3cb011698ec4271bc931b1f37670ef9",
+     "signature": "export type Id = string | number;",
+     "signature_digest": "294def287c6d70648ec00bc60a58a06c9e95e9cd1e58d3efebc62cafa289c783"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.models.Color#type#0",
+     "range": [
+      218,
+      255
+     ],
+     "semantic_fingerprint": "8b6c3d90c678658549dcfdeff4f8b4f1b32203875ffad986e3443ffafaad64cb",
+     "signature": "export enum Color",
+     "signature_digest": "30b28e7229d6ba96d31dc4969176f3bd8afcca02c6a4a0e24318847bb22eb793"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.models.Entity#class#0",
+     "range": [
+      257,
+      777
+     ],
+     "semantic_fingerprint": "ed70579c66b0808526eeea9ccb4ca4b68ea91a0e5ae2b518814e30fe8848552e",
+     "signature": "export abstract class Entity extends Base implements Tagged",
+     "signature_digest": "a2998bd367364162d1fbefe15c3620d777c288f030ac126399003d39a48928f6"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.models.Entity.count#field#0",
+     "range": [
+      321,
+      337
+     ],
+     "semantic_fingerprint": "a586c08fc91a69958091f2745449c3e5e1c518cb8d3871fac5058913547b422f",
+     "signature": "static count =",
+     "signature_digest": "75d64d54ed3aa94c6873a920f8361868a05d2bae203d7fb5d685aab4cdc1a911"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.models.Entity.tag#field#0",
+     "range": [
+      341,
+      355
+     ],
+     "semantic_fingerprint": "59c2e2f4a69a277d892498b0a7211b27471da2a1bfd991a41a9f7b0fa6cc749f",
+     "signature": "tag =",
+     "signature_digest": "d5a703f5381413ea35f83bf2a88835fd475f8a96a6c23da199f3995c7c447b7e"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.models.Entity.log#field#0",
+     "range": [
+      359,
+      394
+     ],
+     "semantic_fingerprint": "7406d65226ee4968da2181a8290fb3aadfd6fad1168d8471c58ae84f2d9a40cf",
+     "signature": "private readonly log =",
+     "signature_digest": "f7207cf072fd867940946572b1f48a6a1ecf44c0df22f0e34eea28c78e41f9c1"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.models.Entity.handler#method#0",
+     "range": [
+      398,
+      462
+     ],
+     "semantic_fingerprint": "97f271372355536527159079d7a9ba0ebde92a4f7e50c148d66d02766533ba66",
+     "signature": "handler = (event: string): void =>",
+     "signature_digest": "46e3052a90ef3a35b4f4a7877c0bc0f2d5750362bc70cf8585308baad02c038e"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.models.Entity.constructor#method#0",
+     "range": [
+      467,
+      512
+     ],
+     "semantic_fingerprint": "4aa6c52bdd13b2f9dd7f8abd5bec15d3c2b9a8d45965e729ae91f1f54a01aa55",
+     "signature": "constructor(public id: Id)",
+     "signature_digest": "9dfb664d993a3fde97a1fdfadffc9d8cf3d4cd1d1d58958e1fad76a9f7403c0d"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.models.Entity.label#property#0",
+     "range": [
+      516,
+      580
+     ],
+     "semantic_fingerprint": "8c26c5f809471a7ff7c5126c0f03b60751206a7e7de0d3e1c2af1c8a28f3404f",
+     "signature": "get label(): string",
+     "signature_digest": "78328d88e4f3e8f50fc7cb0dd8a86c45eb5a7f4943c307f0312a7a3f32da18e4"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.models.Entity.label#property#1",
+     "range": [
+      584,
+      636
+     ],
+     "semantic_fingerprint": "801269a1d01f9c53fb21a05f7c26c601ecba01e3b9c0022c1a5e6f4c91ab20b7",
+     "signature": "set label(value: string)",
+     "signature_digest": "95ce31895fd3eea63353391a538e345f07b2cd397f8671f61b4fa42aabee50ab"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.models.Entity.describe#method#0",
+     "range": [
+      640,
+      667
+     ],
+     "semantic_fingerprint": "1a4520c6d79b7e8a5a4e96e4eafb84e18787e647ce713930e9355c6baefec309",
+     "signature": "abstract describe(): string",
+     "signature_digest": "2d2954c2888da1a4aa847b5d41383cc0d2c7fec667c24979895f553abf922290"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.models.Entity.record#method#0",
+     "range": [
+      672,
+      775
+     ],
+     "semantic_fingerprint": "6a8d349ccffdd3c5d698fa9592820a9c893eda3a76e42e9fa592508e04be50bd",
+     "signature": "record(event: string): void",
+     "signature_digest": "9471e1ecdc162435bf804e9796e87504ce0f1a085317e9931675ed7e4816edac"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.models.Geometry#module#0",
+     "range": [
+      779,
+      892
+     ],
+     "semantic_fingerprint": "cf04aa4fb0b627e98b63a43f5e731e5b2743211d1e73aafa7307cf22f03e64e2",
+     "signature": "export namespace Geometry.Shapes",
+     "signature_digest": "1b39e155f909081d47422e3cb2f432e26b1ac47f3b594d52bacc2e909045ea49"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.models.Geometry.Shapes#module#0",
+     "range": [
+      779,
+      892
+     ],
+     "semantic_fingerprint": "cf04aa4fb0b627e98b63a43f5e731e5b2743211d1e73aafa7307cf22f03e64e2",
+     "signature": "export namespace Geometry.Shapes",
+     "signature_digest": "1b39e155f909081d47422e3cb2f432e26b1ac47f3b594d52bacc2e909045ea49"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.models.Geometry.Shapes.area#function#0",
+     "range": [
+      816,
+      890
+     ],
+     "semantic_fingerprint": "114cd28f361f87036282d6bed16a7090388953410b644ea9b768844989581bde",
+     "signature": "export function area(w: number, h: number): number",
+     "signature_digest": "ee5f38c49033bcb700941e12e3de6f15ed9671bea59d15d1178df051f7df47ca"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.models.helper#function#0",
+     "range": [
+      894,
+      957
+     ],
+     "semantic_fingerprint": "3dc7623fdc3898a0f84f79277a6ff59e598433195b8d7b7291c04c5b864bd685",
+     "signature": "function helper(text: string): string",
+     "signature_digest": "4e3e47139b28f4359ace04cbe6ec00fb681a2a2af3c9cf552e641a2a05d65eb9"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.models.DEFAULT_TAG#constant#0",
+     "range": [
+      959,
+      993
+     ],
+     "semantic_fingerprint": "fe3a2d9e91812f9f02c530092e867ba661286b7029bce1c03c2510491fb7b2e0",
+     "signature": "export const DEFAULT_TAG =",
+     "signature_digest": "fe31cb838adb7837e697d128da5c91dca55bd2f02a7b38b15120bb8d4a0cd6cf"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.models.shout#function#0",
+     "range": [
+      994,
+      1066
+     ],
+     "semantic_fingerprint": "6ca21bcc3f85cf4039458b58e8428bafbf9506ee903ffb458db218fe8cd99f31",
+     "signature": "export const shout = async (text: string) =>",
+     "signature_digest": "194a4f90ef7410e17c98eb97728414c6db2e68ee4a32ccb13a7ae6df5842f4b3"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.models.counter#variable#0",
+     "range": [
+      1067,
+      1083
+     ],
+     "semantic_fingerprint": "b3a76a982f8c907138b8fd7e57fc0e9746686b65e181aed21a29f6dc37f1f8f2",
+     "signature": "let counter =",
+     "signature_digest": "a30d901375ab270825e17a3a32e09948a6306e466c0177548267f532c73ba48c"
+    }
+   ]
+  },
+  {
+   "diagnostics": [
+    {
+     "code": "references_capped",
+     "count": 2
+    }
+   ],
+   "language": "typescript",
+   "parser_fingerprint": "929f06046f63eecf6d84648b76fbb1a3842b8cd2cc99c7bb7425f192f47732cf",
+   "path": "src/service.ts",
+   "references": [
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      499,
+      505
+     ],
+     "relative_level": 0,
+     "source": "src.service.Service.run#method#0",
+     "target": "Entity"
+    },
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      514,
+      529
+     ],
+     "relative_level": 0,
+     "source": "src.service.Service.run#method#0",
+     "target": "entity.describe"
+    },
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      537,
+      546
+     ],
+     "relative_level": 0,
+     "source": "src.service.Service.run#method#0",
+     "target": "path.join"
+    },
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      586,
+      601
+     ],
+     "relative_level": 0,
+     "source": "src.service.Service.run#method#0",
+     "target": "fs.readFileSync"
+    },
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      706,
+      711
+     ],
+     "relative_level": 0,
+     "source": "src.service.main#function#0",
+     "target": "s.run"
+    },
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      737,
+      738
+     ],
+     "relative_level": 0,
+     "source": "src.service.main#function#0",
+     "target": "b"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "config",
+     "qualifier_range": [
+      151,
+      163
+     ],
+     "range": [
+      136,
+      142
+     ],
+     "relative_level": 3,
+     "source": null,
+     "target": "Config"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "models",
+     "qualifier_range": [
+      225,
+      233
+     ],
+     "range": [
+      210,
+      216
+     ],
+     "relative_level": 1,
+     "source": null,
+     "target": "Entity"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "models",
+     "qualifier_range": [
+      339,
+      347
+     ],
+     "range": [
+      307,
+      312
+     ],
+     "relative_level": 1,
+     "source": null,
+     "target": "Color"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "models",
+     "qualifier_range": [
+      339,
+      347
+     ],
+     "range": [
+      314,
+      316
+     ],
+     "relative_level": 1,
+     "source": null,
+     "target": "Id"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "scope",
+     "qualifier_range": [
+      110,
+      115
+     ],
+     "range": [
+      116,
+      119
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "pkg"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "scope.pkg",
+     "qualifier_range": [
+      109,
+      119
+     ],
+     "range": [
+      91,
+      92
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "a"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "scope.pkg",
+     "qualifier_range": [
+      109,
+      119
+     ],
+     "range": [
+      99,
+      100
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "c"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      16,
+      18
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "fs"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      191,
+      197
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "legacy"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      253,
+      259
+     ],
+     "relative_level": 1,
+     "source": null,
+     "target": "models"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      289,
+      295
+     ],
+     "relative_level": 1,
+     "source": null,
+     "target": "models"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      66,
+      74
+     ],
+     "relative_level": 1,
+     "source": null,
+     "target": "polyfill"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "inherit",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      449,
+      455
+     ],
+     "relative_level": 0,
+     "source": "src.service.Service#class#0",
+     "target": "Entity"
+    }
+   ],
+   "relations": [
+    {
+     "evidence_kind": "tree_sitter",
+     "kind": "calls",
+     "range": [
+      567,
+      571
+     ],
+     "source": "src.service.Service.run#method#0",
+     "target": "src.service.Service.stop#method#0"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "kind": "calls",
+     "range": [
+      692,
+      699
+     ],
+     "source": "src.service.main#function#0",
+     "target": "src.service.Service#class#0"
+    }
+   ],
+   "symbols": [
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.service#module#0",
+     "range": [
+      0,
+      757
+     ],
+     "semantic_fingerprint": "2e6790e998de9301f5112523d864ac4ac4fda9d0d119455acfd1d5245ef0f145",
+     "signature": "",
+     "signature_digest": "8275fa0191541e90edb42f489021660b0d599d301d3c67a2af0886b538ee5129"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.service.local#constant#0",
+     "range": [
+      402,
+      418
+     ],
+     "semantic_fingerprint": "e3b5979a80edb8fa3f10867aa4ad1983ad921b2a2652ba276b70c4a8622599f8",
+     "signature": "const local =",
+     "signature_digest": "55461d0dc5c01e34209d60addf20c8f8bfcf2f484791275f27e0f1a0d339dfc3"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.service.Service#class#0",
+     "range": [
+      420,
+      643
+     ],
+     "semantic_fingerprint": "eae7333b23017f806c961ac6f33f995011f6b6ead306e1d286f615b0de94e4dd",
+     "signature": "export class Service extends Entity",
+     "signature_digest": "8a29ae7f59ebe3e62704cc3f981d8a3709c4f8b3d89b5a989000ce27d3428056"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.service.Service.run#method#0",
+     "range": [
+      460,
+      622
+     ],
+     "semantic_fingerprint": "3a47f7c7daff11a290efd799f0bd4c3d1b8de02d8a9f87edc155117b53520f13",
+     "signature": "run(): string",
+     "signature_digest": "9e1bbadab57e13440d20bb7b6226b750c68cb4ce1f8aa7e4322c665e1e267a2f"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.service.Service.stop#method#0",
+     "range": [
+      626,
+      641
+     ],
+     "semantic_fingerprint": "f6e34eb5313d6c7a23cf6d5c85a671de51b60d3f6a6acfd4a8d807aea1670949",
+     "signature": "stop(): void",
+     "signature_digest": "52595bfb7691cff310d4810324e429bd68bddfde215198fa321035bb4b6b1619"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.service.main#function#0",
+     "range": [
+      645,
+      756
+     ],
+     "semantic_fingerprint": "abae6725824ae74f775a79ad9780f3e3c000b9a72a00007cbdc7c8ded7247220",
+     "signature": "export function main(): void",
+     "signature_digest": "7f383508c902e0e28f77bd683ebcf9595e684ce9e0b2c84d8bc902156b4bd109"
+    }
+   ]
+  },
+  {
+   "diagnostics": [],
+   "language": "typescript",
+   "parser_fingerprint": "929f06046f63eecf6d84648b76fbb1a3842b8cd2cc99c7bb7425f192f47732cf",
+   "path": "src/util.js",
+   "references": [
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      108,
+      112
+     ],
+     "relative_level": 0,
+     "source": "src.util.read#function#0",
+     "target": "join"
+    },
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      11,
+      18
+     ],
+     "relative_level": 0,
+     "source": "src.util#module#0",
+     "target": "require"
+    },
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      240,
+      243
+     ],
+     "relative_level": 0,
+     "source": "src.util.Cache.clear#method#0",
+     "target": "Map"
+    },
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      314,
+      316
+     ],
+     "relative_level": 0,
+     "source": "src.util.memo#function#0",
+     "target": "fn"
+    },
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      92,
+      107
+     ],
+     "relative_level": 0,
+     "source": "src.util.read#function#0",
+     "target": "fs.readFileSync"
+    }
+   ],
+   "relations": [
+    {
+     "evidence_kind": "tree_sitter",
+     "kind": "calls",
+     "range": [
+      251,
+      255
+     ],
+     "source": "src.util.Cache.clear#method#0",
+     "target": "src.util.read#function#0"
+    }
+   ],
+   "symbols": [
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.util#module#0",
+     "range": [
+      0,
+      364
+     ],
+     "semantic_fingerprint": "1a03956d53bf985238442b0587e58ff85619d04b5ef8b95420b511dad280d1cf",
+     "signature": "",
+     "signature_digest": "8275fa0191541e90edb42f489021660b0d599d301d3c67a2af0886b538ee5129"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.util.fs#constant#0",
+     "range": [
+      0,
+      25
+     ],
+     "semantic_fingerprint": "2cf952378f9e4e87e028cab4055f290f968055befde7fd91c68460a4f905c395",
+     "signature": "const fs =",
+     "signature_digest": "7f1ed3b5850e89cefd3d31aaebcd43f4fb3faad5ce009c9876a9316bdb4d90ee"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.util.read#function#0",
+     "range": [
+      61,
+      133
+     ],
+     "semantic_fingerprint": "106bd6be1be4eb4b7d7d93339b0e044d4f6dd2a7ed7cd39b9426c6269f9c1e90",
+     "signature": "function read(name)",
+     "signature_digest": "c95343583eef42783b005121ec02e30a5444c02dedc933ee83a6c4ae3e4a2cf0"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.util.Cache#class#0",
+     "range": [
+      135,
+      267
+     ],
+     "semantic_fingerprint": "800265ae3cf1e4c52f30aae48f8fbdd89c5b34c9004279d63a6138fb0daac115",
+     "signature": "class Cache",
+     "signature_digest": "9b89bf8c1686f321b7905a389cb12c488a6cbaaa84fd29e18ca644c9144bd03f"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.util.Cache#secret#field#0",
+     "range": [
+      151,
+      162
+     ],
+     "semantic_fingerprint": "353058f50b306264e0d9c40bbec3ce173d06c51aa80e01815705dd970dcc131d",
+     "signature": "#secret =",
+     "signature_digest": "7312f5e23704822817978a31560ef1afbc41015851ecc19399716b3a632583c5"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.util.Cache.size#property#0",
+     "range": [
+      166,
+      208
+     ],
+     "semantic_fingerprint": "6030346e5ddb70375e84d5d7ebd9422cb6572c0195718819f6ca23500479fbe5",
+     "signature": "get size()",
+     "signature_digest": "b32752422a99072ee4d2f1e46df297e38091eef2aff18ab3960c701245676e63"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.util.Cache.clear#method#0",
+     "range": [
+      211,
+      265
+     ],
+     "semantic_fingerprint": "feefab6fbec7537085232f7c849d7527a7180ce32b4b8d993893897807216ac7",
+     "signature": "clear()",
+     "signature_digest": "5e584688db7f68b673887228692c80e81dd97a387437b0f7365ffbea210dd680"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.util.memo#function#0",
+     "range": [
+      269,
+      322
+     ],
+     "semantic_fingerprint": "d652a1907d5a17e178b91655f5971487fc22339559e5b44225ca3cf8e8df5fe6",
+     "signature": "const memo = function memoize(fn)",
+     "signature_digest": "ba8e6636a36dddaf0986e1c28a9710da5f4bd1340babc52df698ac781a11e231"
+    }
+   ]
+  },
+  {
+   "diagnostics": [],
+   "language": "typescript",
+   "parser_fingerprint": "929f06046f63eecf6d84648b76fbb1a3842b8cd2cc99c7bb7425f192f47732cf",
+   "path": "src/view.tsx",
+   "references": [
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      171,
+      187
+     ],
+     "relative_level": 0,
+     "source": "src.view.format#function#0",
+     "target": "text.toUpperCase"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      19,
+      24
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "react"
+    }
+   ],
+   "relations": [
+    {
+     "evidence_kind": "tree_sitter",
+     "kind": "calls",
+     "range": [
+      113,
+      119
+     ],
+     "source": "src.view.View#function#0",
+     "target": "src.view.format#function#0"
+    }
+   ],
+   "symbols": [
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.view#module#0",
+     "range": [
+      0,
+      191
+     ],
+     "semantic_fingerprint": "e32623592df7d8e15995afb0bee27e50e442775580528940069d44e987e818b3",
+     "signature": "",
+     "signature_digest": "8275fa0191541e90edb42f489021660b0d599d301d3c67a2af0886b538ee5129"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.view.View#function#0",
+     "range": [
+      28,
+      136
+     ],
+     "semantic_fingerprint": "e906b448a49c7fd6b5a9be4e57cc40cffc84a9a02b1ae717abbf221db755ab51",
+     "signature": "export function View({ title }: { title: string })",
+     "signature_digest": "75cc99cd68e5d6e8506ecb4dfe8680fdf1ac38933837ccfa07072477191cf7bd"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.view.format#function#0",
+     "range": [
+      138,
+      190
+     ],
+     "semantic_fingerprint": "c679c22eac033f153949d5becde56b2425410dc7e7e4cfe4be612b0a7975ee69",
+     "signature": "const format = (text: string) =>",
+     "signature_digest": "df431f8ad336af6a0dd5d1e69ca397983b2ad45ce17db48be6ea389ea3eb9963"
+    }
+   ]
+  }
+ ],
+ "protocol_version": 2
+}
