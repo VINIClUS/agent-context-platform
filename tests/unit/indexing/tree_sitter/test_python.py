@@ -1305,6 +1305,11 @@ def test_shedding_steps_are_reported_and_add_to_what_the_adapter_reported() -> N
     assert only[1].relations == ()
 
 
+# PLATFORM-037 sizes requests by bytes as well as file count: a normal request carries at most
+# 1 MiB of source in up to 64 files, which keeps it well inside the CPU backstop and the output bound.
+NORMAL_REQUEST_SOURCE_BYTES = 1 << 20
+
+
 def _realistic_module(n: int) -> str:
     """A ~25 KB module: imports, dataclass-style classes with decorators, methods, calls."""
     parts = [
@@ -1314,7 +1319,7 @@ def _realistic_module(n: int) -> str:
         f"from . import helpers{n % 7}\nfrom ..core.models import Base, Mixin\n\n",
         "T = TypeVar('T')\nDEFAULT_LIMIT = 100\n\n\n",
     ]
-    for k in range(10):
+    for k in range(6):
         parts.append(
             f"@dataclass\nclass Account{k}(Base, Generic[T]):\n"
             f'    """Account {k}."""\n\n'
@@ -1361,15 +1366,15 @@ def _realistic_module(n: int) -> str:
     return "".join(parts)
 
 
-def test_a_normal_two_megabyte_corpus_degrades_nothing_through_the_sandbox() -> None:
+def test_a_normal_one_mebibyte_request_degrades_nothing_through_the_sandbox() -> None:
     files = [source(f"app/pkg{n % 9}/mod{n}.py", _realistic_module(n)) for n in range(64)]
     total = sum(len(item.content()) for item in files)
-    assert total > 1_800_000
+    assert 0.9 * NORMAL_REQUEST_SOURCE_BYTES < total <= 1.1 * NORMAL_REQUEST_SOURCE_BYTES
     module, cpu = confined(*files)
     print(f"cpu[normal_corpus_{total // 1000}KB] = {cpu:.2f}s")
     assert [item.path for item in module.files] == [item.path for item in files]
     for item in module.files:
         assert diagnostics_of(item) == {}, item.path
-        assert len(item.symbols) > 60
+        assert len(item.symbols) > 40
         assert item.references
         assert item.relations
