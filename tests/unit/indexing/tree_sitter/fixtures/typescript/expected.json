@@ -47,7 +47,7 @@
       0,
       94
      ],
-     "semantic_fingerprint": "0d1550ddb42ab5f0d670c865636f94d0e3c8352f7a80cdcfcced8851aaf6bbfa",
+     "semantic_fingerprint": "065a1605d6622bd224bbe01b6b8f733f43267735ecbfce183f5dab52812cb112",
      "signature": "",
      "signature_digest": "8275fa0191541e90edb42f489021660b0d599d301d3c67a2af0886b538ee5129"
     },
@@ -58,9 +58,9 @@
       34,
       93
      ],
-     "semantic_fingerprint": "871364eba06135e953fadacde48202318d083a412129da05704dbc89ec7b244d",
+     "semantic_fingerprint": "79679b281657b1ad348bc331492a49d9dcdf72fbdd9155aaad6d49ef046afba7",
      "signature": "export default function load(name)",
-     "signature_digest": "eb90f897adcd7a5e7bef490282537b25ab18717077915de70a25318521185c8b"
+     "signature_digest": "7ae1a977a97da40d4ade48996aa3412ab949883c8070ba70a9fb84c42198c889"
     }
    ]
   },
@@ -327,7 +327,7 @@
       0,
       1084
      ],
-     "semantic_fingerprint": "6bc140b7e5f32aad9bac6bf8b6326819f608a97e4f1f91c81fc7bfa5cf5027a5",
+     "semantic_fingerprint": "2af6a18ea7576a7af5f7ecfe3b9b02071ff0f6a684f430b9c922a330a37c5807",
      "signature": "",
      "signature_digest": "8275fa0191541e90edb42f489021660b0d599d301d3c67a2af0886b538ee5129"
     },
@@ -338,9 +338,9 @@
       103,
       181
      ],
-     "semantic_fingerprint": "d3dc3f07f78f9770ec8bc86061fab330ab6e839a31aaf3a86ae0c5d7e8147e4c",
+     "semantic_fingerprint": "0099f782721d939ff4e521be2539d64f517dbcece2726a89486c2735356e1f7a",
      "signature": "export interface Tagged extends Shape",
-     "signature_digest": "b51627d33abf6f3493bc633048e243971e07dc07de7b6fd5d030834decdecf25"
+     "signature_digest": "a31324b688bf6ec1589a17c29a6c873da71dda8adf8607ed7510f9d5e69341d1"
     },
     {
      "evidence_kind": "tree_sitter",
@@ -349,9 +349,9 @@
       183,
       216
      ],
-     "semantic_fingerprint": "71b8c8cb7db267da7e58fde64ac691967f9117af934163e69d6409b17a4d2070",
+     "semantic_fingerprint": "ecb7dec7c3d10d525b38725e455ff8dea3cb011698ec4271bc931b1f37670ef9",
      "signature": "export type Id = string | number;",
-     "signature_digest": "c3d9c7f05e13166a388216f09e8eb2ae1c24b6fdc90f13fc8c875f3be66c6a38"
+     "signature_digest": "294def287c6d70648ec00bc60a58a06c9e95e9cd1e58d3efebc62cafa289c783"
     },
     {
      "evidence_kind": "tree_sitter",
@@ -360,9 +360,9 @@
       218,
       255
      ],
-     "semantic_fingerprint": "68b18a87f73fa815b2400bec2e18e66d5b0dc93618c43cd08af19fda2b574132",
+     "semantic_fingerprint": "8b6c3d90c678658549dcfdeff4f8b4f1b32203875ffad986e3443ffafaad64cb",
      "signature": "export enum Color",
-     "signature_digest": "ef9a1220c5d1d9c35962ae38f8580d464146717758e3483b2eb4d7e931ba9159"
+     "signature_digest": "30b28e7229d6ba96d31dc4969176f3bd8afcca02c6a4a0e24318847bb22eb793"
     },
     {
      "evidence_kind": "tree_sitter",
@@ -371,9 +371,9 @@
       257,
       777
      ],
-     "semantic_fingerprint": "e8734417be8cad0cbc42539096c884087df01580bb5c36cf7506dd8f93c3424d",
+     "semantic_fingerprint": "ed70579c66b0808526eeea9ccb4ca4b68ea91a0e5ae2b518814e30fe8848552e",
      "signature": "export abstract class Entity extends Base implements Tagged",
-     "signature_digest": "364ee737edcfcba57013d5a84dfa2fdf8369e6df53349f4fe7ceb278413603c3"
+     "signature_digest": "a2998bd367364162d1fbefe15c3620d777c288f030ac126399003d39a48928f6"
     },
     {
      "evidence_kind": "tree_sitter",
@@ -481,9 +481,9 @@
       779,
       892
      ],
-     "semantic_fingerprint": "9024214a337ff46b5ea392eab2752f958c9e700d83128f7fc34d979f8c7f0b7e",
+     "semantic_fingerprint": "cf04aa4fb0b627e98b63a43f5e731e5b2743211d1e73aafa7307cf22f03e64e2",
      "signature": "export namespace Geometry.Shapes",
-     "signature_digest": "5f68174411879d92d12afd5196f7e1e90b611bfda0d7dcc0e9118be9f4947ed5"
+     "signature_digest": "1b39e155f909081d47422e3cb2f432e26b1ac47f3b594d52bacc2e909045ea49"
     },
     {
      "evidence_kind": "tree_sitter",
@@ -492,9 +492,9 @@
       779,
       892
      ],
-     "semantic_fingerprint": "9024214a337ff46b5ea392eab2752f958c9e700d83128f7fc34d979f8c7f0b7e",
+     "semantic_fingerprint": "cf04aa4fb0b627e98b63a43f5e731e5b2743211d1e73aafa7307cf22f03e64e2",
      "signature": "export namespace Geometry.Shapes",
-     "signature_digest": "5f68174411879d92d12afd5196f7e1e90b611bfda0d7dcc0e9118be9f4947ed5"
+     "signature_digest": "1b39e155f909081d47422e3cb2f432e26b1ac47f3b594d52bacc2e909045ea49"
     },
     {
      "evidence_kind": "tree_sitter",
@@ -503,9 +503,9 @@
       816,
       890
      ],
-     "semantic_fingerprint": "f91f665e190af0b516b707e4312adcfb4d01577662a6442e778101a21f2bd33e",
+     "semantic_fingerprint": "114cd28f361f87036282d6bed16a7090388953410b644ea9b768844989581bde",
      "signature": "export function area(w: number, h: number): number",
-     "signature_digest": "cc1c4dc2ca2f729ab2d4cffae8f2f68f4fac9fa02305193f70ba951ca9428bfb"
+     "signature_digest": "ee5f38c49033bcb700941e12e3de6f15ed9671bea59d15d1178df051f7df47ca"
     },
     {
      "evidence_kind": "tree_sitter",
@@ -525,9 +525,9 @@
       959,
       993
      ],
-     "semantic_fingerprint": "c6142cc3eccd14fccc3dc8ef9010383e833ec518368c64f4ed76088e0a8fe096",
+     "semantic_fingerprint": "fe3a2d9e91812f9f02c530092e867ba661286b7029bce1c03c2510491fb7b2e0",
      "signature": "export const DEFAULT_TAG =",
-     "signature_digest": "357a942b299adae37956ca029d95ff691ea3fd9aac16a5b75de0bc959137cd23"
+     "signature_digest": "fe31cb838adb7837e697d128da5c91dca55bd2f02a7b38b15120bb8d4a0cd6cf"
     },
     {
      "evidence_kind": "tree_sitter",
@@ -536,9 +536,9 @@
       994,
       1066
      ],
-     "semantic_fingerprint": "b85033c970c76f342bf69a1d95c25f636fee2435da255e4ca72e14056729fd48",
+     "semantic_fingerprint": "6ca21bcc3f85cf4039458b58e8428bafbf9506ee903ffb458db218fe8cd99f31",
      "signature": "export const shout = async (text: string) =>",
-     "signature_digest": "45d09c70395f88d2e075880084911515bd88b9b45ff8a11804bae8ef0f29b87c"
+     "signature_digest": "194a4f90ef7410e17c98eb97728414c6db2e68ee4a32ccb13a7ae6df5842f4b3"
     },
     {
      "evidence_kind": "tree_sitter",
@@ -882,7 +882,7 @@
       0,
       757
      ],
-     "semantic_fingerprint": "a6dee1b3e6d4f83fe1945fd8c5c14dc4dca4c6dd62ac69059feec0fda4b98f6a",
+     "semantic_fingerprint": "2e6790e998de9301f5112523d864ac4ac4fda9d0d119455acfd1d5245ef0f145",
      "signature": "",
      "signature_digest": "8275fa0191541e90edb42f489021660b0d599d301d3c67a2af0886b538ee5129"
     },
@@ -904,9 +904,9 @@
       420,
       643
      ],
-     "semantic_fingerprint": "560d7547cc925172c4264e0dace6c665ed7fa4c3aad451a9281b153c48261835",
+     "semantic_fingerprint": "eae7333b23017f806c961ac6f33f995011f6b6ead306e1d286f615b0de94e4dd",
      "signature": "export class Service extends Entity",
-     "signature_digest": "59310ccf71608dd9653faccda4c5cc4f26978923edc14381813f7bf4619d8bb7"
+     "signature_digest": "8a29ae7f59ebe3e62704cc3f981d8a3709c4f8b3d89b5a989000ce27d3428056"
     },
     {
      "evidence_kind": "tree_sitter",
@@ -937,9 +937,9 @@
       645,
       756
      ],
-     "semantic_fingerprint": "bfe3ceb34e6d155cdfb613f38ff188dfb1148d9b066f658bb1255b985782c091",
+     "semantic_fingerprint": "abae6725824ae74f775a79ad9780f3e3c000b9a72a00007cbdc7c8ded7247220",
      "signature": "export function main(): void",
-     "signature_digest": "bd203e3d9d177c35550b958b4214f5c7192ffddcaf2813fb9bedb36f554bbc95"
+     "signature_digest": "7f383508c902e0e28f77bd683ebcf9595e684ce9e0b2c84d8bc902156b4bd109"
     }
    ]
   },
@@ -1040,7 +1040,7 @@
       0,
       364
      ],
-     "semantic_fingerprint": "1a7147ca502a384766904e0bc003010aafd67134ce06c4e418ca2cc2dcba290a",
+     "semantic_fingerprint": "1a03956d53bf985238442b0587e58ff85619d04b5ef8b95420b511dad280d1cf",
      "signature": "",
      "signature_digest": "8275fa0191541e90edb42f489021660b0d599d301d3c67a2af0886b538ee5129"
     },
@@ -1073,9 +1073,20 @@
       135,
       267
      ],
-     "semantic_fingerprint": "afb0c4e6e6e272dd32bbeb4cb8b49cc076744011870261e75e8a9f4754cf9449",
+     "semantic_fingerprint": "800265ae3cf1e4c52f30aae48f8fbdd89c5b34c9004279d63a6138fb0daac115",
      "signature": "class Cache",
      "signature_digest": "9b89bf8c1686f321b7905a389cb12c488a6cbaaa84fd29e18ca644c9144bd03f"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "src.util.Cache#secret#field#0",
+     "range": [
+      151,
+      162
+     ],
+     "semantic_fingerprint": "353058f50b306264e0d9c40bbec3ce173d06c51aa80e01815705dd970dcc131d",
+     "signature": "#secret =",
+     "signature_digest": "7312f5e23704822817978a31560ef1afbc41015851ecc19399716b3a632583c5"
     },
     {
      "evidence_kind": "tree_sitter",
@@ -1167,7 +1178,7 @@
       0,
       191
      ],
-     "semantic_fingerprint": "9d2ebb56a120bd383eaba54a5e6bbd7382d5b628c0f52cade20f61e1f73905cc",
+     "semantic_fingerprint": "e32623592df7d8e15995afb0bee27e50e442775580528940069d44e987e818b3",
      "signature": "",
      "signature_digest": "8275fa0191541e90edb42f489021660b0d599d301d3c67a2af0886b538ee5129"
     },
@@ -1178,9 +1189,9 @@
       28,
       136
      ],
-     "semantic_fingerprint": "55f1d57e59e7497b5a7cf2e67f09ec43ae4aab9c769bec173a02e604501dd0b9",
+     "semantic_fingerprint": "e906b448a49c7fd6b5a9be4e57cc40cffc84a9a02b1ae717abbf221db755ab51",
      "signature": "export function View({ title }: { title: string })",
-     "signature_digest": "9848be2ab0274c0a74863f6148a1db9e0f8b169581b96a84f8eae2b77ee21409"
+     "signature_digest": "75cc99cd68e5d6e8506ecb4dfe8680fdf1ac38933837ccfa07072477191cf7bd"
     },
     {
      "evidence_kind": "tree_sitter",

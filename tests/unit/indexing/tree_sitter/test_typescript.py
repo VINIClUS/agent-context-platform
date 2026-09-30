@@ -191,6 +191,7 @@ def test_kinds_and_qualified_names() -> None:
         "src.mod.C": "class",
         "src.mod.C.x": "field",
         "src.mod.C.y": "field",
+        "src.mod.C#p": "field",  # a #private member is Class#name
         "src.mod.C.m": "method",
         "src.mod.C.v": "property",
         "src.mod.C.arrow": "method",
@@ -881,3 +882,102 @@ def test_an_unresolvable_qualified_target_stays_a_reference() -> None:
     item = parsed("namespace N { }\nclass D extends N.Base {}\nfunction g() { other.f() }\n")
     assert [x[1] for x in refs(item, "inherit")] == ["N.Base"]
     assert [x[1] for x in refs(item, "call")] == ["other.f"]
+
+
+# --- round 3: wrappers, private members, drops that are counted --------------------------------
+
+WRAPPED = [
+    ("function f() {}\n", "export function f() {}\n", "src.mod.f"),
+    ("export function f() {}\n", "export default function f() {}\n", "src.mod.f"),
+    ("class C {}\n", "export class C {}\n", "src.mod.C"),
+    ("interface I {}\n", "export interface I {}\n", "src.mod.I"),
+    ("const a = () => 1;\n", "export const a = () => 1;\n", "src.mod.a"),
+    ("const k = 1;\n", "export const k = 1;\n", "src.mod.k"),
+    ("function f(): void;\n", "declare function f(): void;\n", "src.mod.f"),
+    ("class C {}\n", "declare class C {}\n", "src.mod.C"),
+    ("export class C {}\n", "export abstract class C {}\n", "src.mod.C"),
+    ("export class C {}\n", "export declare class C {}\n", "src.mod.C"),
+]
+
+
+@pytest.mark.parametrize(("plain", "wrapped", "name"), WRAPPED)
+def test_adding_or_removing_a_wrapper_changes_both_digests(
+    plain: str, wrapped: str, name: str
+) -> None:
+    before, after = digests(plain, name), digests(wrapped, name)
+    assert before[0] != after[0]
+    assert before[1] != after[1]
+
+
+def test_reformatting_around_a_wrapper_changes_nothing() -> None:
+    tight = "export   default function f(a,b) { return a+b }\n"
+    loose = "export default function f(a, b) {\n  return a + b; // sum\n}\n"
+    assert digests(tight, "src.mod.f") == digests(loose, "src.mod.f")
+
+
+PRIVATE = (
+    "class A {\n  #x = 1;\n  #m() { return 1 }\n  static #s = 2;\n  get #g() { return 1 }\n"
+    "  x = 3;\n}\n"
+)
+
+
+def test_private_members_are_emitted_and_do_not_collide_with_public_ones() -> None:
+    kinds = names(parsed(PRIVATE, "src/mod.js"))
+    assert kinds["src.mod.A#x"] == "field"
+    assert kinds["src.mod.A#m"] == "method"
+    assert kinds["src.mod.A#s"] == "field"
+    assert kinds["src.mod.A#g"] == "property"
+    assert kinds["src.mod.A.x"] == "field"
+    assert codes(parsed(PRIVATE, "src/mod.js")) == {}
+
+
+def test_a_private_member_revises_on_edit() -> None:
+    a = digests(PRIVATE, "src.mod.A#m", "src/mod.js")
+    b = digests(
+        PRIVATE.replace("return 1 }\n  static", "return 2 }\n  static"), "src.mod.A#m", "src/mod.js"
+    )
+    assert a[1] != b[1]
+
+
+def test_a_root_that_does_not_fit_is_symbols_dropped_not_a_retryable_budget_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(_common.Budget, "take", lambda *_a, **_k: False)
+    item = parsed("function f() {}\n")
+    assert codes(item) == {"file_degraded": 1, "symbols_dropped": 1}
+
+
+def test_a_parenthesized_class_expression_gets_its_edge() -> None:
+    item = parsed("class B {}\nconst w = (class Q extends B {});\n")
+    assert ("src.mod.w", "src.mod.B", "inherits") in heritage(item)
+    assert names(item)["src.mod.w"] == "class"
+
+
+@pytest.mark.parametrize(
+    "text",
+    [
+        "module.exports = class extends B {};\n",
+        "export default class extends Base {}\n",
+        "const f = () => class extends B {};\n",
+    ],
+)
+def test_anonymous_class_bases_are_counted(text: str) -> None:
+    item = parsed(text)
+    assert codes(item).get("references_capped") == 1
+    assert refs(item, "inherit") == []
+
+
+def test_ambient_module_bodies_are_counted() -> None:
+    item = parsed("declare module 'x' { export function f(): void }\nfunction g() {}\n")
+    assert codes(item) == {"symbols_dropped": 1}
+    assert "src.mod.g" in names(item)
+
+
+def test_a_js_file_with_jsx_is_parsed() -> None:
+    item = parsed(
+        "function View() { return <div onClick={() => go()}>{label()}</div> }\nfunction go() {}\n",
+        "src/view.js",
+    )
+    assert {"src.view.View", "src.view.go"} <= set(names(item))
+    assert "syntax_recovered" not in codes(item)
+    assert len(item.relations) == 1  # View -> go

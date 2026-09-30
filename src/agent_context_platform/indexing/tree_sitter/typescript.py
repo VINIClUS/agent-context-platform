@@ -55,8 +55,12 @@ each ``variable_declarator`` of ``const a = ..., b = ...`` (and each class expre
 frame, with the ``const``/``let`` keyword mixed in as a prefix. The one shared frame is a dotted
 ``namespace A.B {}``, whose symbols ``A`` and ``A.B`` really do contain the same text.
 
-Members: fields (also ``abstract``/``declare``/``static``/``#private``/``accessor``), methods,
-accessors, and class-body overload/optional method signatures are symbols. Not emitted, on
+Members: fields (also ``abstract``/``declare``/``static``/``accessor``), methods,
+accessors, and class-body overload/optional method signatures are symbols. A ``#private``
+member is ``Class#name`` (``#`` is a contract separator; ``Class.#x`` would not validate, and
+``Class.x`` would collide with a public ``x``). ``export``/``default``/``declare`` are mixed
+into the digests of the declaration they wrap. Anonymous classes with bases (no owner) and
+``declare module 'x' {}`` bodies are counted (``references_capped`` / ``symbols_dropped``). Not emitted, on
 purpose: index signatures, static blocks, call/construct signatures and interface members
 (no name, or no owner symbol in the contract), constructor parameter properties (a parameter
 list, not a member declaration) and object-literal methods.
@@ -256,7 +260,7 @@ class _Declaration:
 
     top: bool
     constant: bool
-    keyword: bytes
+    prefix: tuple[bytes, ...]
     start: int
     end: int
     first: int
@@ -310,6 +314,7 @@ class _Walk:
     seen_imports: set[tuple[int, int, int]] = field(default_factory=set)
     decorators_at: int = -1
     declarations: dict[int, _Declaration] = field(default_factory=dict)
+    wrappers: dict[int, tuple[bytes, ...]] = field(default_factory=dict)
     recovered: int = 0
     dropped: int = 0
     capped: int = 0
@@ -353,6 +358,8 @@ def _identifier(walk: _Walk, node: Node | None) -> str | None:
 
 
 def _qualified(parent: _Sym, simple: str) -> str:
+    if simple.startswith("#"):  # a private member: ``A#x`` (``#`` is a contract separator)
+        return f"{parent.qualified}{simple}"
     return f"{parent.qualified}.{simple}" if parent.qualified else simple
 
 
@@ -364,6 +371,20 @@ def _outer_start(walk: _Walk, node: Node) -> int:
         start = walk.ancestors[index][2]
         index -= 1
     return start
+
+
+def _wrapper_prefix(walk: _Walk) -> tuple[bytes, ...]:
+    """``export``/``default``/``declare`` around the declaration being opened, outermost first.
+
+    They sit outside the definition's own node, so they are mixed into its digests as a prefix:
+    adding or removing one is an API change and must be a new revision.
+    """
+    found: list[tuple[bytes, ...]] = []
+    index = len(walk.ancestors) - 1
+    while index >= 0 and walk.ancestors[index][0] in _WRAPPERS:
+        found.append(walk.wrappers.get(walk.ancestors[index][1], ()))
+        index -= 1
+    return tuple(token for group in reversed(found) for token in group)
 
 
 def _at_top(walk: _Walk) -> bool:
@@ -408,6 +429,7 @@ def _declare(
         return []
     start = _outer_start(walk, node)
     entry = _Frame(node.id, True, len(walk.tokens), len(walk.syms))
+    entry.prefix = _wrapper_prefix(walk)
     if body is not None:
         entry.body_id = body.id
     signature = _header(walk, start, header_end)
@@ -436,6 +458,8 @@ def _enter_named(walk: _Walk, node: Node, kind: SymbolKind) -> None:
     if name is None:
         if walk.scopes[-1] is not None and node.type != "type_alias_declaration":
             _push(walk, node, [None])
+            if kind == "class":
+                _heritage(walk, None, node)
         return
     made = _declare(walk, node, [(kind, name)], end, body)
     if made and kind in _TYPE_KINDS:
@@ -464,6 +488,7 @@ def _enter_namespace(walk: _Walk, node: Node) -> None:
             break
         parts.append(simple)
     if not parts or name is None or body is None:
+        walk.dropped += 1  # ``declare module 'x' {}``/``global``: a body we do not descend into
         _push(walk, node, [None])
         return
     _declare(walk, node, [("module", part) for part in parts], body.start_byte, body)
@@ -471,6 +496,13 @@ def _enter_namespace(walk: _Walk, node: Node) -> None:
 
 def _member_name(walk: _Walk, node: Node) -> str | None:
     name = node.child_by_field_name("name") or node.child_by_field_name("property")
+    if name is not None and name.type == "private_property_identifier":
+        # ``#x``: the token inside the range is ``x``; the ``#`` is the separator of ``A#x``.
+        raw = walk.content[name.start_byte + 1 : name.end_byte]
+        if len(raw) > MAX_NAME_BYTES:
+            return None
+        text = identifier_bytes(raw, walk.content, name.start_byte + 1, name.end_byte)
+        return None if text is None else "#" + text
     return _identifier(walk, name) if name is not None and name.type != "identifier" else None
 
 
@@ -478,7 +510,7 @@ def _is_accessor(node: Node) -> bool:
     for child in node.children:
         if child.type in ("get", "set") and not child.is_named:
             return True
-        if child.type == "property_identifier":
+        if child.type in ("property_identifier", "private_property_identifier"):
             return False
     return False
 
@@ -500,7 +532,7 @@ def _enter_member(walk: _Walk, node: Node) -> None:
         kind = "property" if _is_accessor(node) else "method"
         end = body.start_byte if body is not None else node.end_byte
     else:
-        value = node.child_by_field_name("value")
+        value = _unwrapped(node.child_by_field_name("value"))
         function = value is not None and value.type in _FUNCTION_VALUES
         kind = "method" if function else "field"
         body = value.child_by_field_name("body") if function and value is not None else None
@@ -518,6 +550,15 @@ def _enter_member(walk: _Walk, node: Node) -> None:
         walk.frames[-1].is_definition = False
 
 
+def _unwrapped(node: Node | None) -> Node | None:
+    """``(x)`` is ``x``: a bounded peel of parentheses, so ``const w = (class {})`` is a class."""
+    for _ in range(16):
+        if node is None or node.type != "parenthesized_expression" or node.named_child_count != 1:
+            return node
+        node = node.named_child(0)
+    return node
+
+
 def _enter_variables(walk: _Walk, node: Node) -> None:
     """Record what each declarator needs from its statement; the declarators own the frames."""
     scope = walk.scopes[-1]
@@ -530,7 +571,10 @@ def _enter_variables(walk: _Walk, node: Node) -> None:
     walk.declarations[node.id] = _Declaration(
         top=_at_top(walk),
         constant=marker is not None and marker.type == "const",
-        keyword=frame(b"k:" + (marker.type if marker is not None else "var").encode()),
+        prefix=(
+            *_wrapper_prefix(walk),
+            frame(b"k:" + (marker.type if marker is not None else "var").encode()),
+        ),
         start=_outer_start(walk, node),
         end=node.end_byte,
         first=declarators[0].id,
@@ -552,7 +596,7 @@ def _enter_declarator(walk: _Walk, node: Node) -> None:
         return
     if node.id == context.last:
         del walk.declarations[walk.ancestors[-1][1]]
-    value = node.child_by_field_name("value")
+    value = _unwrapped(node.child_by_field_name("value"))
     callable_value = value is not None and value.type in _FUNCTION_VALUES
     class_value = value is not None and value.type == "class"
     if not (context.top or callable_value or class_value):
@@ -583,7 +627,7 @@ def _enter_declarator(walk: _Walk, node: Node) -> None:
     start = context.start if node.id == context.first else node.start_byte
     end = context.end if node.id == context.last else node.end_byte
     entry = _Frame(node.id, body is not None, len(walk.tokens), len(walk.syms))
-    entry.prefix = (context.keyword,)
+    entry.prefix = context.prefix
     if body is not None:
         entry.body_id = body.id
     candidate = _Sym(
@@ -604,8 +648,12 @@ def _enter_declarator(walk: _Walk, node: Node) -> None:
             _heritage(walk, candidate, value)
 
 
-def _heritage(walk: _Walk, sym: _Sym, node: Node) -> None:
-    """Base sites of a class or interface: every ``extends``/``implements`` name."""
+def _heritage(walk: _Walk, sym: _Sym | None, node: Node) -> None:
+    """Base sites of a class or interface: every ``extends``/``implements`` name.
+
+    With no owner symbol (an anonymous class) there is nothing to attach a base to: each base
+    is counted in ``references_capped`` instead of vanishing.
+    """
     for child in node.children:
         if child.type == "class_heritage":
             groups = child.named_children
@@ -620,6 +668,9 @@ def _heritage(walk: _Walk, sym: _Sym, node: Node) -> None:
                 if target.type == "generic_type":
                     target = target.child_by_field_name("name") or target
                 if target.type not in _BASE_TYPES:
+                    continue
+                if sym is None:
+                    walk.capped += 1
                     continue
                 if target.end_byte - target.start_byte > MAX_NAME_BYTES:
                     walk.capped += 1  # too long to be a name: counted, not silent
@@ -843,6 +894,14 @@ def _enter(walk: _Walk, node: Node) -> bool:
     value_owner = walk.value_scopes.pop(node.id, None)
     if value_owner is not None:
         _push(walk, node, [value_owner])
+    if kind in _WRAPPERS:
+        walk.wrappers[node.id] = tuple(
+            frame(b"w:" + child.type.encode())
+            for child in node.children
+            if not child.is_named and child.type in ("export", "default", "declare")
+        )
+    elif kind == "class" and value_owner is None and walk.scopes[-1] is not None:
+        _heritage(walk, None, node)  # a class expression nobody owns: its bases are counted
     if kind in _FUNCTION_DECLARATIONS:
         _enter_named(walk, node, "function")
     elif kind in _CLASS_DECLARATIONS:
@@ -1111,7 +1170,7 @@ def _parse(source: SourceFile, budget: Budget, output: list[int]) -> ParsedFile:
     root = _Sym(name.rsplit(".", 1)[-1], name, "module", 0, len(content), None)
     walk = _Walk(content, budget, output, root)
     if name and not walk.add(root, _Frame(-1, False, 0, 0)):
-        return degraded_file(source, FINGERPRINT, "work_budget_exceeded")
+        return degraded_file(source, FINGERPRINT, "symbols_dropped")
     walk.scopes.append(root)
     _traverse(bounded_parse(_parser(_flavor(source.path)), content, budget), walk)
     if name:
