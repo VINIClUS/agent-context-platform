@@ -352,3 +352,51 @@ def test_a_memory_blowup_ts_file_is_degraded_alone_through_the_real_typescript_a
     assert _degraded(result) == ["src/blow.ts"]
     assert by_path["src/a.ts"].symbols and by_path["src/c.ts"].symbols
     assert result.diagnostics["file_degraded"] == 1
+
+
+def test_a_real_go_index_resolves_siblings_imports_aliases_and_external_dependencies(
+    tmp_path: Path, make_repo: Callable[[str], RepoBuilder]
+) -> None:
+    repo = make_repo("repo")
+    repo.write("store/store.go", "package store\n\nfunc Open() {\n\thelper()\n}\n")
+    repo.write("store/helper.go", "package store\n\nfunc helper() {}\n")
+    repo.write(
+        "cmd/app/main.go",
+        'package main\n\nimport (\n\t"fmt"\n\t"example.com/app/store"\n)\n\n'
+        "func plain() {\n\tstore.Open()\n\tfmt.Println()\n}\n",
+    )
+    repo.write(
+        "cmd/app/aliased.go",
+        'package main\n\nimport s "example.com/app/store"\n\nfunc viaAlias() {\n\ts.Open()\n}\n',
+    )
+    repo.write(
+        "cmd/app/wrong.go",
+        'package main\n\nimport "example.com/app/store"\n\nfunc unbound() {\n\ts.Open()\n}\n',
+    )
+    repo.commit("seed")
+    scan = scan_of(repo)
+    ids = lineage(scan, scan.workspace.head_commit or "")
+    structural = parse_structural(registry.build_adapters(_settings(tmp_path)), read_sources(scan))
+
+    drafts = service().index(scan, None, list(structural.files), file_logical_ids=ids)
+
+    assert not structural.diagnostics
+    names = {
+        str(d.payload["symbol_id"]): str(d.payload["qualified_name"])
+        for d in by_type(drafts, "code.symbol.indexed")
+    }
+    calls = {
+        (names[str(r.payload["subject_id"])], names[str(r.payload["object_id"])])
+        for r in by_type(drafts, "code.relation.asserted")
+        if r.payload["predicate"] == "CALLS"
+    }
+    opened = next(n for n in names.values() if n.endswith("store.Open"))
+    helper = next(n for n in names.values() if n.endswith("store.helper"))
+    assert {caller.rsplit(".", 1)[-1] for caller, callee in calls if callee == opened} == {
+        "plain",
+        "viaAlias",  # bound by its alias; ``unbound`` calls ``s`` without importing it
+    }
+    assert (opened, helper) in calls  # a call across sibling files of one package
+    dependencies = by_type(drafts, "code.dependency.asserted")
+    assert len(dependencies) == 1  # ``fmt`` only: example.com/app/store resolved in the repository
+    assert dependencies[0].payload["dependency_kind"] == "observed"

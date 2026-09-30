@@ -236,9 +236,9 @@ def test_every_import_form_is_a_syntactic_reference_at_module_level() -> None:
     imports = {(r.qualifier, r.target_name) for r in parsed.references if r.kind == "import"}
     assert imports == {
         ("fmt", "fmt"),
-        ("strings", "str"),
+        ("strings", "strings"),
         ("math", "math"),
-        ("embed", "_"),
+        ("embed", "embed"),
         ("net.http", "http"),
         ("os", "os"),
         (None, "d"),  # not expressible as identifiers: only the last token is kept
@@ -612,25 +612,47 @@ def test_a_long_license_header_does_not_hide_the_package_clause() -> None:
     assert {s.qualified_name for s in parsed.symbols} >= {"cmd.x.main", "cmd.x.main.run"}
 
 
-def test_imports_are_bound_by_their_alias_or_last_non_version_token() -> None:
+def test_imports_report_the_local_name_as_an_alias_and_the_path_as_the_target() -> None:
     code = (
         'package p\n\nimport (\n\tstr "strings"\n\t. "math"\n\t_ "embed"\n\t"fmt"\n'
-        '\t"gopkg.in/yaml.v3"\n\t"example.com/lib/v2"\n)\n'
+        '\t"gopkg.in/yaml.v3"\n\tm "example.com/x/mod"\n\tl "example.com/lib/v2"\n)\n'
     )
     (parsed,) = in_process(request(source("p/a.go", code))).files
     got = {
-        (r.qualifier, r.target_name, code[r.start_byte : r.end_byte])
+        (
+            r.qualifier,
+            r.target_name,
+            code[r.start_byte : r.end_byte],
+            r.alias,
+            None if r.alias is None else code[r.alias_start_byte : r.alias_end_byte],
+        )
         for r in parsed.references
         if r.kind == "import"
     }
     assert got == {
-        ("strings", "str", "str"),
-        ("math", "math", "math"),
-        ("embed", "_", "_"),
-        ("fmt", "fmt", "fmt"),
-        ("gopkg.in.yaml.v3", "yaml", "yaml"),
-        ("example.com.lib.v2", "lib", "lib"),
+        ("strings", "strings", "strings", "str", "str"),
+        ("math", "math", "math", None, None),  # a dot import has no identifier to report
+        ("embed", "embed", "embed", "_", "_"),  # the blank identifier: binds nothing usable
+        ("fmt", "fmt", "fmt", None, None),
+        ("gopkg.in.yaml.v3", "yaml", "yaml", None, None),
+        ("example.com.x.mod", "mod", "mod", "m", "m"),
+        ("example.com.lib.v2", "lib", "lib", "l", "l"),
     }
+
+
+def test_two_aliases_of_one_path_are_two_references() -> None:
+    code = 'package p\n\nimport (\n\ta "x/mod"\n\tb "x/mod"\n)\n'
+    (parsed,) = in_process(request(source("p/a.go", code))).files
+    assert sorted(r.alias or "" for r in parsed.references if r.kind == "import") == ["a", "b"]
+
+
+def test_an_explicit_alias_survives_an_undecodable_final_path_element() -> None:
+    code = 'package p\n\nimport p "example.com/a\\u002db"\nfunc F() { p.G() }\n'
+    (parsed,) = in_process(request(source("p/a.go", code))).files
+    (imported,) = [r for r in parsed.references if r.kind == "import"]
+    assert (imported.alias, imported.qualifier) == ("p", None)
+    assert code[imported.start_byte : imported.end_byte] == imported.target_name
+    assert ("p", "G") in {(r.qualifier, r.target_name) for r in parsed.references}
 
 
 def test_dropped_broken_declarations_never_charge_their_budget() -> None:

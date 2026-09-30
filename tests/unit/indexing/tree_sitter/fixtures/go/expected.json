@@ -176,6 +176,50 @@
       "path": "internal/store/store.go",
       "references": [
         {
+          "alias": "_",
+          "alias_range": [
+            88,
+            89
+          ],
+          "confidence": "syntactic",
+          "evidence_kind": "tree_sitter",
+          "kind": "import",
+          "qualifier": "embed",
+          "qualifier_range": [
+            91,
+            96
+          ],
+          "range": [
+            91,
+            96
+          ],
+          "relative_level": 0,
+          "source": null,
+          "target": "embed"
+        },
+        {
+          "alias": "str",
+          "alias_range": [
+            63,
+            66
+          ],
+          "confidence": "syntactic",
+          "evidence_kind": "tree_sitter",
+          "kind": "import",
+          "qualifier": "strings",
+          "qualifier_range": [
+            68,
+            75
+          ],
+          "range": [
+            68,
+            75
+          ],
+          "relative_level": 0,
+          "source": null,
+          "target": "strings"
+        },
+        {
           "confidence": "heuristic",
           "evidence_kind": "tree_sitter",
           "kind": "call",
@@ -309,23 +353,6 @@
           "confidence": "syntactic",
           "evidence_kind": "tree_sitter",
           "kind": "import",
-          "qualifier": "embed",
-          "qualifier_range": [
-            91,
-            96
-          ],
-          "range": [
-            88,
-            89
-          ],
-          "relative_level": 0,
-          "source": null,
-          "target": "_"
-        },
-        {
-          "confidence": "syntactic",
-          "evidence_kind": "tree_sitter",
-          "kind": "import",
           "qualifier": "fmt",
           "qualifier_range": [
             57,
@@ -406,23 +433,6 @@
           "relative_level": 0,
           "source": null,
           "target": "os"
-        },
-        {
-          "confidence": "syntactic",
-          "evidence_kind": "tree_sitter",
-          "kind": "import",
-          "qualifier": "strings",
-          "qualifier_range": [
-            68,
-            75
-          ],
-          "range": [
-            63,
-            66
-          ],
-          "relative_level": 0,
-          "source": null,
-          "target": "str"
         },
         {
           "confidence": "syntactic",

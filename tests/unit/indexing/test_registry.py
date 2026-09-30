@@ -49,7 +49,10 @@ def test_typescript_and_javascript_share_one_adapter_with_their_own_labels() -> 
 def test_adapters_are_built_from_settings_limits(tmp_path: Path) -> None:
     adapters = registry.build_adapters(Settings(indexer_checkout_roots=(str(tmp_path),)))
 
-    assert set(adapters) == {"python", "typescript"}
+    assert set(adapters) == {"python", "typescript", "go"}
+    assert adapters["go"].language == "go"
+    assert registry.label_for_path("cmd/main.go") == "go"
+    assert registry.LANGUAGES["go"].max_request_source_bytes == 512 * 1024
     assert adapters["python"].language == "python"
     assert adapters["typescript"].language == "typescript"
     assert registry.build_adapters(Settings(indexer_checkout_roots=(str(tmp_path),)), ()) == {}

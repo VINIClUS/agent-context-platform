@@ -27,11 +27,14 @@ What is emitted
 - ``import`` references (single, grouped, aliased, dot, blank, raw or interpreted string).
   The import path is a string literal, so the whole path is the ``qualifier`` (its range is the
   literal's content, which is what lets ``/`` separate; ``example.com/a/b`` is ``example.com.a.b``)
-  and ``target_name`` is the token the import binds, at its own range: the alias (or ``_``) when
-  there is one, otherwise the last path token that is not a ``vN`` suffix (``yaml`` for
-  ``gopkg.in/yaml.v3``). Dot imports are therefore indistinguishable from plain ones. A path
-  that cannot be expressed as a qualifier (``go-yaml``, a leading digit, an escape sequence) has
-  no qualifier.
+  and ``target_name`` is the last path token that is not a ``vN`` suffix, at its own range
+  (``yaml`` for ``gopkg.in/yaml.v3``). An explicit local name is ``alias`` at its own token
+  (``import m "example.com/x/mod"``: target ``mod``, ``alias="m"``); ``import _ "x"`` reports
+  ``alias="_"`` (the blank identifier, which binds nothing usable). A dot import has no
+  identifier to report, so it is indistinguishable from a plain import. A path that cannot be
+  expressed as a qualifier (``go-yaml``, a leading digit, an escape sequence) has no qualifier;
+  an aliased import whose final path element cannot be decoded (an escape) is still reported,
+  with the alias, against the last identifier token no escape touches.
 - ``call`` references: ``pkg.F()`` where ``pkg`` names an import of the file (its alias, or the
   path's last element, without a ``vN`` suffix or a ``go-`` style prefix) is qualified by the
   package identifier; ``F()`` that no function of this file matches is unqualified.
@@ -231,6 +234,7 @@ class _Site:
 class _ImportRef:
     name: _Name
     qualifier: _Name | None
+    alias: _Name | None = None
 
 
 @dataclass(eq=False)
@@ -561,12 +565,33 @@ def _enter_import(walk: _Walk, node: Node) -> None:
     # path element when no escape touches it, and give it no qualifier.
     escaped = b"\\" in body
     base = 0
+    alias: _Name | None = None
+    if name_node is not None and name_node.type in ("package_identifier", "blank_identifier"):
+        alias = _name(content, name_node)
+        if alias is None:
+            walk.oversized += 1
+            return
+    scanned = body
+    tokens: list[re.Match[bytes]] = []
     if escaped:
         base = body.rfind(b"/") + 1
-        if base == 0 or b"\\" in body[base:]:
+        if base > 0 and b"\\" not in body[base:]:
+            scanned = body[base:]
+        elif alias is None:
             return
-    scanned = body[base:]
-    tokens = list(IDENT.finditer(scanned))
+        else:
+            # The alias needs no path decoding: keep the import, targeting the last identifier
+            # token that no escape sequence touches (the path's final element cannot be read).
+            base = 0
+            for item in reversed(list(IDENT.finditer(body))):
+                near = body[max(item.start() - 1, 0) : item.end() + 1]
+                if b"\\" not in near:
+                    tokens = [item]
+                    break
+            if not tokens:
+                return
+    if not tokens:
+        tokens = list(IDENT.finditer(scanned))
     if not tokens:
         return
     try:
@@ -576,19 +601,13 @@ def _enter_import(walk: _Walk, node: Node) -> None:
     if any(len(item.group()) > MAX_NAME_BYTES for item in tokens):  # UTF-8 bytes, as the contract
         walk.oversized += 1
         return
-    if name_node is not None and name_node.type in ("package_identifier", "blank_identifier"):
-        alias = _name(content, name_node)
-        if alias is None:
-            walk.oversized += 1
-            return
-        target = alias
-    else:
-        # Plain and dot imports bind the last path token that is not a "vN" major-version suffix.
-        pick = len(tokens) - 1
-        while pick > 0 and _VERSION.fullmatch(tokens[pick].group()):
-            pick -= 1
-        offset = start + base
-        target = _Name(names[pick], offset + tokens[pick].start(), offset + tokens[pick].end())
+    # The target is the last path token that is not a "vN" major-version suffix; the local name an
+    # import binds (its alias, or ``_``) is reported separately as ``alias``.
+    pick = len(tokens) - 1
+    while pick > 0 and _VERSION.fullmatch(tokens[pick].group()):
+        pick -= 1
+    offset = start + base
+    target = _Name(names[pick], offset + tokens[pick].start(), offset + tokens[pick].end())
     last = tokens[-1]
     # Clean: the path is nothing but identifiers joined by "." or "/", so the qualifier is the path.
     clean = (
@@ -605,9 +624,8 @@ def _enter_import(walk: _Walk, node: Node) -> None:
     if clean and not fits:
         walk.oversized += 1
     qualifier = _Name(joined, start, end) if clean and fits else None
-    walk.imports.append(_ImportRef(target, qualifier))
+    walk.imports.append(_ImportRef(target, qualifier, alias))
     if name_node is not None and name_node.type == "package_identifier":
-        alias = _name(content, name_node)
         if alias is not None:
             walk.import_names.add(alias.text)
     elif name_node is None:
@@ -842,7 +860,7 @@ class _Output:
     per_reference: dict[int | None, int] = field(default_factory=dict)
     edges: set[tuple[int, int, str]] = field(default_factory=set)
     refs: set[tuple[str, int, int]] = field(default_factory=set)
-    seen: set[tuple[int | None, str, str, str]] = field(default_factory=set)
+    seen: set[tuple[int | None, str, str, str, str]] = field(default_factory=set)
     capped: int = 0
 
     def full(self, source: int | None) -> bool:
@@ -850,13 +868,28 @@ class _Output:
         return self.per_reference.get(source, 0) >= limit
 
     def reference(
-        self, source: int | None, kind: str, name: _Name, qualifier: _Name | None
+        self,
+        source: int | None,
+        kind: str,
+        name: _Name,
+        qualifier: _Name | None,
+        alias: _Name | None = None,
     ) -> None:
         marker = (kind, name.start, name.end)
-        first = (source, kind, qualifier.text if qualifier else "", name.text)
+        first = (
+            source,
+            kind,
+            qualifier.text if qualifier else "",
+            name.text,
+            alias.text if alias else "",
+        )
         if marker in self.refs or first in self.seen:
             return
-        cost = len(name.text.encode()) + (len(qualifier.text.encode()) if qualifier else 0)
+        cost = (
+            len(name.text.encode())
+            + (len(qualifier.text.encode()) if qualifier else 0)
+            + (len(alias.text.encode()) if alias else 0)
+        )
         if (
             self.full(source)
             or len(self.references) >= MAX_REFERENCES_PER_FILE
@@ -877,6 +910,9 @@ class _Output:
                 qualifier=qualifier.text if qualifier else None,
                 qualifier_start_byte=qualifier.start if qualifier else None,
                 qualifier_end_byte=qualifier.end if qualifier else None,
+                alias=alias.text if alias else None,
+                alias_start_byte=alias.start if alias else None,
+                alias_end_byte=alias.end if alias else None,
                 evidence_kind=EVIDENCE_KIND,
                 confidence="heuristic" if kind == "call" else "syntactic",
             )
@@ -917,7 +953,7 @@ def _resolve(walk: _Walk, result: _Output) -> None:
         ):
             types.setdefault(sym.simple, []).append(sym)
     for item in walk.imports:
-        result.reference(None, "import", item.name, item.qualifier)
+        result.reference(None, "import", item.name, item.qualifier, item.alias)
     memo: dict[tuple[int, str, str], list[_Sym] | None] = {}
     for site in walk.sites:
         scope = site.scope

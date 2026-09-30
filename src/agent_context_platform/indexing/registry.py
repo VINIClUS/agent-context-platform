@@ -12,7 +12,7 @@ Everything the indexer needs to know about a language lives here, and nowhere el
 it always goes through ``Limits.from_settings`` so the configured ``checkout_roots`` and the
 Landlock read set are enforced (FU-39). Nothing else in the platform builds an adapter.
 
-To register a language (PLATFORM-035 Go; TypeScript/JavaScript, PLATFORM-034, is registered) add ONE entry to
+To register a language (Python, TypeScript/JavaScript and Go are registered) add ONE entry to
 ``_ENTRIES`` below. Its ``factory`` is that adapter module's ``<language>_adapter(limits=...)``.
 ``language`` is the ADAPTER's language (what ``ParsedModule.language`` carries); ``labels`` maps
 an extension to the label events use when it differs, e.g. ``{".js": "javascript"}``.
@@ -26,6 +26,7 @@ from pathlib import PurePosixPath
 from types import MappingProxyType
 from typing import Final
 
+from agent_context_platform.indexing.tree_sitter import go as go_adapter
 from agent_context_platform.indexing.tree_sitter import python as python_adapter
 from agent_context_platform.indexing.tree_sitter import typescript as typescript_adapter
 from agent_context_platform.indexing.tree_sitter.base import StructuralAdapter
@@ -90,8 +91,16 @@ _ENTRIES: Final[tuple[LanguageSupport, ...]] = (
         },
         max_request_source_bytes=512 * 1024,
     ),
-    # PLATFORM-035 (go): one LanguageSupport(...) entry with max_request_source_bytes=512 * 1024
-    # (a 1 MiB Go request measured 4.4 s of child CPU against the 5 s backstop; Python keeps 1 MiB).
+    LanguageSupport(
+        language=go_adapter.LANGUAGE,
+        extensions=(".go",),
+        extractor_name=go_adapter.ADAPTER_NAME,
+        extractor_version=go_adapter.ADAPTER_VERSION,
+        parser_fingerprint=go_adapter.FINGERPRINT,
+        factory=lambda limits: go_adapter.go_adapter(limits=limits),
+        # A 1 MiB Go request measured 4.4 s of child CPU against the 5 s backstop.
+        max_request_source_bytes=512 * 1024,
+    ),
 )
 
 
