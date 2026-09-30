@@ -1454,7 +1454,7 @@ class _Run:
         """The package an import path names: by the ``go.mod`` module path, else by directory.
 
         With a module path, an import equal to it or below it (``module/rest``) is the directory
-        ``rest``. Without one, the longest repository directory that is a ``/``-bounded suffix of
+        ``rest``. Only without one, the longest repository directory that is a ``/``-bounded suffix of
         the import path (standard-library paths, whose first element has no dot, never match).
         A directory holding only test files is not importable.
         """
@@ -1463,7 +1463,7 @@ class _Run:
         directory: str | None = None
         if module is not None and (path == module or path.startswith(module + "/")):
             directory = path[len(module) + 1 :] or "."
-        elif "." in path.split("/", 1)[0]:
+        elif module is None and "." in path.split("/", 1)[0]:
             matches = (
                 candidate
                 for candidate in directories

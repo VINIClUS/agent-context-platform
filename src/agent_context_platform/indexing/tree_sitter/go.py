@@ -213,6 +213,7 @@ class _Open:
     # the spec has neither, so that it repeats the previous spec's type and expression (iota).
     const_mark: int = -1
     implicit: bool = False
+    ordinal: int = 0  # index of the spec within its const declaration (what ``iota`` counts)
 
 
 @dataclass(frozen=True, slots=True)
@@ -258,6 +259,7 @@ class _Walk:
     type_sym: _Sym | None = None
     tainted: int = 0
     dropped: int = 0
+    const_ordinal: int = 0
     const_tail: tuple[list[bytes], list[list[bytes]]] = field(default_factory=lambda: ([], []))
     oversized: int = 0  # import names over the byte limit: reported as references_capped
 
@@ -504,6 +506,9 @@ def _enter_value_spec(walk: _Walk, node: Node) -> None:
         entry.const_mark = name_ids[-1]
         entry.marks[name_ids[-1]] = -1
         entry.implicit = value is None and node.child_by_field_name("type") is None
+        entry.ordinal = walk.const_ordinal
+    if kind == "constant":
+        walk.const_ordinal += 1
     if len(name_ids) > 1:
         entry.names, entry.owners = name_ids, owners
         if value is not None:
@@ -710,6 +715,7 @@ def _enter_top(walk: _Walk, node: Node) -> None:
     kind = node.type
     if kind == "const_declaration":
         walk.const_tail = ([], [])
+        walk.const_ordinal = 0
     if kind in ("function_declaration", "method_declaration"):
         _enter_function(walk, node)
     elif node.is_error or node.is_missing:
@@ -815,11 +821,15 @@ def _finish_implicit_const(walk: _Walk, entry: _Open) -> None:
     typ, elements = walk.const_tail
     paired = len(elements) == (len(entry.names) or 1)
     whole = [token for element in elements for token in element]
+    # The inherited expression may use ``iota``, which is this spec's position in the group.
+    position = frame(b"iota=" + str(entry.ordinal).encode())
     for sym, index in entry.owners or [(entry.syms[0], 0)]:
         at = entry.marks[entry.names[index] if entry.names else entry.const_mark]
         head = [tokens[at], *typ]
         sym.signature_digest = digest(_SIGNATURE_DOMAIN, head)
-        sym.semantic = digest(_SEMANTIC_DOMAIN, [*head, *(elements[index] if paired else whole)])
+        sym.semantic = digest(
+            _SEMANTIC_DOMAIN, [*head, position, *(elements[index] if paired else whole)]
+        )
 
 
 def _finish_declarators(walk: _Walk, entry: _Open, stop: int, end: int) -> None:

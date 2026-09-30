@@ -483,3 +483,17 @@ def test_a_go_test_file_sees_sibling_test_files_but_production_never_sees_them(
     assert any(a.endswith(".TestB") and b.endswith(".helper") for a, b in calls)
     assert any(a.endswith(".TestB") and b.endswith(".Real") for a, b in calls)  # production seen
     assert not any(a.endswith(".Prod") and b.endswith(".helper") for a, b in calls)
+
+
+def test_an_import_outside_the_go_module_stays_external_despite_a_local_directory(
+    tmp_path: Path, make_repo: Callable[[str], RepoBuilder]
+) -> None:
+    files = {
+        "go.mod": "module example.com/app\n",
+        "store/store.go": "package store\n\nfunc Open() {}\n",
+        "cmd/main.go": 'package main\n\nimport "github.com/acme/store"\n\nfunc run() {\n\tstore.Open()\n}\n',
+    }
+    calls, dependencies = _go_facts(tmp_path, files, make_repo)
+
+    assert not any(b.endswith("store.Open") for _, b in calls)
+    assert dependencies == {_external_id("github.com/acme/store")}

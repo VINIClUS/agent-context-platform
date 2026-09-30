@@ -1010,3 +1010,9 @@ def test_an_oversized_call_name_is_counted_not_silently_lost() -> None:
     parsed = parsed_of(HEAD + f"func f() {{\n\t{long}()\n\tpkg.{long}()\n\t{long}.x()\n}}\n")
     assert codes_of(parsed).get("references_capped") == 3
     assert "file_degraded" not in codes_of(parsed)
+
+
+def test_an_inherited_iota_expression_depends_on_the_spec_position() -> None:
+    before = "const (\n\tA = iota\n\tB\n)\n"
+    after = "const (\n\tA = iota\n\t_\n\tB\n)\n"
+    assert _changed(before, after) == {"pkg.mod.B"}  # B is 2 now, A is untouched
