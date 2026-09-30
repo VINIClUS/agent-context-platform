@@ -6,20 +6,52 @@ child of ``SandboxedAdapter`` (``ParseRequest`` on stdin, ``ParsedModule`` on st
 on stdin and the grammar is loaded from site-packages only.
 
 What is emitted
-- ``module`` for the file (``__init__.py`` is the package), named from the path;
+- ``module`` for the file (``__init__.py`` is the package), named from the path (Unicode
+  identifier components are kept);
 - ``class`` (nested too), ``function`` and ``method`` (sync and async), ``property`` for
   ``@property``/``@x.setter``/``@cached_property`` methods, module-level ``variable`` and
-  ``constant`` (ALL_CAPS), class-level ``field`` and ``type`` for ``type X = ...``;
+  ``constant`` (ALL_CAPS), class-level ``field`` and ``type`` for ``type X = ...``. An assignment
+  binds in the module or class it lexically sits in even when nested in ``if``/``try``/``with``/
+  loop blocks (``if TYPE_CHECKING: Alias = ...``); one inside a function body does not;
 - ``inherits`` edges (a class to a same-file base class it names) and ``calls`` edges (a
-  caller to a same-file function/method/class named at the call site).
+  caller to a same-file function/method/class named at the call site);
+- ``references`` (PLATFORM-032c), unresolved names the syntax mentions, for what a
+  ``StructuralRelation`` cannot say because its target is not a symbol of this file:
 
-Every edge is a *heuristic* structural candidate: ``evidence_kind`` is always
+  * ``import a.b`` and ``import a.b as c``: ``import``/``syntactic``, target ``a.b`` at the
+    dotted name (the alias is not part of it);
+  * ``from a.b import c, d``: one ``import`` per name, target ``c`` at the name, qualifier
+    ``a.b`` at the module; ``from ..pkg import x``: qualifier ``pkg`` and ``relative_level`` 2;
+    ``from . import x``: no qualifier, level 1;
+  * star imports: ``from a.b import *`` references the MODULE (target ``a.b``, or ``pkg`` for
+    ``from .pkg import *``) since ``*`` is not a name and the names it binds cannot be listed
+    syntactically; ``from . import *`` names nothing and yields no reference;
+  * calls to names this file does not define, ``print()``, ``Imported()`` and qualified
+    ``mod.f()``/``a.b.f()`` (qualifier ``mod``/``a.b`` at the owner, owner a plain identifier
+    or dotted name), as ``call``/``heuristic``. Local variables, parameters and comprehension
+    names are not tracked, so ``callback()`` on a parameter is reported: that is what
+    ``heuristic`` means. ``self.f()``/``cls.f()`` and calls on anything but a dotted name
+    (``f().g()``, ``x[0].g()``) have no module to name and yield none;
+  * bases defined elsewhere as ``inherit``/``syntactic`` (``class A(Base)``, ``class A(m.Base)``,
+    ``class A(Base[T])`` names ``Base``; keyword and starred arguments are not bases).
+
+  A name bound in this file (a class, function or variable, also as the head of ``Acc.build()``)
+  is NOT a reference: a same-file edge is a relation, and a name with more than 8 candidates in
+  its scope yields nothing. The same edge is never both. References are deduplicated per
+  (source, kind, level, qualifier, target), imports first, then bases, then calls, and capped
+  (64 per symbol, 4096 at module level, 50k per file, name and output budgets); what does not
+  fit is reported as ``references_capped``. Module-level references have ``source`` None.
+
+Every relation is a *heuristic* structural candidate: ``evidence_kind`` is always
 ``tree_sitter`` and nothing here resolves scope, imports, aliases, ``obj.method()`` or
-dynamic calls. The P032 contract only lets an edge end at a symbol emitted for the same
-file, so a call/base/import whose target lives elsewhere (``import os``, ``from x import y``,
-``Imported()``) has no representable target and yields no relation. That gap is reported to
-the coordinator rather than worked around with placeholder symbols. Per source symbol the
-first call site of each target is kept (at most ``MAX_RELATIONS_PER_SYMBOL`` edges).
+dynamic calls. Per source symbol the first call site of each target is kept (at most
+``MAX_RELATIONS_PER_SYMBOL`` edges).
+
+Diagnostics (closed codes with counts, no text): ``syntax_recovered`` counts the ERROR/MISSING
+nodes tree-sitter recovered from; ``symbols_dropped`` the symbols dropped for them or for a
+limit or an unrepresentable name; ``references_capped`` the references that did not fit;
+``file_degraded`` plus ``work_budget_exceeded``/``symbols_dropped`` (see ``_common.safe_module``)
+marks a file answered with no structure at all.
 
 Semantic fingerprint and signature digest (they feed SymbolRevision identity)
 Both hash a *normalized token stream* of the symbol's syntax tree: node types, identifier
@@ -34,7 +66,9 @@ the body; the fingerprint covers the whole definition including nested definitio
 Syntax errors. tree-sitter recovers, so the walk never fails. A definition or assignment
 that *contains* an ERROR or MISSING node (not counting nested definitions, which decide for
 themselves) is skipped together with everything nested inside it, because nested names are
-qualified through it. Precisely: an error inside a method's own tokens drops only that method
+qualified through it, and so are the references made inside it. An error in a decorator
+belongs to its own ``decorated_definition`` (which owns a marker frame): only that definition
+goes, not the class around it. Precisely: an error inside a method's own tokens drops only that method
 (the class and its other members are kept), but an ERROR node sitting directly in a class body,
 between members, belongs to the class and drops the whole class with its members. Enclosing an
 error is not overlapping it. The module symbol is always emitted. Dropped symbols release
@@ -66,7 +100,10 @@ from agent_context_platform.indexing.tree_sitter._common import (
     Budget,
     WorkBudgetExceeded,
     cut_signature,
+    degraded_file,
+    diagnostics,
     digest,
+    dotted_name_at,
     frame,
     identifier_bytes,
     module_name,
@@ -74,12 +111,17 @@ from agent_context_platform.indexing.tree_sitter._common import (
 )
 from agent_context_platform.indexing.tree_sitter.base import (
     EVIDENCE_KIND,
+    MAX_MODULE_REFERENCES,
     MAX_NAME_BYTES,
+    MAX_REFERENCES_PER_FILE,
+    MAX_REFERENCES_PER_SYMBOL,
     MAX_RELATIONS_PER_FILE,
     MAX_RELATIONS_PER_SYMBOL,
+    MAX_RELATIVE_LEVEL,
     MAX_SYMBOLS_PER_FILE,
     ParsedFile,
     ParsedModule,
+    ParsedReference,
     ParsedSymbol,
     ParseRequest,
     SourceFile,
@@ -92,7 +134,7 @@ from agent_context_platform.indexing.tree_sitter.runner import Limits, Sandboxed
 LANGUAGE: Final = "python"
 ADAPTER_NAME: Final = "agent-context-python-tree-sitter"
 # Bump whenever the emitted structure or the fingerprint token stream changes.
-ADAPTER_VERSION: Final = "1"
+ADAPTER_VERSION: Final = "2"
 # Pinned in pyproject.toml/uv.lock; a test asserts these equal the installed distributions,
 # so the child never reads package metadata at run time.
 GRAMMAR_VERSIONS: Final = {"tree-sitter": "0.26.0", "tree-sitter-python": "0.25.0"}
@@ -103,6 +145,24 @@ _SIGNATURE_DOMAIN: Final = b"agent-context/python/signature/v1"
 _CLOSE: Final = frame(b")")
 _MAX_CALL_SITES: Final = 200_000
 _MAX_CANDIDATES: Final = 8
+_MAX_BASES: Final = 64
+_MAX_UNWRAP: Final = 16  # ``Base[T][U]...``: how many subscripts are peeled off a base
+# An import statement with more children than this is ~4000 names: skipped and reported.
+_MAX_IMPORT_CHILDREN: Final = 8_200
+_MEMBER_OWNERS: Final = (b"self", b"cls")
+_ANY_KIND: Final = frozenset(
+    {
+        "function",
+        "method",
+        "class",
+        "interface",
+        "type",
+        "variable",
+        "constant",
+        "field",
+        "property",
+    }
+)
 _DEFINITIONS: Final = frozenset({"function_definition", "class_definition"})
 _SKIPPED: Final = frozenset({"comment", "line_continuation", "string_end", ",", ";"})
 _PROPERTY_NAMES: Final = frozenset({"property", "cached_property"})
@@ -139,6 +199,10 @@ class _Frame:
     body_id: int = -1
     header_end: int = -1
     tainted: bool = False
+    # A marker frame (a ``decorated_definition``) only owns the taint of its decorators.
+    merkle: bool = True
+    first_site: int = 0
+    first_import: int = 0
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,6 +212,25 @@ class _Site:
     name: str
     start: int
     end: int
+    # ``mod.f()``/``class A(m.B)``: the owner's dotted name and range (never ``self``/``cls``).
+    qualifier: str | None = None
+    qualifier_start: int = 0
+    qualifier_end: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class _Candidate:
+    """A reference before caps: ``owner`` is the scope symbol (the root scope is module level)."""
+
+    owner: _Sym
+    kind: str  # "import" | "call" | "inherit"
+    target: str
+    start: int
+    end: int
+    level: int = 0
+    qualifier: str | None = None
+    qualifier_start: int = 0
+    qualifier_end: int = 0
 
 
 @dataclass(eq=False)
@@ -158,6 +241,10 @@ class _Walk:
     root: _Sym
     syms: list[_Sym] = field(default_factory=list)
     sites: list[_Site] = field(default_factory=list)
+    imports: list[_Candidate] = field(default_factory=list)
+    errors: int = 0
+    dropped: int = 0
+    capped: int = 0
     tokens: list[bytes] = field(default_factory=list)
     frames: list[_Frame] = field(default_factory=list)
     scopes: list[_Sym | None] = field(default_factory=list)
@@ -171,11 +258,13 @@ class _Walk:
     def add(self, sym: _Sym, parent: _Frame | None = None) -> bool:
         """Register a symbol if limits allow; the caller drops its subtree otherwise."""
         if len(self.syms) >= MAX_SYMBOLS_PER_FILE:
+            self.dropped += 1
             return False
         key = (sym.qualified, sym.kind, sym.start, sym.end)
         if key in self.seen:  # ``a = a = 1``, ``a, a = v``: one construct, one symbol
             return False
         if not self.budget.take(sym.qualified, sym.signature, self.output):
+            self.dropped += 1
             return False
         self.seen.add(key)
         self.syms.append(sym)
@@ -269,6 +358,13 @@ def _header_end(body: Node) -> int:
     return before.end_byte if before is not None else body.start_byte
 
 
+def _open_frame(walk: _Walk, node_id: int, is_definition: bool, tok_start: int) -> _Frame:
+    return _Frame(
+        node_id, is_definition, tok_start, len(walk.syms), first_site=len(walk.sites),
+        first_import=len(walk.imports),
+    )  # fmt: skip
+
+
 def _enter_definition(walk: _Walk, node: Node) -> None:
     parent_scope = walk.scopes[-1]
     decorated = bool(walk.ancestors) and walk.ancestors[-1][0] == "decorated_definition"
@@ -276,7 +372,7 @@ def _enter_definition(walk: _Walk, node: Node) -> None:
         start, tok_start = walk.decorated[walk.ancestors[-1][1]]
     else:
         start, tok_start = node.start_byte, len(walk.tokens)
-    entry = _Frame(node.id, True, tok_start, len(walk.syms))
+    entry = _open_frame(walk, node.id, True, tok_start)
     body = node.child_by_field_name("body")
     name_node = node.child_by_field_name("name")
     sym: _Sym | None = None
@@ -288,7 +384,9 @@ def _enter_definition(walk: _Walk, node: Node) -> None:
             if raw is not None
             else None
         )
-        if simple is not None:
+        if simple is None:
+            walk.dropped += 1  # not representable (too long, glued to non-ASCII, bad UTF-8)
+        else:
             kind: SymbolKind
             if node.type == "class_definition":
                 kind = "class"
@@ -311,16 +409,48 @@ def _enter_definition(walk: _Walk, node: Node) -> None:
     walk.scopes.append(sym)
     if sym is not None and node.type == "class_definition":
         bases = node.child_by_field_name("superclasses")
-        for base in bases.named_children if bases is not None else ():
-            raw = _name_bytes(walk.content, base) if base.type == "identifier" else None
-            if raw is not None:
-                walk.sites.append(
-                    _Site(sym, "base", raw.decode("utf-8", "replace"), *base.byte_range)
-                )
+        if bases is not None:
+            _enter_bases(walk, sym, bases)
+
+
+def _enter_bases(walk: _Walk, cls: _Sym, bases: Node) -> None:
+    """Base sites of a class: ``B``, ``m.B``, ``B[T]`` (unwrapped to ``B``); no keywords/splats."""
+    for number in range(min(bases.named_child_count, _MAX_BASES)):
+        base = bases.named_child(number)
+        for _ in range(_MAX_UNWRAP):  # the subscript chain of ``Base[T][U]`` is bounded
+            if base is None or base.type != "subscript":
+                break
+            base = base.child_by_field_name("value")
+        site = None if base is None else _name_site(walk, cls, "base", base)
+        if site is not None:
+            walk.sites.append(site)
+
+
+def _name_site(walk: _Walk, scope: _Sym, kind: str, node: Node) -> _Site | None:
+    """A site for an identifier or a ``owner.name`` attribute whose owner is a dotted name."""
+    if node.end_byte - node.start_byte > MAX_NAME_BYTES:  # a chain prefix can be the whole file
+        return None
+    content = walk.content
+    if node.type == "identifier":
+        name = dotted_name_at(content, node.start_byte, node.end_byte)
+        return None if name is None else _Site(scope, kind, name, *node.byte_range)
+    if node.type != "attribute":
+        return None
+    owner = node.child_by_field_name("object")
+    attribute = node.child_by_field_name("attribute")
+    if owner is None or attribute is None or owner.type not in ("identifier", "attribute"):
+        return None
+    qualifier = dotted_name_at(content, owner.start_byte, owner.end_byte)
+    name = dotted_name_at(content, attribute.start_byte, attribute.end_byte)
+    if qualifier is None or name is None or "." in name:
+        return None
+    if qualifier.split(".", 1)[0].encode() in _MEMBER_OWNERS:
+        return None  # ``self.a.f()`` names no module
+    return _Site(scope, kind, name, *attribute.byte_range, qualifier, *owner.byte_range)
 
 
 def _assignment_targets(node: Node) -> list[Node]:
-    """Flat identifier targets of ``a = b = 1``, ``x: int``, ``a, (b, c) = ...``."""
+    """Flat identifier targets of ``a = b = 1``, ``x: int``, ``a, (b, *c) = ...``."""
     found: list[Node] = []
     stack: list[Node] = [node]
     while stack:
@@ -332,7 +462,12 @@ def _assignment_targets(node: Node) -> list[Node]:
                 stack.append(right)
             if left is not None:
                 stack.append(left)
-        elif current.type in ("pattern_list", "tuple_pattern", "list_pattern"):
+        elif current.type in (
+            "pattern_list",
+            "tuple_pattern",
+            "list_pattern",
+            "list_splat_pattern",
+        ):
             stack.extend(reversed(current.named_children))
         elif current.type == "identifier":
             found.append(current)
@@ -341,21 +476,17 @@ def _assignment_targets(node: Node) -> list[Node]:
 
 
 def _enter_statement(walk: _Walk, node: Node) -> None:
-    """Module-level assignments/type aliases and class-level fields."""
+    """Assignments/type aliases binding in the module or class the statement lexically sits in.
+
+    ``walk.scopes[-1]`` is the innermost enclosing definition, so a statement nested in
+    ``if``/``try``/``with``/loop/``match`` blocks still binds at module or class level, and one
+    inside a function body (at any block depth) never does.
+    """
     scope = walk.scopes[-1]
-    if scope is None or not walk.ancestors:
+    if scope is None or not (scope is walk.root or scope.kind == "class"):
         return
-    parent_type = walk.ancestors[-1][0]
-    at_module = parent_type == "module" and scope is walk.root
-    in_class = (
-        parent_type == "block"
-        and len(walk.ancestors) > 1
-        and walk.ancestors[-2][0] == "class_definition"
-        and scope.kind == "class"
-    )
-    if not (at_module or in_class):
-        return
-    entry = _Frame(node.id, False, len(walk.tokens), len(walk.syms))
+    in_class = scope is not walk.root
+    entry = _open_frame(walk, node.id, False, len(walk.tokens))
     if node.type == "type_alias_statement":
         left = node.child_by_field_name("left")
         right = node.child_by_field_name("right")
@@ -382,6 +513,7 @@ def _enter_statement(walk: _Walk, node: Node) -> None:
             else None
         )
         if simple is None:
+            walk.dropped += 1
             continue
         actual: SymbolKind = kind
         if kind == "variable" and simple.isascii() and simple.isupper():
@@ -404,29 +536,92 @@ def _enter_statement(walk: _Walk, node: Node) -> None:
 def _enter_call(walk: _Walk, node: Node) -> None:
     scope = walk.scopes[-1]
     function = node.child_by_field_name("function")
-    if scope is None or function is None or len(walk.sites) >= _MAX_CALL_SITES:
+    if scope is None or function is None:
+        return
+    if len(walk.sites) >= _MAX_CALL_SITES:
+        walk.capped += 1
         return
     if function.type == "identifier":
-        raw = _name_bytes(walk.content, function)
-        if raw is not None:
-            walk.sites.append(
-                _Site(scope, "name", raw.decode("utf-8", "replace"), *function.byte_range)
-            )
+        site = _name_site(walk, scope, "name", function)
     elif function.type == "attribute":
         owner = function.child_by_field_name("object")
         attribute = function.child_by_field_name("attribute")
         # ``owner`` may be the whole nested prefix of a chain: test its type and size first.
-        if owner is None or attribute is None or owner.type != "identifier":
+        if owner is None or attribute is None or owner.type not in ("identifier", "attribute"):
             return
-        if owner.end_byte - owner.start_byte not in (3, 4) or _text(walk.content, owner) not in (
-            b"self",
-            b"cls",
+        if (
+            owner.type == "identifier"
+            and owner.end_byte - owner.start_byte in (3, 4)
+            and _text(walk.content, owner) in _MEMBER_OWNERS
         ):
+            name = dotted_name_at(walk.content, attribute.start_byte, attribute.end_byte)
+            site = None if name is None else _Site(scope, "member", name, *attribute.byte_range)
+        else:
+            site = _name_site(walk, scope, "name", function)
+    else:
+        return
+    if site is not None:
+        walk.sites.append(site)
+
+
+def _relative_module(header: Node) -> tuple[int, Node | None] | None:
+    """(level, module name node) of a ``relative_import``: the dots, then an optional dotted name."""
+    prefix = header.child(0)
+    if prefix is None or prefix.type != "import_prefix" or prefix.child_count > 64:
+        return None
+    level = sum(1 for dot in prefix.children if dot.type == ".")  # ``. .`` is level 2 too
+    return level, header.child(1) if header.child_count > 1 else None
+
+
+def _enter_import(walk: _Walk, node: Node) -> None:
+    """``import a.b [as c]``, ``from [.]m import x [as y]``, ``from m import *`` (the module)."""
+    scope = walk.scopes[-1]
+    if scope is None or node.has_error:  # a recovered statement names nothing reliably
+        return
+    if node.child_count > _MAX_IMPORT_CHILDREN:
+        walk.capped += node.child_count // 2
+        return
+    content = walk.content
+    names: list[tuple[Node, str]] = []
+    for child in node.children_by_field_name("name"):
+        item = child.child_by_field_name("name") if child.type == "aliased_import" else child
+        if item is not None and item.type == "dotted_name":
+            name = dotted_name_at(content, item.start_byte, item.end_byte)
+            if name is not None:
+                names.append((item, name))
+    if node.type == "import_statement":
+        for item, name in names:
+            walk.imports.append(_Candidate(scope, "import", name, *item.byte_range))
+        return
+    header = node.child_by_field_name("module_name")
+    module, level = header, 0
+    if header is not None and header.type == "relative_import":
+        relative = _relative_module(header)
+        if relative is None or relative[0] > MAX_RELATIVE_LEVEL:
             return
-        raw = _name_bytes(walk.content, attribute)
-        if raw is not None:
-            walk.sites.append(
-                _Site(scope, "member", raw.decode("utf-8", "replace"), *attribute.byte_range)
+        level, module = relative
+    qualifier: str | None = None
+    if module is not None:
+        qualifier = (
+            dotted_name_at(content, module.start_byte, module.end_byte)
+            if module.type == "dotted_name"
+            else None
+        )
+        if qualifier is None:
+            return
+    if any(child.type == "wildcard_import" for child in node.children):
+        # ``*`` is not a name: the reference is the module (none for ``from . import *``).
+        if module is not None and qualifier is not None:
+            walk.imports.append(_Candidate(scope, "import", qualifier, *module.byte_range, level))
+        return
+    for item, name in names:
+        if module is None:
+            walk.imports.append(_Candidate(scope, "import", name, *item.byte_range, level))
+        else:
+            walk.imports.append(
+                _Candidate(
+                    scope, "import", name, *item.byte_range, level, qualifier, *module.byte_range
+                )
             )
 
 
@@ -434,12 +629,14 @@ def _enter(walk: _Walk, node: Node) -> bool:
     """Emit the node's tokens and open frames; True when its children must be walked."""
     kind = node.type
     walk.budget.node()
+    if node.is_error or node.is_missing:
+        walk.errors += 1
+        if walk.frames:
+            walk.frames[-1].tainted = True
     if kind in _SKIPPED:
         return False
     if node.is_named and walk.ancestors and walk.ancestors[-1][0] in ("module", "block"):
         walk.first_child.setdefault(walk.ancestors[-1][1], node.id)
-    if walk.frames and (node.is_error or node.is_missing):
-        walk.frames[-1].tainted = True
     frame_open = walk.frames[-1] if walk.frames else None
     if frame_open is not None and frame_open.body_id == node.id:
         frame_open.header_end = len(walk.tokens)
@@ -448,6 +645,10 @@ def _enter(walk: _Walk, node: Node) -> bool:
     if kind == "decorated_definition":
         walk.decorated[node.id] = (node.start_byte, len(walk.tokens))
         walk.property_decorator = False
+        # Owns the taint of its decorators: an error there drops this definition only.
+        marker = _open_frame(walk, node.id, False, len(walk.tokens))
+        marker.merkle = False
+        walk.frames.append(marker)
     elif kind == "decorator":
         walk.property_decorator = walk.property_decorator or _is_property_decorator(
             walk.content, node
@@ -458,6 +659,8 @@ def _enter(walk: _Walk, node: Node) -> bool:
         _enter_statement(walk, node)
     elif kind == "call":
         _enter_call(walk, node)
+    elif kind in ("import_statement", "import_from_statement"):
+        _enter_import(walk, node)
     if node.child_count == 0:
         walk.tokens.append(_leaf_token(walk.content, node))
         return False
@@ -471,7 +674,15 @@ def _finish_frame(walk: _Walk, entry: _Frame) -> None:
         for sym in walk.syms[entry.first_sym :]:
             sym.alive = False
             walk.budget.release(sym.qualified, sym.signature, walk.output)
+        walk.dropped += len(walk.syms) - entry.first_sym
         del walk.syms[entry.first_sym :]
+        if entry.is_definition or not entry.merkle:
+            # Everything called or imported inside belongs to dropped symbols (or to the
+            # dropped decorated definition): release it too.
+            del walk.sites[entry.first_site :]
+            del walk.imports[entry.first_import :]
+        return
+    if not entry.merkle:
         return
     # Definitions: decorators + header up to the body. Assignments: the whole statement.
     stop = entry.header_end if entry.is_definition else len(walk.tokens)
@@ -521,37 +732,53 @@ def _traverse(tree: Tree, walk: _Walk) -> None:
             node, opened = parent, True
 
 
-def _index_members(syms: Sequence[_Sym]) -> dict[tuple[int, str], list[_Sym]]:
-    members: dict[tuple[int, str], list[_Sym]] = {}
-    for sym in syms:
-        if sym.parent is not None:
-            members.setdefault((id(sym.parent), sym.simple), []).append(sym)
-    return members
+class _Index:
+    """Same-file symbols by (parent, name), filtered by kind once and then looked up in O(1)."""
+
+    def __init__(self, syms: Sequence[_Sym]) -> None:
+        self.members: dict[tuple[int, str], list[_Sym]] = {}
+        self.names: set[str] = set()
+        for sym in syms:
+            if sym.parent is not None:
+                self.members.setdefault((id(sym.parent), sym.simple), []).append(sym)
+                self.names.add(sym.simple)
+        self._filtered: dict[tuple[int, str, bool], list[_Sym]] = {}
+
+    def find(self, scope: _Sym, name: str, kinds: frozenset[str]) -> list[_Sym]:
+        key = (id(scope), name, kinds is _ANY_KIND)
+        found = self._filtered.get(key)
+        if found is None:
+            found = [s for s in self.members.get((id(scope), name), []) if s.kind in kinds]
+            self._filtered[key] = found
+        return found
 
 
 def _resolve(
-    members: dict[tuple[int, str], list[_Sym]], site: _Site, kinds: frozenset[str]
-) -> list[_Sym]:
-    """Same-file candidates by name. Heuristic: lexical scope order, no import/alias logic.
+    index: _Index, scope_of: _Sym, kind: str, name: str, kinds: frozenset[str]
+) -> list[_Sym] | None:
+    """Same-file candidates by name (lexical scope order, no import/alias logic).
 
-    A name with more than ``_MAX_CANDIDATES`` definitions in the scope that binds it is
-    ambiguous noise: it yields no edge (and bounds the work per call site).
+    ``[]``: nothing in this file binds the name. ``None``: more than ``_MAX_CANDIDATES``
+    definitions in the scope that binds it, ambiguous noise that yields no edge and no reference.
     """
-    if site.kind == "member":
-        scope: _Sym | None = site.scope
+    if name not in index.names:
+        return []
+    if kind == "member":
+        scope: _Sym | None = scope_of
         while scope is not None and scope.kind != "class":
             scope = scope.parent
-        found = members.get((id(scope), site.name), []) if scope is not None else []
-        found = [sym for sym in found if sym.kind == "method"]
-        return found if len(found) <= _MAX_CANDIDATES else []
-    scope = site.scope.parent if site.kind == "base" else site.scope
+        if scope is None:
+            return []
+        found = [s for s in index.members.get((id(scope), name), []) if s.kind == "method"]
+        return found if len(found) <= _MAX_CANDIDATES else None
+    scope = scope_of.parent if kind == "base" else scope_of
     first = True
     while scope is not None:
         # Names of an enclosing class body are not visible from its methods.
         if scope.kind != "class" or first:
-            found = [s for s in members.get((id(scope), site.name), []) if s.kind in kinds]
+            found = index.find(scope, name, kinds)
             if len(found) > _MAX_CANDIDATES:
-                return []
+                return None
             if found:
                 return found
         first = False
@@ -559,30 +786,53 @@ def _resolve(
     return []
 
 
-def _relations(
-    syms: list[_Sym], sites: list[_Site], index: dict[int, int]
-) -> tuple[StructuralRelation, ...]:
-    members = _index_members(syms)
+def _link(
+    walk: _Walk, syms: list[_Sym], numbers: dict[int, int]
+) -> tuple[tuple[StructuralRelation, ...], list[_Candidate]]:
+    """Resolve every site: a same-file target is a relation, an unbound name a reference."""
+    index = _Index(syms)
     per_source: dict[int, int] = {}
     seen: set[tuple[int, int, str]] = set()
-    memo: dict[tuple[int, str, str], list[_Sym]] = {}
+    memo: dict[tuple[int, str, str, bool], list[_Sym] | None] = {}
     out: list[StructuralRelation] = []
-    ordered = sorted(sites, key=lambda site: site.kind != "base")  # stable: bases first
+    references: list[_Candidate] = []
+    ordered = sorted(walk.sites, key=lambda site: site.kind != "base")  # stable: bases first
     for site in ordered:
-        source = index.get(id(site.scope))
-        if source is None or per_source.get(source, 0) >= MAX_RELATIONS_PER_SYMBOL:
-            continue  # unemitted source, or its relation cap is reached: no resolving at all
+        source = numbers.get(id(site.scope))
+        if source is None and site.scope is not walk.root:
+            continue  # the scope was dropped: so is everything inside it
         base = site.kind == "base"
-        kinds = frozenset({"class"}) if base else _CALLABLE_KINDS
-        cache_key = (id(site.scope), site.kind, site.name)
+        qualified = site.qualifier is not None
+        if qualified:
+            # ``Acc.build()``: the head names something of this file, so it is not non-local.
+            name, kinds = (site.qualifier or "").split(".", 1)[0], _ANY_KIND
+        else:
+            name, kinds = site.name, frozenset({"class"}) if base else _CALLABLE_KINDS
+        cache_key = (id(site.scope), site.kind, name, qualified)
         if cache_key not in memo:
-            memo[cache_key] = _resolve(members, site, kinds)
-        for target in memo[cache_key]:
-            key = (source, index[id(target)], "inherits" if base else "calls")
+            memo[cache_key] = _resolve(
+                index, site.scope, "name" if qualified else site.kind, name, kinds
+            )
+        found = memo[cache_key]
+        if found is None:
+            continue
+        if not found:
+            if site.kind != "member":
+                references.append(
+                    _Candidate(
+                        site.scope, "inherit" if base else "call", site.name, site.start, site.end,
+                        0, site.qualifier, site.qualifier_start, site.qualifier_end,
+                    )
+                )  # fmt: skip
+            continue
+        if qualified or source is None:
+            continue  # bound in this file, never a reference; a relation needs an emitted source
+        for target in found:
+            key = (source, numbers[id(target)], "inherits" if base else "calls")
             if key in seen or per_source.get(source, 0) >= MAX_RELATIONS_PER_SYMBOL:
                 continue
             if len(out) >= MAX_RELATIONS_PER_FILE:
-                return tuple(out)
+                return tuple(out), references
             seen.add(key)
             per_source[source] = per_source.get(source, 0) + 1
             out.append(
@@ -595,6 +845,55 @@ def _relations(
                     evidence_kind=EVIDENCE_KIND,
                 )
             )
+    return tuple(out), references
+
+
+def _references(
+    walk: _Walk, candidates: list[_Candidate], numbers: dict[int, int]
+) -> tuple[ParsedReference, ...]:
+    """Cap and deduplicate: first site per (source, kind, level, qualifier, target) wins.
+
+    Candidates arrive imports first, then bases, then calls, so a busy scope drops calls (never
+    its imports) when it hits a cap. Everything dropped is counted for ``references_capped``.
+    """
+    out: list[ParsedReference] = []
+    per_source: dict[int | None, int] = {}
+    seen: set[tuple[int | None, str, int, str | None, str]] = set()
+    for item in candidates:
+        source: int | None = None
+        if item.owner is not walk.root:
+            source = numbers.get(id(item.owner))
+            if source is None:
+                continue
+        key = (source, item.kind, item.level, item.qualifier, item.target)
+        if key in seen:
+            continue
+        limit = MAX_MODULE_REFERENCES if source is None else MAX_REFERENCES_PER_SYMBOL
+        names = len(item.target.encode()) + len((item.qualifier or "").encode())
+        if (
+            per_source.get(source, 0) >= limit
+            or len(out) >= MAX_REFERENCES_PER_FILE
+            or not walk.budget.take_reference(names, walk.output)
+        ):
+            walk.capped += 1
+            continue
+        seen.add(key)
+        per_source[source] = per_source.get(source, 0) + 1
+        out.append(
+            ParsedReference(
+                source=None if source is None else str(source),
+                kind=item.kind,  # type: ignore[arg-type]
+                target_name=item.target,
+                relative_level=item.level,
+                start_byte=item.start,
+                end_byte=item.end,
+                qualifier=item.qualifier,
+                qualifier_start_byte=None if item.qualifier is None else item.qualifier_start,
+                qualifier_end_byte=None if item.qualifier is None else item.qualifier_end,
+                evidence_kind=EVIDENCE_KIND,
+                confidence="heuristic" if item.kind == "call" else "syntactic",
+            )
+        )
     return tuple(out)
 
 
@@ -633,14 +932,14 @@ def _parse_file(source: SourceFile, budget: Budget, output: list[int]) -> Parsed
     root = _Sym(name.rsplit(".", 1)[-1], name, "module", 0, len(content), None)
     walk = _Walk(content, budget, output, root)
     if name and not walk.add(root):
-        return empty
+        return degraded_file(source, FINGERPRINT, "symbols_dropped")
     walk.scopes.append(root)
     _traverse(_bounded_parse(content, budget), walk)
     if name:
         root.semantic = digest(_SEMANTIC_DOMAIN, walk.tokens)
         root.signature_digest = digest(_SIGNATURE_DOMAIN, ())
     live = [sym for sym in walk.syms if sym.alive]
-    index = {id(sym): number for number, sym in enumerate(live)}
+    numbers = {id(sym): number for number, sym in enumerate(live)}
     symbols = tuple(
         ParsedSymbol(
             ref=str(number),
@@ -656,12 +955,20 @@ def _parse_file(source: SourceFile, budget: Budget, output: list[int]) -> Parsed
         )
         for number, sym in enumerate(live)
     )
+    relations, candidates = _link(walk, live, numbers)
+    references = _references(walk, [*walk.imports, *candidates], numbers)
     return ParsedFile(
         path=source.path,
         language=source.language,
         parser_fingerprint=FINGERPRINT,
         symbols=symbols,
-        relations=_relations(live, walk.sites, index),
+        relations=relations,
+        references=references,
+        diagnostics=diagnostics(
+            syntax_recovered=walk.errors,
+            symbols_dropped=walk.dropped,
+            references_capped=walk.capped,
+        ),
     )
 
 

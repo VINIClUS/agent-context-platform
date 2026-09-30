@@ -1,9 +1,46 @@
 {
  "files": [
   {
+   "diagnostics": [],
    "language": "python",
-   "parser_fingerprint": "1cec4e2bed983ed944d97093309b738f3c59dd6fa2177a012483f97567bf8259",
+   "parser_fingerprint": "b4895cc638911ca361fffda8fc8a0e50332a9b6dfc3999db88029eac3dfc6551",
    "path": "pkg/__init__.py",
+   "references": [
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "models",
+     "qualifier_range": [
+      59,
+      65
+     ],
+     "range": [
+      73,
+      80
+     ],
+     "relative_level": 1,
+     "source": null,
+     "target": "Account"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "models",
+     "qualifier_range": [
+      59,
+      65
+     ],
+     "range": [
+      82,
+      88
+     ],
+     "relative_level": 1,
+     "source": null,
+     "target": "Ledger"
+    }
+   ],
    "relations": [],
    "symbols": [
     {
@@ -39,14 +76,248 @@
      "signature": "VERSION =",
      "signature_digest": "c1c28e0dcd3ae056644b84359cba4d3a211cc7b155492a41ac1621bea99a6824"
     }
-   ],
-   "references": [],
-   "diagnostics": []
+   ]
   },
   {
+   "diagnostics": [
+    {
+     "code": "symbols_dropped",
+     "count": 2
+    },
+    {
+     "code": "syntax_recovered",
+     "count": 2
+    }
+   ],
    "language": "python",
-   "parser_fingerprint": "1cec4e2bed983ed944d97093309b738f3c59dd6fa2177a012483f97567bf8259",
+   "parser_fingerprint": "b4895cc638911ca361fffda8fc8a0e50332a9b6dfc3999db88029eac3dfc6551",
+   "path": "pkg/broken.py",
+   "references": [
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      105,
+      108
+     ],
+     "relative_level": 0,
+     "source": "pkg.broken.Shelf.kept#method#0",
+     "target": "len"
+    }
+   ],
+   "relations": [],
+   "symbols": [
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.broken#module#0",
+     "range": [
+      0,
+      168
+     ],
+     "semantic_fingerprint": "117a6a9e0a4174ab5ded6262d7dfb098d2fab9eb173ba839debaacb0e4207e0c",
+     "signature": "",
+     "signature_digest": "9259e18f5395272204a21c72e58bbbd22f24eb4b9175f012e4f7c14fa3b73027"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.broken.Shelf#class#0",
+     "range": [
+      0,
+      113
+     ],
+     "semantic_fingerprint": "160b76e3757d8442cc96535cd9f960fd05427ff68b9ff0cf86e54bdff38bf032",
+     "signature": "class Shelf:",
+     "signature_digest": "74e42fcae3209603d3d8bc4ecf2072b972d244e3f26052ca043a1bbf4bc98593"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.broken.Shelf.kept#method#0",
+     "range": [
+      74,
+      113
+     ],
+     "semantic_fingerprint": "6250d6ff8326154a5562961045e882be6d78a451d75bd746a04512d52d12e365",
+     "signature": "def kept(self):",
+     "signature_digest": "9f3a2e570dc8387d37df6342418165219a3170b4bbd6e15d4a5cf055adf817d6"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.broken.fine#function#0",
+     "range": [
+      143,
+      167
+     ],
+     "semantic_fingerprint": "84a96dbe4b74e841f2dc1c390ca4b83cf166e37deb794f15ba733c6d52f0244f",
+     "signature": "def fine():",
+     "signature_digest": "458398183ec21a2ad9bdedded47ebb7e310ae056c45a7f1fe3882bfd054bb2c3"
+    }
+   ]
+  },
+  {
+   "diagnostics": [],
+   "language": "python",
+   "parser_fingerprint": "b4895cc638911ca361fffda8fc8a0e50332a9b6dfc3999db88029eac3dfc6551",
    "path": "pkg/models.py",
+   "references": [
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": "functools",
+     "qualifier_range": [
+      1295,
+      1304
+     ],
+     "range": [
+      1305,
+      1314
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "lru_cache"
+    },
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": "value",
+     "qualifier_range": [
+      1371,
+      1376
+     ],
+     "range": [
+      1377,
+      1382
+     ],
+     "relative_level": 0,
+     "source": "pkg.models.helper#function#0",
+     "target": "upper"
+    },
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      1274,
+      1277
+     ],
+     "relative_level": 0,
+     "source": "pkg.models.Ledger.total#method#0",
+     "target": "len"
+    },
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      1464,
+      1469
+     ],
+     "relative_level": 0,
+     "source": "pkg.models.fetch_all#function#0",
+     "target": "range"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "dataclasses",
+     "qualifier_range": [
+      55,
+      66
+     ],
+     "range": [
+      74,
+      83
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "dataclass"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "typing",
+     "qualifier_range": [
+      89,
+      95
+     ],
+     "range": [
+      103,
+      106
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "Any"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      29,
+      32
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "abc"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      40,
+      49
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "functools"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "inherit",
+     "qualifier": "abc",
+     "qualifier_range": [
+      203,
+      206
+     ],
+     "range": [
+      207,
+      210
+     ],
+     "relative_level": 0,
+     "source": "pkg.models.Base#class#0",
+     "target": "ABC"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "inherit",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      1155,
+      1162
+     ],
+     "relative_level": 0,
+     "source": "pkg.models.Ledger#class#0",
+     "target": "Missing"
+    }
+   ],
    "relations": [
     {
      "evidence_kind": "tree_sitter",
@@ -426,14 +697,219 @@
      "signature": "async def fetch_all() -> list[Account]:",
      "signature_digest": "a4854ad9a994beeef5ce5da550a5611107300d1c05c8fd9c8d574ddbdc36a373"
     }
-   ],
-   "references": [],
-   "diagnostics": []
+   ]
   },
   {
+   "diagnostics": [],
    "language": "python",
-   "parser_fingerprint": "1cec4e2bed983ed944d97093309b738f3c59dd6fa2177a012483f97567bf8259",
+   "parser_fingerprint": "b4895cc638911ca361fffda8fc8a0e50332a9b6dfc3999db88029eac3dfc6551",
+   "path": "pkg/m\u00f3dulo.py",
+   "references": [],
+   "relations": [],
+   "symbols": [
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.m\u00f3dulo#module#0",
+     "range": [
+      0,
+      51
+     ],
+     "semantic_fingerprint": "edec25d6c0e1d76549df2b95fb4eba6b4326786b4c80262401124a966019de43",
+     "signature": "",
+     "signature_digest": "9259e18f5395272204a21c72e58bbbd22f24eb4b9175f012e4f7c14fa3b73027"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.m\u00f3dulo.VALUE#constant#0",
+     "range": [
+      41,
+      50
+     ],
+     "semantic_fingerprint": "dc7fa42734fe309066dc8bd6b0f1792dc413969b1d0d710da406e52d6c417211",
+     "signature": "VALUE =",
+     "signature_digest": "dab08e5e9c9daa2daaf4857487cb9e4848d2b9c1c5a675b49e0cbad13b48e051"
+    }
+   ]
+  },
+  {
+   "diagnostics": [],
+   "language": "python",
+   "parser_fingerprint": "b4895cc638911ca361fffda8fc8a0e50332a9b6dfc3999db88029eac3dfc6551",
    "path": "pkg/service.py",
+   "references": [
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": "Acc",
+     "qualifier_range": [
+      150,
+      153
+     ],
+     "range": [
+      154,
+      159
+     ],
+     "relative_level": 0,
+     "source": "pkg.service.run#function#0",
+     "target": "build"
+    },
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": "ledger",
+     "qualifier_range": [
+      131,
+      137
+     ],
+     "range": [
+      138,
+      143
+     ],
+     "relative_level": 0,
+     "source": "pkg.service.run#function#0",
+     "target": "total"
+    },
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": "models",
+     "qualifier_range": [
+      166,
+      172
+     ],
+     "range": [
+      173,
+      179
+     ],
+     "relative_level": 0,
+     "source": "pkg.service.run#function#0",
+     "target": "helper"
+    },
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": "os.path",
+     "qualifier_range": [
+      195,
+      202
+     ],
+     "range": [
+      203,
+      207
+     ],
+     "relative_level": 0,
+     "source": "pkg.service.run#function#0",
+     "target": "join"
+    },
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      118,
+      124
+     ],
+     "relative_level": 0,
+     "source": "pkg.service.run#function#0",
+     "target": "Ledger"
+    },
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      189,
+      194
+     ],
+     "relative_level": 0,
+     "source": "pkg.service.run#function#0",
+     "target": "print"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "models",
+     "qualifier_range": [
+      27,
+      33
+     ],
+     "range": [
+      41,
+      48
+     ],
+     "relative_level": 1,
+     "source": null,
+     "target": "Account"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "models",
+     "qualifier_range": [
+      27,
+      33
+     ],
+     "range": [
+      57,
+      63
+     ],
+     "relative_level": 1,
+     "source": null,
+     "target": "Ledger"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      14,
+      20
+     ],
+     "relative_level": 1,
+     "source": null,
+     "target": "models"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      71,
+      78
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "os.path"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      80,
+      83
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "sys"
+    }
+   ],
    "relations": [
     {
      "evidence_kind": "tree_sitter",
@@ -469,9 +945,354 @@
      "signature": "def run() -> None:",
      "signature_digest": "83bb44cd7df4b06b4ae630405078c9d8438a798e9d870fc13bfff70d61b028f6"
     }
+   ]
+  },
+  {
+   "diagnostics": [],
+   "language": "python",
+   "parser_fingerprint": "b4895cc638911ca361fffda8fc8a0e50332a9b6dfc3999db88029eac3dfc6551",
+   "path": "pkg/sub/deep.py",
+   "references": [
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": "c",
+     "qualifier_range": [
+      538,
+      539
+     ],
+     "range": [
+      540,
+      543
+     ],
+     "relative_level": 0,
+     "source": "pkg.sub.deep.Box.open#method#0",
+     "target": "run"
+    },
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": "models",
+     "qualifier_range": [
+      498,
+      504
+     ],
+     "range": [
+      505,
+      511
+     ],
+     "relative_level": 0,
+     "source": "pkg.sub.deep.Box.open#method#0",
+     "target": "helper"
+    },
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": "sibling",
+     "qualifier_range": [
+      524,
+      531
+     ],
+     "range": [
+      532,
+      534
+     ],
+     "relative_level": 0,
+     "source": "pkg.sub.deep.Box.open#method#0",
+     "target": "go"
+    },
+    {
+     "confidence": "heuristic",
+     "evidence_kind": "tree_sitter",
+     "kind": "call",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      295,
+      302
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "TypeVar"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "far",
+     "qualifier_range": [
+      200,
+      203
+     ],
+     "range": [
+      211,
+      216
+     ],
+     "relative_level": 3,
+     "source": null,
+     "target": "thing"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "models",
+     "qualifier_range": [
+      148,
+      154
+     ],
+     "range": [
+      162,
+      169
+     ],
+     "relative_level": 2,
+     "source": null,
+     "target": "Account"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "typing",
+     "qualifier_range": [
+      244,
+      250
+     ],
+     "range": [
+      258,
+      271
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "TYPE_CHECKING"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "typing",
+     "qualifier_range": [
+      244,
+      250
+     ],
+     "range": [
+      273,
+      280
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "Generic"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "typing",
+     "qualifier_range": [
+      244,
+      250
+     ],
+     "range": [
+      282,
+      289
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "TypeVar"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      110,
+      113
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "a.b"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      134,
+      140
+     ],
+     "relative_level": 2,
+     "source": null,
+     "target": "models"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      184,
+      191
+     ],
+     "relative_level": 1,
+     "source": null,
+     "target": "sibling"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      222,
+      229
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "os.path"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "inherit",
+     "qualifier": "models",
+     "qualifier_range": [
+      421,
+      427
+     ],
+     "range": [
+      428,
+      432
+     ],
+     "relative_level": 0,
+     "source": "pkg.sub.deep.Box#class#0",
+     "target": "Base"
+    },
+    {
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "inherit",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      409,
+      416
+     ],
+     "relative_level": 0,
+     "source": "pkg.sub.deep.Box#class#0",
+     "target": "Generic"
+    }
    ],
-   "references": [],
-   "diagnostics": []
+   "relations": [],
+   "symbols": [
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.sub.deep#module#0",
+     "range": [
+      0,
+      561
+     ],
+     "semantic_fingerprint": "e89332f63e5f17ae050b18b12d597493fb262c34de2ff6c74ab87c551263ba76",
+     "signature": "",
+     "signature_digest": "9259e18f5395272204a21c72e58bbbd22f24eb4b9175f012e4f7c14fa3b73027"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.sub.deep.T#constant#0",
+     "range": [
+      291,
+      307
+     ],
+     "semantic_fingerprint": "4d58a2126b41c4775a37b86e0ec1caa43154673880e4056c2a28b35a513458fc",
+     "signature": "T =",
+     "signature_digest": "99649e4fd9645064a7ce5b57576a5e2b47469b1db7476c03148fdeb9b56de1e1"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.sub.deep.Alias#variable#0",
+     "range": [
+      331,
+      346
+     ],
+     "semantic_fingerprint": "cf0db4bb64e6e2fd58ed3fa5179db7816231d87f2f77d4ebf29d32f809e08902",
+     "signature": "Alias =",
+     "signature_digest": "2f246324e6d326478d959604947694a8dc304c2be0552e8394dac5fa18b030a5"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.sub.deep.Alias#variable#1",
+     "range": [
+      357,
+      371
+     ],
+     "semantic_fingerprint": "6d77ed04ff30eb68d2784dcf02748202260a5fafa7e2f9e99b458697823da31a",
+     "signature": "Alias =",
+     "signature_digest": "a3e77ff7b97ae3bdf927584782d96168e9d4b3b10fc14b29e86c0c69585d5dbf"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.sub.deep.head#variable#0",
+     "range": [
+      373,
+      396
+     ],
+     "semantic_fingerprint": "1778878c56140037e170eb9ce803e80a270c9963d2fd3290e60d8d41bba7a6a9",
+     "signature": "head, *tail =",
+     "signature_digest": "db5d5b3792f66622a73d8ab91254e28110f0d11ba04f88086a1384270201f6b9"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.sub.deep.tail#variable#0",
+     "range": [
+      373,
+      396
+     ],
+     "semantic_fingerprint": "1778878c56140037e170eb9ce803e80a270c9963d2fd3290e60d8d41bba7a6a9",
+     "signature": "head, *tail =",
+     "signature_digest": "db5d5b3792f66622a73d8ab91254e28110f0d11ba04f88086a1384270201f6b9"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.sub.deep.Box#class#0",
+     "range": [
+      399,
+      560
+     ],
+     "semantic_fingerprint": "4f09f353b949b8d18cf2993312e3bc45a39c3c21578f0fb89359abfed96eb0d7",
+     "signature": "class Box(Generic[T], models.Base):",
+     "signature_digest": "4239d27c63571336abb1659436f18fd2520738179a19cf51b9368de6a6604c85"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.sub.deep.Box.flag#field#0",
+     "range": [
+      453,
+      461
+     ],
+     "semantic_fingerprint": "5e4878015dac74566e0cd23f8a322abfada4ea1f9f750a2dd64ea31573889a48",
+     "signature": "flag =",
+     "signature_digest": "c2c1e9003d398c91a7488aad698f58a37bbc30bd2a88519923627db40b073980"
+    },
+    {
+     "evidence_kind": "tree_sitter",
+     "key": "pkg.sub.deep.Box.open#method#0",
+     "range": [
+      467,
+      560
+     ],
+     "semantic_fingerprint": "62bb6f7abd918cc5c5dccd5359edfdd005aa37cedb7068b4a48b304532746ec6",
+     "signature": "def open(self):",
+     "signature_digest": "3d1526a6e5484a76d4e673348f2d2ff85a9e6a7bf634ae87e4968dcb7ec4c2e7"
+    }
+   ]
   }
  ],
  "protocol_version": 2
