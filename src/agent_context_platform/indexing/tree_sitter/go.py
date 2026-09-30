@@ -801,12 +801,25 @@ def _finish_open(walk: _Walk, entry: _Open) -> None:
         return
     if entry.names:
         _finish_declarators(walk, entry, stop, end)
-        return
-    semantic = digest(_SEMANTIC_DOMAIN, walk.tokens[entry.tok_start : end])
-    signature = digest(_SIGNATURE_DOMAIN, walk.tokens[entry.tok_start : stop])
-    for sym in entry.syms:
-        sym.semantic = semantic
-        sym.signature_digest = signature
+    else:
+        semantic = digest(_SEMANTIC_DOMAIN, walk.tokens[entry.tok_start : end])
+        signature = digest(_SIGNATURE_DOMAIN, walk.tokens[entry.tok_start : stop])
+        for sym in entry.syms:
+            sym.semantic = semantic
+            sym.signature_digest = signature
+    if entry.const_mark >= 0 and _IOTA in walk.tokens[stop:end]:
+        # ``iota`` is this spec's position in its group: moving the spec changes its value.
+        for sym in entry.syms:
+            sym.semantic = digest(
+                _SEMANTIC_DOMAIN, [frame(sym.semantic.encode()), _ordinal_token(entry)]
+            )
+
+
+_IOTA: Final = frame(b"n:iota=iota")
+
+
+def _ordinal_token(entry: _Open) -> bytes:
+    return frame(b"iota=" + str(entry.ordinal).encode())
 
 
 def _finish_implicit_const(walk: _Walk, entry: _Open) -> None:
@@ -821,14 +834,14 @@ def _finish_implicit_const(walk: _Walk, entry: _Open) -> None:
     typ, elements = walk.const_tail
     paired = len(elements) == (len(entry.names) or 1)
     whole = [token for element in elements for token in element]
-    # The inherited expression may use ``iota``, which is this spec's position in the group.
-    position = frame(b"iota=" + str(entry.ordinal).encode())
+    # An inherited ``iota`` is this spec's position in the group; other expressions ignore it.
+    position = [_ordinal_token(entry)] if _IOTA in whole else []
     for sym, index in entry.owners or [(entry.syms[0], 0)]:
         at = entry.marks[entry.names[index] if entry.names else entry.const_mark]
         head = [tokens[at], *typ]
         sym.signature_digest = digest(_SIGNATURE_DOMAIN, head)
         sym.semantic = digest(
-            _SEMANTIC_DOMAIN, [*head, position, *(elements[index] if paired else whole)]
+            _SEMANTIC_DOMAIN, [*head, *position, *(elements[index] if paired else whole)]
         )
 
 

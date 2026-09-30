@@ -1016,3 +1016,9 @@ def test_an_inherited_iota_expression_depends_on_the_spec_position() -> None:
     before = "const (\n\tA = iota\n\tB\n)\n"
     after = "const (\n\tA = iota\n\t_\n\tB\n)\n"
     assert _changed(before, after) == {"pkg.mod.B"}  # B is 2 now, A is untouched
+
+
+def test_an_explicit_iota_spec_changes_with_its_position_and_others_do_not() -> None:
+    before = "const (\n\tX = 1\n\tA = iota\n\tB = 5\n)\n"
+    inserted = "const (\n\tX = 1\n\t_ = 0\n\tA = iota\n\tB = 5\n)\n"
+    assert _changed(before, inserted) == {"pkg.mod.A"}  # B has no iota: its revision holds
