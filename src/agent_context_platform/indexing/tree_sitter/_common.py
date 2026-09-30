@@ -43,7 +43,7 @@ from agent_context_platform.indexing.tree_sitter.base import (
 )
 
 # Same token rule as base._IDENT: the parent finds names by these maximal runs.
-_IDENT: Final = re.compile(rb"[A-Za-z_$\x80-\xff][A-Za-z0-9_$\x80-\xff]*")
+IDENT: Final = re.compile(rb"[A-Za-z_$\x80-\xff][A-Za-z0-9_$\x80-\xff]*")
 _WHITESPACE: Final = re.compile(rb"[ \t\r\n\f\v]+")
 _CONTROLS: Final = re.compile(rb"[\x00-\x08\x0e-\x1f\x7f]")
 _TOKEN_BYTE: Final = re.compile(rb"[A-Za-z0-9_$\x80-\xff]")
@@ -51,13 +51,13 @@ _SEPARATOR_SPACE: Final = rb"[ \t\r\n\f\v]*"
 # ``a``, ``a.b``, ``a . b``: what ``base._SourceText.path_ok`` accepts for a reference name.
 _DOTTED: Final = re.compile(
     b"(?:"
-    + _IDENT.pattern
+    + IDENT.pattern
     + b")(?:"
     + _SEPARATOR_SPACE
     + rb"\."
     + _SEPARATOR_SPACE
     + b"(?:"
-    + _IDENT.pattern
+    + IDENT.pattern
     + b"))*"
 )
 # Reference cost estimate for the output bound: JSON framing of one ParsedReference.
@@ -90,7 +90,7 @@ def identifier_bytes(raw: bytes, content: bytes, start: int, end: int) -> str | 
     The parent looks names up among maximal ``[A-Za-z0-9_$\\x80-\\xff]`` runs, so an identifier
     glued to such a byte (``f→``) or with invalid UTF-8 must be skipped, not emitted.
     """
-    if not _IDENT.fullmatch(raw):
+    if not IDENT.fullmatch(raw):
         return None
     if start > 0 and _TOKEN_BYTE.fullmatch(content, start - 1, start):
         return None
@@ -206,6 +206,11 @@ class Budget:
 
     MAX_NODES_PER_FILE: Final = 600_000
     CPU_SOFT_LIMIT: Final = 5.0
+    # CPU one file's parse may take (checked in the read callback, where memory grows with time).
+    # A legitimate 1 MiB file parses in well under 0.5 s: 2 s is a pathology bound only. After a
+    # trip the parser unwinds for up to about the time it spent, so a parse-deadline trip costs
+    # at most ~2 + ~2 s of the request's CPU, which the 5 s backstop then absorbs.
+    PARSE_SOFT_LIMIT: Final = 2.0
 
     def __init__(self, name_limit: int = MAX_NAME_TOTAL_BYTES // 2) -> None:
         self._name_limit = name_limit
@@ -284,10 +289,11 @@ def bounded_parse(parser: Parser, content: bytes, budget: Budget, chunk: int = R
     """
     budget.check()
     stopped = False
+    deadline = time.process_time() + budget.PARSE_SOFT_LIMIT
 
     def read(offset: int, _point: object) -> bytes:
         nonlocal stopped
-        if not stopped and budget.out_of_time():
+        if not stopped and (budget.out_of_time() or time.process_time() > deadline):
             stopped = True
         return b"" if stopped else content[offset : offset + chunk]
 

@@ -76,6 +76,7 @@ from agent_context_platform.indexing.tree_sitter._common import (
     Budget,
     bounded_parse,
     cut_signature,
+    degraded_file,
     digest,
     frame,
     identifier_bytes,
@@ -85,7 +86,6 @@ from agent_context_platform.indexing.tree_sitter.base import (
     EVIDENCE_KIND,
     MAX_MODULE_REFERENCES,
     MAX_NAME_BYTES,
-    MAX_NAME_TOTAL_BYTES,
     MAX_REFERENCES_PER_FILE,
     MAX_REFERENCES_PER_SYMBOL,
     MAX_RELATIONS_PER_FILE,
@@ -115,16 +115,11 @@ FINGERPRINT: Final = parser_fingerprint(ADAPTER_NAME, ADAPTER_VERSION, GRAMMAR_V
 
 _SEMANTIC_DOMAIN: Final = b"agent-context/go/semantic/v1"
 _SIGNATURE_DOMAIN: Final = b"agent-context/go/signature/v1"
-# Error recovery keeps running for a while after the backstop stops the parse (about a third of
-# the time spent, more on a slow runner), and its memory grows with the time spent (about 230 MB
-# RSS at 2 s on hostile input, RLIMIT_AS is 512 MiB): 2 s keeps both under their rlimits.
-_CPU_LIMIT: Final = 2.0
 _MAX_SITES: Final = 200_000
 _MAX_CANDIDATES: Final = 8
 _MAX_HEADER: Final = 4096
 _MAX_IMPORT_PATH: Final = 1024
 # Names of references share the file-wide name budget with the symbols (which get the other half).
-_REFERENCE_NAME_BUDGET: Final = MAX_NAME_TOTAL_BYTES // 2 - 4096
 _SKIPPED: Final = frozenset({"comment", ",", ";"})
 _SPEC_HOLDERS: Final = frozenset({"type_declaration", "const_declaration", "var_declaration"})
 _TYPE_SHAPES: Final = frozenset({"type_identifier", "qualified_type", "generic_type"})
@@ -205,6 +200,12 @@ class _Open:
     syms: list[_Sym]
     body_id: int = -1
     header_end: int = -1
+    # Multi-name specs (``var a, b = x, y``): token position of every name and value element,
+    # so each symbol is digested from its own declarator rather than from the whole spec.
+    marks: dict[int, int] = field(default_factory=dict)
+    names: list[int] = field(default_factory=list)  # node ids of every name, in order
+    values: list[int] = field(default_factory=list)
+    owners: list[tuple[_Sym, int]] = field(default_factory=list)  # symbol, index into names
 
 
 @dataclass(frozen=True, slots=True)
@@ -460,9 +461,12 @@ def _enter_value_spec(walk: _Walk, node: Node) -> None:
     stop = value.start_byte if value is not None else node.end_byte
     signature = _header(walk.content, node.start_byte, stop)
     made: list[_Sym] = []
+    owners: list[tuple[_Sym, int]] = []
+    name_ids: list[int] = []
     for child in node.children_by_field_name("name"):
         if child.type != "identifier":  # the field also lists the commas between names
             continue
+        name_ids.append(child.id)
         simple = _declared(walk, child)
         if simple is None or simple.text == "_":
             continue
@@ -476,7 +480,14 @@ def _enter_value_spec(walk: _Walk, node: Node) -> None:
         )
         if walk.add(candidate):
             made.append(candidate)
+            owners.append((candidate, len(name_ids) - 1))
     _open(walk, node, made, value)
+    if len(name_ids) > 1 and made:
+        entry = walk.opens[-1]
+        entry.names, entry.owners = name_ids, owners
+        if value is not None:
+            entry.values = [item.id for item in value.named_children if item.type != "comment"]
+        entry.marks = dict.fromkeys(entry.names + entry.values, -1)
 
 
 def _enter_interface_member(walk: _Walk, node: Node) -> None:
@@ -696,6 +707,8 @@ def _enter(walk: _Walk, node: Node) -> bool:
     for entry in walk.opens[-1:]:
         if entry.body_id == node.id:
             entry.header_end = len(walk.tokens)
+        if node.id in entry.marks:
+            entry.marks[node.id] = len(walk.tokens)
     if node.child_count == 0:
         walk.tokens.append(_leaf_token(walk.content, node))
         return False
@@ -708,11 +721,33 @@ def _finish_open(walk: _Walk, entry: _Open) -> None:
     stop = entry.header_end if entry.header_end >= 0 else end
     if not entry.syms:
         return
+    if entry.names:
+        _finish_declarators(walk, entry, stop, end)
+        return
     semantic = digest(_SEMANTIC_DOMAIN, walk.tokens[entry.tok_start : end])
     signature = digest(_SIGNATURE_DOMAIN, walk.tokens[entry.tok_start : stop])
     for sym in entry.syms:
         sym.semantic = semantic
         sym.signature_digest = signature
+
+
+def _finish_declarators(walk: _Walk, entry: _Open, stop: int, end: int) -> None:
+    """Digest each name of ``var a, b T = x, y`` from its own name, the shared type and its value."""
+    tokens = walk.tokens
+    positions = [entry.marks[item] for item in entry.names]
+    after_names = max(positions) + 1
+    shared_type = tokens[after_names:stop]
+    starts = [entry.marks[item] for item in entry.values]
+    paired = len(entry.values) == len(entry.names)
+    for sym, index in entry.owners:
+        head = [tokens[positions[index]], *shared_type]
+        if paired:
+            last = index + 1 == len(starts)
+            value = tokens[starts[index] : end if last else starts[index + 1]]
+        else:
+            value = tokens[stop:end]  # ``a, b = f()``: every name depends on the whole value
+        sym.signature_digest = digest(_SIGNATURE_DOMAIN, head)
+        sym.semantic = digest(_SEMANTIC_DOMAIN, [*head, *value])
 
 
 def _exit(walk: _Walk, node: Node, opened: bool) -> None:
@@ -757,6 +792,8 @@ class _Output:
 
     index: dict[int, int]
     module: int | None
+    budget: Budget
+    output: list[int]
     relations: list[StructuralRelation] = field(default_factory=list)
     references: list[ParsedReference] = field(default_factory=list)
     per_relation: dict[int | None, int] = field(default_factory=dict)
@@ -764,7 +801,6 @@ class _Output:
     edges: set[tuple[int, int, str]] = field(default_factory=set)
     refs: set[tuple[str, int, int]] = field(default_factory=set)
     seen: set[tuple[int | None, str, str, str]] = field(default_factory=set)
-    name_bytes: int = 0
     capped: int = 0
 
     def full(self, source: int | None) -> bool:
@@ -782,13 +818,12 @@ class _Output:
         if (
             self.full(source)
             or len(self.references) >= MAX_REFERENCES_PER_FILE
-            or self.name_bytes + cost > _REFERENCE_NAME_BUDGET
+            or not self.budget.take_reference(cost, self.output)
         ):
             self.capped += 1
             return
         self.refs.add(marker)
         self.seen.add(first)
-        self.name_bytes += cost
         self.per_reference[source] = self.per_reference.get(source, 0) + 1
         self.references.append(
             ParsedReference(
@@ -899,20 +934,13 @@ def _parse_file(source: SourceFile, budget: Budget, output: list[int]) -> Parsed
     walk = _Walk(content, budget, output, root, name)
     if name and not walk.add(root):
         # The module symbol was refused (name or output limit): the file's structure is lost.
-        return empty.model_copy(
-            update={
-                "diagnostics": (
-                    ParsedDiagnostic(code="file_degraded", count=1),
-                    ParsedDiagnostic(code="symbols_dropped", count=1),
-                )
-            }
-        )
+        return degraded_file(source, FINGERPRINT, "symbols_dropped")
     _traverse(tree, walk)
     if name:
         root.semantic = digest(_SEMANTIC_DOMAIN, walk.tokens)
         root.signature_digest = digest(_SIGNATURE_DOMAIN, [frame(name.encode())])
     index = {id(sym): number for number, sym in enumerate(walk.syms)}
-    result = _Output(index, index.get(id(root)))
+    result = _Output(index, index.get(id(root)), budget, output)
     _resolve(walk, result)
     symbols = tuple(
         ParsedSymbol(
@@ -951,7 +979,7 @@ def _parse_file(source: SourceFile, budget: Budget, output: list[int]) -> Parsed
 
 def parse_go(request: ParseRequest) -> ParsedModule:
     """Child-side entry: one ``ParsedFile`` per input file; the parent validates the result."""
-    return safe_module(request, FINGERPRINT, _parse_file, cpu_limit=_CPU_LIMIT)
+    return safe_module(request, FINGERPRINT, _parse_file)
 
 
 def go_adapter(

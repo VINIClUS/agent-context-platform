@@ -565,9 +565,9 @@
             255,
             271
           ],
-          "semantic_fingerprint": "9b3d2b6149a8409a69b06ac728995e56b05db2350ba7e7ae7bbc6e20b5e0bb25",
+          "semantic_fingerprint": "833b961bed0433d8f6df243e13ed144d5ececc36f12f4f62f680f9ff2b446a07",
           "signature": "Low, High =",
-          "signature_digest": "39c19062420b6b4122d23f458bc642d5ae5a3a7e3932fd6b9c6d6ec5ce16222d"
+          "signature_digest": "b8dd71f7bf8806ab100877ccd9fdc30380b4ace8f30f4de8350c0e7f8a3712c1"
         },
         {
           "evidence_kind": "tree_sitter",
@@ -576,9 +576,9 @@
             255,
             271
           ],
-          "semantic_fingerprint": "9b3d2b6149a8409a69b06ac728995e56b05db2350ba7e7ae7bbc6e20b5e0bb25",
+          "semantic_fingerprint": "3bc6d7228e8a69cd8fad176699e666cd1ad0e25c11eaafe3a1cd81c22c0606ff",
           "signature": "Low, High =",
-          "signature_digest": "39c19062420b6b4122d23f458bc642d5ae5a3a7e3932fd6b9c6d6ec5ce16222d"
+          "signature_digest": "8e49acf697714ae75bb522a8898ac787cf7942635474cb99f0e4651cf9e1d78a"
         },
         {
           "evidence_kind": "tree_sitter",

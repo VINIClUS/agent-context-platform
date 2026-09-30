@@ -42,6 +42,10 @@ pytestmark = pytest.mark.unit
 FIXTURES = Path(__file__).with_name("fixtures") / "typescript"
 
 
+# Sandbox wall timeout: generous, so a loaded machine never turns a slow run into a failure.
+PATIENT = Limits(wall_seconds=180.0)
+
+
 def fixture_request() -> ParseRequest:
     paths = sorted(p for p in FIXTURES.rglob("*") if p.is_file() and p.suffix != ".json")
     return ParseRequest(
@@ -54,7 +58,7 @@ def fixture_request() -> ParseRequest:
 
 def test_golden_through_the_real_sandboxed_subprocess() -> None:
     expected = json.loads((FIXTURES / "expected.json").read_text())
-    assert normalize_module(typescript_adapter().parse(fixture_request())) == expected
+    assert normalize_module(typescript_adapter(limits=PATIENT).parse(fixture_request())) == expected
 
 
 def source(path: str, content: bytes | str) -> SourceFile:
@@ -105,11 +109,13 @@ def children_cpu() -> float:
 
 def test_in_process_output_equals_the_sandboxed_output() -> None:
     req = fixture_request()
-    assert normalize_module(in_process(req)) == normalize_module(typescript_adapter().parse(req))
+    assert normalize_module(in_process(req)) == normalize_module(
+        typescript_adapter(limits=PATIENT).parse(req)
+    )
 
 
 def test_adapter_contract() -> None:
-    adapter = typescript_adapter()
+    adapter = typescript_adapter(limits=PATIENT)
     assert isinstance(adapter, StructuralAdapter)
     assert adapter.language == "typescript"
     assert adapter.fingerprint == parser_fingerprint(
@@ -791,7 +797,7 @@ def test_a_huge_single_expression_degrades_or_survives_but_the_batch_returns() -
 
 
 def test_invalid_utf8_crlf_and_bom_through_the_sandbox() -> None:
-    module = typescript_adapter().parse(
+    module = typescript_adapter(limits=PATIENT).parse(
         request(
             source("src/a.ts", b"\xef\xbb\xbffunction f() {}\r\nfunction g\xff() {}\r\n"),
             source("src/b.ts", b"\xff\xfe\x00"),
