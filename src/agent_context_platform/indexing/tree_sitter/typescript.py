@@ -50,7 +50,16 @@ literal text. Comments (JSDoc included), ``;`` and ``,`` (ASI, trailing commas) 
 style of string literals are not part of it and CRLF inside string/template text is read as LF,
 so reformatting does not create a new revision while a changed body, operator, literal or
 decorator does. The signature digest covers the header up to the body; the fingerprint covers the
-whole definition including nested definitions.
+whole definition including nested definitions. Every symbol is fingerprinted from ITS OWN range:
+each ``variable_declarator`` of ``const a = ..., b = ...`` (and each class expression) has its own
+frame, with the ``const``/``let`` keyword mixed in as a prefix. The one shared frame is a dotted
+``namespace A.B {}``, whose symbols ``A`` and ``A.B`` really do contain the same text.
+
+Members: fields (also ``abstract``/``declare``/``static``/``#private``/``accessor``), methods,
+accessors, and class-body overload/optional method signatures are symbols. Not emitted, on
+purpose: index signatures, static blocks, call/construct signatures and interface members
+(no name, or no owner symbol in the contract), constructor parameter properties (a parameter
+list, not a member declaration) and object-literal methods.
 
 Syntax errors. tree-sitter recovers, so the walk never fails. A definition that *contains* an
 ERROR or MISSING node (not counting nested definitions, which decide for themselves) is skipped
@@ -143,6 +152,9 @@ _MEMBERS: Final = frozenset(
     {
         "method_definition",
         "abstract_method_signature",
+        "method_signature",  # an overload or optional method declared in a class body
+        "abstract_property_signature",  # not produced by grammar 0.23.2 (abstract fields parse as
+        # public_field_definition); listed so a grammar that does produce it loses nothing
         "public_field_definition",
         "field_definition",
     }
@@ -238,6 +250,19 @@ class _Sym:
     alive: bool = True
 
 
+@dataclass(frozen=True, slots=True)
+class _Declaration:
+    """What a ``variable_declarator`` needs from its statement."""
+
+    top: bool
+    constant: bool
+    keyword: bytes
+    start: int
+    end: int
+    first: int
+    last: int
+
+
 @dataclass(eq=False, slots=True)
 class _Frame:
     """An open definition or declaration: where its tokens start and which symbols it owns."""
@@ -250,6 +275,7 @@ class _Frame:
     body_id: int = -1
     header_end: int = -1
     tainted: bool = False
+    prefix: tuple[bytes, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -283,6 +309,7 @@ class _Walk:
     imports: list[ParsedReference] = field(default_factory=list)
     seen_imports: set[tuple[int, int, int]] = field(default_factory=set)
     decorators_at: int = -1
+    declarations: dict[int, _Declaration] = field(default_factory=dict)
     recovered: int = 0
     dropped: int = 0
     capped: int = 0
@@ -469,7 +496,7 @@ def _enter_member(walk: _Walk, node: Node) -> None:
     kind: SymbolKind
     body = node.child_by_field_name("body")
     value: Node | None = None
-    if node.type in ("method_definition", "abstract_method_signature"):
+    if node.type in ("method_definition", "abstract_method_signature", "method_signature"):
         kind = "property" if _is_accessor(node) else "method"
         end = body.start_byte if body is not None else node.end_byte
     else:
@@ -483,67 +510,98 @@ def _enter_member(walk: _Walk, node: Node) -> None:
     made = _declare(walk, node, [(kind, simple)], end, body)
     if made and value is not None and value.type in _FUNCTION_VALUES:
         walk.value_scopes[value.id] = made[0]
-    elif made and node.type in ("public_field_definition", "field_definition"):
+    elif made and node.type in (
+        "public_field_definition",
+        "abstract_property_signature",
+        "field_definition",
+    ):
         walk.frames[-1].is_definition = False
 
 
 def _enter_variables(walk: _Walk, node: Node) -> None:
+    """Record what each declarator needs from its statement; the declarators own the frames."""
     scope = walk.scopes[-1]
     if scope is None:
         return
-    top = _at_top(walk)
+    declarators = [child for child in node.named_children if child.type == "variable_declarator"]
+    if not declarators:
+        return
     marker = node.child_by_field_name("kind")
-    constant = marker is not None and marker.type == "const"
-    start = _outer_start(walk, node)
-    entry = _Frame(node.id, False, len(walk.tokens), len(walk.syms))
-    header_end = -1
-    for child in node.named_children:
-        if child.type != "variable_declarator":
-            continue
-        value = child.child_by_field_name("value")
-        callable_value = value is not None and value.type in _FUNCTION_VALUES
-        class_value = value is not None and value.type == "class"
-        if not (top or callable_value or class_value):
-            continue
-        simple = _identifier(walk, child.child_by_field_name("name"))
-        if simple is None or (child.child_by_field_name("name") or child).type != "identifier":
-            continue
-        kind: SymbolKind = (
-            "function"
-            if callable_value
-            else "class"
-            if class_value
-            else "constant"
-            if constant
-            else "variable"
-        )
-        body = value.child_by_field_name("body") if callable_value and value is not None else None
-        if header_end < 0:
-            header_end = (
-                body.start_byte
-                if body is not None
-                else value.start_byte
-                if value is not None
-                else node.end_byte
-            )
-            if body is not None:
-                entry.body_id = body.id
-                entry.is_definition = True
-        candidate = _Sym(
-            simple,
-            _qualified(scope, simple),
-            kind,
-            start,
-            node.end_byte,
-            scope,
-            _header(walk, start, header_end),
-        )
-        if walk.add(candidate, entry) and value is not None and (callable_value or class_value):
-            walk.value_scopes[value.id] = candidate
-            if class_value and value is not None:
-                _heritage(walk, candidate, value)
-    if entry.syms:
-        walk.frames.append(entry)
+    walk.declarations[node.id] = _Declaration(
+        top=_at_top(walk),
+        constant=marker is not None and marker.type == "const",
+        keyword=frame(b"k:" + (marker.type if marker is not None else "var").encode()),
+        start=_outer_start(walk, node),
+        end=node.end_byte,
+        first=declarators[0].id,
+        last=declarators[-1].id,
+    )
+
+
+def _enter_declarator(walk: _Walk, node: Node) -> None:
+    """One symbol per declarator, with its OWN frame: its fingerprints cover only its range.
+
+    ``const a = () => 1, b = () => 2`` is two definitions: editing ``b`` must not revise ``a``.
+    The statement's keyword (``const``/``let``) is mixed into each digest as a prefix token.
+    """
+    scope = walk.scopes[-1]
+    if not walk.ancestors or walk.ancestors[-1][0] not in _VARIABLES or scope is None:
+        return
+    context = walk.declarations.get(walk.ancestors[-1][1])
+    if context is None:
+        return
+    if node.id == context.last:
+        del walk.declarations[walk.ancestors[-1][1]]
+    value = node.child_by_field_name("value")
+    callable_value = value is not None and value.type in _FUNCTION_VALUES
+    class_value = value is not None and value.type == "class"
+    if not (context.top or callable_value or class_value):
+        return
+    name = node.child_by_field_name("name")
+    simple = _identifier(walk, name)
+    if simple is None or name is None or name.type != "identifier":
+        return
+    kind: SymbolKind = (
+        "function"
+        if callable_value
+        else "class"
+        if class_value
+        else "constant"
+        if context.constant
+        else "variable"
+    )
+    body = value.child_by_field_name("body") if (callable_value or class_value) and value else None
+    header_end = (
+        body.start_byte
+        if body is not None
+        else value.start_byte
+        if value is not None
+        else node.end_byte
+    )
+    # The first declarator keeps the whole statement's start (``export``, decorators), the last
+    # its end; a middle declarator is exactly its own text.
+    start = context.start if node.id == context.first else node.start_byte
+    end = context.end if node.id == context.last else node.end_byte
+    entry = _Frame(node.id, body is not None, len(walk.tokens), len(walk.syms))
+    entry.prefix = (context.keyword,)
+    if body is not None:
+        entry.body_id = body.id
+    candidate = _Sym(
+        simple,
+        _qualified(scope, simple),
+        kind,
+        start,
+        end,
+        scope,
+        _header(walk, start, header_end),
+    )
+    if not walk.add(candidate, entry):
+        return
+    walk.frames.append(entry)
+    if value is not None and (callable_value or class_value):
+        walk.value_scopes[value.id] = candidate
+        if class_value:
+            _heritage(walk, candidate, value)
 
 
 def _heritage(walk: _Walk, sym: _Sym, node: Node) -> None:
@@ -799,6 +857,8 @@ def _enter(walk: _Walk, node: Node) -> bool:
         _enter_member(walk, node)
     elif kind in _VARIABLES:
         _enter_variables(walk, node)
+    elif kind == "variable_declarator":
+        _enter_declarator(walk, node)
     elif kind in ("call_expression", "new_expression"):
         _enter_call(walk, node)
     elif kind in ("import_statement", "export_statement"):
@@ -832,8 +892,8 @@ def _finish_frame(walk: _Walk, entry: _Frame) -> None:
         del walk.syms[entry.first_sym :]
         return
     stop = entry.header_end if entry.is_definition and entry.header_end >= 0 else len(walk.tokens)
-    semantic = digest(_SEMANTIC_DOMAIN, walk.tokens[entry.tok_start :])
-    signature = digest(_SIGNATURE_DOMAIN, walk.tokens[entry.tok_start : stop])
+    semantic = digest(_SEMANTIC_DOMAIN, [*entry.prefix, *walk.tokens[entry.tok_start :]])
+    signature = digest(_SIGNATURE_DOMAIN, [*entry.prefix, *walk.tokens[entry.tok_start : stop]])
     for sym in entry.syms:
         sym.signature_digest = signature
         sym.semantic = semantic
@@ -917,6 +977,45 @@ def _resolve(
     return []
 
 
+_CONTAINERS: Final = frozenset({"module", "class"})
+
+
+def _resolve_path(
+    members: dict[tuple[int, str], list[_Sym]], site: _Site, kinds: frozenset[str]
+) -> list[_Sym] | None:
+    """``N.Base`` / ``N.M.f``: the first segment resolves lexically to a namespace or class of
+    this file, each further one is a member of it; anything else is unresolved (``[]``)."""
+    parts = site.name.split(".")
+    if len(parts) == 1:
+        return _resolve(members, site, kinds)
+    head = _Site(site.scope, site.kind, parts[0], site.start, site.end)
+    owners = _resolve(members, head, _CONTAINERS)
+    for part in parts[1:-1]:
+        if not owners:
+            break
+        owners = _members_of(members, owners, part, _CONTAINERS)
+    if owners is None:
+        return None
+    if not owners:
+        return []
+    return _members_of(members, owners, parts[-1], kinds)
+
+
+def _members_of(
+    members: dict[tuple[int, str], list[_Sym]],
+    owners: list[_Sym],
+    name: str,
+    kinds: frozenset[str],
+) -> list[_Sym] | None:
+    found: list[_Sym] = []
+    for owner in owners:
+        named = members.get((id(owner), name), [])
+        if len(named) > _MAX_CANDIDATES:
+            return None
+        found.extend(sym for sym in named if sym.kind in kinds)
+    return found if len(found) <= _MAX_CANDIDATES else None
+
+
 @dataclass(eq=False)
 class _Linked:
     relations: list[StructuralRelation] = field(default_factory=list)
@@ -940,12 +1039,9 @@ def _link(walk: _Walk, live: list[_Sym], index: dict[int, int]) -> _Linked:
         base = site.kind == "base"
         relation_kind: Literal["inherits", "calls"] = "inherits" if base else "calls"
         cache_key = (id(site.scope), site.kind, site.name)
-        if "." in site.name:
-            found: list[_Sym] | None = []
-        else:
-            if cache_key not in memo:
-                memo[cache_key] = _resolve(members, site, _TYPE_KINDS if base else _CALLABLE_KINDS)
-            found = memo[cache_key]
+        if cache_key not in memo:
+            memo[cache_key] = _resolve_path(members, site, _TYPE_KINDS if base else _CALLABLE_KINDS)
+        found = memo[cache_key]
         if found is None:
             walk.capped += 1  # more than _MAX_CANDIDATES in scope: no edge, no reference, counted
             continue

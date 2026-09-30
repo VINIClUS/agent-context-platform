@@ -779,3 +779,105 @@ def test_the_real_adapter_runs_confined(tmp_path: Path) -> None:
     assert normalize_module(module) == json.loads((FIXTURES / "expected.json").read_text())
     rules = landlock.read_set([sys.executable, "-m", typescript.__name__])
     assert not any(str(tmp_path).startswith(r.rstrip("/") + "/") for r in rules.read if r != "/")
+
+
+# --- round 2: per-symbol fingerprints, members, qualified targets -----------------------------
+
+TWO = "const a = () => 1, b = () => 2;\n"
+
+
+def test_editing_one_declarator_revises_only_that_symbol() -> None:
+    before_a, before_b = digests(TWO, "src.mod.a"), digests(TWO, "src.mod.b")
+    edited = "const a = () => 1, b = () => 3;\n"
+    assert digests(edited, "src.mod.a") == before_a
+    after_b = digests(edited, "src.mod.b")
+    assert after_b[1] != before_b[1]
+    assert before_a != before_b  # never the same identity
+
+
+def test_editing_the_first_declarator_leaves_the_second_alone() -> None:
+    before_b = digests(TWO, "src.mod.b")
+    assert digests("const a = () => 9, b = () => 2;\n", "src.mod.b") == before_b
+
+
+def test_changing_the_parameters_of_one_declarator_changes_only_its_signature() -> None:
+    before_a, before_b = digests(TWO, "src.mod.a"), digests(TWO, "src.mod.b")
+    edited = "const a = () => 1, b = (x: number) => 2;\n"
+    assert digests(edited, "src.mod.a") == before_a
+    assert digests(edited, "src.mod.b")[0] != before_b[0]
+
+
+def test_a_body_edit_keeps_the_signature_of_a_declarator() -> None:
+    before = digests("const a = () => 1, b = (x) => 2;\n", "src.mod.b")
+    after = digests("const a = () => 1, b = (x) => 3;\n", "src.mod.b")
+    assert after[0] == before[0]
+    assert after[1] != before[1]
+
+
+def test_a_class_expression_body_edit_changes_its_fingerprint() -> None:
+    before = digests("const C = class { m() { return 1 } };\n", "src.mod.C")
+    after = digests("const C = class { m() { return 2 } };\n", "src.mod.C")
+    assert after[1] != before[1]
+    assert after[0] == before[0]  # the header is unchanged
+
+
+def test_class_expression_declarators_are_independent() -> None:
+    src = "const A = class { m() { return 1 } }, B = class { n() { return 1 } };\n"
+    before_a = digests(src, "src.mod.A")
+    assert digests(src.replace("n() { return 1", "n() { return 2"), "src.mod.A") == before_a
+
+
+def test_const_and_let_are_different_revisions() -> None:
+    assert digests("const a = () => 1;\n", "src.mod.a") != digests(
+        "let a = () => 1;\n", "src.mod.a"
+    )
+
+
+def test_multi_declarator_ranges_are_each_declarators_own() -> None:
+    src = "export const a = () => 1, b = () => 2, c = 3;\n"
+    item = parsed(src)
+    span = {
+        x.qualified_name: src.encode()[x.start_byte : x.end_byte].decode() for x in item.symbols
+    }
+    assert span["src.mod.a"].startswith("export const a")
+    assert span["src.mod.b"] == "b = () => 2"
+    assert span["src.mod.c"].endswith("c = 3;")
+
+
+def test_abstract_and_declared_fields_and_class_overloads_are_emitted() -> None:
+    item = parsed(
+        "abstract class A {\n  abstract value: number;\n  declare d: string;\n"
+        "  m(a: string): void;\n  m(a: number): void;\n  m(a: any) {}\n}\n"
+    )
+    kinds = names(item)
+    assert kinds["src.mod.A.value"] == "field"
+    assert kinds["src.mod.A.d"] == "field"
+    assert kinds["src.mod.A.m"] == "method"
+    # index signatures and static blocks have no name to carry: skipped, not an error
+    assert names(parsed("class A { [k: string]: any; static { init() } }\n")) == {
+        "src.mod": "module",
+        "src.mod.A": "class",
+    }
+
+
+def test_a_qualified_base_resolves_through_a_same_file_namespace() -> None:
+    item = parsed("namespace N { export class Base {} }\nclass D extends N.Base {}\n")
+    assert heritage(item) == {("src.mod.D", "src.mod.N.Base", "inherits")}
+    assert refs(item, "inherit") == []
+
+
+def test_a_qualified_call_resolves_through_a_same_file_namespace() -> None:
+    item = parsed(
+        "namespace N { export namespace M { export function f() {} } }\nfunction g() { N.M.f() }\n"
+    )
+    by_ref = {x.ref: x.qualified_name for x in item.symbols}
+    assert {(by_ref[e.source_ref], by_ref[e.target_ref], e.kind) for e in item.relations} == {
+        ("src.mod.g", "src.mod.N.M.f", "calls")
+    }
+    assert refs(item, "call") == []
+
+
+def test_an_unresolvable_qualified_target_stays_a_reference() -> None:
+    item = parsed("namespace N { }\nclass D extends N.Base {}\nfunction g() { other.f() }\n")
+    assert [x[1] for x in refs(item, "inherit")] == ["N.Base"]
+    assert [x[1] for x in refs(item, "call")] == ["other.f"]

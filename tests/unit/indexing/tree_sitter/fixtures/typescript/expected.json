@@ -327,7 +327,7 @@
       0,
       1084
      ],
-     "semantic_fingerprint": "f6ec29c25d1331c446739703c5fd6824462d9181b784f372d2b58188a59a70b7",
+     "semantic_fingerprint": "6bc140b7e5f32aad9bac6bf8b6326819f608a97e4f1f91c81fc7bfa5cf5027a5",
      "signature": "",
      "signature_digest": "8275fa0191541e90edb42f489021660b0d599d301d3c67a2af0886b538ee5129"
     },
@@ -525,9 +525,9 @@
       959,
       993
      ],
-     "semantic_fingerprint": "59be3a34ba6d026a168a6ba0cf2e1dff06f0e47ad296c0c254dcd10d0fa3abc2",
+     "semantic_fingerprint": "c6142cc3eccd14fccc3dc8ef9010383e833ec518368c64f4ed76088e0a8fe096",
      "signature": "export const DEFAULT_TAG =",
-     "signature_digest": "2b96c28984fd0520157418a11ee6b7c74eb3d0c68af1dcfa6019fc677f0b9cfe"
+     "signature_digest": "357a942b299adae37956ca029d95ff691ea3fd9aac16a5b75de0bc959137cd23"
     },
     {
      "evidence_kind": "tree_sitter",
@@ -536,9 +536,9 @@
       994,
       1066
      ],
-     "semantic_fingerprint": "ccca15e3d518dbe57e81bb7a8546ada9fad0d876b724fe2e1ad927c4c1508947",
+     "semantic_fingerprint": "b85033c970c76f342bf69a1d95c25f636fee2435da255e4ca72e14056729fd48",
      "signature": "export const shout = async (text: string) =>",
-     "signature_digest": "b3e9d874ae03bda5fecfaebd00cb58462ba8264acc19ec9fd7e10dad5dbc8183"
+     "signature_digest": "45d09c70395f88d2e075880084911515bd88b9b45ff8a11804bae8ef0f29b87c"
     },
     {
      "evidence_kind": "tree_sitter",
@@ -547,9 +547,9 @@
       1067,
       1083
      ],
-     "semantic_fingerprint": "b0d122bfe5528f47c247b39f75670a88f45d74561e09545147bc67a59093c1f1",
+     "semantic_fingerprint": "b3a76a982f8c907138b8fd7e57fc0e9746686b65e181aed21a29f6dc37f1f8f2",
      "signature": "let counter =",
-     "signature_digest": "70fb923f44f526aaa96910eb3e7be8dba1ed8f594458cc2f8cc531bbc6dab13a"
+     "signature_digest": "a30d901375ab270825e17a3a32e09948a6306e466c0177548267f532c73ba48c"
     }
    ]
   },
@@ -882,7 +882,7 @@
       0,
       757
      ],
-     "semantic_fingerprint": "d1125d82008cfbd80d2dca6e5cb5558642450afd6c2912338a9a1108b0916228",
+     "semantic_fingerprint": "a6dee1b3e6d4f83fe1945fd8c5c14dc4dca4c6dd62ac69059feec0fda4b98f6a",
      "signature": "",
      "signature_digest": "8275fa0191541e90edb42f489021660b0d599d301d3c67a2af0886b538ee5129"
     },
@@ -893,9 +893,9 @@
       402,
       418
      ],
-     "semantic_fingerprint": "951fec42b19789da0f8437ee2a13e67f7a7a743561a501ea90eaab10234d8527",
+     "semantic_fingerprint": "e3b5979a80edb8fa3f10867aa4ad1983ad921b2a2652ba276b70c4a8622599f8",
      "signature": "const local =",
-     "signature_digest": "cd725769a7005031546c14c3370e03d55b6f842b02c60b61d2f4251fd3bc5544"
+     "signature_digest": "55461d0dc5c01e34209d60addf20c8f8bfcf2f484791275f27e0f1a0d339dfc3"
     },
     {
      "evidence_kind": "tree_sitter",
@@ -1040,7 +1040,7 @@
       0,
       364
      ],
-     "semantic_fingerprint": "4beb124c95435e7081ac3a08539693818e2ce1f4a9b0107a9d296c030fd6000f",
+     "semantic_fingerprint": "1a7147ca502a384766904e0bc003010aafd67134ce06c4e418ca2cc2dcba290a",
      "signature": "",
      "signature_digest": "8275fa0191541e90edb42f489021660b0d599d301d3c67a2af0886b538ee5129"
     },
@@ -1051,9 +1051,9 @@
       0,
       25
      ],
-     "semantic_fingerprint": "bd393341668d364c5c9c8086bccad7ce8316b889489bc85abbde2f5c4c0cb073",
+     "semantic_fingerprint": "2cf952378f9e4e87e028cab4055f290f968055befde7fd91c68460a4f905c395",
      "signature": "const fs =",
-     "signature_digest": "7078599e13b2fe2c82121c9cdc16bdafbbfdd938f702509a76f7d3c8b1d4aa6d"
+     "signature_digest": "7f1ed3b5850e89cefd3d31aaebcd43f4fb3faad5ce009c9876a9316bdb4d90ee"
     },
     {
      "evidence_kind": "tree_sitter",
@@ -1106,9 +1106,9 @@
       269,
       322
      ],
-     "semantic_fingerprint": "97bf28aa6e63938312188a4e24cf511162eef792de9e1fa2ad335c9abafed331",
+     "semantic_fingerprint": "d652a1907d5a17e178b91655f5971487fc22339559e5b44225ca3cf8e8df5fe6",
      "signature": "const memo = function memoize(fn)",
-     "signature_digest": "f43303faec06343669b303efd635051b37f7467bce873e50a3b8962ea9439899"
+     "signature_digest": "ba8e6636a36dddaf0986e1c28a9710da5f4bd1340babc52df698ac781a11e231"
     }
    ]
   },
@@ -1167,7 +1167,7 @@
       0,
       191
      ],
-     "semantic_fingerprint": "573eb259dfbff458e473b55a08edce21f709f81c01ec4c0e0fe13567f1541332",
+     "semantic_fingerprint": "9d2ebb56a120bd383eaba54a5e6bbd7382d5b628c0f52cade20f61e1f73905cc",
      "signature": "",
      "signature_digest": "8275fa0191541e90edb42f489021660b0d599d301d3c67a2af0886b538ee5129"
     },
@@ -1189,9 +1189,9 @@
       138,
       190
      ],
-     "semantic_fingerprint": "56df2cf9b021e6ab411d2e5ae96ee6f4db8d909f0535caea537019dcdeb7ce49",
+     "semantic_fingerprint": "c679c22eac033f153949d5becde56b2425410dc7e7e4cfe4be612b0a7975ee69",
      "signature": "const format = (text: string) =>",
-     "signature_digest": "970df841609ac18c4ebaf822cc51f6a61caf841a23eb458a83d9cb2f39c079fb"
+     "signature_digest": "df431f8ad336af6a0dd5d1e69ca397983b2ad45ce17db48be6ea389ea3eb9963"
     }
    ]
   }
