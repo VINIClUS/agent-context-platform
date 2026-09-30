@@ -1022,3 +1022,11 @@ def test_an_explicit_iota_spec_changes_with_its_position_and_others_do_not() -> 
     before = "const (\n\tX = 1\n\tA = iota\n\tB = 5\n)\n"
     inserted = "const (\n\tX = 1\n\t_ = 0\n\tA = iota\n\tB = 5\n)\n"
     assert _changed(before, inserted) == {"pkg.mod.A"}  # B has no iota: its revision holds
+
+
+def test_an_import_literal_over_the_limit_is_counted_and_keeps_the_other_symbols() -> None:
+    long = "a" * 1100
+    parsed = parsed_of(f'package p\n\nimport x "example.com/{long}"\n\nfunc F() {{}}\n')
+    assert codes_of(parsed) == {"references_capped": 1}
+    assert {s.qualified_name for s in parsed.symbols} >= {"pkg.p.F"}
+    assert not [r for r in parsed.references if r.kind == "import"]

@@ -563,7 +563,10 @@ def _enter_field(walk: _Walk, node: Node) -> None:
 def _enter_import(walk: _Walk, node: Node) -> None:
     name_node = node.child_by_field_name("name")
     path = node.child_by_field_name("path")
-    if node.has_error or path is None or path.end_byte - path.start_byte > _MAX_IMPORT_PATH:
+    if node.has_error or path is None:
+        return
+    if path.end_byte - path.start_byte > _MAX_IMPORT_PATH:
+        walk.oversized += 1  # counted as references_capped, never lost silently
         return
     content = walk.content
     start, end = path.start_byte + 1, path.end_byte - 1
