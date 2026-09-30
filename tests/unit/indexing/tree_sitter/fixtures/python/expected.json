@@ -3,7 +3,7 @@
   {
    "diagnostics": [],
    "language": "python",
-   "parser_fingerprint": "b4895cc638911ca361fffda8fc8a0e50332a9b6dfc3999db88029eac3dfc6551",
+   "parser_fingerprint": "df9347cfa598b25fbbfdfa6a7dd99dc08e8991e046c9677ef1a6f8b59c35c0ee",
    "path": "pkg/__init__.py",
    "references": [
     {
@@ -90,7 +90,7 @@
     }
    ],
    "language": "python",
-   "parser_fingerprint": "b4895cc638911ca361fffda8fc8a0e50332a9b6dfc3999db88029eac3dfc6551",
+   "parser_fingerprint": "df9347cfa598b25fbbfdfa6a7dd99dc08e8991e046c9677ef1a6f8b59c35c0ee",
    "path": "pkg/broken.py",
    "references": [
     {
@@ -159,7 +159,7 @@
   {
    "diagnostics": [],
    "language": "python",
-   "parser_fingerprint": "b4895cc638911ca361fffda8fc8a0e50332a9b6dfc3999db88029eac3dfc6551",
+   "parser_fingerprint": "df9347cfa598b25fbbfdfa6a7dd99dc08e8991e046c9677ef1a6f8b59c35c0ee",
    "path": "pkg/models.py",
    "references": [
     {
@@ -702,7 +702,7 @@
   {
    "diagnostics": [],
    "language": "python",
-   "parser_fingerprint": "b4895cc638911ca361fffda8fc8a0e50332a9b6dfc3999db88029eac3dfc6551",
+   "parser_fingerprint": "df9347cfa598b25fbbfdfa6a7dd99dc08e8991e046c9677ef1a6f8b59c35c0ee",
    "path": "pkg/m\u00f3dulo.py",
    "references": [],
    "relations": [],
@@ -734,7 +734,7 @@
   {
    "diagnostics": [],
    "language": "python",
-   "parser_fingerprint": "b4895cc638911ca361fffda8fc8a0e50332a9b6dfc3999db88029eac3dfc6551",
+   "parser_fingerprint": "df9347cfa598b25fbbfdfa6a7dd99dc08e8991e046c9677ef1a6f8b59c35c0ee",
    "path": "pkg/service.py",
    "references": [
     {
@@ -955,7 +955,7 @@
   {
    "diagnostics": [],
    "language": "python",
-   "parser_fingerprint": "b4895cc638911ca361fffda8fc8a0e50332a9b6dfc3999db88029eac3dfc6551",
+   "parser_fingerprint": "df9347cfa598b25fbbfdfa6a7dd99dc08e8991e046c9677ef1a6f8b59c35c0ee",
    "path": "pkg/sub/deep.py",
    "references": [
     {

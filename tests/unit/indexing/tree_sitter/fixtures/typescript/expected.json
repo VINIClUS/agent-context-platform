@@ -3,7 +3,7 @@
   {
    "diagnostics": [],
    "language": "typescript",
-   "parser_fingerprint": "c6c70b505bb89a65642bb33adfa6c0d22dc0c43562559cafa44fa0528dd5980e",
+   "parser_fingerprint": "a660c2dea19ff3b9a1e439cb1adbbac507c8981a448f8fb1914d87375f202a83",
    "path": "src/esm.mjs",
    "references": [
     {
@@ -67,7 +67,7 @@
   {
    "diagnostics": [],
    "language": "typescript",
-   "parser_fingerprint": "c6c70b505bb89a65642bb33adfa6c0d22dc0c43562559cafa44fa0528dd5980e",
+   "parser_fingerprint": "a660c2dea19ff3b9a1e439cb1adbbac507c8981a448f8fb1914d87375f202a83",
    "path": "src/index.ts",
    "references": [
     {
@@ -106,7 +106,7 @@
   {
    "diagnostics": [],
    "language": "typescript",
-   "parser_fingerprint": "c6c70b505bb89a65642bb33adfa6c0d22dc0c43562559cafa44fa0528dd5980e",
+   "parser_fingerprint": "a660c2dea19ff3b9a1e439cb1adbbac507c8981a448f8fb1914d87375f202a83",
    "path": "src/legacy.cjs",
    "references": [
     {
@@ -142,7 +142,7 @@
   {
    "diagnostics": [],
    "language": "typescript",
-   "parser_fingerprint": "c6c70b505bb89a65642bb33adfa6c0d22dc0c43562559cafa44fa0528dd5980e",
+   "parser_fingerprint": "a660c2dea19ff3b9a1e439cb1adbbac507c8981a448f8fb1914d87375f202a83",
    "path": "src/models.ts",
    "references": [
     {
@@ -566,7 +566,7 @@
     }
    ],
    "language": "typescript",
-   "parser_fingerprint": "c6c70b505bb89a65642bb33adfa6c0d22dc0c43562559cafa44fa0528dd5980e",
+   "parser_fingerprint": "a660c2dea19ff3b9a1e439cb1adbbac507c8981a448f8fb1914d87375f202a83",
    "path": "src/service.ts",
    "references": [
     {
@@ -971,7 +971,7 @@
   {
    "diagnostics": [],
    "language": "typescript",
-   "parser_fingerprint": "c6c70b505bb89a65642bb33adfa6c0d22dc0c43562559cafa44fa0528dd5980e",
+   "parser_fingerprint": "a660c2dea19ff3b9a1e439cb1adbbac507c8981a448f8fb1914d87375f202a83",
    "path": "src/util.js",
    "references": [
     {
@@ -1151,7 +1151,7 @@
   {
    "diagnostics": [],
    "language": "typescript",
-   "parser_fingerprint": "c6c70b505bb89a65642bb33adfa6c0d22dc0c43562559cafa44fa0528dd5980e",
+   "parser_fingerprint": "a660c2dea19ff3b9a1e439cb1adbbac507c8981a448f8fb1914d87375f202a83",
    "path": "src/view.tsx",
    "references": [
     {

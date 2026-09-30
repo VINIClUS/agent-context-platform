@@ -1,0 +1,878 @@
+{
+  "files": [
+    {
+      "diagnostics": [
+        {
+          "code": "syntax_recovered",
+          "count": 1
+        }
+      ],
+      "language": "go",
+      "parser_fingerprint": "fabfef5da20c8420351c91f927e7d44fd5f84aa453e72e50392931e8044e80cd",
+      "path": "broken/broken.go",
+      "references": [],
+      "relations": [
+        {
+          "evidence_kind": "tree_sitter",
+          "kind": "calls",
+          "range": [
+            34,
+            38
+          ],
+          "source": "broken.Good#function#0",
+          "target": "broken.Good#function#0"
+        }
+      ],
+      "symbols": [
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "broken#module#0",
+          "range": [
+            0,
+            94
+          ],
+          "semantic_fingerprint": "3d1e897931089fb1bbb9da44bc733b0f18c978d7c27cd8177297d598dcc10f46",
+          "signature": "package broken",
+          "signature_digest": "25c272571fe38e806de913ba831a0ee8450001e1f27241c4705ceb5d445a4a45"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "broken.Good#function#0",
+          "range": [
+            18,
+            43
+          ],
+          "semantic_fingerprint": "1bd7a818d0d63225d68a02c52d084fc1b4dd67a29236a6dbe5e08bee046bb1c1",
+          "signature": "func Good()",
+          "signature_digest": "1c636436f0f86bca5fb55e1d7fa05525c93e9e3c4c8b09c910774b267a82bbc9"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "broken.T#class#0",
+          "range": [
+            71,
+            92
+          ],
+          "semantic_fingerprint": "f579c8a7cacec3932d5ed0adcab24e4ee25ccf13d93799843cf4cd5683c97421",
+          "signature": "T struct { A int }",
+          "signature_digest": "a89e90324bbf4ab2eaa3fd98a145ba7b732698eca072019d9fd9ff6142b0e54d"
+        }
+      ]
+    },
+    {
+      "diagnostics": [],
+      "language": "go",
+      "parser_fingerprint": "fabfef5da20c8420351c91f927e7d44fd5f84aa453e72e50392931e8044e80cd",
+      "path": "cmd/tool/main.go",
+      "references": [
+        {
+          "confidence": "heuristic",
+          "evidence_kind": "tree_sitter",
+          "kind": "call",
+          "qualifier": "store",
+          "qualifier_range": [
+            79,
+            84
+          ],
+          "range": [
+            85,
+            89
+          ],
+          "relative_level": 0,
+          "source": "cmd.tool.main.main#function#0",
+          "target": "Open"
+        },
+        {
+          "confidence": "syntactic",
+          "evidence_kind": "tree_sitter",
+          "kind": "import",
+          "qualifier": "example.com.app.internal.store",
+          "qualifier_range": [
+            22,
+            52
+          ],
+          "range": [
+            47,
+            52
+          ],
+          "relative_level": 0,
+          "source": null,
+          "target": "store"
+        }
+      ],
+      "relations": [
+        {
+          "evidence_kind": "tree_sitter",
+          "kind": "calls",
+          "range": [
+            114,
+            117
+          ],
+          "source": "cmd.tool.main.main#function#0",
+          "target": "cmd.tool.main.run#function#0"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "kind": "calls",
+          "range": [
+            179,
+            182
+          ],
+          "source": "cmd.tool.main.Server.Serve#method#0",
+          "target": "cmd.tool.main.run#function#0"
+        }
+      ],
+      "symbols": [
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "cmd.tool.main#module#0",
+          "range": [
+            0,
+            190
+          ],
+          "semantic_fingerprint": "f857673c563a82197d8b5f78419285488c4c6d0ccfd1bdcd0251548529ded2a3",
+          "signature": "package main",
+          "signature_digest": "c468fb96de26e51577a2e01cb29e3caa612c0074ea3f7d887c12000ad9381f7c"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "cmd.tool.main.main#function#0",
+          "range": [
+            55,
+            123
+          ],
+          "semantic_fingerprint": "5802cfb6316a5dc1206430222eeaa7abb9b253e997327071c7543ec1c2ea927c",
+          "signature": "func main()",
+          "signature_digest": "ac84f596965d30690cacd0e509a364460631789dc38424d2bf3e6149e906746f"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "cmd.tool.main.run#function#0",
+          "range": [
+            125,
+            150
+          ],
+          "semantic_fingerprint": "b3febce8c6556a4cdf10677442f121391d672cc70196b205adde4b1ba7660d09",
+          "signature": "func run(db *store.DB)",
+          "signature_digest": "1d64bd57f92e4085d9d47d0db0577d8c06acd65fd536b8c8c13e395e5f3cbffc"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "cmd.tool.main.Server.Serve#method#0",
+          "range": [
+            152,
+            189
+          ],
+          "semantic_fingerprint": "b5d01818ccda04998b1cec788c8997042347c1c648b5fcb72004578be0b094b8",
+          "signature": "func (s *Server) Serve()",
+          "signature_digest": "28edcbc98c441fd1e87cf7b6b0cb14095d53ef8b6b18a8c471654fe41e5f9fb3"
+        }
+      ]
+    },
+    {
+      "diagnostics": [],
+      "language": "go",
+      "parser_fingerprint": "fabfef5da20c8420351c91f927e7d44fd5f84aa453e72e50392931e8044e80cd",
+      "path": "internal/store/store.go",
+      "references": [
+        {
+          "alias": "_",
+          "alias_range": [
+            88,
+            89
+          ],
+          "confidence": "syntactic",
+          "evidence_kind": "tree_sitter",
+          "kind": "import",
+          "qualifier": "embed",
+          "qualifier_range": [
+            91,
+            96
+          ],
+          "range": [
+            91,
+            96
+          ],
+          "relative_level": 0,
+          "source": null,
+          "target": "embed"
+        },
+        {
+          "alias": "str",
+          "alias_range": [
+            63,
+            66
+          ],
+          "confidence": "syntactic",
+          "evidence_kind": "tree_sitter",
+          "kind": "import",
+          "qualifier": "strings",
+          "qualifier_range": [
+            68,
+            75
+          ],
+          "range": [
+            68,
+            75
+          ],
+          "relative_level": 0,
+          "source": null,
+          "target": "strings"
+        },
+        {
+          "confidence": "heuristic",
+          "evidence_kind": "tree_sitter",
+          "kind": "call",
+          "qualifier": "fmt",
+          "qualifier_range": [
+            299,
+            302
+          ],
+          "range": [
+            303,
+            309
+          ],
+          "relative_level": 0,
+          "source": null,
+          "target": "Errorf"
+        },
+        {
+          "confidence": "heuristic",
+          "evidence_kind": "tree_sitter",
+          "kind": "call",
+          "qualifier": "fmt",
+          "qualifier_range": [
+            823,
+            826
+          ],
+          "range": [
+            827,
+            834
+          ],
+          "relative_level": 0,
+          "source": "internal.store.Open#function#0",
+          "target": "Println"
+        },
+        {
+          "confidence": "heuristic",
+          "evidence_kind": "tree_sitter",
+          "kind": "call",
+          "qualifier": "lib",
+          "qualifier_range": [
+            913,
+            916
+          ],
+          "range": [
+            917,
+            919
+          ],
+          "relative_level": 0,
+          "source": "internal.store.Open#function#0",
+          "target": "Do"
+        },
+        {
+          "confidence": "heuristic",
+          "evidence_kind": "tree_sitter",
+          "kind": "call",
+          "qualifier": "os",
+          "qualifier_range": [
+            867,
+            869
+          ],
+          "range": [
+            870,
+            876
+          ],
+          "relative_level": 0,
+          "source": "internal.store.Open#function#0",
+          "target": "Getenv"
+        },
+        {
+          "confidence": "heuristic",
+          "evidence_kind": "tree_sitter",
+          "kind": "call",
+          "qualifier": "str",
+          "qualifier_range": [
+            835,
+            838
+          ],
+          "range": [
+            839,
+            846
+          ],
+          "relative_level": 0,
+          "source": "internal.store.Open#function#0",
+          "target": "ToUpper"
+        },
+        {
+          "confidence": "heuristic",
+          "evidence_kind": "tree_sitter",
+          "kind": "call",
+          "qualifier": "yaml",
+          "qualifier_range": [
+            890,
+            894
+          ],
+          "range": [
+            895,
+            902
+          ],
+          "relative_level": 0,
+          "source": "internal.store.Open#function#0",
+          "target": "Marshal"
+        },
+        {
+          "confidence": "heuristic",
+          "evidence_kind": "tree_sitter",
+          "kind": "call",
+          "qualifier": null,
+          "qualifier_range": null,
+          "range": [
+            854,
+            857
+          ],
+          "relative_level": 0,
+          "source": "internal.store.Open#function#0",
+          "target": "Abs"
+        },
+        {
+          "confidence": "heuristic",
+          "evidence_kind": "tree_sitter",
+          "kind": "call",
+          "qualifier": null,
+          "qualifier_range": null,
+          "range": [
+            974,
+            981
+          ],
+          "relative_level": 0,
+          "source": "internal.store.check#function#0",
+          "target": "unknown"
+        },
+        {
+          "confidence": "syntactic",
+          "evidence_kind": "tree_sitter",
+          "kind": "import",
+          "qualifier": "fmt",
+          "qualifier_range": [
+            57,
+            60
+          ],
+          "range": [
+            57,
+            60
+          ],
+          "relative_level": 0,
+          "source": null,
+          "target": "fmt"
+        },
+        {
+          "confidence": "syntactic",
+          "evidence_kind": "tree_sitter",
+          "kind": "import",
+          "qualifier": "github.com.example.lib.v2",
+          "qualifier_range": [
+            150,
+            175
+          ],
+          "range": [
+            169,
+            172
+          ],
+          "relative_level": 0,
+          "source": null,
+          "target": "lib"
+        },
+        {
+          "confidence": "syntactic",
+          "evidence_kind": "tree_sitter",
+          "kind": "import",
+          "qualifier": "gopkg.in.yaml.v3",
+          "qualifier_range": [
+            130,
+            146
+          ],
+          "range": [
+            139,
+            143
+          ],
+          "relative_level": 0,
+          "source": null,
+          "target": "yaml"
+        },
+        {
+          "confidence": "syntactic",
+          "evidence_kind": "tree_sitter",
+          "kind": "import",
+          "qualifier": "math",
+          "qualifier_range": [
+            81,
+            85
+          ],
+          "range": [
+            81,
+            85
+          ],
+          "relative_level": 0,
+          "source": null,
+          "target": "math"
+        },
+        {
+          "confidence": "syntactic",
+          "evidence_kind": "tree_sitter",
+          "kind": "import",
+          "qualifier": "os",
+          "qualifier_range": [
+            188,
+            190
+          ],
+          "range": [
+            188,
+            190
+          ],
+          "relative_level": 0,
+          "source": null,
+          "target": "os"
+        },
+        {
+          "confidence": "syntactic",
+          "evidence_kind": "tree_sitter",
+          "kind": "import",
+          "qualifier": null,
+          "qualifier_range": null,
+          "range": [
+            122,
+            126
+          ],
+          "relative_level": 0,
+          "source": null,
+          "target": "yaml"
+        },
+        {
+          "confidence": "syntactic",
+          "evidence_kind": "tree_sitter",
+          "kind": "inherit",
+          "qualifier": "fmt",
+          "qualifier_range": [
+            392,
+            395
+          ],
+          "range": [
+            396,
+            404
+          ],
+          "relative_level": 0,
+          "source": "internal.store.Reader#interface#0",
+          "target": "Stringer"
+        },
+        {
+          "confidence": "syntactic",
+          "evidence_kind": "tree_sitter",
+          "kind": "inherit",
+          "qualifier": "fmt",
+          "qualifier_range": [
+            545,
+            548
+          ],
+          "range": [
+            549,
+            557
+          ],
+          "relative_level": 0,
+          "source": "internal.store.DB#class#0",
+          "target": "Stringer"
+        }
+      ],
+      "relations": [
+        {
+          "evidence_kind": "tree_sitter",
+          "kind": "inherits",
+          "range": [
+            406,
+            412
+          ],
+          "source": "internal.store.Reader#interface#0",
+          "target": "internal.store.Closer#interface#0"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "kind": "inherits",
+          "range": [
+            531,
+            535
+          ],
+          "source": "internal.store.DB#class#0",
+          "target": "internal.store.Base#class#0"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "kind": "inherits",
+          "range": [
+            538,
+            543
+          ],
+          "source": "internal.store.DB#class#0",
+          "target": "internal.store.Cache#type#0"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "kind": "calls",
+          "range": [
+            775,
+            780
+          ],
+          "source": "internal.store.Open#function#0",
+          "target": "internal.store.check#function#0"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "kind": "calls",
+          "range": [
+            1037,
+            1042
+          ],
+          "source": "internal.store.DB.Close#method#0",
+          "target": "internal.store.DB.flush#method#0"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "kind": "calls",
+          "range": [
+            1117,
+            1122
+          ],
+          "source": "internal.store.DB.init#method#0",
+          "target": "internal.store.check#function#0"
+        }
+      ],
+      "symbols": [
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "internal.store#module#0",
+          "range": [
+            0,
+            1220
+          ],
+          "semantic_fingerprint": "5087504eb79c7f041d412ff309defcd837142b2cebd6ff877abef9e5e01307b4",
+          "signature": "package store",
+          "signature_digest": "b6fad84cbf7dfe91bbb395bcf50639a4bc2bd7f27facab5da36e29f9608bddf7"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "internal.store.Version#constant#0",
+          "range": [
+            233,
+            244
+          ],
+          "semantic_fingerprint": "e2e1e837481954be36dd15de962b145f969d8217ee4bbf89bddfbc2ce0a7e4f2",
+          "signature": "Version =",
+          "signature_digest": "0c699b8c231cb293e0b4cd94cee016d656f1a2449df01e8beeba5090b7a3af44"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "internal.store.Low#constant#0",
+          "range": [
+            255,
+            271
+          ],
+          "semantic_fingerprint": "833b961bed0433d8f6df243e13ed144d5ececc36f12f4f62f680f9ff2b446a07",
+          "signature": "Low, High =",
+          "signature_digest": "b8dd71f7bf8806ab100877ccd9fdc30380b4ace8f30f4de8350c0e7f8a3712c1"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "internal.store.High#constant#0",
+          "range": [
+            255,
+            271
+          ],
+          "semantic_fingerprint": "3bc6d7228e8a69cd8fad176699e666cd1ad0e25c11eaafe3a1cd81c22c0606ff",
+          "signature": "Low, High =",
+          "signature_digest": "8e49acf697714ae75bb522a8898ac787cf7942635474cb99f0e4651cf9e1d78a"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "internal.store.Mid#constant#0",
+          "range": [
+            273,
+            276
+          ],
+          "semantic_fingerprint": "b1c0475081a8712ca2f3638df2ee84015a067d622fc8a5430fe9dd21139d50bc",
+          "signature": "Mid",
+          "signature_digest": "376846f7e6ab0a79bf8fbc85afeea2e6110145ccfa3cb90a18e67b2465f8d3d4"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "internal.store.ErrClosed#variable#0",
+          "range": [
+            287,
+            319
+          ],
+          "semantic_fingerprint": "376b1f2e498be44a5588736e8a56934f3cf013fbecb2d492fec732db50611b16",
+          "signature": "ErrClosed =",
+          "signature_digest": "78f2f83eb4cada228b1d6964e6a2cd6d0916aa62cc5cfe0c4a84ceba2db86c96"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "internal.store.count#variable#0",
+          "range": [
+            321,
+            334
+          ],
+          "semantic_fingerprint": "700917f7fb1152e74b4680ec8cd334060cc23d93b34ecf3f597992a589d96b4d",
+          "signature": "count int",
+          "signature_digest": "970594210d897e92886c245d537d2ead281b619b68eefd599b4d14a5007d8435"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "internal.store.Reader#interface#0",
+          "range": [
+            343,
+            414
+          ],
+          "semantic_fingerprint": "c59891031b5cdf80cc0d02a44c9748af86ad12368375355f04654fef591c7263",
+          "signature": "Reader interface { Read(p []byte) (int, error) fmt.Stringer Closer }",
+          "signature_digest": "a604c6939a2a83c83d02eb764c79e14b1c5c223c929002e7f72c3889658b58bd"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "internal.store.Reader.Read#method#0",
+          "range": [
+            363,
+            390
+          ],
+          "semantic_fingerprint": "1ffc9c3f95f26a5985d8c3a5c3267453b244f8f40ac9fe7e5503a5154d977999",
+          "signature": "Read(p []byte) (int, error)",
+          "signature_digest": "ab4e13c50250d8ddcce72e656225eb3f9dd5e5bcfe4f230fc79f7fdb68bc13fc"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "internal.store.Closer#interface#0",
+          "range": [
+            421,
+            456
+          ],
+          "semantic_fingerprint": "a9f0409d03b5c632b6996bf3f0ee67fa8b096355a660f15f111b878ac852c8fe",
+          "signature": "Closer interface { Close() error }",
+          "signature_digest": "e46549afaa2d6846231513791421c7838886777bfc9e8d21708762c2ad40544e"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "internal.store.Closer.Close#method#0",
+          "range": [
+            441,
+            454
+          ],
+          "semantic_fingerprint": "8d4bb9a7c3ec32ec9b3b64c123bda58af367fb9f88f1554c8161af7bb20c89dd",
+          "signature": "Close() error",
+          "signature_digest": "516819de580e9196108d66360c9f3e878cf63c820ed4773c509b3bb302e28177"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "internal.store.Base#class#0",
+          "range": [
+            490,
+            511
+          ],
+          "semantic_fingerprint": "3663c1e85fdd7a9b1be0656028172c74fc50ba0ec0f5bc9120ea5b0a200576fc",
+          "signature": "Base struct{ id int }",
+          "signature_digest": "5d439a8973d0d59a17480c54a317d0a000eaae42ccae2a364ff1d40f3542eb9f"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "internal.store.DB#class#0",
+          "range": [
+            518,
+            586
+          ],
+          "semantic_fingerprint": "42a59befac008a8319acded2396c52e5d287231cdc2ee3a0ff4634e5ef6be360",
+          "signature": "DB struct { Base *Cache fmt.Stringer name string `json:\"name\"` }",
+          "signature_digest": "d348a80da222b65c4673e9364556841add33caad6059170ee55a74e8183a7d4b"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "internal.store.Cache#type#0",
+          "range": [
+            593,
+            613
+          ],
+          "semantic_fingerprint": "cbac83662e2c671ccc4dfc138d6e125746d4df0c7c42a9dfb89f42770134a13d",
+          "signature": "Cache map[string]int",
+          "signature_digest": "3a2c87ea858b01bdf076302e9a9aa6f182d80cc0caeaa109ee2d95ea73691875"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "internal.store.Alias#type#0",
+          "range": [
+            620,
+            633
+          ],
+          "semantic_fingerprint": "11a7a6fbfb85c12ef7a72122d2a8b27ac45e06ae5607b49b01285c4d1f141632",
+          "signature": "Alias = Cache",
+          "signature_digest": "223a0c2f4dc2572292bd6942b4baee1ad876fbe2c20dc3fcc861c2b073fa1dad"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "internal.store.Pair#class#0",
+          "range": [
+            640,
+            690
+          ],
+          "semantic_fingerprint": "7580fa049e15d6577ef11c62e1a2419f5f384fc62a625661f8fbecdc8523f5ed",
+          "signature": "Pair[K comparable, V any] struct { Key K Val V }",
+          "signature_digest": "de5102d68e2d6e680af6b5d48dab8015c3efe5186ec0ab5501c5ed60edd6c48f"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "internal.store.Open#function#0",
+          "range": [
+            692,
+            939
+          ],
+          "semantic_fingerprint": "a2c851b7fd27c77a5ea398c61cd438264857b47b9b5c29f5ce98de15ea94a118",
+          "signature": "func Open(name string) (*DB, error)",
+          "signature_digest": "1657ea1347fac1841b5f6e5ab32a3221e1e1ea57d66b52530f7adb4d436aa96b"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "internal.store.check#function#0",
+          "range": [
+            941,
+            1001
+          ],
+          "semantic_fingerprint": "8f78beef1df9201507f3435a1a779af471b62705f04924f33dbf357ac693f364",
+          "signature": "func check(name string) error",
+          "signature_digest": "2dd4a5eda3b308c7996aa40087f16ed80d9dcaa2059b10624081e498abcdc5a4"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "internal.store.DB.Close#method#0",
+          "range": [
+            1003,
+            1058
+          ],
+          "semantic_fingerprint": "069f4844a5643947b75150d43d35a6bb610925cad5ff645fdd35fce4364148a6",
+          "signature": "func (db *DB) Close() error",
+          "signature_digest": "ee78c640a6f342c597614264849ab35807b9fb9dae4bc54084e02e4e36e89b51"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "internal.store.DB.flush#method#0",
+          "range": [
+            1060,
+            1080
+          ],
+          "semantic_fingerprint": "d5709612a077a36f06520c05f874be42ab3cd571d59dac01d5772ccec57bbcef",
+          "signature": "func (DB) flush()",
+          "signature_digest": "e144b1ff4f41e9fe795f1184bc4a038ed51ebf9fcf89ea494e6a67d9f2c9d1e0"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "internal.store.DB.init#method#0",
+          "range": [
+            1082,
+            1137
+          ],
+          "semantic_fingerprint": "374e3bf9d0209c1833a5cff209df49e5e4e5b64d9f9f523f3c92fab39a139e77",
+          "signature": "func (db DB) init()",
+          "signature_digest": "9da40bcc81b1891c0bca077ec658035ab42a2bf0a465cd9a15a37897b5192ddd"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "internal.store.Pair.Swap#method#0",
+          "range": [
+            1139,
+            1169
+          ],
+          "semantic_fingerprint": "a8073babe87741057db4d4473037a15cfefb59557f1a06ce4174794191826b37",
+          "signature": "func (p *Pair[K, V]) Swap()",
+          "signature_digest": "d26c37102a94d265c2d608c924187f38bf205d56765f8b9f56033577985b1de3"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "internal.store.init#function#0",
+          "range": [
+            1171,
+            1194
+          ],
+          "semantic_fingerprint": "90d091b42bf908f0c9dcb84db99287ed0041a1fee6296949a973d1ba60557925",
+          "signature": "func init()",
+          "signature_digest": "52ea878ca874188fbc1f02531f9c11fe8210aabd834d53b25f5e682b85514a95"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "internal.store.init#function#1",
+          "range": [
+            1196,
+            1219
+          ],
+          "semantic_fingerprint": "9ee112a5ec1de899c3beb0782c239ee82656a50fde0cf814271303ec63d89061",
+          "signature": "func init()",
+          "signature_digest": "52ea878ca874188fbc1f02531f9c11fe8210aabd834d53b25f5e682b85514a95"
+        }
+      ]
+    },
+    {
+      "diagnostics": [],
+      "language": "go",
+      "parser_fingerprint": "fabfef5da20c8420351c91f927e7d44fd5f84aa453e72e50392931e8044e80cd",
+      "path": "weird/my-dir/odd.go",
+      "references": [
+        {
+          "confidence": "heuristic",
+          "evidence_kind": "tree_sitter",
+          "kind": "call",
+          "qualifier": null,
+          "qualifier_range": null,
+          "range": [
+            46,
+            52
+          ],
+          "relative_level": 0,
+          "source": "odd.Do#function#0",
+          "target": "helper"
+        },
+        {
+          "confidence": "syntactic",
+          "evidence_kind": "tree_sitter",
+          "kind": "import",
+          "qualifier": null,
+          "qualifier_range": null,
+          "range": [
+            30,
+            31
+          ],
+          "relative_level": 0,
+          "source": null,
+          "target": "y"
+        }
+      ],
+      "relations": [],
+      "symbols": [
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "odd#module#0",
+          "range": [
+            0,
+            57
+          ],
+          "semantic_fingerprint": "5f0a3a644ce1a5900c7f4f49b58e3aa932778ad1d3ffb666b5c2eda27c7092a8",
+          "signature": "package odd",
+          "signature_digest": "bc4fbda51a09a1fe289e02281e6a4946fff937f04cc7c1a32542b26df7b9f9ac"
+        },
+        {
+          "evidence_kind": "tree_sitter",
+          "key": "odd.Do#function#0",
+          "range": [
+            34,
+            56
+          ],
+          "semantic_fingerprint": "6b3a8aa991f621e6b87e07af98b711185df8924828d558c46d07a35ea050141e",
+          "signature": "func Do()",
+          "signature_digest": "2e8fae94537f4eb91c6ad030ecd4de4e0a4e213ea7b21b61a40af435db3d876d"
+        }
+      ]
+    }
+  ],
+  "protocol_version": 2
+}

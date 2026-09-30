@@ -493,6 +493,10 @@ def _module_dir(path: str) -> str:
 _PACKAGE_SCOPED_LANGUAGES: Final = frozenset({"go"})
 
 
+_GO_MOD_BYTES: Final = 64 * 1024
+_GO_MODULE_LINE: Final = re.compile(r'^\s*module\s+"?([^\s"]+)"?\s*(?://.*)?$')
+
+
 def _is_go_test_file(path: str) -> bool:
     return path.endswith("_test.go")
 
@@ -852,6 +856,7 @@ class _Run:
         self.namespace = repository_namespace(self.repository_id)
         self.files: dict[str, _File] = {}
         self.packages: dict[str, list[_File]] = {}
+        self.go_module: str | None = None
         self.package_names: dict[str, dict[str, list[_Sym]]] = {}
         self.file_events: list[EventDraftV1] = []
         self.symbol_events: list[EventDraftV1] = []
@@ -1309,6 +1314,7 @@ class _Run:
         path_modules = self.path_modules()
         directories = self.go_directories()
         self.packages = directories
+        self.go_module = self.read_go_module() if directories else None
         for path in sorted(self.files):
             item = self.files[path]
             parsed = self.structural.get(path)
@@ -1344,12 +1350,14 @@ class _Run:
     def scope_files(self, item: _File) -> list[_File]:
         """The files whose top-level names ``item``'s namespace shares (the file, or its package).
 
-        A Go test file sees its package; a package never sees its test files (which may belong
-        to a separate ``_test`` package).
+        A Go test file sees its package's production files and its sibling test files; a
+        production file never sees a test file (which may belong to a separate ``_test`` package).
         """
         if item.language not in _PACKAGE_SCOPED_LANGUAGES:
             return [item]
         siblings = self.packages.get(_module_dir(item.path), [])
+        if _is_go_test_file(item.path):
+            return list(siblings) or [item]  # production files and sibling test files
         return [f for f in siblings if not _is_go_test_file(f.path)] or [item]
 
     def go_directories(self) -> dict[str, list[_File]]:
@@ -1368,11 +1376,10 @@ class _Run:
         directories: Mapping[str, list[_File]],
     ) -> tuple[_File | None, bool]:
         """The repository file an import names, or ``None`` when it is external or unknown."""
-        name = reference.target_name
         if source.language == "python":
             return self.resolve_python(source, reference, modules, path_modules)
         if source.language == "go":
-            return self.resolve_go(name, directories), True
+            return self.resolve_go(source, reference, directories), True
         return self.resolve_script(source, reference)
 
     def resolve_python(
@@ -1424,13 +1431,55 @@ class _Run:
             names.setdefault(".".join(parts), item)
         return names
 
-    def resolve_go(self, name: str, directories: Mapping[str, list[_File]]) -> _File | None:
-        parts = name.split("/")
-        for start in range(len(parts)):
-            found = directories.get("/".join(parts[start:]))
+    def read_go_module(self) -> str | None:
+        """The root ``go.mod`` module path: ``None`` when there is no go.mod, ``""`` when there is
+        one whose module path is unknown (unreadable, over the read cap, no ``module`` line)."""
+        try:
+            data = read_worktree_file(self.scan, "go.mod", _GO_MOD_BYTES)
+        except ScanError:
+            return ""
+        if data is None:
+            return None
+        if len(data) > _GO_MOD_BYTES:
+            return ""
+        for line in data.decode("utf-8", "replace").splitlines():
+            found = _GO_MODULE_LINE.match(line)
             if found:
-                return found[0]
-        return None
+                return found.group(1)
+        return ""
+
+    def resolve_go(
+        self,
+        source: _File,
+        reference: ParsedReference,
+        directories: Mapping[str, list[_File]],
+    ) -> _File | None:
+        """The package an import path names: by the ``go.mod`` module path, else by directory.
+
+        With a module path, an import equal to it or below it (``module/rest``) is the directory
+        ``rest``. Only without one, the longest repository directory that is a ``/``-bounded suffix of
+        the import path (standard-library paths, whose first element has no dot, never match).
+        A directory holding only test files is not importable.
+        """
+        path = _go_import_path(reference, self.sources.get(source.path))
+        module = self.go_module
+        if module == "":
+            return None  # a go.mod exists but its module path is unknown: never guess by suffix
+        directory: str | None = None
+        if module is not None and (path == module or path.startswith(module + "/")):
+            directory = path[len(module) + 1 :] or "."
+        elif module is None and "." in path.split("/", 1)[0]:
+            matches = (
+                candidate
+                for candidate in directories
+                if candidate != "." and (path == candidate or path.endswith("/" + candidate))
+            )
+            directory = max(matches, key=len, default=None)
+        if directory is None:
+            return None
+        return next(
+            (f for f in directories.get(directory, []) if not _is_go_test_file(f.path)), None
+        )
 
     def resolve_script(
         self, source: _File, reference: ParsedReference
@@ -1554,7 +1603,9 @@ class _Run:
             # A Go import path is slash-separated (its first element is a host with dots).
             name = reference.target_name.rsplit("/", 1)[-1]
             bound.setdefault(reference.alias or name, []).append(_Binding(target, (), None, *place))
-            if reference.qualifier:  # a Go adapter may also spell an alias as the qualifier
+            if (
+                reference.qualifier and not reference.alias
+            ):  # an unaliased import binds its last token
                 bound.setdefault(reference.qualifier.split(".")[-1], []).append(
                     _Binding(target, (), None, *place)
                 )
@@ -1716,9 +1767,9 @@ class _Run:
 
         The package's names are indexed once per directory, not rescanned per reference.
         """
-        # A package's non-test files share one name table; a test file gets its own (it may be
-        # the package's only file). Either way the table is built once, on first use.
-        key = item.path if _is_go_test_file(item.path) else _module_dir(item.path)
+        # A package's non-test files share one name table; a test file gets its own (it also sees
+        # the sibling test files). Either way the table is built once, on first use.
+        key = ("test:" if _is_go_test_file(item.path) else "") + _module_dir(item.path)
         names = self.package_names.get(key)
         if names is None:
             names = {}
@@ -2093,6 +2144,19 @@ def posixpath_join(base: str, relative: str) -> str | None:
     return "/".join(parts)
 
 
+def _go_import_path(reference: ParsedReference, source: bytes | None) -> str:
+    """The full import path: the literal's content (the qualifier's range), else the last token."""
+    if source is not None and reference.qualifier_start_byte is not None:
+        raw = source[reference.qualifier_start_byte : reference.qualifier_end_byte]
+        try:
+            text = raw.decode()
+        except UnicodeDecodeError:
+            return reference.target_name
+        if text and not any(char.isspace() for char in text):
+            return text
+    return reference.target_name
+
+
 def _external_name(
     language: str, reference: ParsedReference, source: bytes | None = None
 ) -> str | None:
@@ -2101,7 +2165,7 @@ def _external_name(
     if reference.relative_level or name.startswith("."):
         return None
     if language == "go":
-        return name
+        return _go_import_path(reference, source)
     tokens = ((reference.qualifier + ".") if reference.qualifier else "") + name
     parts = tokens.split(".")
     if language in ("typescript", "javascript") and source is not None and len(parts) >= 2:
