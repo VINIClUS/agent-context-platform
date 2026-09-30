@@ -878,3 +878,40 @@ def test_the_typescript_memory_blowup_input_is_contained_in_the_go_child_too() -
     except StructuralError:
         return  # child died under RLIMIT_AS: contained, not a hang
     _contained(module, [f.path for f in files])
+
+
+def test_import_limits_are_measured_in_utf8_bytes() -> None:
+    wide = "é" * 300  # 300 characters, 600 bytes
+    code = f'package p\n\nimport "{wide}"\nimport "a/{"é" * 200}/{"é" * 200}"\nfunc F() {{}}\n'
+    parsed = parsed_of(code)
+    assert any(s.qualified_name.endswith(".F") for s in parsed.symbols)
+    assert "file_degraded" not in codes_of(parsed)
+    assert codes_of(parsed).get("references_capped", 0) >= 1
+    assert all(len(r.target_name.encode()) <= 512 for r in parsed.references)
+    assert all(r.qualifier is None or len(r.qualifier.encode()) <= 512 for r in parsed.references)
+
+
+def test_a_rejected_package_name_degrades_instead_of_guessing_an_identity() -> None:
+    code = f"package {'p' * 600}\n\nfunc F() {{}}\n"
+    (parsed,) = in_process(request(source("src/x/a.go", code))).files
+    assert parsed.symbols == ()
+    assert codes_of(parsed) == {"file_degraded": 1, "symbols_dropped": 1}
+
+
+def test_unicode_directory_components_stay_in_the_module_name() -> None:
+    (parsed,) = in_process(request(source("src/café/x.go", "package p\n\nfunc F() {}\n"))).files
+    assert {s.qualified_name for s in parsed.symbols} == {
+        "src.café.p",
+        "src.café.p.F",
+    }
+    assert "file_degraded" not in codes_of(parsed)
+
+
+def test_parenthesized_and_nested_callees_are_calls() -> None:
+    code = (
+        'package p\n\nimport "fmt"\n\nfunc F() {}\n'
+        "func G() { (F)(); ((fmt.Println))(1); (F[int])() }\n"
+    )
+    parsed = parsed_of(code)
+    assert ("fmt", "Println") in _refs(parsed, "call")
+    assert any(r.kind == "calls" for r in parsed.relations)

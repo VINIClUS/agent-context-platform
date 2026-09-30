@@ -250,6 +250,7 @@ class _Walk:
     type_sym: _Sym | None = None
     tainted: int = 0
     dropped: int = 0
+    oversized: int = 0  # import names over the byte limit: reported as references_capped
 
     def add(self, sym: _Sym) -> bool:
         """Register a symbol if limits allow; a duplicate construct is silently one symbol."""
@@ -297,7 +298,7 @@ def _header(content: bytes, start: int, stop: int) -> str:
 def _directory_name(path: str) -> list[str]:
     run: list[str] = []
     for part in reversed(path.split("/")[:-1]):
-        if not re.fullmatch(r"[A-Za-z_][A-Za-z0-9_]*", part):
+        if not part.isidentifier() or len(part.encode()) > MAX_NAME_BYTES:
             break
         run.append(part)
     return run[::-1]
@@ -317,6 +318,7 @@ def _package_name(root: Node, content: bytes) -> tuple[_Name | None, Node | None
                 name = child.named_child(0)
                 if child.has_error or name is None or name.type != "package_identifier":
                     return None, None
+                # A name the limits reject is not an absent clause: the caller must not guess.
                 return _name(content, name), child
             if child.type != "comment" or not cursor.goto_next_sibling():
                 return None, None
@@ -562,11 +564,13 @@ def _enter_import(walk: _Walk, node: Node) -> None:
         names = [item.group().decode() for item in tokens]
     except UnicodeDecodeError:
         return
-    if any(len(item) > MAX_NAME_BYTES for item in names):
+    if any(len(item.group()) > MAX_NAME_BYTES for item in tokens):  # UTF-8 bytes, as the contract
+        walk.oversized += 1
         return
     if name_node is not None and name_node.type in ("package_identifier", "blank_identifier"):
         alias = _name(content, name_node)
         if alias is None:
+            walk.oversized += 1
             return
         target = alias
     else:
@@ -588,7 +592,10 @@ def _enter_import(walk: _Walk, node: Node) -> None:
         )
     )
     joined = ".".join(names)
-    qualifier = _Name(joined, start, end) if clean and len(joined) <= MAX_NAME_BYTES else None
+    fits = len(joined.encode()) <= MAX_NAME_BYTES
+    if clean and not fits:
+        walk.oversized += 1
+    qualifier = _Name(joined, start, end) if clean and fits else None
     walk.imports.append(_ImportRef(target, qualifier))
     if name_node is not None and name_node.type == "package_identifier":
         alias = _name(content, name_node)
@@ -617,8 +624,15 @@ def _enter_call(walk: _Walk, node: Node) -> None:
     if walk.skip_node != -1 or len(walk.sites) >= _MAX_SITES:
         return
     function = node.child_by_field_name("function")
-    while function is not None and function.type == "index_expression":
-        function = function.child_by_field_name("operand")  # F[int](), pkg.F[T]()
+    while function is not None and function.type in (
+        "index_expression",
+        "parenthesized_expression",
+    ):
+        # F[int](), pkg.F[T](), (F)(), (pkg.F)(): unwrap until the shape is stable
+        if function.type == "index_expression":
+            function = function.child_by_field_name("operand")
+        else:
+            function = function.named_child(0)
     if function is None:
         return
     if function.type == "identifier":
@@ -927,6 +941,8 @@ def _parse_file(source: SourceFile, budget: Budget, output: list[int]) -> Parsed
     text = b"   " + content[3:] if content.startswith(_BOM) else content
     tree = bounded_parse(_PARSER, text, budget)
     package, clause = _package_name(tree.root_node, content)
+    if clause is not None and package is None:
+        return degraded_file(source, FINGERPRINT, "symbols_dropped")
     name = _module_qualified(source.path, package)
     root = _Sym(name.rsplit(".", 1)[-1], name, "module", 0, len(content))
     if clause is not None:
@@ -942,6 +958,7 @@ def _parse_file(source: SourceFile, budget: Budget, output: list[int]) -> Parsed
     index = {id(sym): number for number, sym in enumerate(walk.syms)}
     result = _Output(index, index.get(id(root)), budget, output)
     _resolve(walk, result)
+    result.capped += walk.oversized
     symbols = tuple(
         ParsedSymbol(
             ref=str(number),
