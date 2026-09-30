@@ -437,14 +437,21 @@ def _enter_bases(walk: _Walk, cls: _Sym, bases: Node) -> None:
             walk.sites.append(site)
 
 
+def _dotted(walk: _Walk, node: Node) -> str | None:
+    """The dotted name a node spells, or None; a name over ``MAX_NAME_BYTES`` is counted."""
+    if node.end_byte - node.start_byte > MAX_NAME_BYTES:
+        walk.capped += 1  # representable syntax that the contract cannot carry: not silent
+        return None
+    return dotted_name_at(walk.content, node.start_byte, node.end_byte)
+
+
 def _name_site(walk: _Walk, scope: _Sym, kind: str, node: Node) -> _Site | None:
     """A site for an identifier or a ``owner.name`` attribute whose owner is a dotted name."""
     if node.end_byte - node.start_byte > MAX_NAME_BYTES:  # a chain prefix can be the whole file
         walk.capped += 1  # too long to be a name: not silently ignored
         return None
-    content = walk.content
     if node.type == "identifier":
-        name = dotted_name_at(content, node.start_byte, node.end_byte)
+        name = _dotted(walk, node)
         return None if name is None else _Site(scope, kind, name, *node.byte_range)
     if node.type != "attribute":
         return None
@@ -452,8 +459,8 @@ def _name_site(walk: _Walk, scope: _Sym, kind: str, node: Node) -> _Site | None:
     attribute = node.child_by_field_name("attribute")
     if owner is None or attribute is None or owner.type not in ("identifier", "attribute"):
         return None
-    qualifier = dotted_name_at(content, owner.start_byte, owner.end_byte)
-    name = dotted_name_at(content, attribute.start_byte, attribute.end_byte)
+    qualifier = _dotted(walk, owner)
+    name = _dotted(walk, attribute)
     if qualifier is None or name is None or "." in name:
         return None
     if qualifier.split(".", 1)[0].encode() in _MEMBER_OWNERS:
@@ -566,7 +573,7 @@ def _enter_call(walk: _Walk, node: Node) -> None:
             and owner.end_byte - owner.start_byte in (3, 4)
             and _text(walk.content, owner) in _MEMBER_OWNERS
         ):
-            name = dotted_name_at(walk.content, attribute.start_byte, attribute.end_byte)
+            name = _dotted(walk, attribute)
             site = None if name is None else _Site(scope, "member", name, *attribute.byte_range)
         else:
             site = _name_site(walk, scope, "name", function)
@@ -581,7 +588,8 @@ def _relative_module(header: Node) -> tuple[int, Node | None] | None:
     prefix = header.child(0)
     if prefix is None or prefix.type != "import_prefix" or prefix.child_count > 64:
         return None
-    level = sum(1 for dot in prefix.children if dot.type == ".")  # ``. .`` is level 2 too
+    # Total dots over ALL children: ``.`` is 1, and a grammar that emits ``...`` as one token is 3.
+    level = sum(len(dot.type) for dot in prefix.children if dot.type and set(dot.type) == {"."})
     return level, header.child(1) if header.child_count > 1 else None
 
 
@@ -593,12 +601,11 @@ def _enter_import(walk: _Walk, node: Node) -> None:
     if node.child_count > _MAX_IMPORT_CHILDREN:
         walk.capped += node.child_count // 2
         return
-    content = walk.content
     names: list[tuple[Node, str]] = []
     for child in node.children_by_field_name("name"):
         item = child.child_by_field_name("name") if child.type == "aliased_import" else child
         if item is not None and item.type == "dotted_name":
-            name = dotted_name_at(content, item.start_byte, item.end_byte)
+            name = _dotted(walk, item)
             if name is not None:
                 names.append((item, name))
     if node.type == "import_statement":
@@ -615,11 +622,7 @@ def _enter_import(walk: _Walk, node: Node) -> None:
         level, module = relative
     qualifier: str | None = None
     if module is not None:
-        qualifier = (
-            dotted_name_at(content, module.start_byte, module.end_byte)
-            if module.type == "dotted_name"
-            else None
-        )
+        qualifier = _dotted(walk, module) if module.type == "dotted_name" else None
         if qualifier is None:
             return
     if any(child.type == "wildcard_import" for child in node.children):
@@ -829,6 +832,15 @@ def _link(
         if found is None:
             walk.capped += 1  # more than _MAX_CANDIDATES in scope: no edge, no reference, counted
             continue
+        if not found and site.kind != "member" and not qualified:
+            # Nothing callable/class binds the name; a VARIABLE (``f = imported()``) may. Its
+            # target is not knowable syntactically, so it is neither linked nor reported as an
+            # external reference: bound in this file by any kind means no unresolved reference.
+            bound_key = (id(site.scope), "bound", name, False)
+            if bound_key not in memo:
+                memo[bound_key] = _resolve(index, site.scope, site.kind, name, _ANY_KIND)
+            if memo[bound_key]:
+                continue
         if not found:
             if site.kind != "member":
                 references.append(

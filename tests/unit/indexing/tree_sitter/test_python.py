@@ -1218,7 +1218,8 @@ def test_a_name_used_as_base_and_as_call_target_is_resolved_per_kind() -> None:
     # ``Base`` is a function: not a class base, but a callable target in the same scope.
     code = "def Base():\n    pass\n\n\nclass A(Base):\n    def m(self):\n        pass\n\n\ndef caller():\n    Base()\n"
     assert edges_of(code) == {("pkg.mod.caller", "pkg.mod.Base", "calls")}
-    assert refs_of(code) == [("pkg.mod.A", "inherit", 0, None, "Base", "Base", None)]
+    # A function binds the name in this file: not a class to link, and not an external base.
+    assert refs_of(code) == []
     # And the other way round: bases first must not poison the call lookup of a class.
     code = "class K:\n    pass\n\n\nclass B(K):\n    pass\n\n\ndef f():\n    K()\n"
     assert edges_of(code) == {
@@ -1378,3 +1379,98 @@ def test_a_normal_one_mebibyte_request_degrades_nothing_through_the_sandbox() ->
         assert len(item.symbols) > 40
         assert item.references
         assert item.relations
+
+
+class _Token:
+    """A stand-in tree-sitter child: only ``type`` is read for an import prefix."""
+
+    def __init__(self, type: str) -> None:
+        self.type = type
+
+
+class _Prefix:
+    type = "import_prefix"
+
+    def __init__(self, *tokens: str) -> None:
+        self.children = [_Token(item) for item in tokens]
+        self.child_count = len(self.children)
+
+
+class _Header:
+    def __init__(self, *tokens: str) -> None:
+        self._prefix = _Prefix(*tokens)
+        self.child_count = 1
+
+    def child(self, index: int) -> object:
+        return self._prefix if index == 0 else None
+
+
+@pytest.mark.parametrize(
+    ("tokens", "level"),
+    [
+        ((".",), 1),
+        ((".", "."), 2),
+        (("...",), 3),  # a grammar that emits the ellipsis as one token
+        (("...", "."), 4),
+        (("...", "..."), 6),
+        (("...", "...", "...", "...", "...", "..."), 18),
+    ],
+)
+def test_the_relative_level_is_the_total_number_of_dots(
+    tokens: tuple[str, ...], level: int
+) -> None:
+    relative = python._relative_module(_Header(*tokens))  # type: ignore[arg-type]
+    assert relative is not None and relative[0] == level
+
+
+@pytest.mark.parametrize(
+    ("prefix", "level"),
+    [("...", 3), ("....", 4), ("......", 6), (". . .", 3), (". ...", 4)],
+)
+def test_multi_dot_relative_imports_keep_their_level(prefix: str, level: int) -> None:
+    assert refs_of(f"from {prefix}pkg import x\n") == [
+        (None, "import", level, "pkg", "x", "x", "pkg")
+    ]
+    assert refs_of(f"from {prefix} import x\n") == [(None, "import", level, None, "x", "x", None)]
+
+
+def test_relative_prefixes_over_the_maximum_are_capped_and_reported() -> None:
+    for dots in ("." * 17, "..." * 6, "." * 200):
+        parsed = symbols_of(f"from {dots}pkg import x\n")["pkg/mod.py"]
+        assert parsed.references == ()
+        assert diagnostics_of(parsed) == {"references_capped": 1}
+
+
+def test_a_call_through_a_variable_binding_is_not_an_external_reference() -> None:
+    code = (
+        "from lib import imported_factory\n"
+        "factory = imported_factory\n\n\n"
+        "def f():\n    factory()\n\n\n"
+        "class C:\n    build = imported_factory\n\n    def m(self):\n        build()\n"
+    )
+    calls = [item for item in refs_of(code) if item[1] == "call"]
+    assert calls == [("pkg.mod.C.m", "call", 0, None, "build", "build", None)]  # class scope hidden
+    assert edges_of(code) == set()  # a variable is neither linked nor reported
+
+
+def test_a_base_bound_by_a_variable_is_not_an_external_inherit() -> None:
+    code = "from lib import External\nAlias = External\n\n\nclass C(Alias):\n    pass\n"
+    assert [item for item in refs_of(code) if item[1] == "inherit"] == []
+    assert edges_of(code) == set()
+    # A class alias of nothing local still reports the true external, and a class stays linked.
+    assert [item for item in refs_of("class C(Missing):\n    pass\n") if item[1] == "inherit"]
+    linked = "class B:\n    pass\n\n\nclass C(B):\n    pass\n"
+    assert edges_of(linked) == {("pkg.mod.C", "pkg.mod.B", "inherits")}
+
+
+def test_an_oversized_import_name_or_qualifier_is_counted() -> None:
+    long_module = ".".join("a" * 100 for _ in range(6))
+    for code in (
+        f"import {long_module}\n",
+        f"from {long_module} import x\n",
+        f"from .{long_module} import x\n",
+        f"from pkg import {'n' * 600}\n",
+    ):
+        parsed = symbols_of(code)["pkg/mod.py"]
+        assert parsed.references == (), code
+        assert diagnostics_of(parsed) == {"references_capped": 1}, code
