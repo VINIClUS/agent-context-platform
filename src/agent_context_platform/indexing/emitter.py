@@ -39,10 +39,11 @@ Identity and revision (MANIFEST decisions)
 - ``code.index.completed`` is ``success=false`` with ``scan_incomplete`` when the scan may have hidden
   a source file (truncated with omitted files, or a rejected path that could be one), then
   ``snapshot_incomplete`` (a dirty entry could not be hashed, see below), then ``files_skipped``,
-  then ``files_degraded``. Absence is inferred only from ``success=true``.
+  then ``files_degraded``. Run-level ``scan_incomplete`` and ``snapshot_incomplete`` forbid ALL
+  absence inference for the target; otherwise absence is inferred per file revision (see coverage).
   Any adapter loss (dropped symbols, capped references, a degraded file) degrades the whole run:
-  on large repos a single capped file makes the run ``files_degraded``, so absence is inferred
-  only from fully complete runs. Per-file completeness is follow-up FU-51.
+  on large repos a single capped file makes the run ``files_degraded``. ``success`` and
+  ``error_class`` stay run-level; per-file completeness is ``code.file.coverage_reported`` (below).
 - Repositories with autocrlf, LFS or smudge filters have worktree bytes that differ from the
   committed blobs, so their SCIP evidence is ALWAYS dropped (``scip_file_not_at_commit``) and the
   run reports ``files_degraded``. That is conservative by design.
@@ -78,11 +79,39 @@ bug, raised as ``IndexingError("idempotency_conflict")`` before anything is subm
   under the same ``index_id``, never a conflict.
 - ``success`` is false, with ``error_class`` ``files_skipped`` (a scanned file of a registered
   language never reached emission: missing or mismatched source, no lineage, unsupported, too
-  large) or ``files_degraded`` (an adapter degraded a file). ABSENCE MAY BE INFERRED ONLY from a
-  completed index with ``success=true``: for target T take the latest such completed event of
-  its ``index_id``, then its ``code.file.indexed`` membership.
+  large) or ``files_degraded`` (an adapter degraded a file). The latest completed event of the
+  target's ``index_id`` is its outcome, its ``code.file.indexed`` events the membership. Absence
+  inside a file revision is not read from ``success``: see the coverage rule below.
   ``files_degraded`` also covers dropped SCIP evidence (a position that names no boundary, or a
   file whose bytes are not the SCIP commit's), so a success never hides dropped evidence.
+- ``code.assertion.observed`` (observation: ``index_id``, target) is ASSERTION MEMBERSHIP: one
+  per (source file revision, assertion) for every relation and dependency claim (SCIP,
+  syntactic and heuristic evidence alike). Its claim is ``file_id``, ``file_revision_id``,
+  ``assertion_id`` and ``assertion_family``. ``index_id`` and the target are observations, so
+  membership is per FILE REVISION, like ``code.symbol.indexed``: an unchanged file revision
+  indexed at a new commit emits nothing new, and a changed file emits observations only for the
+  assertions its new revision still produces. A consumer treats an assertion as current at T
+  when an observation names it under a ``file_revision_id`` in T's ``code.file.indexed``
+  membership. The assertion events themselves are unchanged (``valid_from`` and ``index_id`` stay
+  observations of them). Supersession claims are not file-bound and get no observation.
+- ``code.file.coverage_reported`` (no observation fields) is per FILE REVISION PER TARGET: one
+  for every file of the membership, with ``index_id`` and the target in the claim because
+  coverage depends on the run (a file degraded once may be clean on retry, which is a new claim
+  under the same ``index_id``, never a conflict). ``complete=true`` with no losses, or the
+  sorted unique ``losses`` mapped from: adapter ``symbols_dropped``, ``references_capped``,
+  ``file_degraded``, ``work_budget_exceeded``; ``invalid_position``; ``scip_evidence_dropped``
+  (an importer diagnostic for the path or a file not at the SCIP commit). ``syntax_recovered`` is
+  no loss. ``not_indexed`` is reported (with no ``code.file.indexed``) for a scanned file that
+  never reached emission yet has a ``file_id`` and a revision: a tracked file, unchanged against
+  HEAD, that the scanner or parser skipped (too large, unreadable, missing or mismatched bytes),
+  whose revision derives from the committed blob and lineage. A file without a lineage, an
+  unsupported one, or a dirty or untracked one has no such revision: it counts at run level
+  only, as does any diagnostic without a path (an unsafe SCIP path). A rerun with the same
+  outcome is a replay.
+- ABSENCE is inferred by a consumer (PLATFORM-038) for a file revision at T ONLY when a
+  ``complete=true`` coverage event exists for it in T's index. A run-level ``scan_incomplete`` or
+  ``snapshot_incomplete`` still forbids ALL absence inference for T, whatever the per-file events
+  say, because the scan may have hidden files that no per-file event can mention.
 - A cross-file assertion is bound to its SOURCE file revision only. If the TARGET file drops or
   renames the symbol while the source is unchanged, the source's old assertion persists: a
   consumer (PLATFORM-038) must ALSO check that the target symbol exists in the target file's
@@ -159,7 +188,11 @@ from pathlib import PurePosixPath
 from typing import Any, Final
 
 from agent_context_sdk import (
+    CodeAssertionFamily,
+    CodeAssertionObservedV1,
+    CodeCoverageLoss,
     CodeDependencyAssertedV1,
+    CodeFileCoverageReportedV1,
     CodeFileIndexedV1,
     CodeIndexCompletedV1,
     CodeIndexStartedV1,
@@ -754,6 +787,9 @@ class _Claim:
     extractor_name: str
     extractor_version: str
     revision: str  # file revision of the source file: claims are per revision
+    file_id: (
+        str  # the source file of ``revision`` (not part of the claim key: it is in the revision)
+    )
 
     def sort_key(self) -> tuple[str, str, str, int, str, str]:
         rank = 0
@@ -860,9 +896,12 @@ class _Run:
         self.package_names: dict[str, dict[str, list[_Sym]]] = {}
         self.file_events: list[EventDraftV1] = []
         self.symbol_events: list[EventDraftV1] = []
+        self.observation_events: list[EventDraftV1] = []
         self.claims: dict[tuple[str, ...], _Claim] = {}
         self.dependencies: dict[tuple[str, ...], CodeDependencyAssertedV1] = {}
         self.dependency_keys: dict[tuple[str, ...], str] = {}
+        self.dependency_sources: dict[tuple[str, ...], _File] = {}
+        self.file_losses: dict[str, set[CodeCoverageLoss]] = {}
         self.symbol_ids: set[str] = set()
         self.seen_keys: set[str] = set()
         head = scan.workspace.head_commit
@@ -892,6 +931,10 @@ class _Run:
         self.modified = frozenset(scan.workspace.modified_paths)
         self.scip_documents: dict[str, SemanticDocument] = {}
         self.index_id = self._index_id()
+
+    def lose(self, path: str, loss: CodeCoverageLoss) -> None:
+        """Record that ``path`` lost information; it is reported for the file if it is indexed."""
+        self.file_losses.setdefault(path, set()).add(loss)
 
     # --- identifiers and drafts ---
 
@@ -1089,6 +1132,9 @@ class _Run:
         )
         for diagnostic in parsed.diagnostics:
             self.diagnostics[f"adapter_{diagnostic.code}"] += diagnostic.count
+            loss = _ADAPTER_LOSSES.get(diagnostic.code)
+            if loss is not None:
+                self.lose(parsed.path, loss)
         source = self.sources[parsed.path]
         matched = self.match_scip(parsed, document, source)
         used: set[str] = set()
@@ -1220,6 +1266,7 @@ class _Run:
             )
             if offsets is None:
                 self.diagnostics["invalid_position"] += 1  # a definition that names nothing
+                self.lose(parsed.path, CodeCoverageLoss.INVALID_POSITION)
                 continue
             index = owners.owner(source, offsets)
             if index is not None and index not in matched and occurrence.symbol not in taken:
@@ -1263,6 +1310,7 @@ class _Run:
                 extractor_name,
                 extractor_version,
                 revision,
+                str(item.file_id),
             ),
         )
 
@@ -1303,7 +1351,9 @@ class _Run:
             dependency_kind=kind,
             resolved_version=resolved_version,
         )
-        self.dependencies.setdefault(key, payload)
+        if key not in self.dependencies:
+            self.dependencies[key] = payload
+            self.dependency_sources[key] = item
 
     # --- cross-file resolution ---
 
@@ -1817,6 +1867,7 @@ class _Run:
                 )
                 if offsets is None:
                     self.diagnostics["invalid_position"] += 1
+                    self.lose(item.path, CodeCoverageLoss.INVALID_POSITION)
                     continue  # no claim without a valid location
                 subject = self.enclosing(item, offsets)
                 predicate = (
@@ -1862,17 +1913,19 @@ class _Run:
         drafts: list[EventDraftV1] = []
         for claim in sorted(self.claims.values(), key=_Claim.sort_key):
             deterministic = isinstance(claim.evidence, DeterministicEvidenceKind)
+            assertion_id = _assertion_id(
+                "relation",
+                claim.subject,
+                claim.predicate.value,
+                claim.obj,
+                claim.evidence.value,
+                claim.extractor_name,
+                claim.extractor_version,
+                claim.revision,
+            )
+            self.observe(assertion_id, CodeAssertionFamily.RELATION, claim.file_id, claim.revision)
             payload = CodeRelationAssertedV1(
-                assertion_id=_assertion_id(
-                    "relation",
-                    claim.subject,
-                    claim.predicate.value,
-                    claim.obj,
-                    claim.evidence.value,
-                    claim.extractor_name,
-                    claim.extractor_version,
-                    claim.revision,
-                ),
+                assertion_id=assertion_id,
                 evidence_kind=claim.evidence,
                 deterministic=deterministic,
                 extractor_name=claim.extractor_name,
@@ -1888,10 +1941,89 @@ class _Run:
         return drafts
 
     def dependency_drafts(self) -> list[EventDraftV1]:
-        return [
-            self.draft("code.dependency.asserted", payload)
-            for _, payload in sorted(self.dependencies.items())
-        ]
+        drafts: list[EventDraftV1] = []
+        for key, payload in sorted(self.dependencies.items()):
+            source = self.dependency_sources[key]
+            self.observe(
+                payload.assertion_id,
+                CodeAssertionFamily.DEPENDENCY,
+                str(source.file_id),
+                str(source.revision_id),
+            )
+            drafts.append(self.draft("code.dependency.asserted", payload))
+        return drafts
+
+    def observe(
+        self, assertion_id: str, family: CodeAssertionFamily, file_id: str, revision: str
+    ) -> None:
+        """Membership: ``assertion_id`` was produced by source file revision ``revision``."""
+        payload = CodeAssertionObservedV1(
+            **self.target(),
+            index_id=self.index_id,
+            file_id=file_id,
+            file_revision_id=revision,
+            assertion_id=assertion_id,
+            assertion_family=family,
+        )
+        self.add(self.observation_events, self.draft("code.assertion.observed", payload))
+
+    def coverage_drafts(self) -> list[EventDraftV1]:
+        """One per file of the membership: complete, or the sorted unique losses of its revision."""
+        drafts: list[EventDraftV1] = []
+        for path in sorted(self.files):
+            item = self.files[path]
+            losses = tuple(sorted(self.file_losses.get(path, ())))
+            payload = CodeFileCoverageReportedV1(
+                **self.target(),
+                index_id=self.index_id,
+                file_id=str(item.file_id),
+                file_revision_id=str(item.revision_id),
+                complete=not losses,
+                losses=losses,
+            )
+            drafts.append(self.draft("code.file.coverage_reported", payload))
+        drafts.extend(self.unindexed_coverage())
+        return drafts
+
+    def unindexed_coverage(self) -> list[EventDraftV1]:
+        """``not_indexed`` for a clean tracked file that never reached emission and has a revision.
+
+        Only a file unchanged against HEAD qualifies: its revision comes from the committed blob
+        OID and lineage, the very inputs ``admit`` would have used, with no worktree bytes needed.
+        """
+        drafts: list[EventDraftV1] = []
+        for path in sorted(self.tracked):
+            tracked = self.tracked[path]
+            language = registry.language_for_path(path)
+            support = None if language is None else registry.support_for(language)
+            file_id = self.lineage.get(path)
+            if (
+                path in self.files
+                or tracked.kind != FileKind.FILE
+                or support is None
+                or file_id is None
+                or tracked.oid is None
+                or tracked.change is not None
+                or path in self.modified
+            ):
+                continue
+            revision = file_revision_id(
+                self.repository_id,
+                file_id,
+                tracked.oid,
+                registry.label_for_path(path) or support.language,
+                support.parser_fingerprint,
+            )
+            payload = CodeFileCoverageReportedV1(
+                **self.target(),
+                index_id=self.index_id,
+                file_id=str(file_id),
+                file_revision_id=str(revision),
+                complete=False,
+                losses=(CodeCoverageLoss.NOT_INDEXED,),
+            )
+            drafts.append(self.draft("code.file.coverage_reported", payload))
+        return drafts
 
     def supersession_drafts(self) -> list[EventDraftV1]:
         drafts: list[EventDraftV1] = []
@@ -1922,7 +2054,8 @@ class _Run:
     def outcome_error_class(self) -> str | None:
         """Why this index is incomplete: a file was skipped before emission or degraded.
 
-        ``code.index.completed`` with ``success=true`` is the ONLY basis for inferring absence.
+        A ``scan_incomplete``/``snapshot_incomplete`` outcome forbids all absence inference for the
+        target; any other absence needs a ``complete=true`` ``code.file.coverage_reported``.
         """
         for path in [*self.tracked, *self.untracked]:  # scanned files that could not be indexed
             if path not in self.files and registry.label_for_path(path) is not None:
@@ -1966,6 +2099,7 @@ class _Run:
         if tracked is not None and tracked.change is None and self.at_commit(path, tracked):
             return True
         self.diagnostics["scip_file_not_at_commit"] += 1
+        self.lose(path, CodeCoverageLoss.SCIP_EVIDENCE_DROPPED)
         return False
 
     def at_commit(self, path: str, tracked: TrackedFile) -> bool:
@@ -1993,6 +2127,8 @@ class _Run:
             for dropped in semantic.diagnostics:  # the importer dropped this evidence: say so
                 self.diagnostics["scip_evidence_dropped"] += 1
                 self.diagnostics[f"scip_import_{dropped.code}"] += 1
+                if dropped.path is not None:  # an unsafe path names no file of the membership
+                    self.lose(dropped.path, CodeCoverageLoss.SCIP_EVIDENCE_DROPPED)
         documents = {path: d for path, d in everything.items() if self.scip_applies(path)}
         self.scip_documents = documents
         self.lineage = {**from_scip, **self.lineage}  # built once; the caller's lineage wins
@@ -2006,7 +2142,16 @@ class _Run:
         relations = self.relation_drafts()
         dependencies = self.dependency_drafts()
         supersessions = self.supersession_drafts()
-        body = [*self.file_events, *self.symbol_events, *relations, *dependencies, *supersessions]
+        coverage = self.coverage_drafts()
+        body = [
+            *self.file_events,
+            *self.symbol_events,
+            *relations,
+            *dependencies,
+            *supersessions,
+            *self.observation_events,
+            *coverage,
+        ]
         common = {**self.target(), "index_id": self.index_id}
         started = CodeIndexStartedV1(
             **common,
@@ -2037,6 +2182,10 @@ class _Run:
         ]
 
 
+# Adapter diagnostics that are a per-file loss; ``syntax_recovered`` only reports recovery.
+_ADAPTER_LOSSES: Final = {
+    code: CodeCoverageLoss(code) for code in DIAGNOSTIC_CODES if code != "syntax_recovered"
+}
 _SKIP_DIAGNOSTICS: Final = (
     "source_missing",
     "source_mismatch",
@@ -2063,6 +2212,8 @@ _DEGRADED_DIAGNOSTICS: Final = (
 # a digest collision (a bug, surfaced as ``idempotency_conflict``).
 #
 # - ``code.file.indexed``: none. ``index_id`` and the target ARE the claim (membership per target).
+# - ``code.assertion.observed``: ``index_id`` and the target (membership per file revision).
+# - ``code.file.coverage_reported``: none. Coverage is per target (``index_id`` is in the claim).
 # - ``code.symbol.indexed``, ``code.relation.asserted``, ``code.dependency.asserted``: the first
 #   observation's ``index_id``, target and ``valid_from``. Their claim carries the file
 #   (symbols: ``file_id`` and ``file_revision_id``; relations and dependencies: the source file
@@ -2074,6 +2225,8 @@ OBSERVATION_FIELDS: Final[Mapping[str, frozenset[str]]] = {
     "code.symbol.indexed": frozenset({"index_id", "commit_id", "snapshot_id"}),
     "code.relation.asserted": frozenset({"index_id", "valid_from"}),
     "code.dependency.asserted": frozenset({"index_id", "valid_from"}),
+    "code.assertion.observed": frozenset({"index_id", "commit_id", "snapshot_id"}),
+    "code.file.coverage_reported": frozenset(),
     "code.index.started": frozenset(),
     "code.index.completed": frozenset({"duration_ms"}),
 }

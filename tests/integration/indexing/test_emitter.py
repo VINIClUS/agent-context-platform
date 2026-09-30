@@ -206,6 +206,8 @@ def test_reindexing_the_same_head_adds_no_row_of_any_kind(stack: Stack, tmp_path
     assert after_first["code.index.started"] == after_first["code.index.completed"] == 1
     assert after_first["code.symbol.indexed"] > 0
     assert after_first["code.relation.asserted"] > 0
+    assert after_first["code.assertion.observed"] >= after_first["code.relation.asserted"]
+    assert after_first["code.file.coverage_reported"] == after_first["code.file.indexed"] == 4
 
     # A later run: same target and evidence, but different observation times and duration.
     later = stack.service_at(NOW + timedelta(days=3))
@@ -226,6 +228,7 @@ def test_a_new_commit_records_membership_and_only_the_changed_revisions(
     before = asyncio.run(stack.counts())
     revisions_before = asyncio.run(_distinct(stack, "file.indexed", "file_revision_id"))
     symbol_files_before = asyncio.run(_symbol_rows(stack))
+    observed_before = asyncio.run(_distinct(stack, "assertion.observed", "file_revision_id"))
 
     (root / "pkg" / "old_name.py").write_text(HELPER + "\n\ndef extra() -> int:\n    return 1\n")
     _commit(root, "edit one file")
@@ -244,6 +247,13 @@ def test_a_new_commit_records_membership_and_only_the_changed_revisions(
     new_symbols = asyncio.run(_symbol_rows(stack)) - symbol_files_before
     assert new_symbols
     assert {file_id for file_id, _ in new_symbols} == {str(ids["pkg/old_name.py"])}
+    # Assertion membership follows file revisions: only the edited revision is observed anew,
+    # while coverage is per target and lists every file of the new commit again.
+    assert after["code.file.coverage_reported"] == before["code.file.coverage_reported"] + 4
+    new_observed = after["code.assertion.observed"] - before["code.assertion.observed"]
+    assert 0 < new_observed < before["code.assertion.observed"]
+    observed_after = asyncio.run(_distinct(stack, "assertion.observed", "file_revision_id"))
+    assert observed_after - observed_before == revisions_after - revisions_before
 
 
 def test_a_conflicting_payload_under_an_existing_key_is_surfaced_not_dropped(

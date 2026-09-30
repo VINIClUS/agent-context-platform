@@ -44,7 +44,9 @@ def _mutated(value: Any) -> Any:
         return "changed"
     if isinstance(value, str):
         return value + "x"
-    return [*value, "changed"] if isinstance(value, list) else {**value, "changed": "1"}
+    if isinstance(value, list | tuple):  # drafts freeze JSON arrays into tuples
+        return [*value, "changed"]
+    return {**value, "changed": "1"}
 
 
 def test_the_key_changes_with_every_claim_field_and_with_no_observation_field(
