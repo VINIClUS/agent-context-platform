@@ -795,6 +795,26 @@ def test_import_forms() -> None:
     )
 
 
+def test_an_aliased_import_reports_the_name_it_binds() -> None:
+    code = "import a.b as c\nimport d.e\nfrom p.q import r as s, t\nfrom . import u as v\n"
+    parsed = symbols_of(code.encode(), "pkg/mod.py")["pkg/mod.py"]
+    bound = sorted(
+        (item.qualifier or "", item.target_name, item.alias)
+        for item in parsed.references
+        if item.kind == "import"
+    )
+    for item in parsed.references:  # the alias is its own token, at its own range
+        if item.alias is not None:
+            assert code.encode()[item.alias_start_byte : item.alias_end_byte].decode() == item.alias
+    assert bound == [
+        ("", "a.b", "c"),
+        ("", "d.e", None),
+        ("", "u", "v"),
+        ("p.q", "r", "s"),
+        ("p.q", "t", None),
+    ]
+
+
 def test_star_imports_reference_the_module_and_nameless_ones_nothing() -> None:
     code = "from a.b import *\nfrom .pkg import *\nfrom . import *\nfrom .. import *\n"
     assert refs_of(code) == ordered(

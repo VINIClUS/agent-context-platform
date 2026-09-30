@@ -385,6 +385,19 @@ class ParsedReference(BaseModel):
     ) = None
     qualifier_start_byte: Annotated[int, Field(ge=0)] | None = None
     qualifier_end_byte: Annotated[int, Field(ge=0)] | None = None
+    # The local name an ``import`` binds when it is aliased (``import a.b as c``, ``from a import
+    # b as c``); None when the import binds its own name. Only import references carry it. Like
+    # the names above it is a function of its own range (the identifier token of ``c``).
+    alias: (
+        Annotated[
+            Text,
+            StringConstraints(min_length=1),
+            AfterValidator(lambda v: _bounded(v, MAX_NAME_BYTES)),
+        ]
+        | None
+    ) = None
+    alias_start_byte: Annotated[int, Field(ge=0)] | None = None
+    alias_end_byte: Annotated[int, Field(ge=0)] | None = None
     evidence_kind: Literal["tree_sitter"]
     confidence: ReferenceConfidence
 
@@ -394,6 +407,15 @@ class ParsedReference(BaseModel):
             raise ValueError("empty or inverted byte range")
         if (self.confidence == "heuristic") != (self.kind == "call"):
             raise ValueError("confidence does not match the reference kind")
+        if self.alias is not None and self.kind != "import":
+            raise ValueError("only an import binds an alias")
+        alias_parts = (self.alias, self.alias_start_byte, self.alias_end_byte)
+        if any(part is None for part in alias_parts) != all(part is None for part in alias_parts):
+            raise ValueError("an alias needs its name and both range ends")
+        if self.alias is not None and self.alias_start_byte >= self.alias_end_byte:  # type: ignore[operator]
+            raise ValueError("empty or inverted byte range")
+        if self.alias is not None and "." in self.alias:
+            raise ValueError("an alias is one identifier, never a dotted path")
         parts = (self.qualifier, self.qualifier_start_byte, self.qualifier_end_byte)
         if any(part is None for part in parts) != all(part is None for part in parts):
             raise ValueError("a qualifier needs its name and both range ends")
@@ -502,6 +524,9 @@ FIELD_CONFINEMENT: Final[Mapping[str, Mapping[str, Confinement]]] = {
         "qualifier": "token",  # equals the identifier tokens of its own range
         "qualifier_start_byte": "range",
         "qualifier_end_byte": "range",
+        "alias": "token",  # equals the identifier token of its own range
+        "alias_start_byte": "range",
+        "alias_end_byte": "range",
         "evidence_kind": "enum",
         "confidence": "enum",
     },
@@ -778,7 +803,9 @@ def _validate_references(
     parsed: ParsedFile, size: int, refs: dict[str, tuple[int, int]], text: _SourceText
 ) -> None:
     per_source: dict[str | None, int] = {}
-    seen: set[tuple[str, str, int, int, int, str | None, int | None, int | None]] = set()
+    seen: set[
+        tuple[str, str, int, int, int, str | None, int | None, int | None, str | None, int | None]
+    ] = set()
     for reference in parsed.references:
         limit = MAX_MODULE_REFERENCES if reference.source is None else MAX_REFERENCES_PER_SYMBOL
         per_source[reference.source] = per_source.get(reference.source, 0) + 1
@@ -796,6 +823,21 @@ def _validate_references(
             or reference.qualifier_start_byte < low  # type: ignore[operator]
         ):
             raise StructuralError(StructuralErrorCode.RANGE_OUT_OF_BOUNDS)
+        if reference.alias is not None and (
+            reference.alias_end_byte > high  # type: ignore[operator]
+            or reference.alias_start_byte < low  # type: ignore[operator]
+        ):
+            raise StructuralError(StructuralErrorCode.RANGE_OUT_OF_BOUNDS)
+        if reference.alias is not None:
+            # The local name is a token of its own: it never overlaps the names it renames.
+            spans = [(reference.start_byte, reference.end_byte)]
+            if reference.qualifier is not None:
+                spans.append(
+                    (reference.qualifier_start_byte, reference.qualifier_end_byte)  # type: ignore[arg-type]
+                )
+            for start, end in spans:
+                if reference.alias_start_byte < end and start < reference.alias_end_byte:  # type: ignore[operator]
+                    raise StructuralError(StructuralErrorCode.RANGE_OUT_OF_BOUNDS)
         key = (
             reference.kind,
             reference.target_name,
@@ -805,6 +847,8 @@ def _validate_references(
             reference.qualifier,
             reference.qualifier_start_byte,
             reference.qualifier_end_byte,
+            reference.alias,
+            reference.alias_start_byte,
         )
         if key in seen:
             raise StructuralError(StructuralErrorCode.DUPLICATE_REFERENCE)
@@ -816,5 +860,11 @@ def _validate_references(
             reference.qualifier_start_byte,  # type: ignore[arg-type]
             reference.qualifier_end_byte,  # type: ignore[arg-type]
             qualifier=True,
+        ):
+            raise StructuralError(StructuralErrorCode.TEXT_NOT_IN_SOURCE)
+        if reference.alias is not None and not text.path_ok(
+            reference.alias,
+            reference.alias_start_byte,  # type: ignore[arg-type]
+            reference.alias_end_byte,  # type: ignore[arg-type]
         ):
             raise StructuralError(StructuralErrorCode.TEXT_NOT_IN_SOURCE)

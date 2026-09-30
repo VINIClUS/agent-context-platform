@@ -1390,6 +1390,72 @@ def test_a_protocol_one_answer_is_refused() -> None:
     assert outcome("protocol_v1") is StructuralErrorCode.SCHEMA_VIOLATION
 
 
+# --- import aliases ---------------------------------------------------------------------
+
+AS = b"import a.b as c\n"
+
+
+def aref(name: str, start: int, end: int, **over: Any) -> Any:
+    at = AS.index(b"a.b")
+    return imp(at, at + 3, "a.b", alias=name, alias_start_byte=start, alias_end_byte=end, **over)
+
+
+def test_an_alias_is_a_function_of_its_own_range() -> None:
+    c = AS.index(b" c") + 1
+    got = validated(module([], references=[aref("c", c, c + 1)]), request(AS)).references[0]
+    assert (got.target_name, got.alias) == ("a.b", "c")
+
+
+@pytest.mark.parametrize(
+    ("name", "start", "end"),
+    [("d", 15, 16), ("c", 0, 6), ("cc", 15, 16)],
+)
+def test_an_alias_that_is_not_its_range_is_refused(name: str, start: int, end: int) -> None:
+    refused(
+        StructuralErrorCode.TEXT_NOT_IN_SOURCE,
+        module([], references=[aref(name, start, end)]),
+        request(AS),
+    )
+
+
+def test_an_alias_outside_the_source_symbol_or_the_file_is_refused() -> None:
+    refused(
+        StructuralErrorCode.RANGE_OUT_OF_BOUNDS,
+        module([], references=[aref("c", len(AS), len(AS) + 1)]),
+        request(AS),
+    )
+
+
+def test_an_alias_needs_its_name_and_a_proper_range() -> None:
+    for over in (
+        {"alias": "c"},
+        {"alias": None, "alias_start_byte": 1, "alias_end_byte": 2},
+        {"alias": "c", "alias_start_byte": 5, "alias_end_byte": 5},
+        {"alias": "c", "alias_start_byte": 5, "alias_end_byte": 6, "kind": "call"},
+    ):
+        payload = {**imp(4, 5, "a"), **over}
+        with pytest.raises(ValidationError):
+            ParsedReference.model_validate(payload)
+
+
+def test_an_alias_is_one_identifier_never_a_dotted_path() -> None:
+    payload = imp(7, 8, "a", alias="a.b", alias_start_byte=12, alias_end_byte=15)
+    with pytest.raises(ValidationError, match="one identifier"):
+        ParsedReference.model_validate(payload)
+
+
+def test_an_alias_never_overlaps_the_name_it_renames() -> None:
+    source = b"import a as a\n"
+    refused(
+        StructuralErrorCode.RANGE_OUT_OF_BOUNDS,
+        module(
+            [],
+            references=[imp(7, 8, "a", alias="a", alias_start_byte=7, alias_end_byte=8)],
+        ),
+        request(source),
+    )
+
+
 # --- qualified references ---------------------------------------------------------------
 
 FROM = b"from ..pkg import x\nfrom a.b import c\n"

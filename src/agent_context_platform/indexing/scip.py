@@ -39,6 +39,7 @@ import re
 import uuid
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass
+from enum import StrEnum
 from typing import Final, Literal
 
 from google.protobuf.descriptor import FieldDescriptor as _FD
@@ -86,6 +87,7 @@ type ImportErrorReason = Literal[
     "symbol_too_long",
 ]
 type DiagnosticCode = Literal[
+    "conflicting_local_declaration",
     "duplicate_document",
     "empty_relationship",
     "invalid_range",
@@ -93,9 +95,38 @@ type DiagnosticCode = Literal[
     "invalid_symbol",
     "local_symbol_without_file_identity",
     "out_of_document_range",
+    "unknown_position_encoding",
     "unsafe_path",
 ]
 type RelationshipKind = Literal["reference", "implementation", "type_definition", "definition"]
+
+
+class PositionEncoding(StrEnum):
+    """How a document's ``character`` offsets count, normalized once at import (closed set).
+
+    ``UNSPECIFIED`` is the protobuf default (0), which the SCIP spec says indexers should not
+    emit: offsets are then only trustworthy on pure-ASCII lines, where every encoding agrees.
+    ``UNKNOWN`` is a value this build does not know: consumers must not guess (never UTF-16).
+    """
+
+    UNSPECIFIED = "unspecified"
+    UTF8 = "utf8"
+    UTF16 = "utf16"
+    UTF32 = "utf32"
+    UNKNOWN = "unknown"
+
+
+_POSITION_ENCODINGS: Final[dict[int, PositionEncoding]] = {
+    scip_pb2.UnspecifiedPositionEncoding: PositionEncoding.UNSPECIFIED,
+    scip_pb2.UTF8CodeUnitOffsetFromLineStart: PositionEncoding.UTF8,
+    scip_pb2.UTF16CodeUnitOffsetFromLineStart: PositionEncoding.UTF16,
+    scip_pb2.UTF32CodeUnitOffsetFromLineStart: PositionEncoding.UTF32,
+}
+
+
+def position_encoding(value: int) -> PositionEncoding:
+    """The closed-enum form of a protobuf ``PositionEncoding`` value; unknown fails closed."""
+    return _POSITION_ENCODINGS.get(value, PositionEncoding.UNKNOWN)
 
 
 class ScipImportError(Exception):
@@ -187,6 +218,10 @@ class SemanticSymbol:
     documentation: tuple[str, ...]
     signature_text: str
     relationships: tuple[SemanticRelationship, ...]
+    # The digests ``revision_id`` is made of, so an emitter can publish them without
+    # re-deriving (PLATFORM-037: a SCIP-only file has no other fingerprint source).
+    signature_digest: str = ""
+    semantic_digest: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -195,7 +230,7 @@ class SemanticDocument:
 
     path: str
     language: str
-    position_encoding: str
+    position_encoding: PositionEncoding
     file_logical_id: uuid.UUID | None
     occurrences: tuple[SemanticOccurrence, ...]
     symbols: tuple[SemanticSymbol, ...]
@@ -613,6 +648,23 @@ class _Importer:
         # The one resolver of local fallback IDs: kinds declared by the current document.
         self._declared_kinds: dict[str, str] = {}
         self._ids: dict[tuple[str, uuid.UUID | None, str], uuid.UUID] = {}
+        self._conflicting: frozenset[str] = frozenset()
+
+    def _conflicting_locals(self, document: scip_pb2.Document, path: str) -> frozenset[str]:
+        """Local symbols declared with different kinds: ambiguous, so diagnosed and dropped.
+
+        A ``local`` symbol is file-scoped and its identity depends on the declared kind, so two
+        declarations that disagree cannot both be right. Every declaration and occurrence of the
+        symbol is dropped before any identity is derived (FU-34); one diagnostic per symbol.
+        """
+        kinds: dict[str, set[str]] = {}
+        for info in document.symbols:
+            if info.symbol.startswith("local "):
+                kinds.setdefault(info.symbol, set()).add(_kind_name(info))
+        conflicting = frozenset(symbol for symbol, seen in kinds.items() if len(seen) > 1)
+        for _ in sorted(conflicting):
+            self.diagnose("conflicting_local_declaration", path)
+        return conflicting
 
     def diagnose(self, code: DiagnosticCode, path: str | None, index: int | None = None) -> None:
         self.diagnostics.append(ImportDiagnostic(code, path, index))
@@ -624,16 +676,26 @@ class _Importer:
         if len(document.symbols) > limits.max_symbols_per_document:
             raise ScipImportError("too_many_symbols")
         file_id = self._file_ids.get(path)
-        self._declared_kinds = {info.symbol: _kind_name(info) for info in document.symbols}
+        self._conflicting = self._conflicting_locals(document, path)
+        self._declared_kinds = {
+            info.symbol: _kind_name(info)
+            for info in document.symbols
+            if info.symbol not in self._conflicting
+        }
         # Only a caller-supplied source or non-empty Document.text is known text; proto3
         # cannot tell an absent Document.text from an empty one.
         text = self._sources.get(path, document.text or None)
         bounds = _Bounds(text, document.position_encoding)
+        encoding = position_encoding(document.position_encoding)
         occurrences: list[SemanticOccurrence] = []
-        for position, occurrence in enumerate(document.occurrences):
-            item = self._occurrence(occurrence, position, path, document, file_id, bounds)
-            if item is not None:
-                occurrences.append(item)
+        if encoding is PositionEncoding.UNKNOWN:
+            # Positions cannot be interpreted, so none is kept; symbols still are.
+            self.diagnose("unknown_position_encoding", path)
+        else:
+            for position, occurrence in enumerate(document.occurrences):
+                item = self._occurrence(occurrence, position, path, document, file_id, bounds)
+                if item is not None:
+                    occurrences.append(item)
         symbols = tuple(
             symbol
             for info in document.symbols
@@ -642,7 +704,7 @@ class _Importer:
         return SemanticDocument(
             path=path,
             language=document.language,
-            position_encoding=_enum_name(scip_pb2.PositionEncoding, document.position_encoding),
+            position_encoding=encoding,
             file_logical_id=file_id,
             occurrences=tuple(occurrences),
             symbols=symbols,
@@ -709,6 +771,8 @@ class _Importer:
             raise ScipImportError("symbol_too_long")
         if not is_valid_symbol(symbol):
             self.diagnose("invalid_symbol", path, position)
+            return None
+        if symbol in self._conflicting:  # already diagnosed once, at the declarations
             return None
         kind = self._declared_kinds.get(symbol, _UNKNOWN_KIND)
         if symbol.startswith("local ") and file_id is None:
@@ -779,6 +843,8 @@ class _Importer:
             documentation=tuple(info.documentation),
             signature_text=signature_text,
             relationships=tuple(relationships),
+            signature_digest=signature_digest,
+            semantic_digest=semantic_digest,
         )
 
 

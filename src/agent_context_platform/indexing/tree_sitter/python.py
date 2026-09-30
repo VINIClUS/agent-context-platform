@@ -19,7 +19,8 @@ What is emitted
   ``StructuralRelation`` cannot say because its target is not a symbol of this file:
 
   * ``import a.b`` and ``import a.b as c``: ``import``/``syntactic``, target ``a.b`` at the
-    dotted name (the alias is not part of it);
+    dotted name (the alias is not part of the range; it is ``alias="c"``, the name the import
+    binds; ``from a import b as c`` likewise gives target ``b`` and ``alias="c"``);
   * ``from a.b import c, d``: one ``import`` per name, target ``c`` at the name, qualifier
     ``a.b`` at the module; ``from ..pkg import x``: qualifier ``pkg`` and ``relative_level`` 2;
     ``from . import x``: no qualifier, level 1;
@@ -36,7 +37,8 @@ What is emitted
     ``class A(Base[T])`` names ``Base``; keyword and starred arguments are not bases).
 
   A call reference qualifier is the syntactic head, NOT a resolved module: locals, parameters and
-  import aliases are not tracked (``import a.b as c; c.f()`` gives qualifier ``c``). A consumer
+  import aliases are not resolved here (``import a.b as c; c.f()`` gives qualifier ``c``
+  and the import carries ``alias="c"``). A consumer
   must resolve a qualifier only when its first segment is bound by an import or a module-level
   name.
 
@@ -237,6 +239,7 @@ class _Candidate:
     qualifier: str | None = None
     qualifier_start: int = 0
     qualifier_end: int = 0
+    alias: tuple[str, int, int] | None = None  # the ``as`` name and its byte range
 
 
 @dataclass(eq=False)
@@ -593,6 +596,17 @@ def _relative_module(header: Node) -> tuple[int, Node | None] | None:
     return level, header.child(1) if header.child_count > 1 else None
 
 
+def _alias(walk: _Walk, node: Node) -> tuple[str, int, int] | None:
+    """The ``as`` name of an ``aliased_import`` with its range, or None."""
+    if node.type != "aliased_import":
+        return None
+    alias = node.child_by_field_name("alias")
+    if alias is None or alias.type != "identifier":
+        return None
+    name = _dotted(walk, alias)
+    return None if name is None else (name, *alias.byte_range)
+
+
 def _enter_import(walk: _Walk, node: Node) -> None:
     """``import a.b [as c]``, ``from [.]m import x [as y]``, ``from m import *`` (the module)."""
     scope = walk.scopes[-1]
@@ -601,16 +615,16 @@ def _enter_import(walk: _Walk, node: Node) -> None:
     if node.child_count > _MAX_IMPORT_CHILDREN:
         walk.capped += node.child_count // 2
         return
-    names: list[tuple[Node, str]] = []
+    names: list[tuple[Node, str, tuple[str, int, int] | None]] = []
     for child in node.children_by_field_name("name"):
         item = child.child_by_field_name("name") if child.type == "aliased_import" else child
         if item is not None and item.type == "dotted_name":
             name = _dotted(walk, item)
             if name is not None:
-                names.append((item, name))
+                names.append((item, name, _alias(walk, child)))
     if node.type == "import_statement":
-        for item, name in names:
-            walk.imports.append(_Candidate(scope, "import", name, *item.byte_range))
+        for item, name, alias in names:
+            walk.imports.append(_Candidate(scope, "import", name, *item.byte_range, alias=alias))
         return
     header = node.child_by_field_name("module_name")
     module, level = header, 0
@@ -630,13 +644,22 @@ def _enter_import(walk: _Walk, node: Node) -> None:
         if module is not None and qualifier is not None:
             walk.imports.append(_Candidate(scope, "import", qualifier, *module.byte_range, level))
         return
-    for item, name in names:
+    for item, name, alias in names:
         if module is None:
-            walk.imports.append(_Candidate(scope, "import", name, *item.byte_range, level))
+            walk.imports.append(
+                _Candidate(scope, "import", name, *item.byte_range, level, alias=alias)
+            )
         else:
             walk.imports.append(
                 _Candidate(
-                    scope, "import", name, *item.byte_range, level, qualifier, *module.byte_range
+                    scope,
+                    "import",
+                    name,
+                    *item.byte_range,
+                    level,
+                    qualifier,
+                    *module.byte_range,
+                    alias=alias,
                 )
             )
 
@@ -889,18 +912,29 @@ def _references(
     """
     out: list[ParsedReference] = []
     per_source: dict[int | None, int] = {}
-    seen: set[tuple[int | None, str, int, str | None, str]] = set()
+    seen: set[tuple[int | None, str, int, str | None, str, str | None]] = set()
     for item in candidates:
         source: int | None = None
         if item.owner is not walk.root:
             source = numbers.get(id(item.owner))
             if source is None:
                 continue
-        key = (source, item.kind, item.level, item.qualifier, item.target)
+        key = (
+            source,
+            item.kind,
+            item.level,
+            item.qualifier,
+            item.target,
+            None if item.alias is None else item.alias[0],
+        )
         if key in seen:
             continue
         limit = MAX_MODULE_REFERENCES if source is None else MAX_REFERENCES_PER_SYMBOL
-        names = len(item.target.encode()) + len((item.qualifier or "").encode())
+        names = (
+            len(item.target.encode())
+            + len((item.qualifier or "").encode())
+            + len("" if item.alias is None else item.alias[0].encode())
+        )
         if (
             per_source.get(source, 0) >= limit
             or len(out) >= MAX_REFERENCES_PER_FILE
@@ -921,6 +955,9 @@ def _references(
                 qualifier=item.qualifier,
                 qualifier_start_byte=None if item.qualifier is None else item.qualifier_start,
                 qualifier_end_byte=None if item.qualifier is None else item.qualifier_end,
+                alias=None if item.alias is None else item.alias[0],
+                alias_start_byte=None if item.alias is None else item.alias[1],
+                alias_end_byte=None if item.alias is None else item.alias[2],
                 evidence_kind=EVIDENCE_KIND,
                 confidence="heuristic" if item.kind == "call" else "syntactic",
             )

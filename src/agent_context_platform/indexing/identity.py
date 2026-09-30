@@ -154,6 +154,21 @@ def provisional_file_logical_id(repository_id: str, checkout_id: str, path: str)
     )
 
 
+def uncommitted_file_logical_id(repository_id: str, path: str) -> uuid.UUID:
+    """Identity of an uncommitted (untracked or dirty-only) file: repository and path only.
+
+    Deliberately checkout-independent: the same path holding uncommitted content in two
+    checkouts is ONE logical file, whose revisions differ by content. The namespace is disjoint
+    from committed IDs (``file_logical_id``) and from the older checkout-scoped
+    ``provisional_file_logical_id``, which this module keeps for its frozen goldens. The join to a
+    committed identity happens later, by content (``resolve_committed``).
+    """
+    namespace = uuid.uuid5(
+        repository_namespace(repository_id), encode_components("namespace", "uncommitted")
+    )
+    return uuid.uuid5(namespace, encode_components(canonical_path(path)))
+
+
 def file_revision_id(
     repository_id: str,
     file_logical_id: uuid.UUID,

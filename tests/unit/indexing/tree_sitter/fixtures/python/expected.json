@@ -738,6 +738,28 @@
    "path": "pkg/service.py",
    "references": [
     {
+     "alias": "Acc",
+     "alias_range": [
+      52,
+      55
+     ],
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": "models",
+     "qualifier_range": [
+      27,
+      33
+     ],
+     "range": [
+      41,
+      48
+     ],
+     "relative_level": 1,
+     "source": null,
+     "target": "Account"
+    },
+    {
      "confidence": "heuristic",
      "evidence_kind": "tree_sitter",
      "kind": "call",
@@ -843,23 +865,6 @@
       33
      ],
      "range": [
-      41,
-      48
-     ],
-     "relative_level": 1,
-     "source": null,
-     "target": "Account"
-    },
-    {
-     "confidence": "syntactic",
-     "evidence_kind": "tree_sitter",
-     "kind": "import",
-     "qualifier": "models",
-     "qualifier_range": [
-      27,
-      33
-     ],
-     "range": [
       57,
       63
      ],
@@ -953,6 +958,25 @@
    "parser_fingerprint": "b4895cc638911ca361fffda8fc8a0e50332a9b6dfc3999db88029eac3dfc6551",
    "path": "pkg/sub/deep.py",
    "references": [
+    {
+     "alias": "c",
+     "alias_range": [
+      117,
+      118
+     ],
+     "confidence": "syntactic",
+     "evidence_kind": "tree_sitter",
+     "kind": "import",
+     "qualifier": null,
+     "qualifier_range": null,
+     "range": [
+      110,
+      113
+     ],
+     "relative_level": 0,
+     "source": null,
+     "target": "a.b"
+    },
     {
      "confidence": "heuristic",
      "evidence_kind": "tree_sitter",
@@ -1102,20 +1126,6 @@
      "relative_level": 0,
      "source": null,
      "target": "TypeVar"
-    },
-    {
-     "confidence": "syntactic",
-     "evidence_kind": "tree_sitter",
-     "kind": "import",
-     "qualifier": null,
-     "qualifier_range": null,
-     "range": [
-      110,
-      113
-     ],
-     "relative_level": 0,
-     "source": null,
-     "target": "a.b"
     },
     {
      "confidence": "syntactic",

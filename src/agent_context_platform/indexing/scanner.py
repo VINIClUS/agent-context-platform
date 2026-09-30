@@ -210,6 +210,22 @@ class UntrackedFile:
 
 
 @dataclass(frozen=True, slots=True)
+class StatusChange:
+    """One tracked path's porcelain status; ``orig_path`` is the source of a rename or copy."""
+
+    path: str
+    xy: str
+    orig_path: str | None = None
+
+
+@dataclass(frozen=True, slots=True)
+class GitlinkChange:
+    path: str
+    head_oid: str | None
+    index_oid: str | None
+
+
+@dataclass(frozen=True, slots=True)
 class WorkspaceState:
     """HEAD identity and uncommitted state.
 
@@ -227,6 +243,10 @@ class WorkspaceState:
     dirty_state_sha256: str | None
     modified_paths: tuple[str, ...]
     untracked_paths: tuple[str, ...]
+    # Status records of tracked paths (porcelain XY, and a rename's source path).
+    changes: tuple[StatusChange, ...] = ()
+    # Submodule pointer changes: (path, HEAD OID, index OID).
+    gitlinks: tuple[GitlinkChange, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -242,6 +262,8 @@ class RepositoryScan:
     omitted_files: int
     bytes_read: int
     scan_sha256: str
+    # (st_dev, st_ino) of ``root`` as the scanner opened it: later reads verify against this.
+    root_identity: tuple[int, int]
 
 
 _DEFAULT_LIMITS = ScanLimits()
@@ -1085,6 +1107,7 @@ class _Change:
     modes: tuple[str, ...]
     base_oid: str | None
     index_oid: str | None
+    orig_path: str | None = None  # a rename or copy's source path (status type ``2``)
 
 
 def _sort_key(path: str) -> bytes:
@@ -1179,11 +1202,16 @@ def _parse_status(
                 fields, path_index, modes, base, index = text.split(" ", 8), 8, (3, 4, 5), 6, 7
             elif marker == b"2":
                 fields, path_index, modes, base, index = text.split(" ", 9), 9, (3, 4, 5), 6, 7
-                position += 1  # the original path follows as its own token
+                # The original path follows as its own token.
+                orig_raw = tokens[position] if position < len(tokens) else b""
+                orig = _safe_path(orig_raw)
+                position += 1
             else:
                 fields, path_index, modes, base, index = text.split(" ", 10), 10, (3, 4, 5, 6), 7, 8
             if len(fields) != path_index + 1:
                 raise ScanError(ScanFailure.MALFORMED_OUTPUT)
+            if marker != b"2":
+                orig = None
             path = _safe_path(fields[path_index].encode("utf-8", errors="surrogateescape"))
             if path is None:
                 rejections.append(_reject(fields[path_index].encode("utf-8", "surrogateescape")))
@@ -1195,6 +1223,7 @@ def _parse_status(
                 modes=tuple(fields[i] for i in modes),
                 base_oid=None if marker == b"u" else _clean_oid(fields[base]),
                 index_oid=None if marker == b"u" else _clean_oid(fields[index]),
+                orig_path=orig,
             )
         elif marker == b"#":
             continue
@@ -1225,6 +1254,74 @@ def _open_pinned_root(root: Path, identity: tuple[int, int]) -> int:
         os.close(fd)
         raise
     return fd
+
+
+def read_worktree_file(scan: RepositoryScan, path: str, cap: int) -> bytes | None:
+    """Read at most ``cap + 1`` bytes of one repository-relative regular file of a scanned root.
+
+    The root is NOT re-resolved: it is opened from ``/`` one component at a time with
+    ``O_NOFOLLOW`` (a symlink swapped in for the checkout or any ancestor is refused) and its
+    ``(st_dev, st_ino)`` must equal the identity the scanner recorded at scan time, so a
+    replaced directory reads nothing. (The identity is kept in the scan value rather than an
+    open descriptor because scans are plain values that outlive the run that produced them.)
+    Below the root the walk is per-component ``O_NOFOLLOW`` too, the leaf opens ``O_NONBLOCK``
+    (a FIFO cannot hang) and must be a regular file by ``fstat``. Returns ``None`` when the path
+    is absent; raises ``ScanError`` (content-free) for anything unsafe.
+    """
+    if not is_safe_repo_path(path):
+        raise ScanError(ScanFailure.ROOT_MISMATCH)
+    root_fd = _open_pinned_root(scan.root, scan.root_identity)
+    try:
+        fd = _open_below(root_fd, path.split("/"))
+    finally:
+        os.close(root_fd)
+    if fd is None:
+        return None
+    try:
+        data = b""
+        while len(data) <= cap:
+            chunk = os.read(fd, cap + 1 - len(data))
+            if not chunk:
+                break
+            data += chunk
+    except OSError:
+        raise ScanError(ScanFailure.ROOT_MISMATCH) from None
+    finally:
+        os.close(fd)
+    return data
+
+
+def hash_worktree_file(scan: RepositoryScan, path: str, cap: int) -> str | None:
+    """Streamed SHA-256 of one regular file's raw bytes, independent of the scan's parse caps.
+
+    Same safe walk as ``read_worktree_file``. ``None`` when the file is absent or larger than
+    ``cap`` bytes; raises ``ScanError`` for anything unsafe.
+    """
+    if not is_safe_repo_path(path):
+        raise ScanError(ScanFailure.ROOT_MISMATCH)
+    root_fd = _open_pinned_root(scan.root, scan.root_identity)
+    try:
+        fd = _open_below(root_fd, path.split("/"))
+    finally:
+        os.close(root_fd)
+    if fd is None:
+        return None
+    digest = hashlib.sha256()
+    total = 0
+    try:
+        while True:
+            chunk = os.read(fd, 1 << 20)
+            if not chunk:
+                break
+            total += len(chunk)
+            if total > cap:
+                return None
+            digest.update(chunk)
+    except OSError:
+        raise ScanError(ScanFailure.ROOT_MISMATCH) from None
+    finally:
+        os.close(fd)
+    return digest.hexdigest()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1617,6 +1714,13 @@ def _scan(root: Path, limits: ScanLimits) -> RepositoryScan:
         dirty_state_sha256=dirty_digest,
         modified_paths=modified_paths,
         untracked_paths=tuple(item.path for item in untracked) + tuple(omitted_untracked),
+        changes=tuple(
+            StatusChange(path, changes[path].xy, changes[path].orig_path)
+            for path in sorted(changes, key=_sort_key)
+        ),
+        gitlinks=tuple(
+            GitlinkChange(record[0], record[1], record[2]) for record in gitlink_changes
+        ),
     )
     scan_payload: bytes = canonical_json_bytes(
         {
@@ -1661,6 +1765,7 @@ def _scan(root: Path, limits: ScanLimits) -> RepositoryScan:
         omitted_files=omitted,
         bytes_read=bytes_read,
         scan_sha256=sha256_hex(_SCAN_DOMAIN + scan_payload),
+        root_identity=repo.root_identity,
     )
     _LOG.debug(
         "repository scan complete: files=%d untracked=%d rejected=%d truncated=%s",

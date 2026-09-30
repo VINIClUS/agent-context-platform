@@ -267,6 +267,35 @@ def test_import_forms(code: str, expected: list[tuple[str, str | None, int]]) ->
     assert sorted(got, key=str) == sorted(expected, key=str)
 
 
+ALIASES = [
+    ("import helper from './x';", [("x", None, "helper")]),
+    ("import * as ns from './x';", [("x", None, "ns")]),
+    ("import {foo as bar, baz} from './x';", [("foo", "x", "bar"), ("baz", "x", None)]),
+    ("import x = require('./y');", [("y", None, "x")]),
+    ("import def, * as ns from './x';", [("x", None, "def"), ("x", None, "ns")]),
+    ("import './x';", [("x", None, None)]),
+    ("export {a as b} from './x';", [("a", "x", None)]),  # an export binds no local name
+    ("export * as ns from './x';", [("x", None, None)]),
+]
+
+
+@pytest.mark.parametrize(("code", "expected"), ALIASES)
+def test_an_import_reports_the_local_name_it_binds(
+    code: str, expected: list[tuple[str, str | None, str | None]]
+) -> None:
+    item = parsed(code + "\n", "src/mod.ts")
+    raw = code.encode() + b"\n"
+    got = []
+    for ref in item.references:
+        if ref.kind != "import":
+            continue
+        got.append((ref.target_name, ref.qualifier, ref.alias))
+        if ref.alias is not None:  # the alias is the text of its own range
+            assert ref.alias_start_byte is not None and ref.alias_end_byte is not None
+            assert raw[ref.alias_start_byte : ref.alias_end_byte].decode() == ref.alias
+    assert sorted(got, key=str) == sorted(expected, key=str)
+
+
 def test_unrepresentable_specifiers_are_counted_not_silently_lost() -> None:
     item = parsed("import {a} from 'lodash-es';\nimport b from 'node:fs';\n")
     assert codes(item) == {"references_capped": 2}
