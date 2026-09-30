@@ -258,7 +258,7 @@ class _Walk:
     type_sym: _Sym | None = None
     tainted: int = 0
     dropped: int = 0
-    const_tail: tuple[list[bytes], list[bytes]] = field(default_factory=lambda: ([], []))
+    const_tail: tuple[list[bytes], list[list[bytes]]] = field(default_factory=lambda: ([], []))
     oversized: int = 0  # import names over the byte limit: reported as references_capped
 
     def add(self, sym: _Sym) -> bool:
@@ -313,6 +313,11 @@ def _directory_name(path: str) -> list[str]:
     return run[::-1]
 
 
+def _content_children(node: Node) -> list[Node]:
+    """The named children that are not comments (a comment may sit anywhere in a construct)."""
+    return [child for child in node.named_children if child.type != "comment"]
+
+
 def _package_name(root: Node, content: bytes) -> tuple[_Name | None, Node | None]:
     """The package clause follows the leading comments (Go allows nothing else before it)."""
     cursor = root.walk()
@@ -324,8 +329,9 @@ def _package_name(root: Node, content: bytes) -> tuple[_Name | None, Node | None
             if child is None:
                 return None, None
             if child.type == "package_clause":
-                name = child.named_child(0)
-                if child.has_error or name is None or name.type != "package_identifier":
+                found = [c for c in child.named_children if c.type == "package_identifier"]
+                name = found[0] if found else None
+                if child.has_error or name is None:
                     return None, None
                 # A name the limits reject is not an absent clause: the caller must not guess.
                 return _name(content, name), child
@@ -357,7 +363,8 @@ def _unwrap(node: Node | None) -> Node | None:
         if node is None:
             return None
         if node.type in _WRAPPERS:
-            node = node.named_child(0)
+            inner = _content_children(node)
+            node = inner[0] if inner else None
         elif node.type == "generic_type":
             node = node.child_by_field_name("type")
         else:
@@ -396,12 +403,11 @@ def _enter_function(walk: _Walk, node: Node) -> None:
         ok = True
         if method:
             receiver_list = node.child_by_field_name("receiver")
-            param = receiver_list.named_child(0) if receiver_list is not None else None
+            params = _content_children(receiver_list) if receiver_list is not None else []
+            param = params[0] if len(params) == 1 else None
             _, type_name = (
                 _type_name(walk.content, param.child_by_field_name("type"))
                 if param is not None
-                and receiver_list is not None
-                and receiver_list.named_child_count == 1
                 else (None, None)
             )
             ok = type_name is not None
@@ -498,7 +504,7 @@ def _enter_value_spec(walk: _Walk, node: Node) -> None:
         entry.const_mark = name_ids[-1]
         entry.marks[name_ids[-1]] = -1
         entry.implicit = value is None and node.child_by_field_name("type") is None
-    if len(name_ids) > 1 and made:
+    if len(name_ids) > 1:
         entry.names, entry.owners = name_ids, owners
         if value is not None:
             entry.values = [item.id for item in value.named_children if item.type != "comment"]
@@ -510,7 +516,8 @@ def _enter_interface_member(walk: _Walk, node: Node) -> None:
     if owner is None:
         return
     if node.type == "type_elem":
-        child = node.named_child(0) if node.named_child_count == 1 else None
+        members = _content_children(node)
+        child = members[0] if len(members) == 1 else None
         if child is not None and child.type in _TYPE_SHAPES:
             _embedded(walk, owner, child)
         return
@@ -647,6 +654,14 @@ def _default_names(path: bytes) -> set[str]:
     return found
 
 
+def _call_name(walk: _Walk, node: Node) -> _Name | None:
+    """A call's name; one over the byte limit is counted as a capped reference, not lost."""
+    if node.end_byte - node.start_byte > MAX_NAME_BYTES:
+        walk.oversized += 1
+        return None
+    return _name(walk.content, node)
+
+
 def _enter_call(walk: _Walk, node: Node) -> None:
     if walk.skip_node != -1 or len(walk.sites) >= _MAX_SITES:
         return
@@ -659,11 +674,12 @@ def _enter_call(walk: _Walk, node: Node) -> None:
         if function.type == "index_expression":
             function = function.child_by_field_name("operand")
         else:
-            function = function.named_child(0)
+            inner = _content_children(function)
+            function = inner[0] if inner else None
     if function is None:
         return
     if function.type == "identifier":
-        name = _name(walk.content, function)
+        name = _call_name(walk, function)
         if name is not None:
             walk.sites.append(_Site(walk.scope, "call", name))
     elif function.type == "selector_expression":
@@ -672,8 +688,8 @@ def _enter_call(walk: _Walk, node: Node) -> None:
         field_node = function.child_by_field_name("field")
         if operand is None or field_node is None or operand.type != "identifier":
             return
-        qualifier = _name(walk.content, operand)
-        name = _name(walk.content, field_node)
+        qualifier = _call_name(walk, operand)
+        name = _call_name(walk, field_node)
         if qualifier is not None and name is not None:
             walk.sites.append(_Site(walk.scope, "qcall", name, qualifier))
 
@@ -767,7 +783,14 @@ def _finish_open(walk: _Walk, entry: _Open) -> None:
             _finish_implicit_const(walk, entry)
             return
         after = entry.marks[entry.const_mark] + 1
-        walk.const_tail = (walk.tokens[after:stop], walk.tokens[stop:end])
+        tokens = walk.tokens
+        if entry.values:
+            starts = [entry.marks[item] for item in entry.values]
+            ends = [*starts[1:], end]
+            elements = [tokens[a:b] for a, b in zip(starts, ends, strict=True)]
+        else:
+            elements = [tokens[stop:end]]
+        walk.const_tail = (tokens[after:stop], elements)
     if not entry.syms:
         return
     if entry.names:
@@ -781,14 +804,22 @@ def _finish_open(walk: _Walk, entry: _Open) -> None:
 
 
 def _finish_implicit_const(walk: _Walk, entry: _Open) -> None:
-    """Digest a bare ``B`` in ``A = iota; B``: it repeats the previous spec's type and value."""
+    """Digest a bare ``C, D`` in ``A, B = 1, 2; C, D``: each repeats its own inherited value.
+
+    Values are paired by position, like explicit declarators; when the counts differ every name
+    depends on the whole inherited list.
+    """
+    if not entry.syms:  # ``_`` on its own: nothing to digest
+        return
     tokens = walk.tokens
-    typ, value = walk.const_tail
+    typ, elements = walk.const_tail
+    paired = len(elements) == (len(entry.names) or 1)
+    whole = [token for element in elements for token in element]
     for sym, index in entry.owners or [(entry.syms[0], 0)]:
         at = entry.marks[entry.names[index] if entry.names else entry.const_mark]
         head = [tokens[at], *typ]
         sym.signature_digest = digest(_SIGNATURE_DOMAIN, head)
-        sym.semantic = digest(_SEMANTIC_DOMAIN, [*head, *value])
+        sym.semantic = digest(_SEMANTIC_DOMAIN, [*head, *(elements[index] if paired else whole)])
 
 
 def _finish_declarators(walk: _Walk, entry: _Open, stop: int, end: int) -> None:

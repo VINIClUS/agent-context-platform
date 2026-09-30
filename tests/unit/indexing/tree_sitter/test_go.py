@@ -962,3 +962,51 @@ def test_parenthesized_and_nested_callees_are_calls() -> None:
     parsed = parsed_of(code)
     assert ("fmt", "Println") in _refs(parsed, "call")
     assert any(r.kind == "calls" for r in parsed.relations)
+
+
+def test_a_blank_implicit_const_spec_does_not_crash_the_file() -> None:
+    parsed = parsed_of(HEAD + "const (\n\tA = 1\n\t_\n\tB\n)\nconst (\n\t_ = iota\n\t_\n)\n")
+    assert {s.qualified_name for s in parsed.symbols} == {"pkg.mod", "pkg.mod.A", "pkg.mod.B"}
+    assert "file_degraded" not in codes_of(parsed)
+
+
+def test_comments_inside_the_package_clause_and_receiver_change_nothing() -> None:
+    parsed = parsed_of(
+        "package /* keep */ p\n\nfunc (/* keep */ r T) M() {}\nfunc (r /* k */ *T) N() {}\n"
+    )
+    assert {s.qualified_name for s in parsed.symbols} == {
+        "pkg.p",
+        "pkg.p.T.M",
+        "pkg.p.T.N",
+    }
+
+
+def test_comments_between_wrappers_and_embedded_members_are_ignored() -> None:
+    code = (
+        HEAD + 'import "example.com/pkg"\n'
+        "type I interface {\n\t/* c */ pkg.Base\n}\ntype S struct{ /* c */ *pkg.B }\n"
+        "func f() { (/* c */ pkg.G)() }\n"
+    )
+    parsed = parsed_of(code)
+    assert ("pkg", "Base") in _refs(parsed, "inherit")
+    assert ("pkg", "G") in _refs(parsed, "call")
+
+
+def test_inherited_const_values_pair_per_identifier() -> None:
+    group = "const (\n\tA, B = 1, 2\n\tC, D\n)\n"
+    assert _changed(group, group.replace("1, 2", "9, 2")) == {"pkg.mod.A", "pkg.mod.C"}
+    assert _changed(group, group.replace("1, 2", "1, 9")) == {"pkg.mod.B", "pkg.mod.D"}
+    mismatch = "const (\n\tA, B = f()\n\tC, D\n)\n"  # counts differ: the whole list
+    assert _changed(mismatch, mismatch.replace("f()", "g()")) == {
+        "pkg.mod.A",
+        "pkg.mod.B",
+        "pkg.mod.C",
+        "pkg.mod.D",
+    }
+
+
+def test_an_oversized_call_name_is_counted_not_silently_lost() -> None:
+    long = "n" * 513
+    parsed = parsed_of(HEAD + f"func f() {{\n\t{long}()\n\tpkg.{long}()\n\t{long}.x()\n}}\n")
+    assert codes_of(parsed).get("references_capped") == 3
+    assert "file_degraded" not in codes_of(parsed)

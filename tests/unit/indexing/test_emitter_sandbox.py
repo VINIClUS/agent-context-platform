@@ -400,3 +400,86 @@ def test_a_real_go_index_resolves_siblings_imports_aliases_and_external_dependen
     dependencies = by_type(drafts, "code.dependency.asserted")
     assert len(dependencies) == 1  # ``fmt`` only: example.com/app/store resolved in the repository
     assert dependencies[0].payload["dependency_kind"] == "observed"
+
+
+def _go_facts(
+    tmp_path: Path, files: dict[str, str], make_repo: Callable[[str], RepoBuilder]
+) -> tuple[set[tuple[str, str]], set[str]]:
+    """(caller, callee) call edges and the external dependency ids of a real Go index."""
+    repo = make_repo("repo")
+    for path, text in files.items():
+        repo.write(path, text)
+    repo.commit("seed")
+    scan = scan_of(repo)
+    ids = lineage(scan, scan.workspace.head_commit or "")
+    structural = parse_structural(registry.build_adapters(_settings(tmp_path)), read_sources(scan))
+    drafts_service = service()
+    drafts = drafts_service.index(scan, None, list(structural.files), file_logical_ids=ids)
+    names = {
+        str(d.payload["symbol_id"]): str(d.payload["qualified_name"])
+        for d in by_type(drafts, "code.symbol.indexed")
+    }
+    calls = {
+        (names[str(r.payload["subject_id"])], names[str(r.payload["object_id"])])
+        for r in by_type(drafts, "code.relation.asserted")
+        if r.payload["predicate"] == "CALLS"
+    }
+    dependencies = {
+        str(d.payload["dependency_id"]) for d in by_type(drafts, "code.dependency.asserted")
+    }
+    return calls, dependencies
+
+
+def _external_id(name: str) -> str:
+    namespace = repository_namespace(service().config.repository_id)
+    return str(uuid.uuid5(namespace, encode_components("external_module", name)))
+
+
+_GO_NESTED = {
+    "internal/store/store.go": "package store\n\nfunc Open() {}\n",
+    "cmd/app/main.go": (
+        'package main\n\nimport (\n\t"net/http"\n\t"example.com/app/internal/store"\n'
+        '\t"github.com/x/y"\n\t"github.com/other/store"\n)\n\n'
+        "func run() {\n\tstore.Open()\n\thttp.Get()\n\ty.Do()\n}\n"
+    ),
+}
+
+
+def test_a_go_import_resolves_by_its_full_path_with_a_go_mod(
+    tmp_path: Path, make_repo: Callable[[str], RepoBuilder]
+) -> None:
+    files = {**_GO_NESTED, "go.mod": "module example.com/app\n\ngo 1.22\n"}
+    calls, dependencies = _go_facts(tmp_path, files, make_repo)
+
+    assert any(a.endswith(".run") and b.endswith("store.Open") for a, b in calls)
+    assert dependencies == {
+        _external_id("net/http"),
+        _external_id("github.com/x/y"),
+        _external_id("github.com/other/store"),  # not the repository's internal/store
+    }
+
+
+def test_a_go_import_resolves_by_the_longest_directory_suffix_without_a_go_mod(
+    tmp_path: Path, make_repo: Callable[[str], RepoBuilder]
+) -> None:
+    calls, dependencies = _go_facts(tmp_path, _GO_NESTED, make_repo)
+
+    assert any(a.endswith(".run") and b.endswith("store.Open") for a, b in calls)
+    assert _external_id("github.com/x/y") in dependencies
+    assert _external_id("net/http") in dependencies
+    assert _external_id("example.com/app/internal/store") not in dependencies
+
+
+def test_a_go_test_file_sees_sibling_test_files_but_production_never_sees_them(
+    tmp_path: Path, make_repo: Callable[[str], RepoBuilder]
+) -> None:
+    files = {
+        "pkg/a.go": "package pkg\n\nfunc Prod() { helper() }\nfunc Real() {}\n",
+        "pkg/a_test.go": "package pkg\n\nfunc helper() {}\n",
+        "pkg/b_test.go": "package pkg\n\nfunc TestB() { helper(); Real() }\n",
+    }
+    calls, _ = _go_facts(tmp_path, files, make_repo)
+
+    assert any(a.endswith(".TestB") and b.endswith(".helper") for a, b in calls)
+    assert any(a.endswith(".TestB") and b.endswith(".Real") for a, b in calls)  # production seen
+    assert not any(a.endswith(".Prod") and b.endswith(".helper") for a, b in calls)
