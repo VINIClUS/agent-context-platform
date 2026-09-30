@@ -374,18 +374,24 @@ def _unwrap(node: Node | None) -> Node | None:
     return None
 
 
-def _type_name(content: bytes, node: Node | None) -> tuple[_Name | None, _Name | None]:
-    """(package qualifier, type name) of an embedded/receiver type; (None, None) if not a name."""
+def _type_name(walk: _Walk, node: Node | None) -> tuple[_Name | None, _Name | None]:
+    """(package qualifier, type name) of an embedded/receiver type; (None, None) if not a name.
+
+    A qualified type whose package or name is rejected is (None, None), never ``(None, name)``:
+    that would read as a local type. A name over the byte limit is counted as capped.
+    """
     named = _unwrap(node)
     if named is None:
         return None, None
     if named.type == "type_identifier":
-        return None, _name(content, named)
+        return None, _call_name(walk, named)
     if named.type == "qualified_type":
         package = named.child_by_field_name("package")
         name = named.child_by_field_name("name")
         if package is not None and name is not None:
-            return _name(content, package), _name(content, name)
+            found = _call_name(walk, package), _call_name(walk, name)
+            if found[0] is not None and found[1] is not None:
+                return found
     return None, None
 
 
@@ -408,7 +414,7 @@ def _enter_function(walk: _Walk, node: Node) -> None:
             params = _content_children(receiver_list) if receiver_list is not None else []
             param = params[0] if len(params) == 1 else None
             _, type_name = (
-                _type_name(walk.content, param.child_by_field_name("type"))
+                _type_name(walk, param.child_by_field_name("type"))
                 if param is not None
                 else (None, None)
             )
@@ -545,7 +551,7 @@ def _enter_interface_member(walk: _Walk, node: Node) -> None:
 
 
 def _embedded(walk: _Walk, owner: _Sym, node: Node) -> None:
-    package, name = _type_name(walk.content, node)
+    package, name = _type_name(walk, node)
     if name is None or len(walk.sites) >= _MAX_SITES:
         return
     walk.sites.append(_Site(owner, "base" if package is None else "qbase", name, package))
@@ -705,7 +711,7 @@ def _enter_call(walk: _Walk, node: Node) -> None:
 def _enter_instantiated_call(walk: _Walk, node: Node) -> None:
     if walk.skip_node != -1 or len(walk.sites) >= _MAX_SITES:
         return
-    package, name = _type_name(walk.content, node.child_by_field_name("type"))
+    package, name = _type_name(walk, node.child_by_field_name("type"))
     if name is None:
         return
     if package is None:

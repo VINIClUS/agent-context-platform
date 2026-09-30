@@ -1030,3 +1030,12 @@ def test_an_import_literal_over_the_limit_is_counted_and_keeps_the_other_symbols
     assert codes_of(parsed) == {"references_capped": 1}
     assert {s.qualified_name for s in parsed.symbols} >= {"pkg.p.F"}
     assert not [r for r in parsed.references if r.kind == "import"]
+
+
+def test_a_rejected_qualifier_never_reads_as_a_local_type() -> None:
+    alias = "a" * 513
+    code = f'package p\n\nimport {alias} "example.com/x"\ntype T struct{{}}\ntype S struct{{ {alias}.T }}\n'
+    parsed = parsed_of(code)
+    assert parsed.relations == ()  # no inherits edge to the local T
+    assert codes_of(parsed).get("references_capped", 0) >= 1
+    assert "pkg.p.S" in {s.qualified_name for s in parsed.symbols}

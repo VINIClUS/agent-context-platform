@@ -141,7 +141,7 @@ from agent_context_platform.indexing.tree_sitter.runner import Limits, Sandboxed
 LANGUAGE: Final = "python"
 ADAPTER_NAME: Final = "agent-context-python-tree-sitter"
 # Bump whenever the emitted structure or the fingerprint token stream changes.
-ADAPTER_VERSION: Final = "2"
+ADAPTER_VERSION: Final = "3"
 # Pinned in pyproject.toml/uv.lock; a test asserts these equal the installed distributions,
 # so the child never reads package metadata at run time.
 GRAMMAR_VERSIONS: Final = {"tree-sitter": "0.26.0", "tree-sitter-python": "0.25.0"}

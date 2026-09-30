@@ -1432,18 +1432,21 @@ class _Run:
         return names
 
     def read_go_module(self) -> str | None:
-        """The ``module`` path of the repository's root ``go.mod`` (bounded read), if any."""
+        """The root ``go.mod`` module path: ``None`` when there is no go.mod, ``""`` when there is
+        one whose module path is unknown (unreadable, over the read cap, no ``module`` line)."""
         try:
             data = read_worktree_file(self.scan, "go.mod", _GO_MOD_BYTES)
         except ScanError:
+            return ""
+        if data is None:
             return None
-        if data is None or len(data) > _GO_MOD_BYTES:
-            return None
+        if len(data) > _GO_MOD_BYTES:
+            return ""
         for line in data.decode("utf-8", "replace").splitlines():
             found = _GO_MODULE_LINE.match(line)
             if found:
                 return found.group(1)
-        return None
+        return ""
 
     def resolve_go(
         self,
@@ -1460,6 +1463,8 @@ class _Run:
         """
         path = _go_import_path(reference, self.sources.get(source.path))
         module = self.go_module
+        if module == "":
+            return None  # a go.mod exists but its module path is unknown: never guess by suffix
         directory: str | None = None
         if module is not None and (path == module or path.startswith(module + "/")):
             directory = path[len(module) + 1 :] or "."

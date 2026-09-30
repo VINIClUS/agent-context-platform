@@ -497,3 +497,18 @@ def test_an_import_outside_the_go_module_stays_external_despite_a_local_director
 
     assert not any(b.endswith("store.Open") for _, b in calls)
     assert dependencies == {_external_id("github.com/acme/store")}
+
+
+def test_a_go_mod_with_an_unknown_module_path_disables_suffix_matching(
+    tmp_path: Path, make_repo: Callable[[str], RepoBuilder]
+) -> None:
+    body = 'package main\n\nimport "github.com/acme/store"\n\nfunc run() {\n\tstore.Open()\n}\n'
+    for go_mod in ("module example.com/app\n" + "// pad\n" * 10_000, "go 1.22\n"):
+        files = {
+            "go.mod": go_mod,
+            "store/store.go": "package store\n\nfunc Open() {}\n",
+            "cmd/main.go": body,
+        }
+        calls, dependencies = _go_facts(tmp_path, files, make_repo)
+        assert not any(b.endswith("store.Open") for _, b in calls)
+        assert dependencies == {_external_id("github.com/acme/store")}
