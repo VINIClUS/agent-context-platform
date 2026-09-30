@@ -1,4 +1,4 @@
-"""Helpers shared by the syntax-only language adapters (Python now; TypeScript/Go later).
+"""Helpers shared by the syntax-only language adapters (Python, TypeScript/JavaScript, Go).
 
 Everything here is adapter-side and untrusted-input-safe: the parent re-checks the
 output with ``base.validate_module``. The rules below exist so that real (and hostile)
@@ -23,6 +23,7 @@ from collections.abc import Callable, Iterable, Iterator
 from typing import Any, Final
 
 from pydantic import ValidationError
+from tree_sitter import Parser, Tree
 
 from agent_context_platform.indexing.tree_sitter.base import (
     DIAGNOSTIC_CODES,
@@ -61,6 +62,7 @@ _DOTTED: Final = re.compile(
 )
 # Reference cost estimate for the output bound: JSON framing of one ParsedReference.
 _REFERENCE_OVERHEAD: Final = 300
+READ_CHUNK: Final = 4096
 
 # Signatures are cut well below MAX_SIGNATURE_BYTES so 10k symbols still fit the output bound.
 SIGNATURE_CUT: Final = 256
@@ -271,6 +273,30 @@ class Budget:
         output[0] -= cost
 
 
+def bounded_parse(parser: Parser, content: bytes, budget: Budget, chunk: int = READ_CHUNK) -> Tree:
+    """Parse under the CPU backstop: checked before the parse and on every chunk it reads.
+
+    py-tree-sitter's ``progress_callback`` is not used: it crashes the interpreter on the
+    cp312 and cp313 wheels (0.25.2 and 0.26.0). Instead the parser reads the source through a
+    read callback in small chunks; once the backstop is spent the callback reports end of
+    input (and keeps doing so), the parse unwinds, and ``WorkBudgetExceeded`` is raised.
+    Error recovery is superlinear on hostile input, so the bound has to act inside the parse.
+    """
+    budget.check()
+    stopped = False
+
+    def read(offset: int, _point: object) -> bytes:
+        nonlocal stopped
+        if not stopped and budget.out_of_time():
+            stopped = True
+        return b"" if stopped else content[offset : offset + chunk]
+
+    tree = parser.parse(read, encoding="utf8")
+    if stopped:
+        raise WorkBudgetExceeded
+    return tree
+
+
 def safe_module(
     request: ParseRequest,
     fingerprint: str,
@@ -298,11 +324,15 @@ def safe_module(
         refused = degraded_file(source, fingerprint, "symbols_dropped")
         try:
             parsed = parse_file(source, budget, output)
-            validate_module(
-                ParseRequest(files=(source,)),
-                ParsedModule(files=(parsed,)),
-                expected_fingerprint=fingerprint,
-            )
+            # A file with no structure has nothing the confinement check could refuse, and
+            # re-validating a degraded 1 MB file costs ~0.7 s of the CPU budget each. The
+            # parent validates the whole answer again regardless.
+            if parsed.symbols or parsed.relations or parsed.references:
+                validate_module(
+                    ParseRequest(files=(source,)),
+                    ParsedModule(files=(parsed,)),
+                    expected_fingerprint=fingerprint,
+                )
         except WorkBudgetExceeded:
             output[0] = mark
             parsed = degraded_file(source, fingerprint, "work_budget_exceeded")
