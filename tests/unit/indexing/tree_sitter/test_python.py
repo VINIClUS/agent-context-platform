@@ -1190,3 +1190,11 @@ def test_fingerprints_ignore_trivia_and_do_not_depend_on_the_process() -> None:
         )
         outputs.add(done.stdout)
     assert len(outputs) == 1
+
+
+def test_a_stray_byte_inside_an_import_loses_the_statement_and_says_so() -> None:
+    """Documented limit: an ERROR node is skipped whole, and the loss is reported."""
+    raw = b"import bad\xff\r\ngo()\r\n"
+    module, _ = confined(source("pkg/mod.py", raw))
+    assert module.files[0].references == ()
+    assert diagnostics_of(module.files[0]).get("syntax_recovered", 0) >= 1
