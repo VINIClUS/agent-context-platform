@@ -1231,3 +1231,61 @@ def test_a_tainted_assignment_takes_its_call_sites_with_it() -> None:
     assert "foo" not in targets
     assert "bar" not in targets
     assert {"baz"} <= targets
+
+
+def test_bases_past_the_cap_are_reported() -> None:
+    bases = ", ".join(f"B{n}" for n in range(70))
+    parsed = symbols_of(f"class A({bases}):\n    pass\n")["pkg/mod.py"]
+    assert len([item for item in parsed.references if item.kind == "inherit"]) == 64
+    assert diagnostics_of(parsed) == {"references_capped": 6}
+    exact = ", ".join(f"B{n}" for n in range(64))
+    assert diagnostics_of(symbols_of(f"class A({exact}):\n    pass\n")["pkg/mod.py"]) == {}
+
+
+def test_every_silent_skip_of_a_name_is_counted() -> None:
+    deep = "Base" + "[T]" * 20
+    assert diagnostics_of(symbols_of(f"class A({deep}):\n    pass\n")["pkg/mod.py"]) == {
+        "references_capped": 1
+    }
+    assert diagnostics_of(symbols_of(f"from {'.' * 17} import x\n")["pkg/mod.py"]) == {
+        "references_capped": 1
+    }
+    ambiguous = "".join("def x():\n    pass\n" for _ in range(9)) + "def caller():\n    x()\n"
+    assert diagnostics_of(symbols_of(ambiguous)["pkg/mod.py"]) == {"references_capped": 1}
+    long_owner = ".".join("a" * 100 for _ in range(6))
+    assert diagnostics_of(symbols_of(f"def f():\n    {long_owner}.g()\n")["pkg/mod.py"]) == {
+        "references_capped": 1
+    }
+
+
+def test_relations_dropped_by_a_cap_are_reported(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(python, "MAX_RELATIONS_PER_FILE", 2)
+    defs = "".join(f"def t{n}():\n    pass\n\n\n" for n in range(5))
+    calls = "def caller():\n" + "".join(f"    t{n}()\n" for n in range(5))
+    parsed = symbols_of(defs + calls)["pkg/mod.py"]
+    assert len(parsed.relations) == 2
+    assert diagnostics_of(parsed) == {"references_capped": 3}
+
+
+def test_shedding_steps_are_reported_and_add_to_what_the_adapter_reported() -> None:
+    bases = ", ".join(f"B{n}" for n in range(70))
+    code = f"def a():\n    pass\n\n\ndef b():\n    a()\n\n\nclass A({bases}):\n    pass\n"
+    full = symbols_of(code)["pkg/mod.py"]
+    assert (len(full.references), len(full.relations)) == (64, 1)
+    refused = _common.degraded_file(
+        SourceFile.from_bytes("pkg/mod.py", "python", b""), FINGERPRINT, "symbols_dropped"
+    )
+    steps = list(_common._reductions(full, refused))
+    assert [(len(item.references), len(item.relations)) for item in steps] == [
+        (64, 1),
+        (0, 1),
+        (0, 0),
+        (0, 0),
+    ]
+    assert diagnostics_of(steps[1]) == {"references_capped": 6 + 64}
+    assert diagnostics_of(steps[2]) == {"references_capped": 6 + 64 + 1}
+    assert len(steps[2].symbols) == 4
+    relations_only = full.model_copy(update={"references": (), "diagnostics": ()})
+    only = list(_common._reductions(relations_only, refused))
+    assert diagnostics_of(only[1]) == {"references_capped": 1}
+    assert only[1].relations == ()

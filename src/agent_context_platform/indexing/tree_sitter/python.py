@@ -421,12 +421,17 @@ def _enter_definition(walk: _Walk, node: Node) -> None:
 
 def _enter_bases(walk: _Walk, cls: _Sym, bases: Node) -> None:
     """Base sites of a class: ``B``, ``m.B``, ``B[T]`` (unwrapped to ``B``); no keywords/splats."""
+    walk.capped += max(0, bases.named_child_count - _MAX_BASES)  # bases past the cap: reported
     for number in range(min(bases.named_child_count, _MAX_BASES)):
         base = bases.named_child(number)
         for _ in range(_MAX_UNWRAP):  # the subscript chain of ``Base[T][U]`` is bounded
             if base is None or base.type != "subscript":
                 break
             base = base.child_by_field_name("value")
+        else:
+            if base is not None and base.type == "subscript":
+                walk.capped += 1  # still wrapped after the last peel: the base is skipped
+                continue
         site = None if base is None else _name_site(walk, cls, "base", base)
         if site is not None:
             walk.sites.append(site)
@@ -435,6 +440,7 @@ def _enter_bases(walk: _Walk, cls: _Sym, bases: Node) -> None:
 def _name_site(walk: _Walk, scope: _Sym, kind: str, node: Node) -> _Site | None:
     """A site for an identifier or a ``owner.name`` attribute whose owner is a dotted name."""
     if node.end_byte - node.start_byte > MAX_NAME_BYTES:  # a chain prefix can be the whole file
+        walk.capped += 1  # too long to be a name: not silently ignored
         return None
     content = walk.content
     if node.type == "identifier":
@@ -604,6 +610,7 @@ def _enter_import(walk: _Walk, node: Node) -> None:
     if header is not None and header.type == "relative_import":
         relative = _relative_module(header)
         if relative is None or relative[0] > MAX_RELATIVE_LEVEL:
+            walk.capped += 1  # a level beyond the contract cannot be represented
             return
         level, module = relative
     qualifier: str | None = None
@@ -820,6 +827,7 @@ def _link(
             )
         found = memo[cache_key]
         if found is None:
+            walk.capped += 1  # more than _MAX_CANDIDATES in scope: no edge, no reference, counted
             continue
         if not found:
             if site.kind != "member":
@@ -834,10 +842,16 @@ def _link(
             continue  # bound in this file, never a reference; a relation needs an emitted source
         for target in found:
             key = (source, numbers[id(target)], "inherits" if base else "calls")
-            if key in seen or per_source.get(source, 0) >= MAX_RELATIONS_PER_SYMBOL:
+            if key in seen:
                 continue
-            if len(out) >= MAX_RELATIONS_PER_FILE:
-                break  # no more relations, but later sites still become references
+            if (
+                per_source.get(source, 0) >= MAX_RELATIONS_PER_SYMBOL
+                or len(out) >= MAX_RELATIONS_PER_FILE
+            ):
+                # The contract has no relations code: a dropped relation is reported as
+                # ``references_capped`` (the closest one). Later sites still become references.
+                walk.capped += 1
+                continue
             seen.add(key)
             per_source[source] = per_source.get(source, 0) + 1
             out.append(

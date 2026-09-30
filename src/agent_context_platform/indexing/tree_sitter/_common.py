@@ -325,14 +325,20 @@ def _reductions(parsed: ParsedFile, refused: ParsedFile) -> Iterator[ParsedFile]
     yield parsed
     shed = parsed
     if parsed.references:
-        kept = [item for item in parsed.diagnostics if item.code != "references_capped"]
-        kept.append(
-            ParsedDiagnostic(code="references_capped", count=min(len(parsed.references), 1000))
-        )
-        shed = parsed.model_copy(update={"references": (), "diagnostics": tuple(kept)})
+        shed = _shed(parsed, "references", len(parsed.references))
         yield shed
-    yield shed.model_copy(update={"relations": ()})
+    if shed.relations:
+        # The contract has no relations code: shed relations are reported as ``references_capped``,
+        # the closest one, added to whatever the adapter already reported.
+        yield _shed(shed, "relations", len(shed.relations))
     yield refused
+
+
+def _shed(parsed: ParsedFile, field: str, dropped: int) -> ParsedFile:
+    """``parsed`` without ``field``, with the loss added to ``references_capped``."""
+    counts = {item.code: item.count for item in parsed.diagnostics}
+    counts["references_capped"] = counts.get("references_capped", 0) + dropped
+    return parsed.model_copy(update={field: (), "diagnostics": diagnostics(**counts)})
 
 
 def _reference_view(item: ParsedReference, by_ref: dict[str, str]) -> dict[str, Any]:
