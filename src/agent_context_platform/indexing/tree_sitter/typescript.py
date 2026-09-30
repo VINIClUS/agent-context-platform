@@ -80,11 +80,12 @@ from tree_sitter import Language, Node, Parser, Tree
 
 from agent_context_platform.indexing.tree_sitter._common import (
     Budget,
-    WorkBudgetExceeded,
     bounded_parse,
     cut_signature,
+    degraded_file,
+    diagnostics,
     digest,
-    dotted_name,
+    dotted_name_at,
     frame,
     identifier_bytes,
     module_name,
@@ -92,17 +93,14 @@ from agent_context_platform.indexing.tree_sitter._common import (
 )
 from agent_context_platform.indexing.tree_sitter.base import (
     EVIDENCE_KIND,
-    MAX_DIAGNOSTIC_COUNT,
     MAX_MODULE_REFERENCES,
     MAX_NAME_BYTES,
-    MAX_NAME_TOTAL_BYTES,
     MAX_REFERENCES_PER_FILE,
     MAX_REFERENCES_PER_SYMBOL,
     MAX_RELATIONS_PER_FILE,
     MAX_RELATIONS_PER_SYMBOL,
     MAX_RELATIVE_LEVEL,
     MAX_SYMBOLS_PER_FILE,
-    ParsedDiagnostic,
     ParsedFile,
     ParsedModule,
     ParsedReference,
@@ -135,7 +133,6 @@ _MAX_SITES: Final = 200_000
 _MAX_CANDIDATES: Final = 8
 # A signature is cut at 256 bytes after whitespace collapse; never collapse more than this.
 _HEADER_SLICE: Final = 2048
-_REFERENCE_NAME_LIMIT: Final = MAX_NAME_TOTAL_BYTES // 2 - 8192
 
 _FUNCTION_DECLARATIONS: Final = frozenset(
     {"function_declaration", "generator_function_declaration", "function_signature"}
@@ -285,7 +282,6 @@ class _Walk:
     seen_sites: set[tuple[int, str, str]] = field(default_factory=set)
     imports: list[ParsedReference] = field(default_factory=list)
     seen_imports: set[tuple[int, int, int]] = field(default_factory=set)
-    reference_bytes: int = 0
     decorators_at: int = -1
     recovered: int = 0
     dropped: int = 0
@@ -567,9 +563,16 @@ def _heritage(walk: _Walk, sym: _Sym, node: Node) -> None:
                     target = target.child_by_field_name("name") or target
                 if target.type not in _BASE_TYPES:
                     continue
-                name = dotted_name(walk.content, target.start_byte, target.end_byte)
-                if name is not None and len(walk.sites) < _MAX_SITES:
-                    _add_site(walk, _Site(sym, "base", name, target.start_byte, target.end_byte))
+                if target.end_byte - target.start_byte > MAX_NAME_BYTES:
+                    walk.capped += 1  # too long to be a name: counted, not silent
+                    continue
+                name = dotted_name_at(walk.content, target.start_byte, target.end_byte)
+                if name is None:
+                    continue
+                if len(walk.sites) >= _MAX_SITES:
+                    walk.capped += 1
+                    continue
+                _add_site(walk, _Site(sym, "base", name, target.start_byte, target.end_byte))
 
 
 def _add_site(walk: _Walk, site: _Site) -> None:
@@ -581,7 +584,10 @@ def _add_site(walk: _Walk, site: _Site) -> None:
 
 def _enter_call(walk: _Walk, node: Node) -> None:
     scope = walk.scopes[-1]
-    if scope is None or len(walk.sites) >= _MAX_SITES:
+    if scope is None:
+        return
+    if len(walk.sites) >= _MAX_SITES:
+        walk.capped += 1
         return
     callee = node.child_by_field_name(
         "function" if node.type == "call_expression" else "constructor"
@@ -589,7 +595,8 @@ def _enter_call(walk: _Walk, node: Node) -> None:
     if callee is None or callee.type not in ("identifier", "member_expression"):
         return
     if callee.end_byte - callee.start_byte > MAX_NAME_BYTES:
-        return  # the prefix of a long call chain: never inspected, so a chain costs O(1) per link
+        walk.capped += 1  # a name too long for the contract; never inspected, O(1) per link
+        return
     if callee.type == "member_expression" and node.type == "call_expression":
         owner = callee.child_by_field_name("object")
         prop = callee.child_by_field_name("property")
@@ -598,7 +605,7 @@ def _enter_call(walk: _Walk, node: Node) -> None:
             if simple is not None and prop is not None:
                 _add_site(walk, _Site(scope, "member", simple, prop.start_byte, prop.end_byte))
             return
-    name = dotted_name(walk.content, callee.start_byte, callee.end_byte)
+    name = dotted_name_at(walk.content, callee.start_byte, callee.end_byte)
     if name is None or name.split(".", 1)[0] in ("this", "super"):
         return
     _add_site(walk, _Site(scope, "name" if "." not in name else "chain", name, *callee.byte_range))
@@ -612,14 +619,12 @@ def _reference(
     size = len(name.encode()) + (0 if qualifier is None else len(qualifier[0].encode()))
     if key in walk.seen_imports:
         return
-    if (
-        len(walk.imports) >= MAX_MODULE_REFERENCES
-        or walk.reference_bytes + size > _REFERENCE_NAME_LIMIT
+    if len(walk.imports) >= MAX_MODULE_REFERENCES or not walk.budget.take_reference(
+        size, walk.output
     ):
         walk.capped += 1
         return
     walk.seen_imports.add(key)
-    walk.reference_bytes += size
     walk.imports.append(
         ParsedReference(
             source=None,
@@ -942,16 +947,21 @@ def _link(walk: _Walk, live: list[_Sym], index: dict[int, int]) -> _Linked:
                 memo[cache_key] = _resolve(members, site, _TYPE_KINDS if base else _CALLABLE_KINDS)
             found = memo[cache_key]
         if found is None:
+            walk.capped += 1  # more than _MAX_CANDIDATES in scope: no edge, no reference, counted
             continue
         if found:
             if source is None:
                 continue
             for target in found:
                 key = (source, index[id(target)], relation_kind)
-                if key in seen or per_relation.get(source, 0) >= MAX_RELATIONS_PER_SYMBOL:
+                if key in seen:
                     continue
-                if len(linked.relations) >= MAX_RELATIONS_PER_FILE:
-                    break
+                if (
+                    per_relation.get(source, 0) >= MAX_RELATIONS_PER_SYMBOL
+                    or len(linked.relations) >= MAX_RELATIONS_PER_FILE
+                ):
+                    walk.capped += 1  # an edge the contract's bounds refuse: counted
+                    continue
                 seen.add(key)
                 per_relation[source] = per_relation.get(source, 0) + 1
                 linked.relations.append(
@@ -976,11 +986,10 @@ def _link(walk: _Walk, live: list[_Sym], index: dict[int, int]) -> _Linked:
         if (
             per_reference.get(source, 0) >= limit
             or len(linked.references) >= MAX_REFERENCES_PER_FILE
-            or walk.reference_bytes + size > _REFERENCE_NAME_LIMIT
+            or not walk.budget.take_reference(size, walk.output)
         ):
             walk.capped += 1
             continue
-        walk.reference_bytes += size
         per_reference[source] = per_reference.get(source, 0) + 1
         linked.references.append(
             ParsedReference(
@@ -996,34 +1005,6 @@ def _link(walk: _Walk, live: list[_Sym], index: dict[int, int]) -> _Linked:
     return linked
 
 
-def _diagnostics(*counts: tuple[str, int]) -> tuple[ParsedDiagnostic, ...]:
-    return tuple(
-        ParsedDiagnostic(code=code, count=min(count, MAX_DIAGNOSTIC_COUNT))  # type: ignore[arg-type]
-        for code, count in counts
-        if count > 0
-    )
-
-
-def _degraded(source: SourceFile, reason: str) -> ParsedFile:
-    """No structure, but never mistaken for an empty file: ``file_degraded`` plus its reason."""
-    return ParsedFile(
-        path=source.path,
-        language=source.language,
-        parser_fingerprint=FINGERPRINT,
-        symbols=(),
-        diagnostics=_diagnostics(("file_degraded", 1), (reason, 1)),
-    )
-
-
-def _parse_file(source: SourceFile, budget: Budget, output: list[int]) -> ParsedFile:
-    mark = output[0]
-    try:
-        return _parse(source, budget, output)
-    except WorkBudgetExceeded:
-        output[0] = mark
-        return _degraded(source, "work_budget_exceeded")
-
-
 def _parse(source: SourceFile, budget: Budget, output: list[int]) -> ParsedFile:
     content = source.content()
     if not content:
@@ -1034,7 +1015,7 @@ def _parse(source: SourceFile, budget: Budget, output: list[int]) -> ParsedFile:
     root = _Sym(name.rsplit(".", 1)[-1], name, "module", 0, len(content), None)
     walk = _Walk(content, budget, output, root)
     if name and not walk.add(root, _Frame(-1, False, 0, 0)):
-        return _degraded(source, "work_budget_exceeded")
+        return degraded_file(source, FINGERPRINT, "work_budget_exceeded")
     walk.scopes.append(root)
     _traverse(bounded_parse(_parser(_flavor(source.path)), content, budget), walk)
     if name:
@@ -1065,17 +1046,17 @@ def _parse(source: SourceFile, budget: Budget, output: list[int]) -> ParsedFile:
         symbols=symbols,
         relations=tuple(linked.relations),
         references=tuple(linked.references),
-        diagnostics=_diagnostics(
-            ("syntax_recovered", walk.recovered),
-            ("symbols_dropped", walk.dropped),
-            ("references_capped", walk.capped),
+        diagnostics=diagnostics(
+            syntax_recovered=walk.recovered,
+            symbols_dropped=walk.dropped,
+            references_capped=walk.capped,
         ),
     )
 
 
 def parse_typescript(request: ParseRequest) -> ParsedModule:
     """Child-side entry: one ``ParsedFile`` per input file; the parent validates the result."""
-    return safe_module(request, FINGERPRINT, _parse_file)
+    return safe_module(request, FINGERPRINT, _parse)
 
 
 def typescript_adapter(

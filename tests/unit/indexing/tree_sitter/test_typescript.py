@@ -427,8 +427,15 @@ def test_more_than_eight_same_scope_candidates_yield_no_edge() -> None:
     item = parsed(many + "function g() { f() }\n")
     assert item.relations == ()
     assert refs(item, "call") == []
+    assert codes(item)["references_capped"] == 1  # the ambiguity is counted, never silent
     few = "".join("function f() {}\n" for _ in range(8))
     assert len(parsed(few + "function g() { f() }\n").relations) == 8
+
+
+def test_a_call_name_too_long_for_the_contract_is_counted() -> None:
+    item = parsed("function g() { " + "a" * 600 + "() }\n")
+    assert refs(item, "call") == []
+    assert codes(item)["references_capped"] == 1
 
 
 def test_a_file_over_the_work_budget_degrades_alone(monkeypatch: pytest.MonkeyPatch) -> None:
