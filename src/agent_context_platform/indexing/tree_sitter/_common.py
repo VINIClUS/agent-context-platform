@@ -7,7 +7,9 @@ what it cannot express instead of emitting something the confinement rules would
 
 Reused by PLATFORM-034/035: ``frame``/``digest`` (normalized-token fingerprints),
 ``cut_signature``, ``identifier_bytes``, ``module_name``, ``Budget`` (name/output/work
-limits), ``safe_module`` (per-file degradation) and ``normalize_module`` (golden-test view).
+limits, symbol and reference names), ``dotted_name_at`` (a reference name the parent will
+accept), ``diagnostics``/``degraded_file`` (closed-enum degradation reports), ``safe_module``
+(per-file degradation) and ``normalize_module`` (golden-test view).
 """
 
 from __future__ import annotations
@@ -23,9 +25,12 @@ from typing import Any, Final
 from pydantic import ValidationError
 
 from agent_context_platform.indexing.tree_sitter.base import (
+    DIAGNOSTIC_CODES,
+    MAX_DIAGNOSTIC_COUNT,
     MAX_NAME_BYTES,
     MAX_NAME_TOTAL_BYTES,
     MAX_OUTPUT_BYTES,
+    DiagnosticCode,
     ParsedDiagnostic,
     ParsedFile,
     ParsedModule,
@@ -41,7 +46,21 @@ _IDENT: Final = re.compile(rb"[A-Za-z_$\x80-\xff][A-Za-z0-9_$\x80-\xff]*")
 _WHITESPACE: Final = re.compile(rb"[ \t\r\n\f\v]+")
 _CONTROLS: Final = re.compile(rb"[\x00-\x08\x0e-\x1f\x7f]")
 _TOKEN_BYTE: Final = re.compile(rb"[A-Za-z0-9_$\x80-\xff]")
-_IDENT_TEXT: Final = re.compile(r"[A-Za-z_][A-Za-z0-9_]*")
+_SEPARATOR_SPACE: Final = rb"[ \t\r\n\f\v]*"
+# ``a``, ``a.b``, ``a . b``: what ``base._SourceText.path_ok`` accepts for a reference name.
+_DOTTED: Final = re.compile(
+    b"(?:"
+    + _IDENT.pattern
+    + b")(?:"
+    + _SEPARATOR_SPACE
+    + rb"\."
+    + _SEPARATOR_SPACE
+    + b"(?:"
+    + _IDENT.pattern
+    + b"))*"
+)
+# Reference cost estimate for the output bound: JSON framing of one ParsedReference.
+_REFERENCE_OVERHEAD: Final = 300
 
 # Signatures are cut well below MAX_SIGNATURE_BYTES so 10k symbols still fit the output bound.
 SIGNATURE_CUT: Final = 256
@@ -104,7 +123,8 @@ def module_name(path: str, *, package_files: tuple[str, ...] = ("__init__",)) ->
 
     ``pkg/sub/mod.py`` -> ``pkg.sub.mod``; ``pkg/__init__.py`` -> ``pkg`` (a package);
     ``src/my-pkg/mod.py`` -> ``mod`` (components that are not identifiers, such as ``my-pkg``,
-    ``2024`` or ``.github``, end the run). Empty string when no name can be formed.
+    ``2024`` or ``.github``, end the run); ``pkg/m\u00f3dulo.py`` -> ``pkg.m\u00f3dulo`` (Unicode
+    identifiers are kept as written). Empty string when no name can be formed.
     """
     parts = path.split("/")
     stem = parts[-1].rsplit(".", 1)[0] if "." in parts[-1] else parts[-1]
@@ -113,10 +133,56 @@ def module_name(path: str, *, package_files: tuple[str, ...] = ("__init__",)) ->
         parts.pop()
     run: list[str] = []
     for part in reversed(parts):
-        if not _IDENT_TEXT.fullmatch(part):
+        if not part.isidentifier():  # Unicode names stay: they equal the path bytes
             break
         run.append(part)
     return ".".join(reversed(run))
+
+
+def dotted_name_at(content: bytes, start: int, end: int) -> str | None:
+    """The name spelled by ``content[start:end]`` (``a`` or ``a . b``), or None.
+
+    None whenever the parent's reference check would refuse the range: empty (a MISSING
+    node), longer than a name, anything but identifiers joined by ``.`` (a comment, a line
+    continuation, a call), a token cut by either end, or bytes that are not UTF-8. The
+    result is the identifier tokens joined by ``.``, exactly what ``target_name`` must be.
+    """
+    if not 0 <= start < end <= len(content) or end - start > MAX_NAME_BYTES:
+        return None
+    if _DOTTED.fullmatch(content, start, end) is None:
+        return None
+    if start > 0 and _TOKEN_BYTE.fullmatch(content, start - 1, start):
+        return None
+    if _TOKEN_BYTE.fullmatch(content, end, end + 1):
+        return None
+    try:
+        return _WHITESPACE.sub(b"", content[start:end]).decode("utf-8")
+    except UnicodeDecodeError:
+        return None
+
+
+def diagnostics(**counts: int) -> tuple[ParsedDiagnostic, ...]:
+    """Closed-enum diagnostics in a fixed order; zero counts are omitted, counts saturate."""
+    return tuple(
+        ParsedDiagnostic.model_validate(
+            {"code": code, "count": min(counts[code], MAX_DIAGNOSTIC_COUNT)}
+        )
+        for code in DIAGNOSTIC_CODES
+        if counts.get(code, 0) > 0
+    )
+
+
+def degraded_file(
+    source: SourceFile, fingerprint: str, reason: DiagnosticCode, count: int = 1
+) -> ParsedFile:
+    """A file the adapter could not answer: no structure, ``file_degraded`` plus its reason."""
+    return ParsedFile(
+        path=source.path,
+        language=source.language,
+        parser_fingerprint=fingerprint,
+        symbols=(),
+        diagnostics=diagnostics(file_degraded=1, **{reason: count}),
+    )
 
 
 class WorkBudgetExceeded(Exception):
@@ -142,12 +208,14 @@ class Budget:
     def __init__(self, name_limit: int = MAX_NAME_TOTAL_BYTES // 2) -> None:
         self._name_limit = name_limit
         self._names = 0
+        self._reference_names = 0
         self._nodes = 0
         self.max_nodes = self.MAX_NODES_PER_FILE
         self._cpu_deadline = time.process_time() + self.CPU_SOFT_LIMIT  # from this request
 
     def new_file(self) -> None:
         self._names = 0
+        self._reference_names = 0
         self._nodes = 0
 
     def out_of_time(self) -> bool:
@@ -181,6 +249,21 @@ class Budget:
         output[0] += cost
         return True
 
+    def take_reference(self, names: int, output: list[int]) -> bool:
+        """Charge one reference (``names`` = target + qualifier bytes); False when it will not fit.
+
+        The parent charges symbol names and reference names to ONE ``MAX_NAME_TOTAL_BYTES``
+        counter, so references get what the live symbols left, not a fixed half.
+        """
+        cost = names + _REFERENCE_OVERHEAD
+        if self._names + self._reference_names + names > MAX_NAME_TOTAL_BYTES:
+            return False
+        if output[0] + cost > OUTPUT_BUDGET:
+            return False
+        self._reference_names += names
+        output[0] += cost
+        return True
+
     def release(self, qualified_name: str, signature: str, output: list[int]) -> None:
         """Give back what ``take`` charged (a symbol dropped after the fact)."""
         size, cost = self._cost(qualified_name, signature)
@@ -193,16 +276,17 @@ def safe_module(
     fingerprint: str,
     parse_file: Callable[[SourceFile, Budget, list[int]], ParsedFile],
 ) -> ParsedModule:
-    """Parse every file; a file whose answer would be refused degrades to *no symbols*.
+    """Parse every file; a file whose answer would be refused degrades to *no structure*.
 
     Passing ``validate_module`` per file implies passing it for the batch, so one
     pathological file cannot take down the others. Only the validation errors
     (``ValidationError``, ``StructuralError``) and ``WorkBudgetExceeded`` are caught, so an
     adapter bug (any other exception) still fails loudly. ``references`` and ``diagnostics``
-    of a valid file pass through untouched. Only when the whole answer would exceed the output
-    bound are they shed, references first and never silently: ``references_capped`` says so.
-    A file that degrades to *no symbols* is still indistinguishable from an empty one until the
-    adapters emit ``file_degraded`` (PLATFORM-033b).
+    of a valid file pass through untouched. A degraded file is never silent: it carries
+    ``file_degraded`` plus its reason, ``work_budget_exceeded`` (node budget or CPU backstop) or
+    ``symbols_dropped`` (the answer was refused, or did not fit the output bound). Only when the
+    whole answer would exceed the output bound are references shed first, never silently:
+    ``references_capped`` says so, then relations, then the symbols of that file alone.
     """
     budget = Budget()
     output = [0]
@@ -211,12 +295,7 @@ def safe_module(
     for source in request.files:
         budget.new_file()
         mark = output[0]
-        empty = ParsedFile(
-            path=source.path,
-            language=source.language,
-            parser_fingerprint=fingerprint,
-            symbols=(),
-        )
+        refused = degraded_file(source, fingerprint, "symbols_dropped")
         try:
             parsed = parse_file(source, budget, output)
             validate_module(
@@ -224,12 +303,15 @@ def safe_module(
                 ParsedModule(files=(parsed,)),
                 expected_fingerprint=fingerprint,
             )
-        except (ValidationError, StructuralError, WorkBudgetExceeded):
+        except WorkBudgetExceeded:
             output[0] = mark
-            parsed = empty
+            parsed = degraded_file(source, fingerprint, "work_budget_exceeded")
+        except (ValidationError, StructuralError):
+            output[0] = mark
+            parsed = refused
         # The runner refuses the whole answer above MAX_OUTPUT_BYTES: measure the real JSON,
         # then shed references (reported), then relations, then symbols, of this file only.
-        for reduced in _reductions(parsed, empty):
+        for reduced in _reductions(parsed, refused):
             size = len(reduced.model_dump_json())
             if total + size <= OUTPUT_BUDGET:
                 break
@@ -238,19 +320,25 @@ def safe_module(
     return ParsedModule(files=tuple(files))
 
 
-def _reductions(parsed: ParsedFile, empty: ParsedFile) -> Iterator[ParsedFile]:
-    """The file as is, then without references (reported), then without relations, then empty."""
+def _reductions(parsed: ParsedFile, refused: ParsedFile) -> Iterator[ParsedFile]:
+    """The file as is, then without references (reported), without relations, then degraded."""
     yield parsed
     shed = parsed
     if parsed.references:
-        kept = [item for item in parsed.diagnostics if item.code != "references_capped"]
-        kept.append(
-            ParsedDiagnostic(code="references_capped", count=min(len(parsed.references), 1000))
-        )
-        shed = parsed.model_copy(update={"references": (), "diagnostics": tuple(kept)})
+        shed = _shed(parsed, "references", len(parsed.references))
         yield shed
-    yield shed.model_copy(update={"relations": ()})
-    yield empty
+    if shed.relations:
+        # The contract has no relations code: shed relations are reported as ``references_capped``,
+        # the closest one, added to whatever the adapter already reported.
+        yield _shed(shed, "relations", len(shed.relations))
+    yield refused
+
+
+def _shed(parsed: ParsedFile, field: str, dropped: int) -> ParsedFile:
+    """``parsed`` without ``field``, with the loss added to ``references_capped``."""
+    counts = {item.code: item.count for item in parsed.diagnostics}
+    counts["references_capped"] = counts.get("references_capped", 0) + dropped
+    return parsed.model_copy(update={field: (), "diagnostics": diagnostics(**counts)})
 
 
 def _reference_view(item: ParsedReference, by_ref: dict[str, str]) -> dict[str, Any]:
