@@ -1198,3 +1198,36 @@ def test_a_stray_byte_inside_an_import_loses_the_statement_and_says_so() -> None
     module, _ = confined(source("pkg/mod.py", raw))
     assert module.files[0].references == ()
     assert diagnostics_of(module.files[0]).get("syntax_recovered", 0) >= 1
+
+
+def test_a_name_used_as_base_and_as_call_target_is_resolved_per_kind() -> None:
+    # ``Base`` is a function: not a class base, but a callable target in the same scope.
+    code = "def Base():\n    pass\n\n\nclass A(Base):\n    def m(self):\n        pass\n\n\ndef caller():\n    Base()\n"
+    assert edges_of(code) == {("pkg.mod.caller", "pkg.mod.Base", "calls")}
+    assert refs_of(code) == [("pkg.mod.A", "inherit", 0, None, "Base", "Base", None)]
+    # And the other way round: bases first must not poison the call lookup of a class.
+    code = "class K:\n    pass\n\n\nclass B(K):\n    pass\n\n\ndef f():\n    K()\n"
+    assert edges_of(code) == {
+        ("pkg.mod.B", "pkg.mod.K", "inherits"),
+        ("pkg.mod.f", "pkg.mod.K", "calls"),
+    }
+
+
+def test_references_are_still_emitted_after_the_relation_cap(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(python, "MAX_RELATIONS_PER_FILE", 2)
+    defs = "".join(f"def t{n}():\n    pass\n\n\n" for n in range(5))
+    calls = "def caller():\n" + "".join(f"    t{n}()\n" for n in range(5)) + "    later()\n"
+    parsed = symbols_of(defs + calls)["pkg/mod.py"]
+    assert len(parsed.relations) == 2
+    assert [item.target_name for item in parsed.references] == ["later"]
+
+
+def test_a_tainted_assignment_takes_its_call_sites_with_it() -> None:
+    code = "x = foo(1 2)\n\n\nclass C:\n    y = bar(1 2)\n    z = ok()\n\n\nw = baz()\n"
+    parsed = symbols_of(code)["pkg/mod.py"]
+    targets = {item.target_name for item in parsed.references}
+    assert "foo" not in targets
+    assert "bar" not in targets
+    assert {"baz"} <= targets

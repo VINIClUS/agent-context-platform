@@ -35,6 +35,11 @@ What is emitted
   * bases defined elsewhere as ``inherit``/``syntactic`` (``class A(Base)``, ``class A(m.Base)``,
     ``class A(Base[T])`` names ``Base``; keyword and starred arguments are not bases).
 
+  A call reference qualifier is the syntactic head, NOT a resolved module: locals, parameters and
+  import aliases are not tracked (``import a.b as c; c.f()`` gives qualifier ``c``). A consumer
+  must resolve a qualifier only when its first segment is bound by an import or a module-level
+  name.
+
   A name bound in this file (a class, function or variable, also as the head of ``Acc.build()``)
   is NOT a reference: a same-file edge is a relation, and a name with more than 8 candidates in
   its scope yields nothing. The same edge is never both. References are deduplicated per
@@ -168,6 +173,7 @@ _SKIPPED: Final = frozenset({"comment", "line_continuation", "string_end", ",", 
 _PROPERTY_NAMES: Final = frozenset({"property", "cached_property"})
 _PROPERTY_ATTRIBUTES: Final = frozenset({"setter", "getter", "deleter", "cached_property"})
 _CALLABLE_KINDS: Final = frozenset({"function", "method", "class"})
+_CLASS_KINDS: Final = frozenset({"class"})
 
 _READ_CHUNK: Final = 4096
 _PARSER: Final = Parser(Language(tree_sitter_python.language()))
@@ -676,11 +682,10 @@ def _finish_frame(walk: _Walk, entry: _Frame) -> None:
             walk.budget.release(sym.qualified, sym.signature, walk.output)
         walk.dropped += len(walk.syms) - entry.first_sym
         del walk.syms[entry.first_sym :]
-        if entry.is_definition or not entry.merkle:
-            # Everything called or imported inside belongs to dropped symbols (or to the
-            # dropped decorated definition): release it too.
-            del walk.sites[entry.first_site :]
-            del walk.imports[entry.first_import :]
+        # Whatever was called or imported inside a dropped frame (definition, decorated marker or
+        # assignment) belongs to symbols that no longer exist: roll it back with them.
+        del walk.sites[entry.first_site :]
+        del walk.imports[entry.first_import :]
         return
     if not entry.merkle:
         return
@@ -742,10 +747,10 @@ class _Index:
             if sym.parent is not None:
                 self.members.setdefault((id(sym.parent), sym.simple), []).append(sym)
                 self.names.add(sym.simple)
-        self._filtered: dict[tuple[int, str, bool], list[_Sym]] = {}
+        self._filtered: dict[tuple[int, str, frozenset[str]], list[_Sym]] = {}
 
     def find(self, scope: _Sym, name: str, kinds: frozenset[str]) -> list[_Sym]:
-        key = (id(scope), name, kinds is _ANY_KIND)
+        key = (id(scope), name, kinds)
         found = self._filtered.get(key)
         if found is None:
             found = [s for s in self.members.get((id(scope), name), []) if s.kind in kinds]
@@ -807,7 +812,7 @@ def _link(
             # ``Acc.build()``: the head names something of this file, so it is not non-local.
             name, kinds = (site.qualifier or "").split(".", 1)[0], _ANY_KIND
         else:
-            name, kinds = site.name, frozenset({"class"}) if base else _CALLABLE_KINDS
+            name, kinds = site.name, _CLASS_KINDS if base else _CALLABLE_KINDS
         cache_key = (id(site.scope), site.kind, name, qualified)
         if cache_key not in memo:
             memo[cache_key] = _resolve(
@@ -832,7 +837,7 @@ def _link(
             if key in seen or per_source.get(source, 0) >= MAX_RELATIONS_PER_SYMBOL:
                 continue
             if len(out) >= MAX_RELATIONS_PER_FILE:
-                return tuple(out), references
+                break  # no more relations, but later sites still become references
             seen.add(key)
             per_source[source] = per_source.get(source, 0) + 1
             out.append(
