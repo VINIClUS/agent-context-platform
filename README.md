@@ -25,17 +25,17 @@ access to `VINIClUS/agent-context-sdk`, then verify the recorded digest:
 
 ```bash
 mkdir -p build/sdk
-gh release download v0.5.0 \
+gh release download v0.6.0 \
   --repo VINIClUS/agent-context-sdk \
-  --pattern agent_context_sdk-0.5.0-py3-none-any.whl \
+  --pattern agent_context_sdk-0.6.0-py3-none-any.whl \
   --dir build/sdk
-echo "0db43637cd754ba90a0006053a1f9a3a9c17c3dccd0d9524cc9aa26ae45bcda0  build/sdk/agent_context_sdk-0.5.0-py3-none-any.whl" \
+echo "11639c35114c8206ee5922adb3072f1ff31c07b39aaabe681e594d81e67ea079  build/sdk/agent_context_sdk-0.6.0-py3-none-any.whl" \
   | sha256sum --check --strict -
 uv sync --frozen
 ```
 
-Alternatively, check out the SDK at tag `v0.5.0`, confirm it resolves to commit
-`039db78d93ac562ed68feec3ef7d04488a3c0b63`, build the wheel with the SDK's pinned toolchain,
+Alternatively, check out the SDK at tag `v0.6.0`, confirm it resolves to commit
+`474b763a536078adacffd93ca88a05ebfc391ada`, build the wheel with the SDK's pinned toolchain,
 copy it to `build/sdk/`, and run the same digest check before syncing. The wheel is intentionally
 ignored by Git; its tag, commit, version, and expected digest are recorded under
 `[tool.agent-context.sdk]`.
