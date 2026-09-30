@@ -7,7 +7,6 @@ import os
 import resource
 import subprocess
 import sys
-import time
 from importlib import metadata
 from pathlib import Path
 
@@ -742,7 +741,6 @@ def test_the_real_adapter_runs_confined_and_cannot_read_a_sibling_file(tmp_path:
 
 def test_a_memory_starved_child_fails_contained_not_hung() -> None:
     limits = Limits(address_space_bytes=64 * 1024 * 1024, wall_seconds=15.0)
-    time.monotonic()
     with pytest.raises(StructuralError):
         go_adapter(limits=limits).parse(request(source(PATH, HEAD + "func f() {}\n" * 50_000)))
 
@@ -824,6 +822,23 @@ def test_a_shared_type_or_value_changes_every_name_of_the_spec() -> None:
     assert _changed("var a, _, b = 1, 2, 3\n", "var a, _, b = 1, 9, 3\n") == set()
 
 
+def test_an_implicitly_repeated_const_expression_is_part_of_each_repeating_spec() -> None:
+    group = "const (\n\tA = iota * 2\n\tB\n\tC\n\tD = 7\n\tE\n)\n"
+    every = {"pkg.mod.A", "pkg.mod.B", "pkg.mod.C"}
+    assert _changed(group, group.replace("iota * 2", "iota * 3")) == every
+    assert _changed(group, group.replace("D = 7", "D = 8")) == {"pkg.mod.D", "pkg.mod.E"}
+    typed = group.replace("A = iota", "A int = iota")
+    assert _changed(group, typed) == every
+    assert len({v for v in _revisions(group).values()}) == 5  # names still tell them apart
+    assert _changed(
+        "const (\n\tA = 1\n\tB\n)\nconst C = 2\n", "const (\n\tA = 1\n\tB\n)\nconst C = 3\n"
+    ) == {"pkg.mod.C"}
+    # A repetition never reaches into the next const declaration.
+    assert _changed(
+        "const (\n\tA = 1\n)\nconst (\n\tB\n)\n", "const (\n\tA = 2\n)\nconst (\n\tB\n)\n"
+    ) == {"pkg.mod.A"}
+
+
 def test_grouped_declarations_are_digested_per_spec() -> None:
     group = (
         "var (\n\tc = 1\n\td = 2\n)\nconst (\n\te = 1\n\tf = 2\n)\ntype (\n\tG int\n\tH string\n)\n"
@@ -854,10 +869,20 @@ def _realistic_go(n: int) -> str:
     return "".join(parts)
 
 
-def test_a_normal_one_mebibyte_request_degrades_nothing_through_the_sandbox() -> None:
-    files = [source(f"app/pkg{n % 9}/svc{n}.go", _realistic_go(n)) for n in range(64)]
-    total = sum(len(item.content()) for item in files)
-    assert 0.9 * 1024 * 1024 < total <= 1.1 * 1024 * 1024, total
+# PLATFORM-037 batches Go files up to this many source bytes per sandbox request.
+GO_REQUEST_BUDGET_BYTES = 512 * 1024
+
+
+def test_a_normal_full_budget_request_degrades_nothing_through_the_sandbox() -> None:
+    files = []
+    total = 0
+    while True:
+        item = source(f"app/pkg{len(files) % 9}/svc{len(files)}.go", _realistic_go(len(files)))
+        if total + len(item.content()) > GO_REQUEST_BUDGET_BYTES or len(files) == 64:
+            break
+        files.append(item)
+        total += len(item.content())
+    assert 0.9 * GO_REQUEST_BUDGET_BYTES < total <= GO_REQUEST_BUDGET_BYTES, total
     before = child_cpu()
     module = go_adapter(limits=PATIENT).parse(request(*files))
     print(f"cpu[normal_corpus_{total // 1000}KB] = {child_cpu() - before:.2f}s")

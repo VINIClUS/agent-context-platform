@@ -206,6 +206,10 @@ class _Open:
     names: list[int] = field(default_factory=list)  # node ids of every name, in order
     values: list[int] = field(default_factory=list)
     owners: list[tuple[_Sym, int]] = field(default_factory=list)  # symbol, index into names
+    # Const specs: node id of the last name (the type and value tokens follow it), and whether
+    # the spec has neither, so that it repeats the previous spec's type and expression (iota).
+    const_mark: int = -1
+    implicit: bool = False
 
 
 @dataclass(frozen=True, slots=True)
@@ -250,6 +254,7 @@ class _Walk:
     type_sym: _Sym | None = None
     tainted: int = 0
     dropped: int = 0
+    const_tail: tuple[list[bytes], list[bytes]] = field(default_factory=lambda: ([], []))
     oversized: int = 0  # import names over the byte limit: reported as references_capped
 
     def add(self, sym: _Sym) -> bool:
@@ -484,12 +489,16 @@ def _enter_value_spec(walk: _Walk, node: Node) -> None:
             made.append(candidate)
             owners.append((candidate, len(name_ids) - 1))
     _open(walk, node, made, value)
+    entry = walk.opens[-1]
+    if kind == "constant" and name_ids:
+        entry.const_mark = name_ids[-1]
+        entry.marks[name_ids[-1]] = -1
+        entry.implicit = value is None and node.child_by_field_name("type") is None
     if len(name_ids) > 1 and made:
-        entry = walk.opens[-1]
         entry.names, entry.owners = name_ids, owners
         if value is not None:
             entry.values = [item.id for item in value.named_children if item.type != "comment"]
-        entry.marks = dict.fromkeys(entry.names + entry.values, -1)
+        entry.marks.update(dict.fromkeys(entry.names + entry.values, -1))
 
 
 def _enter_interface_member(walk: _Walk, node: Node) -> None:
@@ -665,6 +674,8 @@ def _enter_instantiated_call(walk: _Walk, node: Node) -> None:
 
 def _enter_top(walk: _Walk, node: Node) -> None:
     kind = node.type
+    if kind == "const_declaration":
+        walk.const_tail = ([], [])
     if kind in ("function_declaration", "method_declaration"):
         _enter_function(walk, node)
     elif node.is_error or node.is_missing:
@@ -733,6 +744,12 @@ def _enter(walk: _Walk, node: Node) -> bool:
 def _finish_open(walk: _Walk, entry: _Open) -> None:
     end = len(walk.tokens)
     stop = entry.header_end if entry.header_end >= 0 else end
+    if entry.const_mark >= 0:
+        if entry.implicit:
+            _finish_implicit_const(walk, entry)
+            return
+        after = entry.marks[entry.const_mark] + 1
+        walk.const_tail = (walk.tokens[after:stop], walk.tokens[stop:end])
     if not entry.syms:
         return
     if entry.names:
@@ -743,6 +760,17 @@ def _finish_open(walk: _Walk, entry: _Open) -> None:
     for sym in entry.syms:
         sym.semantic = semantic
         sym.signature_digest = signature
+
+
+def _finish_implicit_const(walk: _Walk, entry: _Open) -> None:
+    """Digest a bare ``B`` in ``A = iota; B``: it repeats the previous spec's type and value."""
+    tokens = walk.tokens
+    typ, value = walk.const_tail
+    for sym, index in entry.owners or [(entry.syms[0], 0)]:
+        at = entry.marks[entry.names[index] if entry.names else entry.const_mark]
+        head = [tokens[at], *typ]
+        sym.signature_digest = digest(_SIGNATURE_DOMAIN, head)
+        sym.semantic = digest(_SEMANTIC_DOMAIN, [*head, *value])
 
 
 def _finish_declarators(walk: _Walk, entry: _Open, stop: int, end: int) -> None:

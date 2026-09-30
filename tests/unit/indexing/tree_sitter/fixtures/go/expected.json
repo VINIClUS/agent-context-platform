@@ -587,9 +587,9 @@
             273,
             276
           ],
-          "semantic_fingerprint": "9c787b06b2dc49cfcfed7593cef1aa915e8e841c18b9b70998cbe6c0cb90c0a2",
+          "semantic_fingerprint": "765fb53e4bfca2542ef4181ca47da851ad877a2d319cd7031e6ace962c71be7c",
           "signature": "Mid",
-          "signature_digest": "f8c75603a0636da92801186f562bd2dda3ae3578f3aaf7fd7bc38767496a36b8"
+          "signature_digest": "376846f7e6ab0a79bf8fbc85afeea2e6110145ccfa3cb90a18e67b2465f8d3d4"
         },
         {
           "evidence_kind": "tree_sitter",

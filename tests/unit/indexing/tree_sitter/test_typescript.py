@@ -501,6 +501,17 @@ def test_the_cpu_backstop_degrades_with_a_reason(monkeypatch: pytest.MonkeyPatch
     assert codes(item) == {"file_degraded": 1, "work_budget_exceeded": 1}
 
 
+@pytest.mark.parametrize("limit", ["CPU_SOFT_LIMIT", "PARSE_SOFT_LIMIT"])
+def test_a_hostile_parse_is_cut_inside_the_parse(
+    monkeypatch: pytest.MonkeyPatch, limit: str
+) -> None:
+    monkeypatch.setattr(_common.Budget, limit, 0.3)
+    hostile = (b"class {{ }}<<< =>\n" * 100_000)[:1_000_000]  # seconds of error recovery
+    item = in_process(request(source("src/h.ts", hostile))).files[0]
+    assert item.symbols == ()
+    assert codes(item) == {"file_degraded": 1, "work_budget_exceeded": 1}
+
+
 def test_bugs_in_the_adapter_are_not_masked(monkeypatch: pytest.MonkeyPatch) -> None:
     def broken(*_args: object) -> ParsedFile:
         raise KeyError("bug")

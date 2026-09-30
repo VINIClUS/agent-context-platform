@@ -324,7 +324,6 @@ def test_deep_nesting_uses_no_recursion() -> None:
 def test_huge_file_through_the_sandbox_within_limits() -> None:
     body = "def f{n}(a, b):\n    return a + b + {n}\n\n\n"
     code = "".join(body.format(n=n) for n in range(30_000))[:MAX_SOURCE_BYTES]
-    time.monotonic()
     module = python_adapter(limits=PATIENT).parse(request(source("pkg/big.py", code)))
     assert 1_000 < len(module.files[0].symbols) <= 10_000
 
@@ -385,18 +384,16 @@ def test_bugs_in_the_adapter_are_not_masked(monkeypatch: pytest.MonkeyPatch) -> 
 
 def test_a_one_megabyte_call_chain_is_linear_through_the_sandbox() -> None:
     chain = "a" + ".f()" * (MAX_SOURCE_BYTES // 4 - 8) + "\n"
-    time.monotonic()
     module = python_adapter(limits=PATIENT).parse(
         request(source("pkg/chain.py", chain), source("pkg/ok.py", "def a():\n    pass\n"))
     )
     assert len(module.files[1].symbols) == 2
 
 
-def test_many_same_named_definitions_and_calls_resolve_fast() -> None:
+def test_many_same_named_definitions_and_calls_stay_ambiguous_without_edges() -> None:
     defs = "".join("def f():\n    pass\n" for _ in range(10_000))
     calls = "def caller():\n" + "".join("    f()\n" for _ in range(30_000))
     code = (defs + calls)[:MAX_SOURCE_BYTES]
-    time.monotonic()
     parsed = symbols_of(code)["pkg/mod.py"]
     assert parsed.relations == ()  # more than 8 candidates: ambiguous, no edge
 
@@ -508,7 +505,6 @@ def test_deeply_nested_definitions_around_a_large_body_hash_in_linear_time() -> 
     depth = 100
     literal = "x = [" + ",".join("a" for _ in range(200_000)) + "]\n"
     code = "".join(f"{' ' * i}def f{i}():\n" for i in range(depth)) + " " * depth + literal
-    time.monotonic()
     module = python_adapter(limits=PATIENT).parse(request(source("pkg/deep.py", code)))
     assert len(module.files[0].symbols) >= depth
 
@@ -583,11 +579,12 @@ def test_the_real_adapter_runs_confined_and_cannot_read_a_sibling_file(tmp_path:
     assert json.loads(raw)["probe"][f"read:{sibling}"] == "EACCES"
 
 
+@pytest.mark.parametrize("limit", ["CPU_SOFT_LIMIT", "PARSE_SOFT_LIMIT"])
 def test_a_hostile_parse_is_cut_inside_the_parse_by_the_cpu_backstop(
-    monkeypatch: pytest.MonkeyPatch,
+    monkeypatch: pytest.MonkeyPatch, limit: str
 ) -> None:
     """Error recovery on this input is quadratic (seconds for 1 MB): the read callback ends it."""
-    monkeypatch.setattr(_common.Budget, "CPU_SOFT_LIMIT", 0.5)
+    monkeypatch.setattr(_common.Budget, limit, 0.3)
     hostile = (b"def (\n" * 200_000)[:1_000_000]
     started = time.process_time()
     module = in_process(request(source("pkg/h.py", hostile)))
