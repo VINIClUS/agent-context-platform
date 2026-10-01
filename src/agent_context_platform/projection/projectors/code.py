@@ -46,6 +46,7 @@ paths, digests and IDs.
 
 from __future__ import annotations
 
+import re
 from collections.abc import Callable, Iterable, Mapping
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
@@ -63,6 +64,7 @@ from agent_context_sdk import (
     StoredEventV1,
 )
 
+from agent_context_platform.indexing.tree_sitter._common import module_name
 from agent_context_platform.projection.neo4j import Neo4jTransaction
 from agent_context_platform.projection.projectors import (
     event_order,
@@ -157,7 +159,9 @@ class Facts:
     claim_run: dict[tuple[str, str], str] = field(default_factory=dict)  # (item, revision) -> run
     claim_observed: dict[tuple[str, str], str] = field(default_factory=dict)  # (item, rev) -> tx
     claimed: dict[str, set[str]] = field(default_factory=dict)  # revision -> runs that claim for it
-    path_bound: set[str] = field(default_factory=set)  # items whose identity derives from the path
+    path_bound: set[str] = field(default_factory=set)  # symbols named from the path (no SCIP ID)
+    scips: dict[str, set[str]] = field(default_factory=dict)  # symbol -> its SCIP symbol strings
+    item_symbols: dict[str, tuple[str, ...]] = field(default_factory=dict)  # assertion -> ends
     assertions: dict[str, AssertionFact] = field(default_factory=dict)
 
     @property
@@ -214,17 +218,44 @@ def _timeline(runs: Iterable[Run], status: Callable[[Run], Status]) -> list[Inte
     return done
 
 
+def _descriptors(path: str) -> set[str]:
+    """How an indexer spells the module of `path`: `src/c` (scip-typescript), `pkg.c`
+    (scip-python and the emitter's own dotted module name)."""
+    directory, _, base = path.rpartition("/")
+    stem = base.rsplit(".", 1)[0] if "." in base else base
+    slash = f"{directory}/{stem}" if directory else stem
+    dotted = {module_name(path), module_name(path, package_files=("__init__", "index"))}
+    return {d for d in {slash, *dotted} if d}
+
+
+def _symbol_path_bound(facts: Facts, symbol_id: str, path: str) -> bool:
+    """Does the identity of `symbol_id` derive from `path`?
+
+    A symbol with no SCIP symbol was named from the module path by the structural parser. A SCIP
+    symbol is path-bound only if it spells the module of the claim path (`pkg.c`, `src/c`, as
+    scip-python and scip-typescript do); one without it (Go's package-path symbols) is not changed
+    by a file rename within its package.
+    """
+    if symbol_id in facts.path_bound:
+        return True
+    found = _descriptors(path)
+    return any(
+        re.search(rf"(?<![A-Za-z0-9_]){re.escape(d)}(?![A-Za-z0-9_])", scip)
+        for scip in facts.scips.get(symbol_id, ())
+        for d in found
+    )
+
+
 def _path_matches(facts: Facts, item: str, member: Member) -> bool:
     """Does `item`'s claim on `member`'s file revision belong to the path it has now?
 
     The path is not part of a file revision (a rename keeps it), but identities derived from the
-    path (a qualified name) are claimed anew under the new path. So an item whose own identity is
-    path-derived holds only while the file is at the path it was claimed at, once its revision is
-    claimed under more than one path. Items with a path-independent identity (a SCIP symbol, a
-    file) keep their claim; so does anything on a revision claimed under a single path.
+    path are claimed anew under the new path. So an item whose own identity is path-derived
+    (`_symbol_path_bound`; an assertion inherits it from its subject or object) holds only while
+    the file is at the path it was claimed at, once its revision is claimed under more than one
+    path. Items with a path-independent identity keep their claim; so does anything on a
+    revision claimed under a single path.
     """
-    if item not in facts.path_bound:
-        return True  # its identity does not derive from the path: a rename does not touch it
     file_id = facts.revision_file[member.revision_id]
 
     def path_of(run_key: str) -> str | None:
@@ -234,7 +265,12 @@ def _path_matches(facts: Facts, item: str, member: Member) -> bool:
     paths = {path_of(k) for k in facts.claimed.get(member.revision_id, ())} - {None}
     own = facts.claim_run.get((item, member.revision_id))
     claimed_at = None if own is None else path_of(own)
-    return len(paths) <= 1 or claimed_at is None or claimed_at == member.path
+    if len(paths) <= 1 or claimed_at is None or claimed_at == member.path:
+        return True
+    return not any(
+        _symbol_path_bound(facts, symbol, claimed_at)
+        for symbol in facts.item_symbols.get(item, (item,))
+    )
 
 
 def _live(facts: Facts, run: Run, item: str, owners: Mapping[str, str]) -> list[str]:
@@ -538,6 +574,8 @@ async def load_facts(
                     row["scip_symbol"] is None
                 ):  # named from the module path by the structural parser
                     facts.path_bound.add(row["symbol_id"])
+                else:
+                    facts.scips.setdefault(row["symbol_id"], set()).add(row["scip_symbol"])
                 if key not in facts.since or row["since"] < facts.since[key]:
                     facts.since[key] = row["since"]
                     facts.claim_run[key] = _run_key(row["index_id"], row["target_id"])
@@ -581,10 +619,11 @@ async def load_facts(
         row = item["row"]
         if row["valid_from"] is None or not seen(row["recorded_from"]):
             continue  # only a stub from an observation: the assertion itself is not recorded
-        if row["subject_id"] in facts.path_bound or (
-            row["family"] == "relation" and row["object_id"] in facts.path_bound
-        ):
-            facts.path_bound.add(assertion_id)
+        facts.item_symbols[assertion_id] = tuple(
+            x
+            for x in (row["subject_id"], row["object_id"] if row["family"] == "relation" else None)
+            if x is not None
+        )
         facts.assertions[assertion_id] = AssertionFact(
             row["family"],
             row["subject_id"],

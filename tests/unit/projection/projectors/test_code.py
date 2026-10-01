@@ -220,20 +220,32 @@ def test_evidence_competes_within_a_triple_not_across_objects() -> None:
     assert edges[("f", "CALLS", "h")]["evidence_kind"] == "tree_sitter"
 
 
-def test_a_rename_closes_path_named_items_but_not_path_independent_ones() -> None:
+def test_a_rename_closes_items_whose_identity_spells_the_old_path() -> None:
     runs = [run(1), run(2)]
     state = Facts(runs=runs)
-    state.members[runs[0].key] = {"f": Member("r1", "c.py", "m")}
-    state.members[runs[1].key] = {"f": Member("r1", "d.py", "m")}  # same revision, new path
+    state.members[runs[0].key] = {"f": Member("r1", "pkg/c.py", "m")}
+    state.members[runs[1].key] = {"f": Member("r1", "pkg/d.py", "m")}  # same revision, new path
     state.coverage = {r.key: {"f": {"r1": True}} for r in runs}
     state.revision_file["r1"] = "f"
     state.claimed["r1"] = {runs[0].key, runs[1].key}  # claimed anew under the new path
-    for item in ("scip-symbol", "named-symbol"):
+    items = {
+        "named": None,  # no SCIP symbol: named from the module path
+        "scip-python": "scip-python python p 0 `pkg.c`/k().",
+        "scip-typescript": "scip-typescript npm p 0 src/`pkg/c`/k().",
+        "go": "gomod example.com/m 0 example.com/m/pkg/K().",  # no file descriptor
+    }
+    for item, scip in items.items():
         state.defs[item] = {"r1": f"{item}-rev"}
         state.since[(item, "r1")] = runs[0].occurred_at
         state.claim_run[(item, "r1")] = runs[0].key
-    state.path_bound.add("named-symbol")  # identity derived from the module path
-    (kept,) = derive_symbol(state, "scip-symbol")
-    assert kept.end is None
-    (closed,) = derive_symbol(state, "named-symbol")
-    assert closed.end is not None and closed.end.key == runs[1].key
+        if scip is None:
+            state.path_bound.add(item)
+        else:
+            state.scips[item] = {scip}
+    ends = {item: derive_symbol(state, item)[0].end for item in items}
+    assert {item: end is not None for item, end in ends.items()} == {
+        "named": True,
+        "scip-python": True,
+        "scip-typescript": True,
+        "go": False,  # a package-path symbol is not changed by a rename within its package
+    }
