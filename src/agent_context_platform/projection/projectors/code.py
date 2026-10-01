@@ -151,6 +151,8 @@ class Facts:
     revision_file: dict[str, str] = field(default_factory=dict)
     defs: dict[str, dict[str, str]] = field(default_factory=dict)  # symbol -> revision -> SR
     since: dict[tuple[str, str], str] = field(default_factory=dict)  # (item, revision) -> time
+    claim_run: dict[tuple[str, str], str] = field(default_factory=dict)  # (item, revision) -> run
+    claimed: dict[str, set[str]] = field(default_factory=dict)  # revision -> runs that claim for it
     assertions: dict[str, AssertionFact] = field(default_factory=dict)
 
 
@@ -193,30 +195,60 @@ def _timeline(runs: Iterable[Run], status: Callable[[Run], Status]) -> list[Inte
     return done
 
 
+def _path_matches(facts: Facts, item: str, member: Member) -> bool:
+    """Does `item`'s claim on `member`'s file revision belong to the path it has now?
+
+    The path is not part of a file revision (a rename keeps it), but identities derived from the
+    path (a qualified name) are claimed anew under the new path. So when a revision is claimed
+    under more than one path, each claim holds only while the file is at the path it was made at.
+    A revision claimed under one path (identities that do not depend on it) keeps all its claims.
+    """
+    file_id = facts.revision_file[member.revision_id]
+
+    def path_of(run_key: str) -> str | None:
+        held = facts.members.get(run_key, {}).get(file_id)
+        return held.path if held is not None and held.revision_id == member.revision_id else None
+
+    paths = {path_of(k) for k in facts.claimed.get(member.revision_id, ())} - {None}
+    own = facts.claim_run.get((item, member.revision_id))
+    claimed_at = None if own is None else path_of(own)
+    return len(paths) <= 1 or claimed_at is None or claimed_at == member.path
+
+
+def _live(facts: Facts, run: Run, item: str, owners: Mapping[str, str]) -> list[str]:
+    """The owning file revisions whose claim on `item` holds in `run`'s membership."""
+    in_run = facts.members.get(run.key, {})
+    live: list[str] = []
+    for revision in sorted(owners):
+        member = in_run.get(facts.revision_file.get(revision, ""))
+        if (
+            member is not None
+            and member.revision_id == revision
+            and owners[revision] <= run.occurred_at
+            and _path_matches(facts, item, member)
+        ):
+            live.append(revision)
+    return live
+
+
 def _owner_status(
-    facts: Facts, run: Run, owners: Mapping[str, str]
+    facts: Facts, run: Run, item: str, owners: Mapping[str, str]
 ) -> Literal["present", "absent", "unknown"]:
-    """Is something owned by the file revisions `owners` in `run`'s membership?
+    """Is `item`, claimed by the file revisions `owners`, in `run`'s membership?
 
     `owners` maps each owning file revision to when the claim was first observed: a claim made
-    later than the run (a symbol a rename introduced under an old revision) is not part of it.
-    Present when an owner is a member. Otherwise absent only when absence may be inferred for
-    the run AND every owning file is gone from it or replaced by a revision whose coverage is
-    complete; anything else (a degraded or uncovered file) is unknown.
+    later than the run is not part of it. Present when a claim holds (`_live`). Otherwise absent
+    only when absence may be inferred for the run AND every owning file is gone from it or has a
+    member revision whose coverage is complete; anything else (a degraded or uncovered file) is
+    unknown.
     """
-    in_run = facts.members.get(run.key, {})
-    files = {facts.revision_file[r] for r in owners if r in facts.revision_file}
-    if any(
-        f in in_run
-        and in_run[f].revision_id in owners
-        and owners[in_run[f].revision_id] <= run.occurred_at
-        for f in files
-    ):
+    if _live(facts, run, item, owners):
         return "present"
     if not run.permits_absence:
         return "unknown"
+    in_run = facts.members.get(run.key, {})
     covered = facts.coverage.get(run.key, {})
-    for file_id in files:
+    for file_id in {facts.revision_file[r] for r in owners if r in facts.revision_file}:
         member = in_run.get(file_id)
         if member is not None:
             if not covered.get(file_id, {}).get(member.revision_id, False):
@@ -241,17 +273,10 @@ def derive_file(facts: Facts, file_id: str) -> list[Interval]:
 def _symbol_present(facts: Facts, symbol_id: str, run: Run) -> Status:
     owners = facts.defs.get(symbol_id, {})
     since = {r: facts.since[(symbol_id, r)] for r in owners}
-    state = _owner_status(facts, run, since)
+    state = _owner_status(facts, run, symbol_id, since)
     if state != "present":
         return _UNKNOWN if state == "unknown" else _ABSENT
-    in_run = facts.members.get(run.key, {})
-    live = sorted(
-        owners[r]
-        for r in owners
-        if facts.revision_file[r] in in_run
-        and in_run[facts.revision_file[r]].revision_id == r
-        and since[r] <= run.occurred_at
-    )
+    live = sorted(owners[r] for r in _live(facts, run, symbol_id, since))
     return ("present", live[0], ())
 
 
@@ -286,7 +311,7 @@ def derive_assertion(facts: Facts, assertion_id: str) -> list[Interval]:
         return _clip([Interval(assertion_id, (), start, None)], fact)
 
     def status(run: Run) -> Status:
-        state = _owner_status(facts, run, fact.revisions)
+        state = _owner_status(facts, run, assertion_id, fact.revisions)
         if state == "absent":
             return _ABSENT
         if state == "unknown":
@@ -338,7 +363,8 @@ _COVERAGE: Final[LiteralString] = (
 _DEFS: Final[LiteralString] = (
     "MATCH (sr:SymbolRevision)-[d:DEFINED_IN]->(fr:FileRevision) WHERE sr.symbol_id IN $symbols "
     "RETURN sr.symbol_id AS symbol_id, sr.symbol_revision_id AS symbol_revision_id, "
-    "fr.file_revision_id AS revision_id, fr.file_id AS file_id, d.observed_at AS observed_at, d.occurred_at AS since"
+    "fr.file_revision_id AS revision_id, fr.file_id AS file_id, d.observed_at AS observed_at, d.occurred_at AS since, "
+    "d.index_id AS index_id, d.claim_target AS target_id"
 )
 _ASSERTIONS: Final[LiteralString] = (
     "MATCH (a:Assertion) WHERE a.assertion_id IN $ids "
@@ -347,7 +373,13 @@ _ASSERTIONS: Final[LiteralString] = (
     "a.predicate AS predicate, a.object_id AS object_id, a.valid_from AS valid_from, "
     "a.asserted_valid_to AS valid_to, "
     "a.recorded_from AS recorded_from, fr.file_revision_id AS revision_id, "
-    "fr.file_id AS file_id, o.observed_at AS observed_at, o.occurred_at AS since"
+    "fr.file_id AS file_id, o.observed_at AS observed_at, o.occurred_at AS since, "
+    "o.index_id AS index_id, o.claim_target AS target_id"
+)
+_CLAIMS: Final[LiteralString] = (
+    "MATCH ()-[d:DEFINED_IN|OBSERVED_IN]->(fr:FileRevision) WHERE fr.file_id IN $files "
+    "RETURN DISTINCT fr.file_revision_id AS revision_id, d.index_id AS index_id, "
+    "d.claim_target AS target_id, d.observed_at AS observed_at"
 )
 
 
@@ -419,6 +451,10 @@ async def load_facts(
                 if row["revision_id"] is not None and seen(row["observed_at"]):
                     held = item["revisions"].get(row["revision_id"])
                     item["revisions"][row["revision_id"]] = min(held or row["since"], row["since"])
+                    if held is None or row["since"] < held:
+                        facts.claim_run[(row["assertion_id"], row["revision_id"])] = _run_key(
+                            row["index_id"], row["target_id"]
+                        )
                     facts.revision_file[row["revision_id"]] = row["file_id"]
                     want_files.add(row["file_id"])
             for item in pending.values():
@@ -435,7 +471,9 @@ async def load_facts(
                 if not seen(row["observed_at"]):
                     continue
                 key = (row["symbol_id"], row["revision_id"])
-                facts.since[key] = min(facts.since.get(key, row["since"]), row["since"])
+                if key not in facts.since or row["since"] < facts.since[key]:
+                    facts.since[key] = row["since"]
+                    facts.claim_run[key] = _run_key(row["index_id"], row["target_id"])
                 owners = facts.defs.setdefault(row["symbol_id"], {})
                 current = owners.get(row["revision_id"])
                 if current is None or row["symbol_revision_id"] < current:
@@ -454,6 +492,11 @@ async def load_facts(
                 if held is None or row["revision_id"] < held.revision_id:
                     facts.members[run_key][row["file_id"]] = Member(
                         row["revision_id"], row["path"], row["module_id"]
+                    )
+            for row in (await tx.run(_CLAIMS, parameters={"files": new_files})).records:
+                if seen(row["observed_at"]):
+                    facts.claimed.setdefault(row["revision_id"], set()).add(
+                        _run_key(row["index_id"], row["target_id"])
                     )
             for row in (await tx.run(_COVERAGE, parameters={"files": new_files})).records:
                 run_key = _run_key(row["index_id"], row["target_id"])
@@ -722,11 +765,13 @@ async def _write_run_event(
                 "OBSERVED_IN",
                 "FileRevision",
                 "file_revision_id",
-                "",
-                min_non_null("observed_at", "occurred_at"),
+                "index_id: $index_id",
+                fill_once("claim_target") + " WITH n " + min_non_null("observed_at", "occurred_at"),
             ),
             parameters={
                 **base,
+                "index_id": payload.index_id,
+                "claim_target": target,
                 "source_id": payload.assertion_id,
                 "target_id": payload.file_revision_id,
                 "observed_at": observed,
@@ -827,11 +872,13 @@ async def _write_symbol(
             "DEFINED_IN",
             "FileRevision",
             "file_revision_id",
-            "",
-            min_non_null("observed_at", "occurred_at"),
+            "index_id: $index_id",
+            fill_once("claim_target") + " WITH n " + min_non_null("observed_at", "occurred_at"),
         ),
         parameters={
             "event_id": str(event.event_id),
+            "index_id": payload.index_id,
+            "claim_target": _target_of(payload, repository_id)[2],
             "source_id": payload.symbol_revision_id,
             "target_id": payload.file_revision_id,
             "observed_at": timestamp(event.observed_at),

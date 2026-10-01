@@ -553,9 +553,13 @@ def test_golden_graph_after_each_index(tmp_path: Path) -> None:
             "rows": [("c1", "pkg/c.py", "t3", "t5"), ("c1", "pkg/d.py", "t5", None)],
         }
         assert renamed["counts"]["File"] == 3 and renamed["counts"]["FileRevision"] == 4
-        # symbols named for the new path appear at the rename; the emitter gives the old-path
-        # symbols (same file revision) no per-target membership, so they are not closed
+        # the revision is claimed under two paths now: each symbol holds only at its own path
+        assert renamed["symbols"]["pkg.c"] == {"current": False, "rows": [("t3", "t5")]}
+        assert renamed["symbols"]["pkg.c.k"] == {"current": False, "rows": [("t3", "t5")]}
+        assert renamed["symbols"]["pkg.d"] == {"current": True, "rows": [("t5", None)]}
         assert renamed["symbols"]["pkg.d.k"] == {"current": True, "rows": [("t5", None)]}
+        old_defines = [e for e in renamed["assertions"] if e[2] in ("pkg.c", "pkg.c.k")]
+        assert [e[4:] for e in old_defines] == [(False, ("12:03:00/12:05:00",))] * 2
 
         # a deletion: validity closes, nothing is removed, the dangling edges go stale
         await deliver(store, runs["deleted"])
@@ -576,11 +580,11 @@ def test_golden_graph_after_each_index(tmp_path: Path) -> None:
             ("IMPORTS", "pkg.b", "pkg.a.f", "tree_sitter", False, ("12:01:00/12:06:00",)),
         ]  # b is unchanged, its target is gone: stale
         assert deleted["counts"] == {**renamed["counts"], "Commit": 5}
-        assert await edge_types(store) == {"DEFINES": 6}  # only current assertions are edges
+        assert await edge_types(store) == {"DEFINES": 4}  # only current assertions are edges
 
         # supersession is not file-bound: current from its valid_from
         await deliver(store, supersession_events(line))
-        assert await edge_types(store) == {"DEFINES": 6, "POSSIBLY_SUPERSEDES": 1}
+        assert await edge_types(store) == {"DEFINES": 4, "POSSIBLY_SUPERSEDES": 1}
         assert (await summary(store, names))["counts"]["Assertion"] == 13
 
     with_graph(body)
@@ -873,5 +877,28 @@ def test_a_retry_is_a_new_observation_and_transaction_time_sees_each(tmp_path: P
         assert await ask("symbol", f_symbol, 3) is not None  # degraded coverage: unknown
         assert await ask("symbol", f_symbol, 4) is None  # the retry's complete coverage
         assert a_id
+
+    with_graph(body)
+
+
+def test_a_degraded_target_file_does_not_close_the_relation_into_it(tmp_path: Path) -> None:
+    line = Timeline(tmp_path)
+    repo = line.repo
+    repo.write("pkg/a.py", A0)
+    repo.write("pkg/b.py", B)
+    repo.commit()
+    first = line.index(1)
+    a_id = str(line.known["pkg/a.py"])
+    repo.write("pkg/a.py", "def other():\n    return 1\n")  # a drops f; b is unchanged
+    repo.commit()
+    second = line.index(2, tweak=degraded(a_id))  # files_degraded, a's coverage incomplete
+    names = Names()
+
+    async def body(store: Neo4jStore) -> None:
+        await deliver(store, [*first, *second])
+        state = await summary(store, names)
+        calls = [e for e in state["assertions"] if e[0] == "CALLS"]
+        assert calls == [("CALLS", "pkg.b.g", "pkg.a.f", "tree_sitter", True, ("12:01:00/",))]
+        assert state["symbols"]["pkg.a.f"]["current"] is True  # unknown, not absent
 
     with_graph(body)
