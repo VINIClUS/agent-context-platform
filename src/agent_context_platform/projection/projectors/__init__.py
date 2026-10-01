@@ -64,9 +64,14 @@ def event_lock_keys(event: StoredEventV1) -> list[tuple[str, str]]:
     Each projector derives its part from the same ID helpers it writes with.
     """
     # Imported here: the projector modules import this package.
-    from agent_context_platform.projection.projectors import agent, git, portfolio
+    from agent_context_platform.projection.projectors import agent, code, git, portfolio
 
-    keys = {*agent.lock_keys(event), *git.lock_keys(event), *portfolio.lock_keys(event)}
+    keys = {
+        *agent.lock_keys(event),
+        *code.lock_keys(event),
+        *git.lock_keys(event),
+        *portfolio.lock_keys(event),
+    }
     return sorted(keys)
 
 
