@@ -24,6 +24,7 @@ from agent_context_platform.indexing.identity import (
     symbol_fallback_id,
     symbol_logical_id,
     symbol_revision_id,
+    uncommitted_file_logical_id,
 )
 
 pytestmark = pytest.mark.unit
@@ -551,3 +552,11 @@ def test_duplicate_added_and_committed_paths_and_similar_pairs_are_deterministic
     ]
     assert outcomes[0] == outcomes[1] == outcomes[2]
     assert outcomes[0].supersessions[0].confidence == 0.6
+
+
+def test_an_uncommitted_file_id_is_per_repository_and_path_only() -> None:
+    frozen = uncommitted_file_logical_id("repo-1", "src/new.py")
+
+    assert str(frozen) == "176df8d5-0f43-58eb-9ee6-432f7d1a6db6"
+    assert uncommitted_file_logical_id("repo-2", "src/new.py") != frozen
+    assert uncommitted_file_logical_id("repo-1", "src/other.py") != frozen

@@ -484,3 +484,23 @@ def test_ingest_without_a_service_is_refused() -> None:
     with pytest.raises(IndexingError) as error:
         asyncio.run(bare.ingest([]))
     assert error.value.code == "ingestion_not_configured"
+
+
+def test_reindexing_after_a_non_code_dirty_file_changes_content_adds_no_row(
+    stack: Stack, tmp_path: Path
+) -> None:
+    root, _, _, ids = _seed(stack, tmp_path)
+    (root / ".env").write_text("TOKEN=one\n")
+    first_scan = scan_repository(root)
+    first = _index(stack, first_scan, ids)
+    asyncio.run(stack.service.ingest(first))
+    before = asyncio.run(stack.counts())
+
+    (root / ".env").write_text("TOKEN=two, and longer\n")  # content only: same dirty state
+    later = stack.service_at(NOW + timedelta(days=1))
+    again = _index(stack, scan_repository(root), ids, service=later)
+    repeat = asyncio.run(later.ingest(again))
+
+    assert [d.idempotency_key for d in again] == [d.idempotency_key for d in first]
+    assert repeat.submitted == 0 and repeat.existing == len(first)
+    assert asyncio.run(stack.counts()) == before
