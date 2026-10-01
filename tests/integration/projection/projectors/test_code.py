@@ -35,6 +35,8 @@ from agent_context_platform.indexing import identity
 from agent_context_platform.indexing.emitter import (
     IndexingConfig,
     IndexingService,
+    claim_key,
+    event_id_for,
     parse_structural,
     read_sources,
 )
@@ -131,8 +133,16 @@ def index_events(
         )
     )
     drafts = service.index(scan, None, list(structural.files), file_logical_ids=lineage)
-    fresh = [d for d in drafts if seen is None or d.idempotency_key not in seen]
-    return seal([d if tweak is None else tweak(d) for d in fresh], when, observed)
+    changed = [d if tweak is None else rekey(tweak(d)) for d in drafts]
+    return seal(
+        [d for d in changed if seen is None or d.idempotency_key not in seen], when, observed
+    )
+
+
+def rekey(draft: EventDraftV1) -> EventDraftV1:
+    """A tweaked claim is a different claim: give it its own key and event ID, as a real run would."""
+    key = claim_key(draft)
+    return draft.model_copy(update={"idempotency_key": key, "event_id": event_id_for(key)})
 
 
 def seal(
@@ -795,5 +805,73 @@ def test_as_of_separates_valid_time_from_transaction_time(tmp_path: Path) -> Non
         assert before is None
         assert first is not None and late == first and known not in (None, first)
         assert deleted_early is None and deleted is None
+
+    with_graph(body)
+
+
+def test_a_retry_is_a_new_observation_and_transaction_time_sees_each(tmp_path: Path) -> None:
+    line = Timeline(tmp_path)
+    repo = line.repo
+    repo.write("pkg/a.py", A0)
+    repo.write("pkg/b.py", B)
+    repo.commit()
+    first = line.index(1)
+    repo.git("rm", "-q", "pkg/b.py")
+    repo.write("pkg/a.py", "def other():\n    return 1\n")  # a drops f; b is deleted
+    repo.commit()
+    a_id = str(line.known["pkg/a.py"])
+    b_id = str(line.known["pkg/b.py"])
+    # three runs of the SAME target: scan_incomplete with degraded a, files_degraded with a still
+    # degraded, then a clean retry. Each outcome and coverage report is its own observation.
+    attempt1 = line.index(2, tweak=lambda d: scan_incomplete(degraded(a_id)(d)))
+    attempt2 = line.index(3, tweak=degraded(a_id))
+    attempt3 = line.index(4)
+    assert [e.event_type for e in attempt3] == [
+        "code.file.coverage_reported",
+        "code.index.completed",
+    ]
+    events = [*first, *attempt1, *attempt2, *attempt3]
+
+    async def body(store: Neo4jStore) -> None:
+        digests = set()
+        for ordered in orders(events).values():
+            await wipe(store)
+            await deliver(store, ordered)
+            digests.add(digest(await graph_state(store)))
+        assert len(digests) == 1  # delivery order never matters
+
+        async def ask(kind: EntityKind, entity: str, recorded: int) -> str | None:
+            async def read(tx: Neo4jTransaction) -> str | None:
+                return await entity_as_of(
+                    tx,
+                    REPO,
+                    kind,
+                    entity,
+                    valid_at=at(2) + timedelta(seconds=30),  # after the run's own time
+                    recorded_at=at(recorded) + timedelta(seconds=30),
+                )
+
+            return await store.execute_read(read)
+
+        async def symbol(name: str) -> str:
+            rows = (
+                await store.execute_read(
+                    lambda tx: tx.run(
+                        "MATCH (s:Symbol)-[:HAS_REVISION]->(sr:SymbolRevision {qualified_name: $n}) "
+                        "RETURN s.symbol_id AS id",
+                        parameters={"n": name},
+                    )
+                )
+            ).records
+            return str(rows[0]["id"])
+
+        f_symbol = await symbol("pkg.a.f")
+        # outcome observations: scan_incomplete (t2) closes nothing; files_degraded (t3) may
+        # infer b's absence; a's coverage stays degraded until t4, when f is provably gone
+        assert await ask("file", b_id, 2) is not None
+        assert await ask("file", b_id, 3) is None
+        assert await ask("symbol", f_symbol, 3) is not None  # degraded coverage: unknown
+        assert await ask("symbol", f_symbol, 4) is None  # the retry's complete coverage
+        assert a_id
 
     with_graph(body)

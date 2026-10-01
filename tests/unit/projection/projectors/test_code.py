@@ -64,22 +64,30 @@ def test_a_replaced_file_revision_closes_its_symbols_only_with_complete_coverage
     assert symbol.end is not None and symbol.end.key == "idx3|t3"  # not run 2: it is degraded
 
 
+def fact(
+    predicate: str = "CALLS",
+    *,
+    valid_to: str | None = None,
+    revisions: dict[str, str] | None = None,
+) -> AssertionFact:
+    return AssertionFact(
+        family="relation",
+        subject_id="s",
+        predicate=predicate,
+        object_id="x",
+        valid_from=run(1).occurred_at,
+        valid_to=valid_to,
+        observed_at=run(1).observed_at,
+        revisions={} if revisions is None else revisions,
+    )
+
+
 def test_a_relation_is_stale_when_its_target_symbol_is_not_in_the_membership() -> None:
     runs = [run(1), run(2)]
     state = facts(runs, {1: "r1", 2: "r1"}, {})
     state.members["idx2|t2"]["g"] = Member("g1", "q.py", "m")
     state.revision_file["g1"] = "g"
-    state.since[("x", "r1")] = run(1).occurred_at
-    state.defs["x"] = {"r1": "x-rev"}
-    state.assertions["a"] = AssertionFact(
-        "relation",
-        "s",
-        "CALLS",
-        "x",
-        run(1).occurred_at,
-        run(1).observed_at,
-        {"g1": run(2).occurred_at},
-    )
+    state.assertions["a"] = fact(revisions={"g1": run(2).occurred_at})
     assert [(i.start.key, i.end) for i in derive_assertion(state, "a")] == [("idx2|t2", None)]
     state.defs["x"] = {}  # the target is gone from the membership: the source's edge is stale
     assert derive_assertion(state, "a") == []
@@ -92,3 +100,38 @@ def test_as_of_picks_the_half_open_interval() -> None:
     assert found is not None and found.key == "r1"
     assert interval_at(intervals, run(2).occurred_at) is None
     assert interval_at(intervals, "2026-03-01T11:00:00.000000Z") is None
+
+
+def _relation_state() -> Facts:
+    """Source file `g` (unchanged, revision g1) calls symbol `x`, defined in file `f`."""
+    state = facts([run(1), run(2)], {1: "r1", 2: "r2"}, {2: False})
+    for n in (1, 2):
+        state.members[run(n).key]["g"] = Member("g1", "q.py", "m")
+        state.coverage[run(n).key]["g"] = {"g1": True}
+    state.revision_file["g1"] = "g"
+    state.assertions["a"] = fact(revisions={"g1": run(1).occurred_at})
+    return state
+
+
+def test_a_relation_stays_current_while_its_target_is_unknown() -> None:
+    # the target file got a new revision with degraded coverage: not an explicit absence
+    state = _relation_state()
+    assert [(i.start.key, i.end) for i in derive_assertion(state, "a")] == [("idx1|t1", None)]
+    state.coverage[run(2).key]["f"]["r2"] = True  # complete and without x: now it is stale
+    (item,) = derive_assertion(state, "a")
+    assert item.end is not None and item.end.key == "idx2|t2"
+
+
+def test_the_declared_valid_to_clips_every_interval() -> None:
+    clip = "2026-03-01T12:01:30.000000Z"
+    state = _relation_state()
+    state.assertions["a"] = fact(valid_to=clip, revisions={"g1": run(1).occurred_at})
+    (item,) = derive_assertion(state, "a")
+    assert item.end is not None and item.end.occurred_at == clip
+    assert interval_at([item], "2026-03-01T12:01:20.000000Z") is item
+    assert interval_at([item], clip) is None
+    state.assertions["super"] = fact("POSSIBLY_SUPERSEDES", valid_to=clip)
+    (closed,) = derive_assertion(state, "super")
+    assert closed.end is not None  # a supersession does not stay open forever
+    state.assertions["early"] = fact("POSSIBLY_SUPERSEDES", valid_to=run(1).occurred_at)
+    assert derive_assertion(state, "early") == []  # declared closed before it opened

@@ -10,11 +10,14 @@ Two layers keep every write idempotent and order-independent:
 
    - `(Repository)-[:INDEXED {index_id}]->(Commit|WorkspaceSnapshot)`: one index run (the target
      node is keyed by the commit or by the opaque `snapshot_id`). It carries the run time (the
-     smallest `occurred_at`, the valid time: code events have no commit time) and the latest
-     `code.index.completed` outcome (newest by `(occurred_at, event_id)`).
+     smallest `occurred_at`, the valid time: code events have no commit time).
+   - `(Repository)-[:COMPLETED {index_id, event_id}]->(target)`: one immutable observation per
+     `code.index.completed` event; the latest visible one (by `(occurred_at, event_id)`, within
+     the transaction-time cutoff) is the run's outcome, so a retry never rewrites history.
    - `(FileRevision)-[:MEMBER_OF {index_id, path, module_id}]->(target)`: file membership. The
      path is NOT part of a file revision (a rename keeps the revision), so it lives here.
-   - `(FileRevision)-[:COVERED_IN {index_id}]->(target)`: per-file coverage (`complete`, `losses`).
+   - `(FileRevision)-[:COVERED_IN {index_id, event_id}]->(target)`: one immutable coverage report
+     (`complete`, `losses`) per event; the latest visible one wins, like the outcome.
    - `(SymbolRevision)-[:DEFINED_IN]->(FileRevision)`: symbol membership follows file revisions.
    - `(Assertion)-[:OBSERVED_IN]->(FileRevision)`: the source file revision of an assertion.
    - `(Assertion)-[:DEPENDS_ON]->(Dependency)`: the external module of a dependency assertion.
@@ -66,7 +69,6 @@ from agent_context_platform.projection.projectors import (
     fill_once,
     lock_event_nodes,
     min_non_null,
-    newest_wins,
     node_statement,
     relationship_statement,
 )
@@ -134,6 +136,7 @@ class AssertionFact:
     predicate: str
     object_id: str | None
     valid_from: str
+    valid_to: str | None
     observed_at: str
     revisions: Mapping[str, str]  # source file revision -> when first observed
 
@@ -256,6 +259,21 @@ def derive_symbol(facts: Facts, symbol_id: str) -> list[Interval]:
     return _timeline(facts.runs, lambda run: _symbol_present(facts, symbol_id, run))
 
 
+def _clip(intervals: list[Interval], fact: AssertionFact) -> list[Interval]:
+    """Honor the `valid_to` the assertion itself declares: nothing is valid at or after it."""
+    if fact.valid_to is None:
+        return intervals
+    end = Run("", fact.valid_to, fact.observed_at, True, None)
+    clipped: list[Interval] = []
+    for item in intervals:
+        if item.start.occurred_at >= fact.valid_to:
+            continue
+        if item.end is None or item.end.occurred_at > fact.valid_to:
+            item = Interval(item.key, item.extra, item.start, end)
+        clipped.append(item)
+    return clipped
+
+
 def derive_assertion(facts: Facts, assertion_id: str) -> list[Interval]:
     """Validity intervals of a file-bound assertion; the key is the assertion itself.
 
@@ -265,7 +283,7 @@ def derive_assertion(facts: Facts, assertion_id: str) -> list[Interval]:
     fact = facts.assertions[assertion_id]
     if fact.predicate == SUPERSEDES:
         start = Run("", fact.valid_from, fact.observed_at, True, None)
-        return [Interval(assertion_id, (), start, None)]
+        return _clip([Interval(assertion_id, (), start, None)], fact)
 
     def status(run: Run) -> Status:
         state = _owner_status(facts, run, fact.revisions)
@@ -273,15 +291,13 @@ def derive_assertion(facts: Facts, assertion_id: str) -> list[Interval]:
             return _ABSENT
         if state == "unknown":
             return _UNKNOWN
-        if (
-            fact.family == "relation"
-            and fact.object_id is not None
-            and _symbol_present(facts, fact.object_id, run)[0] != "present"
-        ):
-            return _ABSENT if run.permits_absence else _UNKNOWN
+        if fact.family == "relation" and fact.object_id is not None:
+            target = _symbol_present(facts, fact.object_id, run)[0]
+            if target != "present":  # only an explicit absence closes; unknown stays unknown
+                return _ABSENT if target == "absent" else _UNKNOWN
         return ("present", assertion_id, ())
 
-    return _timeline(facts.runs, status)
+    return _clip(_timeline(facts.runs, status), fact)
 
 
 def interval_at(intervals: Iterable[Interval], valid_at: str) -> Interval | None:
@@ -300,9 +316,12 @@ def interval_at(intervals: Iterable[Interval], valid_at: str) -> Interval | None
 _RUNS: Final[LiteralString] = (
     "MATCH (:Repository {repository_id: $repository_id})-[r:INDEXED]->(t) "
     "RETURN r.index_id AS index_id, coalesce(t.commit_id, t.snapshot_id) AS target_id, "
-    "r.occurred_at AS occurred_at, r.observed_at AS observed_at, "
-    "r.outcome_order IS NOT NULL AS completed, r.error_class AS error_class, "
-    "r.outcome_observed_at AS outcome_observed_at"
+    "r.occurred_at AS occurred_at, r.observed_at AS observed_at"
+)
+_OUTCOMES: Final[LiteralString] = (
+    "MATCH (:Repository {repository_id: $repository_id})-[c:COMPLETED]->(t) "
+    "RETURN c.index_id AS index_id, coalesce(t.commit_id, t.snapshot_id) AS target_id, "
+    "c.error_class AS error_class, c.event_order AS event_order, c.observed_at AS observed_at"
 )
 _MEMBERS: Final[LiteralString] = (
     "MATCH (fr:FileRevision)-[m:MEMBER_OF]->(t) WHERE fr.file_id IN $files "
@@ -314,7 +333,7 @@ _COVERAGE: Final[LiteralString] = (
     "MATCH (fr:FileRevision)-[c:COVERED_IN]->(t) WHERE fr.file_id IN $files "
     "RETURN fr.file_revision_id AS revision_id, fr.file_id AS file_id, c.index_id AS index_id, "
     "coalesce(t.commit_id, t.snapshot_id) AS target_id, c.complete AS complete, "
-    "c.observed_at AS observed_at"
+    "c.observed_at AS observed_at, c.event_order AS event_order"
 )
 _DEFS: Final[LiteralString] = (
     "MATCH (sr:SymbolRevision)-[d:DEFINED_IN]->(fr:FileRevision) WHERE sr.symbol_id IN $symbols "
@@ -326,6 +345,7 @@ _ASSERTIONS: Final[LiteralString] = (
     "OPTIONAL MATCH (a)-[o:OBSERVED_IN]->(fr:FileRevision) "
     "RETURN a.assertion_id AS assertion_id, a.family AS family, a.subject_id AS subject_id, "
     "a.predicate AS predicate, a.object_id AS object_id, a.valid_from AS valid_from, "
+    "a.asserted_valid_to AS valid_to, "
     "a.recorded_from AS recorded_from, fr.file_revision_id AS revision_id, "
     "fr.file_id AS file_id, o.observed_at AS observed_at, o.occurred_at AS since"
 )
@@ -355,17 +375,27 @@ async def load_facts(
 
     facts = Facts()
     runs = (await tx.run(_RUNS, parameters={"repository_id": repository_id})).records
+    # Every completion is its own immutable observation; the latest one visible at the cutoff
+    # (by `(occurred_at, event_id)`) is the run's outcome, so a retry never rewrites history.
+    outcomes: dict[str, tuple[str, str | None]] = {}
+    for row in (await tx.run(_OUTCOMES, parameters={"repository_id": repository_id})).records:
+        outcome_key = _run_key(row["index_id"], row["target_id"])
+        if seen(row["observed_at"]) and (
+            outcome_key not in outcomes or row["event_order"] > outcomes[outcome_key][0]
+        ):
+            outcomes[outcome_key] = (row["event_order"], row["error_class"])
     for row in runs:
         if not seen(row["observed_at"]):
             continue
-        completed = bool(row["completed"]) and seen(row["outcome_observed_at"])
+        run_key = _run_key(row["index_id"], row["target_id"])
+        outcome = outcomes.get(run_key)
         facts.runs.append(
             Run(
-                _run_key(row["index_id"], row["target_id"]),
+                run_key,
                 row["occurred_at"],
                 row["observed_at"],
-                completed,
-                row["error_class"] if completed else None,
+                outcome is not None,
+                None if outcome is None else outcome[1],
             )
         )
     facts.runs.sort(key=lambda run: run.order)
@@ -376,6 +406,7 @@ async def load_facts(
     done_symbols: set[str] = set()
     done_assertions: set[str] = set()
     pending: dict[str, dict[str, Any]] = {}
+    latest: dict[tuple[str, str], str] = {}  # newest coverage report seen per (run, revision)
     while (
         want_files - done_files or want_symbols - done_symbols or want_assertions - done_assertions
     ):
@@ -429,9 +460,11 @@ async def load_facts(
                 if run_key not in visible or not seen(row["observed_at"]):
                     continue
                 facts.revision_file[row["revision_id"]] = row["file_id"]
-                facts.coverage.setdefault(run_key, {}).setdefault(row["file_id"], {})[
-                    row["revision_id"]
-                ] = bool(row["complete"])
+                reported = facts.coverage.setdefault(run_key, {}).setdefault(row["file_id"], {})
+                coverage_key = (run_key, row["revision_id"])
+                if coverage_key not in latest or row["event_order"] > latest[coverage_key]:
+                    latest[coverage_key] = row["event_order"]
+                    reported[row["revision_id"]] = bool(row["complete"])
     for assertion_id, item in pending.items():
         row = item["row"]
         if row["valid_from"] is None or not seen(row["recorded_from"]):
@@ -442,6 +475,7 @@ async def load_facts(
             row["predicate"],
             row["object_id"],
             row["valid_from"],
+            row["valid_to"],
             row["recorded_from"],
             item["revisions"],
         )
@@ -481,15 +515,27 @@ def _fact_statement(
     )
 
 
-def _run_statement(label: LiteralString, key: LiteralString, completed: bool) -> LiteralString:
-    head = (
+def _run_statement(label: LiteralString, key: LiteralString) -> LiteralString:
+    return (
+        (
+            "MATCH (a:Repository {repository_id: $source_id}) "
+            f"MATCH (b:{label} {{{key}: $target_id}}) "
+            "MERGE (a)-[n:INDEXED {index_id: $index_id}]->(b) WITH n "
+        )
+        + min_non_null("occurred_at", "observed_at")
+        + _PROVENANCE
+    )
+
+
+def _completed_statement(label: LiteralString, key: LiteralString) -> LiteralString:
+    """One immutable observation per `code.index.completed` event."""
+    return (
         "MATCH (a:Repository {repository_id: $source_id}) "
         f"MATCH (b:{label} {{{key}: $target_id}}) "
-        "MERGE (a)-[n:INDEXED {index_id: $index_id}]->(b) WITH n "
-    ) + min_non_null("occurred_at", "observed_at")
-    if completed:
-        head += " " + newest_wins("outcome", "success", "error_class", "outcome_observed_at")
-    return head + _PROVENANCE
+        "MERGE (a)-[n:COMPLETED {index_id: $index_id, event_id: $event_id}]->(b) WITH n "
+        + fill_once("success", "error_class", "event_order", "occurred_at", "observed_at")
+        + _PROVENANCE
+    )
 
 
 _FILE_REVISION: Final = node_statement("FileRevision", "file_revision_id") + fill_once("file_id")
@@ -601,18 +647,20 @@ async def _write_run_event(
     kind = event.event_type
     run = {**base, "source_id": repository_id, "target_id": target, "index_id": payload.index_id}
     run |= {"occurred_at": occurred, "observed_at": observed}
+    await tx.run(_run_statement(label, key), parameters=run)
     if kind in ("code.index.started", "code.index.completed"):
-        completed = kind == "code.index.completed"
-        run |= {
-            "order": event_order(event),
-            "success": getattr(payload, "success", None),
-            "error_class": getattr(payload, "error_class", None),
-            "outcome_observed_at": observed,
-        }
-        await tx.run(_run_statement(label, key, completed), parameters=run)
+        if kind == "code.index.completed":
+            await tx.run(
+                _completed_statement(label, key),
+                parameters=run
+                | {
+                    "event_order": event_order(event),
+                    "success": payload.success,
+                    "error_class": payload.error_class,
+                },
+            )
         scope.everything = True
         return
-    await tx.run(_run_statement(label, key, False), parameters=run)
     link = {
         **base,
         "source_id": payload.file_revision_id,
@@ -637,14 +685,14 @@ async def _write_run_event(
                 "COVERED_IN",
                 label,
                 key,
-                "index_id: $index_id",
-                newest_wins("coverage", "complete", "losses")
+                "index_id: $index_id, event_id: $event_id",
+                fill_once("complete", "losses", "event_order")
                 + " WITH n "
                 + min_non_null("observed_at"),
             ),
             parameters={
                 **link,
-                "order": event_order(event),
+                "event_order": event_order(event),
                 "complete": payload.complete,
                 "losses": sorted(str(loss.value) for loss in payload.losses),
             },
