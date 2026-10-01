@@ -1025,3 +1025,51 @@ def test_recorded_times_are_the_evidence_observation_times(tmp_path: Path) -> No
         assert await ask(4) is None  # recorded at t4, as materialized
 
     with_graph(body)
+
+
+def scip_named(qualified_name: str) -> Callable[[EventDraftV1], EventDraftV1]:
+    """Give the symbol a SCIP identity: its ID no longer derives from the module path."""
+
+    def tweak(draft: EventDraftV1) -> EventDraftV1:
+        payload = dict(draft.payload)
+        if (
+            draft.event_type == "code.symbol.indexed"
+            and payload["qualified_name"] == qualified_name
+        ):
+            payload["scip_symbol"] = "scip-python python test 0 `pkg.c`/k()."
+        return draft.model_copy(update={"payload": payload})
+
+    return tweak
+
+
+def test_a_rename_closes_name_derived_symbols_but_keeps_scip_identified_ones(
+    tmp_path: Path,
+) -> None:
+    line = Timeline(tmp_path)
+    repo = line.repo
+    repo.write("pkg/c.py", C)
+    repo.write("pkg/b.py", "from .c import k\n\n\ndef g():\n    return k()\n")
+    repo.commit()
+    first = line.index(1, tweak=scip_named("pkg.c.k"))
+    repo.git("mv", "pkg/c.py", "pkg/d.py")
+    line.lineage["pkg/d.py"] = line.lineage["pkg/c.py"]
+    repo.commit()
+    second = line.index(2)
+    events = [*first, *second]
+    names = Names()
+
+    async def body(store: Neo4jStore) -> None:
+        digests = set()
+        for ordered in orders(events).values():
+            await wipe(store)
+            await deliver(store, ordered)
+            digests.add(digest(await graph_state(store)))
+        assert len(digests) == 1
+        state = await summary(store, names)
+        assert state["symbols"]["pkg.c"] == {"current": False, "rows": [("t1", "t2")]}  # path-named
+        assert state["symbols"]["pkg.c.k"] == {"current": True, "rows": [("t1", None)]}  # SCIP
+        assert state["symbols"]["pkg.d.k"] == {"current": True, "rows": [("t2", None)]}
+        incoming = [e for e in state["assertions"] if e[0] == "CALLS" and e[2] == "pkg.c.k"]
+        assert [e[4] for e in incoming] == [True]  # the relation into the SCIP symbol stays
+
+    with_graph(body)

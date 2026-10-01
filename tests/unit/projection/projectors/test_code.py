@@ -16,6 +16,7 @@ from agent_context_platform.projection.projectors.code import (
     derive_symbol,
     interval_at,
     is_current,
+    resolve_edges,
 )
 
 pytestmark = pytest.mark.unit
@@ -174,3 +175,65 @@ def test_recorded_times_come_from_the_evidence_not_the_run() -> None:
     (item,) = derive_symbol(state, "x")
     assert item.recorded_from == "2026-03-01T12:01:10.000000Z"
     assert item.recorded_to == late
+
+
+def _current(
+    aid: str, subject: str, predicate: str, obj: str, kind: str, confidence: float
+) -> dict:  # type: ignore[type-arg]
+    return {
+        "assertion_id": aid,
+        "subject_id": subject,
+        "predicate": predicate,
+        "object_id": obj,
+        "evidence_kind": kind,
+        "confidence": confidence,
+        "deterministic": kind == "scip",
+        "extractor_name": "x",
+        "extractor_version": "1",
+        "valid_from": "t",
+        "review_status": "unreviewed",
+    }
+
+
+def test_evidence_competes_within_a_triple_not_across_objects() -> None:
+    edges = resolve_edges(
+        [
+            _current("a1", "f", "CALLS", "g", "scip", 1.0),
+            _current("a2", "f", "CALLS", "h", "tree_sitter", 0.5),
+            _current("a3", "f", "CALLS", "g", "tree_sitter", 0.5),  # lower evidence, same triple
+            _current("d1", "file", "DEFINES", "s1", "tree_sitter", 0.9),
+            _current("d2", "file", "DEFINES", "s2", "tree_sitter", 0.9),
+            _current("i1", "file", "IMPORTS", "m", "tree_sitter", 0.9),
+        ]
+    )
+    assert sorted(edges) == [
+        ("f", "CALLS", "g"),
+        ("f", "CALLS", "h"),
+        ("file", "DEFINES", "s1"),
+        ("file", "DEFINES", "s2"),
+        ("file", "IMPORTS", "m"),
+    ]
+    assert all(edge["resolved"] for edge in edges.values())
+    call = edges[("f", "CALLS", "g")]
+    assert (call["evidence_kind"], call["resolved_assertion_id"]) == ("scip", "a1")
+    assert call["lower_evidence_assertion_ids"] == ["a3"] and call["assertion_ids"] == ["a1", "a3"]
+    assert edges[("f", "CALLS", "h")]["evidence_kind"] == "tree_sitter"
+
+
+def test_a_rename_closes_path_named_items_but_not_path_independent_ones() -> None:
+    runs = [run(1), run(2)]
+    state = Facts(runs=runs)
+    state.members[runs[0].key] = {"f": Member("r1", "c.py", "m")}
+    state.members[runs[1].key] = {"f": Member("r1", "d.py", "m")}  # same revision, new path
+    state.coverage = {r.key: {"f": {"r1": True}} for r in runs}
+    state.revision_file["r1"] = "f"
+    state.claimed["r1"] = {runs[0].key, runs[1].key}  # claimed anew under the new path
+    for item in ("scip-symbol", "named-symbol"):
+        state.defs[item] = {"r1": f"{item}-rev"}
+        state.since[(item, "r1")] = runs[0].occurred_at
+        state.claim_run[(item, "r1")] = runs[0].key
+    state.path_bound.add("named-symbol")  # identity derived from the module path
+    (kept,) = derive_symbol(state, "scip-symbol")
+    assert kept.end is None
+    (closed,) = derive_symbol(state, "named-symbol")
+    assert closed.end is not None and closed.end.key == runs[1].key

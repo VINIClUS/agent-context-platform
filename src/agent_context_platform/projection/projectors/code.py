@@ -157,6 +157,7 @@ class Facts:
     claim_run: dict[tuple[str, str], str] = field(default_factory=dict)  # (item, revision) -> run
     claim_observed: dict[tuple[str, str], str] = field(default_factory=dict)  # (item, rev) -> tx
     claimed: dict[str, set[str]] = field(default_factory=dict)  # revision -> runs that claim for it
+    path_bound: set[str] = field(default_factory=set)  # items whose identity derives from the path
     assertions: dict[str, AssertionFact] = field(default_factory=dict)
 
     @property
@@ -217,10 +218,13 @@ def _path_matches(facts: Facts, item: str, member: Member) -> bool:
     """Does `item`'s claim on `member`'s file revision belong to the path it has now?
 
     The path is not part of a file revision (a rename keeps it), but identities derived from the
-    path (a qualified name) are claimed anew under the new path. So when a revision is claimed
-    under more than one path, each claim holds only while the file is at the path it was made at.
-    A revision claimed under one path (identities that do not depend on it) keeps all its claims.
+    path (a qualified name) are claimed anew under the new path. So an item whose own identity is
+    path-derived holds only while the file is at the path it was claimed at, once its revision is
+    claimed under more than one path. Items with a path-independent identity (a SCIP symbol, a
+    file) keep their claim; so does anything on a revision claimed under a single path.
     """
+    if item not in facts.path_bound:
+        return True  # its identity does not derive from the path: a rename does not touch it
     file_id = facts.revision_file[member.revision_id]
 
     def path_of(run_key: str) -> str | None:
@@ -418,7 +422,7 @@ _DEFS: Final[LiteralString] = (
     "MATCH (sr:SymbolRevision)-[d:DEFINED_IN]->(fr:FileRevision) WHERE sr.symbol_id IN $symbols "
     "RETURN sr.symbol_id AS symbol_id, sr.symbol_revision_id AS symbol_revision_id, "
     "fr.file_revision_id AS revision_id, fr.file_id AS file_id, d.observed_at AS observed_at, d.occurred_at AS since, "
-    "d.index_id AS index_id, d.claim_target AS target_id"
+    "d.index_id AS index_id, d.claim_target AS target_id, sr.scip_symbol AS scip_symbol"
 )
 _ASSERTIONS: Final[LiteralString] = (
     "MATCH (a:Assertion) WHERE a.assertion_id IN $ids "
@@ -521,6 +525,7 @@ async def load_facts(
                     continue
                 if row["family"] == "relation" and row["object_id"] is not None:
                     want_symbols.add(row["object_id"])
+                want_symbols.add(row["subject_id"])  # to know whether its identity is path-derived
         new_symbols = sorted(want_symbols - done_symbols)
         done_symbols |= set(new_symbols)
         if new_symbols:
@@ -529,6 +534,10 @@ async def load_facts(
                 if not seen(row["observed_at"]):
                     continue
                 key = (row["symbol_id"], row["revision_id"])
+                if (
+                    row["scip_symbol"] is None
+                ):  # named from the module path by the structural parser
+                    facts.path_bound.add(row["symbol_id"])
                 if key not in facts.since or row["since"] < facts.since[key]:
                     facts.since[key] = row["since"]
                     facts.claim_run[key] = _run_key(row["index_id"], row["target_id"])
@@ -572,6 +581,10 @@ async def load_facts(
         row = item["row"]
         if row["valid_from"] is None or not seen(row["recorded_from"]):
             continue  # only a stub from an observation: the assertion itself is not recorded
+        if row["subject_id"] in facts.path_bound or (
+            row["family"] == "relation" and row["object_id"] in facts.path_bound
+        ):
+            facts.path_bound.add(assertion_id)
         facts.assertions[assertion_id] = AssertionFact(
             row["family"],
             row["subject_id"],
@@ -1160,25 +1173,34 @@ async def _write_edges(tx: Neo4jTransaction, repository_id: str, subjects: set[s
             parameters={"repository_id": repository_id, "subjects": ordered},
         )
     ).records
+    for (subject, predicate, obj), props in resolve_edges([row["props"] for row in rows]).items():
+        await tx.run(
+            _EDGES[predicate],
+            parameters={"subject_id": subject, "object_id": obj, "props": props},
+        )
+
+
+def resolve_edges(
+    current: Iterable[dict[str, Any]],
+) -> dict[tuple[str, str, str], dict[str, Any]]:
+    """One resolved edge per (subject, predicate, object) among the current assertions.
+
+    Evidence competes only within a triple: CALLS, IMPORTS and DEFINES are not functional, so a
+    SCIP edge to `g` says nothing against a heuristic edge to `h`. Within a triple the best
+    evidence (SCIP, then syntactic, then heuristic; then confidence) decides the edge; the lower
+    ones are kept on their nodes and listed as `lower_evidence_assertion_ids`.
+    """
     triples: dict[tuple[str, str, str], list[dict[str, Any]]] = {}
-    for row in rows:
-        props: dict[str, Any] = row["props"]
+    for props in current:
         if props["predicate"] in _EDGES and props.get("object_id") is not None:
             triples.setdefault(
                 (props["subject_id"], props["predicate"], props["object_id"]), []
             ).append(props)
-    best_rank: dict[tuple[str, str], tuple[int, float]] = {}
-    winners: dict[tuple[str, str, str], dict[str, Any]] = {}
-    for triple, group in triples.items():
-        winner = min(group, key=lambda p: (-_rank(p)[0], -_rank(p)[1], p["assertion_id"]))
-        winners[triple] = winner
-        pair = (triple[0], triple[1])
-        best_rank[pair] = max(best_rank.get(pair, (0, 0.0)), _rank(winner))
+    edges: dict[tuple[str, str, str], dict[str, Any]] = {}
     for triple in sorted(triples):
-        subject, predicate, obj = triple
-        winner = winners[triple]
         group = triples[triple]
-        props = {
+        winner = min(group, key=lambda p: (-_rank(p)[0], -_rank(p)[1], p["assertion_id"]))
+        edges[triple] = {
             "assertion_ids": sorted(p["assertion_id"] for p in group),
             "source_event_ids": sorted({e for p in group for e in p.get("source_event_ids", [])}),
             "source_event_id": winner.get("source_event_id"),
@@ -1190,12 +1212,13 @@ async def _write_edges(tx: Neo4jTransaction, repository_id: str, subjects: set[s
             "valid_from": winner["valid_from"],
             "recorded_from": winner.get("recorded_from"),
             "review_status": winner["review_status"],
-            "resolved": _rank(winner) == best_rank[(subject, predicate)],
+            "resolved": True,
+            "resolved_assertion_id": winner["assertion_id"],
+            "lower_evidence_assertion_ids": sorted(
+                p["assertion_id"] for p in group if p is not winner
+            ),
         }
-        await tx.run(
-            _EDGES[predicate],
-            parameters={"subject_id": subject, "object_id": obj, "props": props},
-        )
+    return edges
 
 
 _SCOPE_OF_FILES: Final[LiteralString] = (
