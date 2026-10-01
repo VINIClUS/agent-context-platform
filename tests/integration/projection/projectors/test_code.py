@@ -120,6 +120,7 @@ def index_events(
     observed: datetime | None = None,
     seen: set[str] | None = None,
     tweak: Callable[[EventDraftV1], EventDraftV1] | None = None,
+    observed_by_type: dict[str, datetime] | None = None,
 ) -> list[StoredEventV1]:
     """Sealed events of indexing HEAD at `when`; keys already in `seen` are replays (skipped)."""
     scan = scan_repository(repo.root)
@@ -134,9 +135,8 @@ def index_events(
     )
     drafts = service.index(scan, None, list(structural.files), file_logical_ids=lineage)
     changed = [d if tweak is None else rekey(tweak(d)) for d in drafts]
-    return seal(
-        [d for d in changed if seen is None or d.idempotency_key not in seen], when, observed
-    )
+    fresh = [d for d in changed if seen is None or d.idempotency_key not in seen]
+    return seal(fresh, when, observed, observed_by_type)
 
 
 def rekey(draft: EventDraftV1) -> EventDraftV1:
@@ -146,11 +146,20 @@ def rekey(draft: EventDraftV1) -> EventDraftV1:
 
 
 def seal(
-    drafts: Sequence[EventDraftV1], when: datetime, observed: datetime | None = None
+    drafts: Sequence[EventDraftV1],
+    when: datetime,
+    observed: datetime | None = None,
+    observed_by_type: dict[str, datetime] | None = None,
 ) -> list[StoredEventV1]:
+    by_type = observed_by_type or {}
     return [
         seal_event(
-            d.model_copy(update={"occurred_at": when, "observed_at": observed or when}),
+            d.model_copy(
+                update={
+                    "occurred_at": when,
+                    "observed_at": by_type.get(d.event_type, observed or when),
+                }
+            ),
             [],
             1,
             None,
@@ -376,6 +385,7 @@ class Timeline:
         *,
         observed: int | None = None,
         tweak: Callable[[EventDraftV1], EventDraftV1] | None = None,
+        observed_by_type: dict[str, datetime] | None = None,
     ) -> list[StoredEventV1]:
         head = self.repo.git("rev-parse", "HEAD")
         paths = [p for p in self.repo.git("ls-files").splitlines() if p.endswith(".py")]
@@ -388,6 +398,7 @@ class Timeline:
             observed=None if observed is None else at(observed),
             seen=self.seen,
             tweak=tweak,
+            observed_by_type=observed_by_type,
         )
         self.seen |= {e.idempotency_key for e in events}
         self.runs.append(events)
@@ -422,16 +433,25 @@ def build_timeline(tmp: Path) -> tuple[Timeline, dict[str, list[StoredEventV1]]]
     return line, runs
 
 
-def supersession_events(line: Timeline) -> list[StoredEventV1]:
+def supersession_events(
+    line: Timeline,
+    *,
+    name: str = "supersedes-1",
+    valid_from: datetime | None = None,
+    valid_to: datetime | None = None,
+    number: int = 0xA007,
+) -> list[StoredEventV1]:
     old, new = line.known["pkg/a.py"], line.known["pkg/b.py"]
+    valid_from = valid_from or at(7)
     payload = CodeRelationAssertedV1(
-        assertion_id="supersedes-1",
+        assertion_id=name,
         evidence_kind=DeterministicEvidenceKind.GIT,
         deterministic=True,
         extractor_name="agent-context-platform-indexer",
         extractor_version="1",
         confidence=1.0,
-        valid_from=at(7),
+        valid_from=valid_from,
+        valid_to=valid_to,
         index_id="idx-supersession",
         subject_id=str(new),
         predicate=CodeRelationPredicate.POSSIBLY_SUPERSEDES,
@@ -440,15 +460,15 @@ def supersession_events(line: Timeline) -> list[StoredEventV1]:
     draft = EventDraftV1.model_validate(
         {
             **line.runs[0][0].model_dump(include={"stream_id", "producer", "redaction", "context"}),
-            "event_id": uuid.UUID("0198a4b1-98c0-7c28-ae3f-00000000a007"),
+            "event_id": uuid.UUID(f"0198a4b1-98c0-7c28-ae3f-{number:012x}"),
             "event_type": "code.relation.asserted",
-            "occurred_at": at(7),
-            "observed_at": at(7),
+            "occurred_at": valid_from,
+            "observed_at": valid_from,
             "payload": payload.model_dump(mode="json"),
-            "idempotency_key": "supersession-1",
+            "idempotency_key": name,
         }
     )
-    return seal([draft], at(7))
+    return seal([draft], valid_from)
 
 
 def test_golden_graph_after_each_index(tmp_path: Path) -> None:
@@ -900,5 +920,108 @@ def test_a_degraded_target_file_does_not_close_the_relation_into_it(tmp_path: Pa
         calls = [e for e in state["assertions"] if e[0] == "CALLS"]
         assert calls == [("CALLS", "pkg.b.g", "pkg.a.f", "tree_sitter", True, ("12:01:00/",))]
         assert state["symbols"]["pkg.a.f"]["current"] is True  # unknown, not absent
+
+    with_graph(body)
+
+
+def test_current_is_valid_at_the_latest_run_so_a_future_valid_to_stays_current(
+    tmp_path: Path,
+) -> None:
+    line, _ = build_timeline(tmp_path)  # runs up to t6
+    future = supersession_events(
+        line, name="future", valid_from=at(2), valid_to=at(20), number=0xA101
+    )
+    past = supersession_events(line, name="past", valid_from=at(2), valid_to=at(3), number=0xA102)
+    events = [*line.all_events(), *future, *past]
+
+    async def flags(store: Neo4jStore) -> dict[str, Any]:
+        async def read(tx: Neo4jTransaction) -> dict[str, Any]:
+            rows = (
+                await tx.run(
+                    "MATCH (a:Assertion) WHERE a.assertion_id IN ['future', 'past'] "
+                    "RETURN a.assertion_id AS id, a.current AS current, a.valid_to AS valid_to",
+                    parameters={},
+                )
+            ).records
+            edges = (
+                await tx.run(
+                    "MATCH ()-[r:POSSIBLY_SUPERSEDES]->() RETURN r.assertion_ids AS ids",
+                    parameters={},
+                )
+            ).records
+            return {
+                "flags": {r["id"]: (r["current"], r["valid_to"]) for r in rows},
+                "edges": sorted(i for r in edges for i in r["ids"]),
+            }
+
+        return await store.execute_read(read)
+
+    async def body(store: Neo4jStore) -> None:
+        digests = set()
+        for ordered in orders(events).values():  # the horizon moves as runs arrive
+            await wipe(store)
+            await deliver(store, ordered)
+            digests.add(digest(await graph_state(store)))
+        assert len(digests) == 1
+        state = await flags(store)
+        assert state["flags"] == {
+            "future": (True, timestamp(at(20))),  # valid beyond the newest run: still current
+            "past": (False, timestamp(at(3))),  # closed before the newest run
+        }
+        assert state["edges"] == ["future"]  # only the current assertion is an edge
+
+    with_graph(body)
+
+
+def test_recorded_times_are_the_evidence_observation_times(tmp_path: Path) -> None:
+    line = Timeline(tmp_path)
+    repo = line.repo
+    repo.write("pkg/a.py", A0)
+    repo.write("pkg/b.py", B)
+    repo.commit()
+    first = line.index(1)
+    repo.git("rm", "-q", "pkg/b.py")
+    repo.commit()
+    # the run starts and lists its files at t2, but its completion and coverage (the evidence of
+    # b's absence) are only observed at t4
+    second = line.index(
+        2, observed_by_type={"code.file.coverage_reported": at(4), "code.index.completed": at(4)}
+    )
+    b_id = str(line.known["pkg/b.py"])
+
+    async def body(store: Neo4jStore) -> None:
+        await deliver(store, [*first, *second])
+
+        async def rows(tx: Neo4jTransaction) -> list[Any]:
+            return (
+                await tx.run(
+                    "MATCH (:File {file_id: $id})-[h:HAS_REVISION]->() "
+                    "RETURN h.valid_to AS vt, h.recorded_from AS rf, h.recorded_to AS rt",
+                    parameters={"id": b_id},
+                )
+            ).records
+
+        (row,) = await store.execute_read(rows)
+        assert (row["vt"], row["rf"], row["rt"]) == (
+            timestamp(at(2)),
+            timestamp(at(1)),
+            timestamp(at(4)),
+        )
+
+        async def ask(recorded: int) -> str | None:
+            async def read(tx: Neo4jTransaction) -> str | None:
+                return await entity_as_of(
+                    tx,
+                    REPO,
+                    "file",
+                    b_id,
+                    valid_at=at(2) + timedelta(seconds=30),
+                    recorded_at=at(recorded) + timedelta(seconds=30),
+                )
+
+            return await store.execute_read(read)
+
+        assert await ask(3) is not None  # the closure was not recorded yet
+        assert await ask(4) is None  # recorded at t4, as materialized
 
     with_graph(body)

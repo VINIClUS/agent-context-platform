@@ -47,7 +47,7 @@ paths, digests and IDs.
 from __future__ import annotations
 
 from collections.abc import Callable, Iterable, Mapping
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime
 from typing import Any, Final, Literal, LiteralString
 
@@ -112,6 +112,7 @@ class Run:
     observed_at: str
     completed: bool
     error_class: str | None
+    outcome_observed_at: str = ""  # when the outcome that `completed` reports was observed
 
     @property
     def permits_absence(self) -> bool:
@@ -127,6 +128,7 @@ class Member:
     revision_id: str
     path: str
     module_id: str
+    observed_at: str = ""
 
 
 @dataclass(frozen=True, slots=True)
@@ -148,27 +150,43 @@ class Facts:
     runs: list[Run] = field(default_factory=list)
     members: dict[str, dict[str, Member]] = field(default_factory=dict)
     coverage: dict[str, dict[str, dict[str, bool]]] = field(default_factory=dict)
+    coverage_observed: dict[tuple[str, str], str] = field(default_factory=dict)  # (run, rev)
     revision_file: dict[str, str] = field(default_factory=dict)
     defs: dict[str, dict[str, str]] = field(default_factory=dict)  # symbol -> revision -> SR
     since: dict[tuple[str, str], str] = field(default_factory=dict)  # (item, revision) -> time
     claim_run: dict[tuple[str, str], str] = field(default_factory=dict)  # (item, revision) -> run
+    claim_observed: dict[tuple[str, str], str] = field(default_factory=dict)  # (item, rev) -> tx
     claimed: dict[str, set[str]] = field(default_factory=dict)  # revision -> runs that claim for it
     assertions: dict[str, AssertionFact] = field(default_factory=dict)
+
+    @property
+    def horizon(self) -> str:
+        """The latest valid time the graph knows: the newest run's."""
+        return max((run.occurred_at for run in self.runs), default="")
 
 
 @dataclass(frozen=True, slots=True)
 class Interval:
-    """A validity interval `[start, end)` of `key` (a revision ID, or the assertion itself)."""
+    """A validity interval `[start, end)` of `key` (a revision ID, or the assertion itself).
+
+    `recorded_from`/`recorded_to` are the transaction times at which the evidence that opened
+    and closed it was observed (membership, claim, outcome, coverage), not the run's own.
+    """
 
     key: str
     extra: tuple[str, ...]
     start: Run
     end: Run | None
+    recorded_from: str = ""
+    recorded_to: str | None = None
 
 
-type Status = tuple[Literal["present"], str, tuple[str, ...]] | tuple[Literal["absent", "unknown"]]
+type Status = (
+    tuple[Literal["present"], str, tuple[str, ...], str]
+    | tuple[Literal["absent"], str]
+    | tuple[Literal["unknown"]]
+)
 _UNKNOWN: Final[Status] = ("unknown",)
-_ABSENT: Final[Status] = ("absent",)
 
 
 def _timeline(runs: Iterable[Run], status: Callable[[Run], Status]) -> list[Interval]:
@@ -181,15 +199,15 @@ def _timeline(runs: Iterable[Run], status: Callable[[Run], Status]) -> list[Inte
             continue
         if state[0] == "absent":
             if open_ is not None:
-                done.append(Interval(open_.key, open_.extra, open_.start, run))
+                done.append(replace(open_, end=run, recorded_to=state[1]))
                 open_ = None
             continue
-        _, key, extra = state
+        _, key, extra, seen_at = state
         if open_ is not None and (open_.key, open_.extra) == (key, extra):
             continue
         if open_ is not None:
-            done.append(Interval(open_.key, open_.extra, open_.start, run))
-        open_ = Interval(key, extra, run, None)
+            done.append(replace(open_, end=run, recorded_to=seen_at))
+        open_ = Interval(key, extra, run, None, seen_at)
     if open_ is not None:
         done.append(open_)
     return done
@@ -233,39 +251,53 @@ def _live(facts: Facts, run: Run, item: str, owners: Mapping[str, str]) -> list[
 
 def _owner_status(
     facts: Facts, run: Run, item: str, owners: Mapping[str, str]
-) -> Literal["present", "absent", "unknown"]:
+) -> tuple[Literal["present", "absent", "unknown"], str]:
     """Is `item`, claimed by the file revisions `owners`, in `run`'s membership?
 
     `owners` maps each owning file revision to when the claim was first observed: a claim made
     later than the run is not part of it. Present when a claim holds (`_live`). Otherwise absent
     only when absence may be inferred for the run AND every owning file is gone from it or has a
     member revision whose coverage is complete; anything else (a degraded or uncovered file) is
-    unknown.
+    unknown. The second value is the latest transaction time of the evidence used.
     """
-    if _live(facts, run, item, owners):
-        return "present"
-    if not run.permits_absence:
-        return "unknown"
+    live = _live(facts, run, item, owners)
     in_run = facts.members.get(run.key, {})
+    if live:
+        revision = live[0]
+        holder = in_run[facts.revision_file[revision]]
+        return "present", max(holder.observed_at, facts.claim_observed.get((item, revision), ""))
+    if not run.permits_absence:
+        return "unknown", ""
     covered = facts.coverage.get(run.key, {})
+    evidence = run.outcome_observed_at
     for file_id in {facts.revision_file[r] for r in owners if r in facts.revision_file}:
         member = in_run.get(file_id)
         if member is not None:
             if not covered.get(file_id, {}).get(member.revision_id, False):
-                return "unknown"
+                return "unknown", ""
+            evidence = max(
+                evidence,
+                member.observed_at,
+                facts.coverage_observed.get((run.key, member.revision_id), ""),
+            )
         elif file_id in covered:
-            return "unknown"  # seen but not indexed: never an absence
-    return "absent"
+            return "unknown", ""  # seen but not indexed: never an absence
+    return "absent", evidence
 
 
 def derive_file(facts: Facts, file_id: str) -> list[Interval]:
     def status(run: Run) -> Status:
         member = facts.members.get(run.key, {}).get(file_id)
         if member is not None:
-            return ("present", member.revision_id, (member.path, member.module_id))
+            return (
+                "present",
+                member.revision_id,
+                (member.path, member.module_id),
+                member.observed_at,
+            )
         if file_id in facts.coverage.get(run.key, {}) or not run.permits_absence:
             return _UNKNOWN
-        return _ABSENT
+        return ("absent", run.outcome_observed_at)
 
     return _timeline(facts.runs, status)
 
@@ -273,11 +305,13 @@ def derive_file(facts: Facts, file_id: str) -> list[Interval]:
 def _symbol_present(facts: Facts, symbol_id: str, run: Run) -> Status:
     owners = facts.defs.get(symbol_id, {})
     since = {r: facts.since[(symbol_id, r)] for r in owners}
-    state = _owner_status(facts, run, symbol_id, since)
-    if state != "present":
-        return _UNKNOWN if state == "unknown" else _ABSENT
+    state, evidence = _owner_status(facts, run, symbol_id, since)
+    if state == "unknown":
+        return _UNKNOWN
+    if state == "absent":
+        return ("absent", evidence)
     live = sorted(owners[r] for r in _live(facts, run, symbol_id, since))
-    return ("present", live[0], ())
+    return ("present", live[0], (), evidence)
 
 
 def derive_symbol(facts: Facts, symbol_id: str) -> list[Interval]:
@@ -285,16 +319,23 @@ def derive_symbol(facts: Facts, symbol_id: str) -> list[Interval]:
 
 
 def _clip(intervals: list[Interval], fact: AssertionFact) -> list[Interval]:
-    """Honor the `valid_to` the assertion itself declares: nothing is valid at or after it."""
-    if fact.valid_to is None:
-        return intervals
-    end = Run("", fact.valid_to, fact.observed_at, True, None)
+    """Honor what the assertion itself declares: nothing is valid before `valid_from` or at or
+    after `valid_to` (an interval opened by an earlier run starts at `valid_from`)."""
     clipped: list[Interval] = []
     for item in intervals:
-        if item.start.occurred_at >= fact.valid_to:
-            continue
-        if item.end is None or item.end.occurred_at > fact.valid_to:
-            item = Interval(item.key, item.extra, item.start, end)
+        if fact.valid_to is not None:
+            if item.start.occurred_at >= fact.valid_to:
+                continue
+            if item.end is None or item.end.occurred_at > fact.valid_to:
+                end = Run("", fact.valid_to, fact.observed_at, True, None)
+                item = replace(item, end=end, recorded_to=fact.observed_at)
+        if item.start.occurred_at < fact.valid_from:
+            if item.end is not None and item.end.occurred_at <= fact.valid_from:
+                continue
+            start = Run("", fact.valid_from, fact.observed_at, True, None)
+            item = replace(
+                item, start=start, recorded_from=max(item.recorded_from, fact.observed_at)
+            )
         clipped.append(item)
     return clipped
 
@@ -304,25 +345,38 @@ def derive_assertion(facts: Facts, assertion_id: str) -> list[Interval]:
 
     Current at T iff observed for a source revision in T's membership and (relations) its target
     symbol is in T's membership; stale otherwise. Supersessions are not file-bound (always open).
+    The assertion's own declared `valid_from`/`valid_to` clamp every interval.
     """
     fact = facts.assertions[assertion_id]
     if fact.predicate == SUPERSEDES:
         start = Run("", fact.valid_from, fact.observed_at, True, None)
-        return _clip([Interval(assertion_id, (), start, None)], fact)
+        return _clip([Interval(assertion_id, (), start, None, fact.observed_at)], fact)
 
     def status(run: Run) -> Status:
-        state = _owner_status(facts, run, assertion_id, fact.revisions)
+        state, evidence = _owner_status(facts, run, assertion_id, fact.revisions)
         if state == "absent":
-            return _ABSENT
+            return ("absent", evidence)
         if state == "unknown":
             return _UNKNOWN
+        evidence = max(evidence, fact.observed_at)
         if fact.family == "relation" and fact.object_id is not None:
-            target = _symbol_present(facts, fact.object_id, run)[0]
-            if target != "present":  # only an explicit absence closes; unknown stays unknown
-                return _ABSENT if target == "absent" else _UNKNOWN
-        return ("present", assertion_id, ())
+            target = _symbol_present(facts, fact.object_id, run)
+            if target[0] == "unknown":
+                return _UNKNOWN  # only an explicit absence closes
+            if target[0] == "absent":
+                return ("absent", max(evidence, target[1]))
+            evidence = max(evidence, target[3])
+        return ("present", assertion_id, (), evidence)
 
     return _clip(_timeline(facts.runs, status), fact)
+
+
+def is_current(intervals: list[Interval], horizon: str) -> bool:
+    """Valid at the latest valid time the graph knows (`horizon`). An end declared in the future,
+    past every run, is not a closure yet."""
+    return bool(intervals) and (
+        intervals[-1].end is None or intervals[-1].end.occurred_at > horizon
+    )
 
 
 def interval_at(intervals: Iterable[Interval], valid_at: str) -> Interval | None:
@@ -409,13 +463,13 @@ async def load_facts(
     runs = (await tx.run(_RUNS, parameters={"repository_id": repository_id})).records
     # Every completion is its own immutable observation; the latest one visible at the cutoff
     # (by `(occurred_at, event_id)`) is the run's outcome, so a retry never rewrites history.
-    outcomes: dict[str, tuple[str, str | None]] = {}
+    outcomes: dict[str, tuple[str, str | None, str]] = {}
     for row in (await tx.run(_OUTCOMES, parameters={"repository_id": repository_id})).records:
         outcome_key = _run_key(row["index_id"], row["target_id"])
         if seen(row["observed_at"]) and (
             outcome_key not in outcomes or row["event_order"] > outcomes[outcome_key][0]
         ):
-            outcomes[outcome_key] = (row["event_order"], row["error_class"])
+            outcomes[outcome_key] = (row["event_order"], row["error_class"], row["observed_at"])
     for row in runs:
         if not seen(row["observed_at"]):
             continue
@@ -428,6 +482,7 @@ async def load_facts(
                 row["observed_at"],
                 outcome is not None,
                 None if outcome is None else outcome[1],
+                "" if outcome is None else outcome[2],
             )
         )
     facts.runs.sort(key=lambda run: run.order)
@@ -452,6 +507,9 @@ async def load_facts(
                     held = item["revisions"].get(row["revision_id"])
                     item["revisions"][row["revision_id"]] = min(held or row["since"], row["since"])
                     if held is None or row["since"] < held:
+                        facts.claim_observed[(row["assertion_id"], row["revision_id"])] = row[
+                            "observed_at"
+                        ]
                         facts.claim_run[(row["assertion_id"], row["revision_id"])] = _run_key(
                             row["index_id"], row["target_id"]
                         )
@@ -474,6 +532,7 @@ async def load_facts(
                 if key not in facts.since or row["since"] < facts.since[key]:
                     facts.since[key] = row["since"]
                     facts.claim_run[key] = _run_key(row["index_id"], row["target_id"])
+                    facts.claim_observed[key] = row["observed_at"]
                 owners = facts.defs.setdefault(row["symbol_id"], {})
                 current = owners.get(row["revision_id"])
                 if current is None or row["symbol_revision_id"] < current:
@@ -491,7 +550,7 @@ async def load_facts(
                 held = facts.members.setdefault(run_key, {}).get(row["file_id"])
                 if held is None or row["revision_id"] < held.revision_id:
                     facts.members[run_key][row["file_id"]] = Member(
-                        row["revision_id"], row["path"], row["module_id"]
+                        row["revision_id"], row["path"], row["module_id"], row["observed_at"]
                     )
             for row in (await tx.run(_CLAIMS, parameters={"files": new_files})).records:
                 if seen(row["observed_at"]):
@@ -508,6 +567,7 @@ async def load_facts(
                 if coverage_key not in latest or row["event_order"] > latest[coverage_key]:
                     latest[coverage_key] = row["event_order"]
                     reported[row["revision_id"]] = bool(row["complete"])
+                    facts.coverage_observed[coverage_key] = row["observed_at"]
     for assertion_id, item in pending.items():
         row = item["row"]
         if row["valid_from"] is None or not seen(row["recorded_from"]):
@@ -980,9 +1040,9 @@ def _row(item: Interval) -> dict[str, object]:
     return {
         "key": item.key,
         "valid_from": item.start.occurred_at,
-        "recorded_from": item.start.observed_at,
+        "recorded_from": item.recorded_from,
         "valid_to": None if item.end is None else item.end.occurred_at,
-        "recorded_to": None if item.end is None else item.end.observed_at,
+        "recorded_to": item.recorded_to,
     }
 
 
@@ -1041,14 +1101,14 @@ async def _write_assertion_state(tx: Neo4jTransaction, facts: Facts, assertion_i
         return
     intervals = derive_assertion(facts, assertion_id)
     last = intervals[-1] if intervals else None
-    current = last is not None and last.end is None
+    current = is_current(intervals, facts.horizon)
     await tx.run(
         _ASSERTION_FLAGS,
         parameters={
             "id": assertion_id,
             "current": current,
             "valid_to": None if last is None or last.end is None else last.end.occurred_at,
-            "recorded_to": None if last is None or last.end is None else last.end.observed_at,
+            "recorded_to": None if last is None else last.recorded_to,
             "intervals": [_text(item) for item in intervals],
         },
     )
@@ -1162,7 +1222,17 @@ _SUBJECTS: Final[LiteralString] = (
 )
 
 
+_BOUNDED: Final[LiteralString] = (
+    "MATCH (a:Assertion {repository_id: $repository_id}) WHERE a.asserted_valid_to IS NOT NULL "
+    "RETURN collect(a.assertion_id) AS assertions"
+)
+
+
 async def _expand(tx: Neo4jTransaction, repository_id: str, scope: _Scope) -> None:
+    # `current` of an assertion with a declared `valid_to` depends on the newest run, which any
+    # event can introduce: re-derive them whenever anything is projected.
+    bounded = (await tx.run(_BOUNDED, parameters={"repository_id": repository_id})).records[0]
+    scope.assertions |= set(bounded["assertions"])
     if scope.everything:
         row = (
             await tx.run(_REPOSITORY_SCOPE, parameters={"repository_id": repository_id})

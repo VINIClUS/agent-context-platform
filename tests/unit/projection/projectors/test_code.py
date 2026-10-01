@@ -2,6 +2,8 @@
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import pytest
 
 from agent_context_platform.projection.projectors.code import (
@@ -13,6 +15,7 @@ from agent_context_platform.projection.projectors.code import (
     derive_file,
     derive_symbol,
     interval_at,
+    is_current,
 )
 
 pytestmark = pytest.mark.unit
@@ -67,6 +70,7 @@ def test_a_replaced_file_revision_closes_its_symbols_only_with_complete_coverage
 def fact(
     predicate: str = "CALLS",
     *,
+    valid_from: str | None = None,
     valid_to: str | None = None,
     revisions: dict[str, str] | None = None,
 ) -> AssertionFact:
@@ -75,7 +79,7 @@ def fact(
         subject_id="s",
         predicate=predicate,
         object_id="x",
-        valid_from=run(1).occurred_at,
+        valid_from=valid_from or run(1).occurred_at,
         valid_to=valid_to,
         observed_at=run(1).observed_at,
         revisions={} if revisions is None else revisions,
@@ -135,3 +139,38 @@ def test_the_declared_valid_to_clips_every_interval() -> None:
     assert closed.end is not None  # a supersession does not stay open forever
     state.assertions["early"] = fact("POSSIBLY_SUPERSEDES", valid_to=run(1).occurred_at)
     assert derive_assertion(state, "early") == []  # declared closed before it opened
+
+
+def test_a_declared_valid_from_later_than_the_first_run_clamps_the_start() -> None:
+    later = "2026-03-01T12:01:30.000000Z"
+    state = _relation_state()
+    state.assertions["a"] = fact(valid_from=later, revisions={"g1": run(1).occurred_at})
+    (item,) = derive_assertion(state, "a")
+    assert item.start.occurred_at == later and item.end is None
+    assert interval_at([item], run(1).occurred_at) is None
+
+
+def test_current_means_valid_at_the_latest_run_not_unbounded() -> None:
+    state = _relation_state()
+    future = "2026-03-01T12:30:00.000000Z"
+    state.assertions["a"] = fact(valid_to=future, revisions={"g1": run(1).occurred_at})
+    intervals = derive_assertion(state, "a")
+    assert intervals[-1].end is not None and is_current(intervals, state.horizon)
+    state.assertions["a"] = fact(
+        valid_to="2026-03-01T12:01:30.000000Z", revisions={"g1": run(1).occurred_at}
+    )
+    assert not is_current(derive_assertion(state, "a"), state.horizon)
+
+
+def test_recorded_times_come_from_the_evidence_not_the_run() -> None:
+    # run 2 started at 12:02 (the run's own observed_at) but its completion and coverage were
+    # observed at 12:05: the closure of x is recorded at 12:05
+    late = "2026-03-01T12:05:00.000000Z"
+    runs = [run(1), replace(run(2), outcome_observed_at=late)]
+    state = facts(runs, {1: "r1", 2: "r2"}, {})
+    state.members[runs[0].key]["f"] = Member("r1", "p.py", "m", "2026-03-01T12:01:10.000000Z")
+    state.members[runs[1].key]["f"] = Member("r2", "p.py", "m", "2026-03-01T12:02:10.000000Z")
+    state.coverage_observed[(runs[1].key, "r2")] = late
+    (item,) = derive_symbol(state, "x")
+    assert item.recorded_from == "2026-03-01T12:01:10.000000Z"
+    assert item.recorded_to == late
