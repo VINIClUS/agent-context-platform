@@ -14,8 +14,13 @@ from types import SimpleNamespace
 
 import pytest
 from agent_context_sdk import EventDraftV1, WorkspaceSnapshotCapturedV1
+from agent_context_sdk.identity import (
+    SNAPSHOT_CODE_EXTENSIONS,
+    gitlink_snapshot_digest,
+    workspace_snapshot_id,
+)
 
-from agent_context_platform.indexing import emitter, identity
+from agent_context_platform.indexing import emitter, identity, registry
 from agent_context_platform.indexing.emitter import (
     INDEXER_PRODUCER_ID,
     IndexingConfig,
@@ -44,7 +49,6 @@ from agent_context_platform.indexing.scip import (
     SourceRange,
     import_scip,
 )
-from agent_context_platform.indexing.snapshot import gitlink_digest, workspace_snapshot_id
 from agent_context_platform.indexing.tree_sitter import python as python_adapter
 from agent_context_platform.indexing.tree_sitter.base import (
     ParsedDiagnostic,
@@ -879,8 +883,8 @@ def test_a_scip_definition_without_a_valid_location_is_counted_and_degrades(
 
 
 def _dirty(repo: RepoBuilder) -> dict[str, tuple[str, str | None]]:
-    entries = emitter._dirty_entries(scan_of(repo))
-    assert entries is not None
+    entries, complete = emitter._dirty_entries(scan_of(repo))
+    assert complete
     return {path: (state, digest) for path, state, digest in entries}
 
 
@@ -921,10 +925,13 @@ def test_a_gitlink_change_is_its_own_state_with_its_oids(indexed: RepoBuilder) -
         untracked_paths=(),
     )
 
-    entries = emitter._dirty_entries(dataclasses.replace(scan, workspace=workspace))
+    entries, complete = emitter._dirty_entries(dataclasses.replace(scan, workspace=workspace))
 
-    assert entries == [("vendor/sub", "gitlink", gitlink_digest("1" * 40, "2" * 40))]
-    assert gitlink_digest("1" * 40, "2" * 40) != gitlink_digest("1" * 40, "3" * 40)
+    assert complete
+    assert entries == [("vendor/sub", "gitlink", gitlink_snapshot_digest("1" * 40, "2" * 40))]
+    assert gitlink_snapshot_digest("1" * 40, "2" * 40) != gitlink_snapshot_digest(
+        "1" * 40, "3" * 40
+    )
 
 
 def test_a_large_dirty_file_is_hashed_by_streaming_beyond_the_parse_cap(
@@ -948,7 +955,7 @@ def test_a_dirty_file_that_cannot_be_hashed_leaves_the_snapshot_incomplete(
 
     drafts = service().index(scan, None, parse(scan), file_logical_ids=ids)
 
-    assert emitter._dirty_entries(scan) is None
+    assert emitter._dirty_entries(scan)[1] is False
     assert _completed(drafts) == (False, "snapshot_incomplete")
     assert {p["path"] for p in _payloads(drafts, "code.file.indexed")}  # file results still emitted
     started = _payloads(drafts, "code.index.started")[0]
@@ -1022,3 +1029,149 @@ def test_every_adapter_loss_diagnostic_degrades_the_run(
     drafts = service().index(scan, None, parsed, file_logical_ids=ids)
 
     assert _completed(drafts) == ((False, "files_degraded") if degrades else (True, None))
+
+
+# --- PLATFORM-037C: the SDK snapshot identity and its digest policy ---------------------------
+
+
+def _started(drafts: list[EventDraftV1]) -> dict[str, object]:
+    return dict(_payloads(drafts, "code.index.started")[0])
+
+
+def _index(repo: RepoBuilder) -> tuple[RepositoryScan, list[EventDraftV1]]:
+    scan = scan_of(repo)
+    ids = lineage(scan, scan.workspace.head_commit or "")
+    return scan, service().index(scan, None, parse(scan), file_logical_ids=ids)
+
+
+def _snapshot_id(repo: RepoBuilder) -> str:
+    return str(_started(_index(repo)[1])["snapshot_id"])
+
+
+def test_the_emitted_snapshot_id_is_the_sdk_id_over_the_expected_entries(
+    indexed: RepoBuilder,
+) -> None:
+    indexed.write("pkg/util.py", HELPER + "\n\ndef more() -> None:\n    pass\n")
+    indexed.write("pkg/new.py", "def fresh() -> None:\n    pass\n")
+    indexed.write(".env", "TOKEN=1\n")
+    indexed.git("rm", "-q", "pkg/shapes.py")
+    scan, drafts = _index(indexed)
+
+    def raw(path: str) -> str:
+        return _sha((indexed.root / path).read_bytes())
+
+    expected = workspace_snapshot_id(
+        service().config.repository_id,
+        scan.workspace.head_commit,
+        [
+            (".env", "untracked", None),
+            ("pkg/new.py", "untracked", raw("pkg/new.py")),
+            ("pkg/shapes.py", "deleted", None),
+            ("pkg/util.py", "modified", raw("pkg/util.py")),
+        ],
+    )
+
+    assert _started(drafts)["snapshot_id"] == expected
+    assert _completed(drafts)[1] != "snapshot_incomplete"
+
+
+def test_a_non_code_dirty_file_contributes_its_path_and_state_but_never_its_content(
+    indexed: RepoBuilder,
+) -> None:
+    indexed.write(".env", "TOKEN=one\n")
+    first = _snapshot_id(indexed)
+    indexed.write(".env", "TOKEN=two-and-longer\n")
+    assert _snapshot_id(indexed) == first  # a content change is invisible
+
+    indexed.write("config.yaml", "a: 1\n")
+    assert _snapshot_id(indexed) != first  # adding one is a change
+    (indexed.root / "config.yaml").unlink()
+    assert _snapshot_id(indexed) == first
+    (indexed.root / ".env").rename(indexed.root / ".env.local")
+    assert _snapshot_id(indexed) != first  # a rename is a change
+    (indexed.root / ".env.local").unlink()
+    assert _snapshot_id(indexed) != first  # so is removing the last dirty path
+
+    indexed.write("README.md", "changed\n")  # a tracked non-code file, modified
+    tracked = _snapshot_id(indexed)
+    indexed.write("README.md", "changed again\n")
+    assert _snapshot_id(indexed) == tracked
+
+
+def test_a_dirty_code_file_contributes_its_content_in_any_letter_case(
+    indexed: RepoBuilder,
+) -> None:
+    indexed.write("pkg/new.py", "a = 1\n")
+    indexed.write("pkg/Loud.PY", "a = 1\n")
+    first = _snapshot_id(indexed)
+    indexed.write("pkg/new.py", "a = 2\n")
+    second = _snapshot_id(indexed)
+    assert second != first
+    indexed.write("pkg/Loud.PY", "a = 2\n")  # not indexed (the registry is case-sensitive) ...
+    assert _snapshot_id(indexed) not in (first, second)  # ... but still hashed for the id
+
+
+def test_a_non_code_file_that_is_unreadable_or_oversized_keeps_the_snapshot_complete(
+    indexed: RepoBuilder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    indexed.write("secret.env", "TOKEN=1\n")
+    indexed.write("blob.bin", b"\0" * (2 * 1024 * 1024))  # past the scan's parse cap: no digest
+    monkeypatch.setattr(emitter, "IDENTITY_HASH_CAP", 1024)
+    opened: list[str] = []
+    real = emitter.hash_worktree_file
+    monkeypatch.setattr(
+        emitter,
+        "hash_worktree_file",
+        lambda scan, path, cap: opened.append(path) or real(scan, path, cap),
+    )
+    (indexed.root / "secret.env").chmod(0)
+    try:
+        scan, drafts = _index(indexed)
+        assert emitter._dirty_entries(scan)[1] is True
+    finally:
+        (indexed.root / "secret.env").chmod(0o644)
+
+    assert _completed(drafts)[1] != "snapshot_incomplete"
+    assert opened == []  # never opened for the snapshot
+
+
+def test_an_unreadable_code_file_makes_the_snapshot_incomplete(indexed: RepoBuilder) -> None:
+    indexed.write("pkg/locked.py", "a = 1\n")
+    (indexed.root / "pkg" / "locked.py").chmod(0)
+    try:
+        scan, drafts = _index(indexed)
+        assert emitter._dirty_entries(scan)[1] is False
+    finally:
+        (indexed.root / "pkg" / "locked.py").chmod(0o644)
+
+    assert _completed(drafts) == (False, "snapshot_incomplete")
+
+
+def test_the_incomplete_fallback_id_ignores_non_code_content(
+    indexed: RepoBuilder, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(emitter, "IDENTITY_HASH_CAP", 1024)
+    indexed.write("pkg/big.py", b"x = 1\n" * (400 * 1024))  # over the cap: cannot be hashed
+    indexed.write(".env", "TOKEN=one\n")
+    _, drafts = _index(indexed)
+    assert _completed(drafts) == (False, "snapshot_incomplete")
+    first = _started(drafts)["snapshot_id"]
+    indexed.write(".env", "TOKEN=two\n")
+    again = _index(indexed)[1]
+    assert _completed(again) == (False, "snapshot_incomplete")
+    assert _started(again)["snapshot_id"] == first  # non-code content never reaches the id
+    indexed.write("other.txt", "x")
+    assert _started(_index(indexed)[1])["snapshot_id"] != first
+
+
+def test_every_indexed_extension_is_hashed_into_the_snapshot_id() -> None:
+    registered = {ext for support in registry.LANGUAGES.values() for ext in support.extensions}
+    assert registered <= SNAPSHOT_CODE_EXTENSIONS
+
+
+def test_an_unchanged_dirty_reindex_emits_no_new_event_keys(indexed: RepoBuilder) -> None:
+    indexed.write("pkg/new.py", "def fresh() -> None:\n    pass\n")
+    indexed.write(".env", "TOKEN=1\n")
+    _, first = _index(indexed)
+    _, second = _index(indexed)
+    assert {d.idempotency_key for d in second} == {d.idempotency_key for d in first}

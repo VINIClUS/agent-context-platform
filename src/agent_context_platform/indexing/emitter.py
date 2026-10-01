@@ -117,30 +117,35 @@ bug, raised as ``IndexingError("idempotency_conflict")`` before anything is subm
   consumer (PLATFORM-038) must ALSO check that the target symbol exists in the target file's
   current membership (the latest successful index's ``code.symbol.indexed`` for that
   ``file_revision_id``) before it treats the edge as live.
-- A dirty snapshot is content-addressed and checkout-independent: ``snapshot_id`` is
-  ``snapshot.workspace_snapshot_id(repository_id, base_commit, dirty entries)``, where an entry is
-  ``(path, state, content_sha256)`` with state ``modified``, ``added``, ``deleted`` (no digest) or
-  ``untracked``. The same dirty state in two checkouts is ONE snapshot, one ``index_id`` and one
-  membership (``checkout_id`` is not part of it).
+- A dirty snapshot is checkout-independent: ``snapshot_id`` is
+  ``agent_context_sdk.identity.workspace_snapshot_id(repository_id, base_commit, dirty entries)``,
+  where an entry is ``(path, state, digest)`` with state ``modified``, ``added``, ``deleted``,
+  ``untracked`` or ``gitlink``. The digest policy is the SDK's: only a code-language file
+  (``snapshot_path_uses_content``) contributes the SHA-256 of its raw bytes, the same value
+  published as ``code.file.indexed.content_sha256``; every other dirty path (``.env``, configs,
+  docs) contributes ``(path, state)`` alone, so no digest of a possibly secret file is derivable
+  from a published id. The same dirty state in two checkouts is ONE snapshot, one ``index_id`` and
+  one membership (``checkout_id`` is not part of it).
 
 Joining a Codex session to the uncommitted revisions (G3)
 ---------------------------------------------------------
-The single source of the ``snapshot_id`` is ``snapshot.workspace_snapshot_id``: a pure function of
-plain strings and tuples with a versioned domain string, to be lifted verbatim into
-``agent_context_sdk`` (pending, additive) so Codex capture and the indexer share it. Until Codex
-emits ``git.workspace_snapshot.captured`` with that ID, the fallback join is
+The single source of the ``snapshot_id`` is the SDK's ``workspace_snapshot_id``, so a producer
+that calls it over the same entries derives the same id. Codex adoption is FU-49 (codex). Until
+Codex emits ``git.workspace_snapshot.captured`` with that ID, the fallback join is
 (``repository_id``, ``base_commit``, the set of ``modified_content_sha256`` values, the
 ``untracked_paths``): the indexer's dirty ``code.file.indexed`` ``content_sha256`` values and
 untracked paths are exactly those fields of ``WorkspaceSnapshotCapturedV1``.
 
 Net dirty state: ``deleted`` comes from the porcelain status (``D`` in the index or the worktree),
 a rename (staged or not) is a ``deleted`` old path plus an ``added`` new one, a submodule pointer
-change is ``gitlink`` (digest of the head and index OIDs), and a deleted path present again is
-``modified``. Dirty files are hashed by streaming, up to ``IDENTITY_HASH_CAP`` (64 MiB) and
-independent of the 1 MiB parse cap. If any dirty entry cannot be hashed (unreadable, over the
-cap) or a path was rejected, NO canonical ``snapshot_id`` is derived: the run keeps a scan-local
-id so the file-level events stay valid, and ``code.index.completed`` is ``success=false`` with
-``error_class=snapshot_incomplete``. Such a snapshot never joins a Codex session.
+change is ``gitlink`` (``gitlink_snapshot_digest`` of the head and index OIDs), and a deleted path
+present again is ``modified``. Dirty code files are hashed by streaming, up to
+``IDENTITY_HASH_CAP`` (64 MiB) and independent of the 1 MiB parse cap; other dirty files are never
+opened for the snapshot. If any dirty code file cannot be hashed (unreadable, over the cap) or a
+path was rejected, NO canonical ``snapshot_id`` is derived: the run keeps a scan-local id (over
+``(path, state)`` and code digests only) so the file-level events stay valid, and
+``code.index.completed`` is ``success=false`` with ``error_class=snapshot_incomplete``. Such a
+snapshot never joins a Codex session.
 
 Known limitation: symbols of a dirty file whose SCIP evidence was dropped get name-derived
 logical IDs, which can differ from the SCIP-derived IDs at the later commit. Identity from commit
@@ -213,6 +218,12 @@ from agent_context_sdk import (
     resolve_event_model,
     sha256_hex,
 )
+from agent_context_sdk.identity import (
+    SnapshotEntry,
+    gitlink_snapshot_digest,
+    snapshot_path_uses_content,
+    workspace_snapshot_id,
+)
 from agent_context_sdk.ids import new_uuid7
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -242,11 +253,6 @@ from agent_context_platform.indexing.scip import (
     SemanticDocument,
     SemanticIndex,
     SourceRange,
-)
-from agent_context_platform.indexing.snapshot import (
-    DirtyEntry,
-    gitlink_digest,
-    workspace_snapshot_id,
 )
 from agent_context_platform.indexing.tree_sitter.base import (
     DIAGNOSTIC_CODES,
@@ -810,14 +816,17 @@ class _Claim:
 IDENTITY_HASH_CAP = 64 * 1024 * 1024  # dirty files are hashed for the snapshot up to this size
 
 
-def _dirty_entries(scan: RepositoryScan) -> list[DirtyEntry] | None:
-    """The scan's NET uncommitted state as ``(path, state, digest)``; ``None`` if incomplete.
+def _dirty_entries(scan: RepositoryScan) -> tuple[list[SnapshotEntry], bool]:
+    """The scan's NET uncommitted state as ``(path, state, digest)``, and whether it is complete.
 
     ``deleted`` comes from the porcelain status (``D`` in the index or the worktree); a rename is a
     delete of the old path plus an add of the new one; a submodule pointer change is ``gitlink``.
-    A deleted path that is present again (untracked) is ``modified``. Every other entry needs a
-    digest: the scan's, else a STREAMED SHA-256 up to ``IDENTITY_HASH_CAP`` (independent of the
-    parse caps). A file that cannot be hashed, or a rejected path, makes the snapshot incomplete.
+    A deleted path that is present again (untracked) is ``modified``. The digest policy is the
+    SDK's (``snapshot_path_uses_content``): a code-language file needs its raw SHA-256, the scan's
+    else a STREAMED one up to ``IDENTITY_HASH_CAP`` (independent of the parse caps); every other
+    path is opaque, digest ``None``, and is never opened or hashed here (it may hold secrets). A
+    code file that cannot be hashed (its digest stays ``None``), or a rejected path, makes the
+    snapshot incomplete.
     """
     workspace = scan.workspace
     tracked = {item.path: item for item in scan.files}
@@ -828,6 +837,8 @@ def _dirty_entries(scan: RepositoryScan) -> list[DirtyEntry] | None:
     complete = not scan.rejections
 
     def digest_of(path: str, known: str | None) -> str | None:
+        if not snapshot_path_uses_content(path):
+            return None  # opaque by policy: no read, no hash
         if known is not None:
             return known
         try:
@@ -843,7 +854,7 @@ def _dirty_entries(scan: RepositoryScan) -> list[DirtyEntry] | None:
     for path in sorted({*workspace.modified_paths, *status}):
         link = gitlinks.get(path)
         if link is not None:
-            live[path] = ("gitlink", gitlink_digest(link.head_oid, link.index_oid))
+            live[path] = ("gitlink", gitlink_snapshot_digest(link.head_oid, link.index_oid))
             continue
         change = status.get(path)
         xy = change.xy if change is not None else ""
@@ -858,12 +869,27 @@ def _dirty_entries(scan: RepositoryScan) -> list[DirtyEntry] | None:
         known = None if found is None else found.content_sha256
         live[path] = ("modified" if path in gone else "untracked", digest_of(path, known))
         gone.discard(path)
-    entries: list[DirtyEntry] = [(path, "deleted", None) for path in sorted(gone - live.keys())]
+    entries: list[SnapshotEntry] = [(path, "deleted", None) for path in sorted(gone - live.keys())]
     for path, (state, digest) in live.items():
-        if digest is None:
+        if digest is None and state != "deleted" and snapshot_path_uses_content(path):
             complete = False
         entries.append((path, state, digest))
-    return entries if complete else None
+    return entries, complete
+
+
+def _incomplete_snapshot_id(
+    repository_id: str, head: str, entries: Sequence[SnapshotEntry], rejected: int
+) -> str:
+    """A scan-local id for a dirty state that has no canonical identity (never joinable).
+
+    It digests only what the canonical id may digest: ``(path, state)`` of every entry, the
+    published digest of a code file (``None`` when it could not be hashed), and the number of
+    rejected paths. No digest of a non-code file's content reaches it.
+    """
+    parts = ["snapshot_incomplete", repository_id, head, str(rejected)]
+    for path, state, digest in sorted(entries):
+        parts.extend((path, state, digest or ""))
+    return "snap_" + _digest(*parts)[:40]
 
 
 class _Run:
@@ -915,17 +941,16 @@ class _Run:
         self.snapshot_id: str | None = None
         self.snapshot_complete = True
         if scan.workspace.is_dirty:
-            entries = _dirty_entries(scan)
-            if entries is None:
+            entries, complete = _dirty_entries(scan)
+            if complete:
+                self.snapshot_id = workspace_snapshot_id(self.repository_id, head, entries)
+            else:
                 # No canonical (joinable) identity: a scan-local id keeps the file-level events
                 # valid, and the run completes ``snapshot_incomplete``.
                 self.snapshot_complete = False
-                local = _digest(
-                    "snapshot_incomplete", head, scan.workspace.dirty_state_sha256 or ""
+                self.snapshot_id = _incomplete_snapshot_id(
+                    self.repository_id, head, entries, len(scan.rejections)
                 )
-                self.snapshot_id = "snap_" + local[:40]
-            else:
-                self.snapshot_id = workspace_snapshot_id(self.repository_id, head, entries)
         self.tracked = {item.path: item for item in scan.files}
         self.untracked = {item.path: item for item in scan.untracked}
         self.modified = frozenset(scan.workspace.modified_paths)
