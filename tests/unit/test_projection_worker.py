@@ -163,6 +163,60 @@ def test_progress_lines_are_content_free_counts() -> None:
     assert progress and all(" lag=" in line and "dead_lettered=" in line for line in progress)
 
 
+def test_a_stop_during_a_slow_probe_claims_nothing_more() -> None:
+    stop = asyncio.Event()
+    runner = FakeRunner([ProjectionRunReport(claimed=1, delivered=1)])
+
+    async def slow_probe() -> bool:
+        await asyncio.sleep(0.01)  # the signal lands while the probe is in flight
+        stop.set()
+        return False
+
+    async def main() -> cli.WorkerTotals:
+        return await cli._drive_worker(
+            runner,
+            slow_probe,
+            stop,
+            once=False,
+            batch_size=7,
+            poll_seconds=0.01,
+            max_seconds=None,
+            log_seconds=3600.0,
+            touch=lambda: None,
+            log=lambda _message: None,
+        )
+
+    totals = asyncio.run(main())
+    assert runner.batches == [] and totals.claimed == 0 and totals.outcome == "stopped"
+
+
+def test_a_deadline_reached_during_a_slow_probe_claims_nothing_more() -> None:
+    clock = [0.0]
+    runner = FakeRunner([ProjectionRunReport(claimed=1, delivered=1)])
+
+    async def slow_probe() -> bool:
+        clock[0] = 10.0  # the deadline passes while the probe is in flight
+        return False
+
+    async def main() -> cli.WorkerTotals:
+        return await cli._drive_worker(
+            runner,
+            slow_probe,
+            asyncio.Event(),
+            once=True,
+            batch_size=7,
+            poll_seconds=0.01,
+            max_seconds=5,
+            log_seconds=3600.0,
+            touch=lambda: None,
+            log=lambda _message: None,
+            now=lambda: clock[0],
+        )
+
+    totals = asyncio.run(main())
+    assert runner.batches == [] and totals.outcome == "timeout"
+
+
 class FakeStore:
     closed = False
 

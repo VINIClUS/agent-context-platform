@@ -703,6 +703,12 @@ async def _drive_worker(
         if paused:
             log("resumed_after_rebuild")
             paused = False
+        # The probe is a round trip: a stop or the deadline may have arrived during it.
+        if stop.is_set():
+            break
+        if max_seconds is not None and now() - started >= max_seconds:
+            totals.outcome = "timeout"
+            return totals
         report = await runner.run_once(batch_size)
         totals.add(report)
         touch()
