@@ -228,7 +228,7 @@ _RESOLVE: Final[LiteralString] = (
     "MATCH (n:Repository {repository_id: $id}) WHERE n.repository_id = $repository_id "
     "RETURN 'repository' AS kind "
     "UNION MATCH (n:Module {module_id: $id}) WHERE n.repository_id = $repository_id "
-    "RETURN 'module' AS kind "
+    "AND EXISTS { (n)<-[:IN_MODULE]-(:File {current: true}) } RETURN 'module' AS kind "
     "UNION MATCH (n:File {file_id: $id}) "
     "WHERE n.repository_id = $repository_id AND n.current = true RETURN 'file' AS kind "
     "UNION MATCH (n:Symbol {symbol_id: $id}) "
@@ -432,7 +432,7 @@ _IMPORTS: Final[dict[NodeKind, LiteralString]] = {
 _EXTERNAL_TAIL: Final[LiteralString] = (
     "MATCH (fr)<-[:OBSERVED_IN]-(a:Assertion {family: 'dependency'}) "
     "WHERE a.repository_id = $repository_id AND a.current = true "
-    "MATCH (a)-[:DEPENDS_ON]->(dep:Dependency) "
+    "MATCH (a)-[:DEPENDS_ON]->(dep:Dependency) WHERE dep.repository_id = $repository_id "
     "RETURN dep.dependency_id AS dependency_id, fr.file_revision_id AS revision_id, "
     "properties(a) AS props ORDER BY dependency_id, a.assertion_id LIMIT $limit"
 )

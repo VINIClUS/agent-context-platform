@@ -454,3 +454,42 @@ def test_outgoing_dependencies_are_bounded_and_scoped() -> None:
             await service.dependencies(R1, "file-2")
 
     with_graph(body)
+
+
+def test_foreign_dependency_nodes_and_emptied_modules_are_not_returned() -> None:
+    async def body(store: Neo4jStore, service: GraphTraversalService, seed: GraphSeed) -> None:
+        await seed.file("repo-1", "file-1", "x.py", "mod-1")
+
+        async def write(tx: Neo4jTransaction) -> None:
+            await tx.run(
+                "MATCH (f:File {file_id: 'file-1'}) "
+                "CREATE (f)-[:CURRENT_REVISION]->(fr:FileRevision {file_revision_id: 'fr-1'}) "
+                "CREATE (a1:Assertion {assertion_id: 'dep-own', repository_id: 'repo-1', "
+                "family: 'dependency', current: true, dependency_kind: 'observed', "
+                "evidence_kind: 'tree_sitter', confidence: 0.9, source_event_ids: ['ev-1']}) "
+                "CREATE (a2:Assertion {assertion_id: 'dep-stray', repository_id: 'repo-1', "
+                "family: 'dependency', current: true, dependency_kind: 'observed', "
+                "evidence_kind: 'tree_sitter', confidence: 0.9, source_event_ids: ['ev-2']}) "
+                "CREATE (a1)-[:OBSERVED_IN]->(fr) CREATE (a2)-[:OBSERVED_IN]->(fr) "
+                "CREATE (a1)-[:DEPENDS_ON]->(:Dependency "
+                "{dependency_id: 'json', repository_id: 'repo-1'}) "
+                "CREATE (a2)-[:DEPENDS_ON]->(:Dependency "
+                "{dependency_id: 'foreign-dep', repository_id: 'repo-2'})",
+                parameters={},
+            )
+
+        await store.execute_write(write)
+        for anchor in ("file-1", "mod-1"):
+            found = await service.dependencies(R1, anchor)
+            assert [d.dependency_id for d in found.external] == ["json"]
+
+        async def empty(tx: Neo4jTransaction) -> None:
+            await tx.run("MATCH (:File)-[r:IN_MODULE]->(:Module) DELETE r", parameters={})
+
+        await store.execute_write(empty)  # the module's last file moved away
+        with pytest.raises(GraphAnchorNotFound):
+            await service.neighborhood(R1, "mod-1", 1)
+        with pytest.raises(GraphAnchorNotFound):
+            await service.dependencies(R1, "mod-1")
+
+    with_graph(body)
