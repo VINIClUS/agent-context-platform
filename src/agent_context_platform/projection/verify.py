@@ -27,7 +27,7 @@ import re
 from collections import Counter
 from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
 from dataclasses import dataclass, replace
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Final, LiteralString
 from uuid import UUID
 
@@ -521,7 +521,8 @@ def classify_replay(
     the old graph and this target would never receive it.
     """
     handled = [item for item in stats if projector.handles(item.event_type)]
-    covered = sum(item.covered for item in handled)
+    dead = sum(item.dead_covered for item in handled)
+    covered = sum(item.covered for item in handled) - dead  # a dead-lettered event is skipped
     beyond = sum(item.delivered_beyond for item in handled)
     unqueued = sum(item.unqueued for item in handled)
     pending_after = sum(
@@ -545,7 +546,7 @@ def classify_replay(
         covered_events=replayed,
         lag=pending_after,
         in_flight=0,
-        dead_lettered=0,
+        dead_lettered=dead,
         unqueued=unqueued,
         from_event_id=from_id,
         through_event_id=through_id,
@@ -1149,6 +1150,8 @@ async def replay_ledger(
     *,
     delivered_only: bool,
     page_size: int = DEFAULT_PAGE_SIZE,
+    after: int = 0,
+    progress: dict[tuple[str, str], ReplayProgress] | None = None,
 ) -> ReplayResult:
     """Project the ledger into `target` in ledger (outbox) order, with its own loop.
 
@@ -1156,18 +1159,24 @@ async def replay_ledger(
     Every event is integrity-checked as the runner does and applied by the matching projectors, in
     registry order, in one write transaction. `delivered_only` limits the replay to events the
     runner has already delivered, which is exactly the set behind the live graph and checkpoints.
-    The per-projector `progress` is the transient checkpoint state of this replay.
+    Otherwise every event the runner has not dead-lettered is replayed: the live runner skips a
+    dead-lettered (poison) event, so the live graph never held it, and one permanent poison event
+    must not fail every rebuild.
+    The per-projector `progress` is the transient checkpoint state of this replay; pass `after`
+    and the earlier `progress` to continue a replay from where it stopped.
     """
-    progress = {(item.name, item.version): ReplayProgress() for item in projectors}
-    after = 0
+    if progress is None:
+        progress = {(item.name, item.version): ReplayProgress() for item in projectors}
     rows = projected = 0
-    head: int | None = None
+    head: int | None = after or None
     while True:
         statement = select(OutboxRow.outbox_id, OutboxRow.event_id).where(
             OutboxRow.outbox_id > after
         )
         if delivered_only:
             statement = statement.where(OutboxRow.status == OutboxStatus.DELIVERED)
+        else:
+            statement = statement.where(OutboxRow.status != OutboxStatus.DEAD_LETTERED)
         async with session_factory() as session:
             page = (
                 await session.execute(statement.order_by(OutboxRow.outbox_id).limit(page_size))
@@ -1233,6 +1242,153 @@ async def active_lease_count(session: AsyncSession) -> int:
     )
 
 
+DEFAULT_RUNNER_QUIET_SECONDS: Final = 30
+CLI_APPLICATION_NAME: Final = "agent-context-cli"
+_SKIPPED_LISTED: Final = 200
+
+_OTHER_PROJECTOR_CONNECTIONS = text(
+    "SELECT count(*) FROM pg_stat_activity a JOIN pg_roles r ON r.rolname = a.usename "
+    "WHERE a.datname = current_database() AND a.pid <> pg_backend_pid() "
+    "AND a.application_name IS DISTINCT FROM :own AND NOT r.rolsuper "
+    "AND pg_has_role(r.oid, 'agent_context_projector', 'MEMBER')"
+)
+
+
+async def dead_lettered_event_ids(session: AsyncSession) -> tuple[UUID, ...]:
+    """Events the runner gave up on, in ledger order: the live graph never held them."""
+    rows = await session.scalars(
+        select(OutboxRow.event_id)
+        .where(OutboxRow.status == OutboxStatus.DEAD_LETTERED)
+        .order_by(OutboxRow.outbox_id)
+    )
+    return tuple(rows)
+
+
+async def ensure_runner_idle(session: AsyncSession, *, quiet_seconds: int) -> None:
+    """Best-effort refusal while the projection runner may be running.
+
+    The runtime keeps no runner lock (FU-62), so three weaker signals are used: an unexpired outbox
+    lease, an outbox row claimed, retried or delivered within `quiet_seconds` (0 disables this),
+    and another connection of a role that is a member of `agent_context_projector` (this CLI's own
+    connections, named by `CLI_APPLICATION_NAME`, are excluded). A runner that is idle between
+    polls and holds no connection passes: stopping it is an operator precondition.
+    """
+    if await active_lease_count(session):
+        raise RunnerActiveError("the projection runner holds outbox leases; stop it first")
+    if quiet_seconds > 0:
+        recent = await session.scalar(
+            select(func.count())
+            .select_from(OutboxRow)
+            .where(
+                OutboxRow.updated_at > OutboxRow.created_at,
+                OutboxRow.updated_at > func.now() - timedelta(seconds=quiet_seconds),
+            )
+        )
+        if recent:
+            raise RunnerActiveError(
+                f"outbox rows changed in the last {quiet_seconds}s; the projection runner may "
+                "be running, stop it first"
+            )
+    if await session.scalar(_OTHER_PROJECTOR_CONNECTIONS, {"own": CLI_APPLICATION_NAME}):
+        raise RunnerActiveError(
+            "another projector-role connection is open; stop the projection runner first"
+        )
+
+
+async def _finalize_checkpoints(
+    session_factory: async_sessionmaker[AsyncSession],
+    target: Neo4jStore,
+    projectors: Sequence[Projector],
+    replay: ReplayResult,
+    *,
+    now: datetime,
+) -> int:
+    """Write the live checkpoints after an in-place replay; return the events projected on top.
+
+    Mirrors `CheckpointRepository.advance`: the rows are locked (`FOR UPDATE`), so a runner that
+    finalizes meanwhile waits and then advances from what is written here; the position is
+    `GREATEST(live, replayed)`, so a checkpoint is never taken backwards over events the runner
+    projected; and the processed count is recomputed from the outbox (delivered handled events up
+    to the position), not summed, so it is exact whichever side projected an event. Under the lock
+    the replay catches up on events delivered since it read its last page. If a delivered event
+    at or below the replay head was missed (a runner delivered it after the wipe), the graph lacks
+    it and the rebuild fails rather than claim otherwise.
+    """
+    async with session_factory() as session, session.begin():
+        live = {}
+        for projector in projectors:
+            live[(projector.name, projector.version)] = await session.scalar(
+                select(ProjectionCheckpointRow)
+                .where(
+                    ProjectionCheckpointRow.projector_name == projector.name,
+                    ProjectionCheckpointRow.projector_version == projector.version,
+                )
+                .with_for_update()
+            )
+        tail = await replay_ledger(
+            session_factory,
+            target,
+            projectors,
+            delivered_only=True,
+            after=replay.head_outbox_id or 0,
+            progress=dict(replay.progress),
+        )
+        for projector in projectors:
+            key = (projector.name, projector.version)
+            step, row = tail.progress[key], live[key]
+            replayed_at = step.last_outbox_id
+            await _require_nothing_missed(session, projector, step)
+            positions = [
+                value
+                for value in (None if row is None else row.last_outbox_id, replayed_at)
+                if value is not None
+            ]
+            position = max(positions) if positions else None
+            event_id = step.last_event_id if position == replayed_at else row.last_event_id  # type: ignore[union-attr]
+            count = 0
+            if position is not None:
+                stats = await event_type_stats(session, position)
+                count = sum(
+                    item.delivered_covered for item in stats if projector.handles(item.event_type)
+                )
+            values = {
+                "last_outbox_id": position,
+                "last_event_id": event_id,
+                "processed_count": count,
+                "state": ProjectionState.ACTIVE,
+                "updated_at": now,
+            }
+            await session.execute(
+                insert(ProjectionCheckpointRow)
+                .values(
+                    projector_name=projector.name, projector_version=projector.version, **values
+                )
+                .on_conflict_do_update(
+                    index_elements=[
+                        ProjectionCheckpointRow.projector_name,
+                        ProjectionCheckpointRow.projector_version,
+                    ],
+                    set_=values,
+                )
+            )
+    return tail.projected_events
+
+
+async def _require_nothing_missed(
+    session: AsyncSession, projector: Projector, step: ReplayProgress
+) -> None:
+    """Fail unless the replay projected every delivered handled event up to where it stopped."""
+    if step.last_outbox_id is None:
+        return
+    stats = await event_type_stats(session, step.last_outbox_id)
+    delivered = sum(item.delivered_covered for item in stats if projector.handles(item.event_type))
+    if delivered != step.count:
+        raise RunnerActiveError(
+            "events were delivered while the graph was being rebuilt; stop the projection "
+            "runner and run the rebuild again"
+        )
+
+
 async def _write_checkpoints(
     session_factory: async_sessionmaker[AsyncSession],
     projectors: Sequence[Projector],
@@ -1278,6 +1434,7 @@ class RebuildReport:
     outcome: ProjectionOutcome
     recorded: RecordResult | None
     record_error: str | None = None
+    skipped_dead_lettered: tuple[UUID, ...] = ()
 
     @property
     def ok(self) -> bool:
@@ -1296,6 +1453,10 @@ class RebuildReport:
             "verification": self.verification.to_dict(),
             "recorded": None if self.recorded is None else self.recorded.to_dict(),
             "record_error": self.record_error,
+            "skipped_dead_lettered": {
+                "count": len(self.skipped_dead_lettered),
+                "event_ids": [str(item) for item in self.skipped_dead_lettered[:_SKIPPED_LISTED]],
+            },
         }
 
 
@@ -1337,6 +1498,7 @@ async def rebuild_projections(
     recorder: ProjectionEventRecorder | None = None,
     clock: Clock = lambda: datetime.now(UTC),
     batch_size: int = DEFAULT_BATCH_SIZE,
+    runner_quiet_seconds: int = DEFAULT_RUNNER_QUIET_SECONDS,
 ) -> RebuildReport:
     """Rebuild the graph projection from the ledger into `target`, then verify it.
 
@@ -1348,18 +1510,24 @@ async def rebuild_projections(
     `wipe_target`, creates the schema, replays every event, and verifies coverage, orphans and the
     digest. Adopting the target (pointing the API and projector at it) is an operator step.
 
-    `in_place=True` rebuilds the live graph (`target` is the live store). It refuses while the
-    projection runner holds an unexpired outbox lease. Order, so a crash never leaves a checkpoint
-    claiming progress the graph lacks: mark checkpoints rebuilding at zero, wipe the graph, create
-    the schema, replay the delivered events, write the checkpoints the replay reached, and verify
-    the live projection like `verify_projections`. Pending events stay pending for the runner.
+    Both modes skip events the runner dead-lettered (the live graph never held them) and report
+    them in `skipped_dead_lettered`.
+
+    `in_place=True` rebuilds the live graph (`target` is the live store). The projection runner
+    MUST be stopped: the runtime keeps no lock, so `ensure_runner_idle` is a best-effort guard
+    (unexpired leases, recent outbox activity, another projector-role connection) and a runner
+    started or idling between polls can still slip past it. Order, so a crash never leaves a
+    checkpoint claiming progress the graph lacks: mark checkpoints rebuilding at zero, wipe the
+    graph, create the schema, replay the delivered events, then `_finalize_checkpoints` (under a
+    row lock: catch up on events delivered meanwhile, never move a checkpoint backwards, recompute
+    the processed counts), and verify the live projection like `verify_projections`. Pending
+    events stay pending for the runner.
     """
     started = clock()
     wiped = 0
     if in_place:
         async with session_factory() as session:
-            if await active_lease_count(session):
-                raise RunnerActiveError("the projection runner holds outbox leases; stop it first")
+            await ensure_runner_idle(session, quiet_seconds=runner_quiet_seconds)
         await _write_checkpoints(
             session_factory, projectors, {}, state=ProjectionState.REBUILDING, now=started
         )
@@ -1370,6 +1538,7 @@ async def rebuild_projections(
         if existing:
             wiped = await wipe_graph(target)
     projected = 0
+    skipped: tuple[UUID, ...] = ()
     verification: VerificationReport | None = None
     try:
         if in_place:
@@ -1377,13 +1546,11 @@ async def rebuild_projections(
         await ensure_schema(target)
         replay = await replay_ledger(session_factory, target, projectors, delivered_only=in_place)
         projected = replay.projected_events
+        async with session_factory() as session:
+            skipped = await dead_lettered_event_ids(session)
         if in_place:
-            await _write_checkpoints(
-                session_factory,
-                projectors,
-                replay.progress,
-                state=ProjectionState.ACTIVE,
-                now=clock(),
+            projected += await _finalize_checkpoints(
+                session_factory, target, projectors, replay, now=clock()
             )
             verification = await verify_projections(
                 session_factory, target, projectors, clock=clock, batch_size=batch_size
@@ -1437,6 +1604,7 @@ async def rebuild_projections(
         outcome=outcome,
         recorded=recorded,
         record_error=record_error,
+        skipped_dead_lettered=skipped,
     )
 
 
@@ -1616,7 +1784,9 @@ async def projection_status(
 
 
 __all__ = [
+    "CLI_APPLICATION_NAME",
     "DEFAULT_BATCH_SIZE",
+    "DEFAULT_RUNNER_QUIET_SECONDS",
     "NODE_KEYS",
     "PLATFORM_PRODUCER_ID",
     "RECORD_FAILED",
@@ -1649,6 +1819,8 @@ __all__ = [
     "classify_replay",
     "compute_graph_digest",
     "count_nodes",
+    "dead_lettered_event_ids",
+    "ensure_runner_idle",
     "node_identity",
     "preflight",
     "primary_label",

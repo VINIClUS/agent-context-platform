@@ -1065,7 +1065,10 @@ async def test_replay_projects_matching_events_in_ledger_order_without_touching_
     assert (result.rows, result.projected_events, result.head_outbox_id) == (3, 3, 3)
     assert result.progress[("p", "1")] == ReplayProgress(2, 3, events[2].event_id)
     assert target.writes == 3
-    assert all("outbox.status" not in text for text in make.served)
+    # Every status but dead-lettered: the live runner skips a poison event, so the graph never had it.
+    assert all(
+        "outbox.status != " in text and "outbox.status =" not in text for text in make.served
+    )
 
 
 async def test_a_delivered_only_replay_filters_on_the_outbox_status(
@@ -1145,13 +1148,23 @@ class Steps:
         self.projectors = [FakeProjector("p", "t.a"), FakeProjector("q", "t.a")]
         self.ok = ok
         self.fail_replay = False
+        self.skipped: tuple[Any, ...] = ()
         progress = {
             ("p", "1"): ReplayProgress(3, 7, EVENT_B),
             ("q", "1"): ReplayProgress(3, 7, EVENT_B),
         }
 
-        async def lease_count(_session: Any) -> int:
-            return leases
+        async def idle(_session: Any, *, quiet_seconds: int) -> None:
+            self.calls.append(f"idle {quiet_seconds}")
+            if leases:
+                raise verify.RunnerActiveError("busy")
+
+        async def finalize(*_args: Any, **_kwargs: Any) -> int:
+            self.calls.append("finalize checkpoints")
+            return 2
+
+        async def skipped(_session: Any) -> tuple[Any, ...]:
+            return self.skipped
 
         async def write(
             _factory: Any, _projectors: Any, _progress: Any, *, state: Any, now: Any
@@ -1184,7 +1197,9 @@ class Steps:
             self.calls.append("wipe")
             return 9
 
-        monkeypatch.setattr(verify, "active_lease_count", lease_count)
+        monkeypatch.setattr(verify, "ensure_runner_idle", idle)
+        monkeypatch.setattr(verify, "_finalize_checkpoints", finalize)
+        monkeypatch.setattr(verify, "dead_lettered_event_ids", skipped)
         monkeypatch.setattr(verify, "_write_checkpoints", write)
         monkeypatch.setattr(verify, "ensure_schema", schema)
         monkeypatch.setattr(verify, "replay_ledger", replay)
@@ -1229,13 +1244,15 @@ async def test_an_in_place_rebuild_resets_checkpoints_before_wiping_then_replays
     result = await rebuild(steps, in_place=True, recorder=recorder)
 
     assert steps.calls == [
+        "idle 30",
         "checkpoints rebuilding",
         "wipe",
         "schema",
         "replay delivered_only=True",
-        "checkpoints active",
+        "finalize checkpoints",
         "verify live",
     ]
+    assert result.projected_events == 8
     assert result.ok and result.mode == "in_place" and result.wiped_nodes == 9
     assert {run.mode for run in recorder.runs[0]} == {ProjectionMode.REBUILD}
     assert {run.outcome for run in recorder.runs[0]} == {ProjectionOutcome.COMPLETED}
@@ -1250,9 +1267,9 @@ async def test_an_in_place_rebuild_refuses_while_the_runner_holds_leases(
     steps = Steps(monkeypatch, leases=2)
 
     with pytest.raises(verify.RunnerActiveError):
-        await rebuild(steps, in_place=True)
+        await rebuild(steps, in_place=True, runner_quiet_seconds=5)
 
-    assert steps.calls == []
+    assert steps.calls == ["idle 5"]
 
 
 async def test_a_standby_rebuild_never_touches_checkpoints_and_replays_everything(
@@ -1454,3 +1471,206 @@ async def test_preflight_names_every_missing_grant_per_role() -> None:
     assert no_insert.value.role == "api"
     assert "INSERT on ledger.events" in str(no_insert.value)
     assert "USAGE on projection.outbox_outbox_id_seq" in no_insert.value.missing
+
+
+def test_a_replay_skips_dead_lettered_events_in_the_expected_count() -> None:
+    projector = FakeProjector("p", "t.a")
+    done = ReplayProgress(count=2, last_outbox_id=9, last_event_id=EVENT_B)
+
+    result = classify_replay(projector, done, [stats(dead_covered=1)])  # three queued, one poison
+
+    assert result.ok and result.dead_lettered == 1 and result.handled_events == 3
+
+
+async def test_a_continued_replay_starts_after_the_head_and_extends_the_progress(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    events = events_for_replay()
+    make = replay_fixture(monkeypatch, events)
+    projector = FakeProjector("p", "t.a")
+    earlier = {("p", "1"): ReplayProgress(5, 2, EVENT_A)}
+
+    result = await verify.replay_ledger(
+        make,  # type: ignore[arg-type]
+        FakeStore(),  # type: ignore[arg-type]
+        [projector],
+        delivered_only=True,
+        after=2,
+        progress=earlier,
+    )
+
+    assert result.progress is earlier and earlier[("p", "1")].count == 7
+    assert (result.rows, result.head_outbox_id) == (3, 3)
+    empty = await verify.replay_ledger(
+        replay_fixture(monkeypatch, []),  # type: ignore[arg-type]
+        FakeStore(),  # type: ignore[arg-type]
+        [projector],
+        delivered_only=True,
+        after=8,
+    )
+    assert empty.head_outbox_id == 8
+
+
+async def test_dead_lettered_event_ids_come_back_in_ledger_order() -> None:
+    first, second = uuid4(), uuid4()
+
+    ids = await verify.dead_lettered_event_ids(factory(lambda *_: [first, second])())
+
+    assert ids == (first, second)
+
+
+def idle_answer(*, leases: int = 0, recent: int = 0, others: int = 0) -> Callable[[str, str], Any]:
+    def answer(kind: str, text: str) -> Any:
+        if "pg_stat_activity" in text:
+            return others
+        if "lease_expires_at" in text:
+            return leases
+        return recent
+
+    return answer
+
+
+async def test_the_runner_guard_refuses_on_each_of_its_three_signals() -> None:
+    await verify.ensure_runner_idle(factory(idle_answer())(), quiet_seconds=30)
+
+    with pytest.raises(verify.RunnerActiveError, match="leases"):
+        await verify.ensure_runner_idle(factory(idle_answer(leases=1))(), quiet_seconds=30)
+    with pytest.raises(verify.RunnerActiveError, match="last 30s"):
+        await verify.ensure_runner_idle(factory(idle_answer(recent=2))(), quiet_seconds=30)
+    with pytest.raises(verify.RunnerActiveError, match="projector-role connection"):
+        await verify.ensure_runner_idle(factory(idle_answer(others=1))(), quiet_seconds=30)
+
+
+async def test_recent_outbox_activity_is_not_checked_with_a_zero_quiet_period() -> None:
+    session = factory(idle_answer(recent=9))()
+
+    await verify.ensure_runner_idle(session, quiet_seconds=0)
+
+    assert not any("updated_at" in text for text in session.statements)
+
+
+class LockedRow:
+    def __init__(self, outbox_id: int | None, event_id: UUID | None) -> None:
+        self.last_outbox_id = outbox_id
+        self.last_event_id = event_id
+
+
+async def finalize(
+    monkeypatch: pytest.MonkeyPatch,
+    *,
+    live: LockedRow | None,
+    replayed: ReplayProgress,
+    delivered: int,
+    tail: ReplayResult | None = None,
+) -> tuple[int, FakeSession]:
+    projector = FakeProjector("p", "t.a")
+    session = FakeSession(lambda kind, text: live)
+
+    async def tail_replay(*_args: Any, **kwargs: Any) -> ReplayResult:
+        assert kwargs["delivered_only"] and kwargs["after"] == 5
+        return tail or ReplayResult(0, 0, 5, kwargs["progress"])
+
+    async def type_stats(_session: Any, position: int | None) -> list[EventTypeStats]:
+        return [stats(delivered_covered=delivered), stats("t.other", delivered_covered=99)]
+
+    monkeypatch.setattr(verify, "replay_ledger", tail_replay)
+    monkeypatch.setattr(verify, "event_type_stats", type_stats)
+    head = ReplayResult(3, 3, 5, {("p", "1"): replayed})
+
+    projected = await verify._finalize_checkpoints(
+        lambda: session,  # type: ignore[arg-type]
+        FakeStore(),  # type: ignore[arg-type]
+        [projector],
+        head,
+        now=NOW,
+    )
+    return projected, session
+
+
+async def test_finalizing_never_takes_a_checkpoint_behind_the_runner(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    ahead = LockedRow(9, EVENT_B)
+
+    _, session = await finalize(
+        monkeypatch,
+        live=ahead,
+        replayed=ReplayProgress(3, 5, EVENT_A),
+        delivered=3,
+    )
+
+    [upsert] = [text for text in session.statements if "INSERT INTO projection" in text]
+    assert "ON CONFLICT" in upsert and any("FOR UPDATE" in text for text in session.statements)
+
+
+async def test_finalizing_takes_the_replayed_position_and_recomputes_the_count(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    captured: list[Any] = []
+    real = verify.insert
+
+    def spy(model: Any) -> Any:
+        statement = real(model)
+        original = statement.values
+
+        def values(**kwargs: Any) -> Any:
+            captured.append(kwargs)
+            return original(**kwargs)
+
+        statement.values = values
+        return statement
+
+    monkeypatch.setattr(verify, "insert", spy)
+
+    projected, _ = await finalize(
+        monkeypatch,
+        live=LockedRow(2, EVENT_A),
+        replayed=ReplayProgress(3, 5, EVENT_B),
+        delivered=3,
+        tail=ReplayResult(1, 1, 5, {("p", "1"): ReplayProgress(3, 5, EVENT_B)}),
+    )
+    assert projected == 1
+    assert (captured[0]["last_outbox_id"], captured[0]["last_event_id"]) == (5, EVENT_B)
+    assert captured[0]["processed_count"] == 3 and captured[0]["state"] is ProjectionState.ACTIVE
+
+    captured.clear()
+    await finalize(
+        monkeypatch, live=LockedRow(9, EVENT_B), replayed=ReplayProgress(3, 5, EVENT_A), delivered=3
+    )
+    assert (captured[0]["last_outbox_id"], captured[0]["last_event_id"]) == (9, EVENT_B)
+
+
+async def test_finalizing_with_no_progress_anywhere_writes_an_empty_checkpoint(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    _, session = await finalize(monkeypatch, live=None, replayed=ReplayProgress(), delivered=0)
+
+    assert any("INSERT INTO projection" in text for text in session.statements)
+
+
+async def test_finalizing_fails_when_a_delivered_event_was_missed(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    with pytest.raises(verify.RunnerActiveError, match="delivered while the graph"):
+        await finalize(
+            monkeypatch,
+            live=LockedRow(5, EVENT_A),
+            replayed=ReplayProgress(3, 5, EVENT_A),
+            delivered=4,  # the outbox has a delivered event the replay never projected
+        )
+
+
+async def test_a_rebuild_reports_the_dead_lettered_events_it_skipped(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    steps = Steps(monkeypatch)
+    poison = [uuid4(), uuid4()]
+    steps.skipped = tuple(poison)
+
+    result = await rebuild(steps, in_place=False)
+
+    assert result.skipped_dead_lettered == tuple(poison)
+    assert result.to_dict()["skipped_dead_lettered"] == {
+        "count": 2,
+        "event_ids": [str(item) for item in poison],
+    }

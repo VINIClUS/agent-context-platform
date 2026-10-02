@@ -19,6 +19,7 @@ import json
 import os
 import subprocess
 import sys
+import threading
 import uuid
 from collections.abc import Iterator, Sequence
 from dataclasses import dataclass
@@ -27,6 +28,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import urlsplit
 
+import psycopg
 import pytest
 from agent_context_sdk import (
     EventDraftV1,
@@ -60,6 +62,7 @@ from agent_context_platform.indexing.tree_sitter import python as python_adapter
 from agent_context_platform.indexing.tree_sitter import typescript as typescript_adapter
 from agent_context_platform.indexing.tree_sitter.base import ParsedModule, ParseRequest
 from agent_context_platform.ledger.service import IngestionService
+from agent_context_platform.projection import verify
 from agent_context_platform.projection.neo4j import Neo4jStore, Neo4jTransaction
 from agent_context_platform.projection.registry import registered_projectors
 from agent_context_platform.projection.runtime import ProjectionRunner
@@ -283,6 +286,71 @@ async def sql(owner: AsyncEngine, statement: str, **parameters: Any) -> list[Any
     async with owner.begin() as connection:
         result = await connection.execute(text(statement), parameters)
         return list(result.all()) if result.returns_rows else []
+
+
+async def ingest_drafts(dsn: str, drafts: Sequence[EventDraftV1]) -> None:
+    api = create_async_engine(
+        dsn, poolclass=NullPool, connect_args={"options": "-c role=agent_context_api"}
+    )
+    try:
+        ingestion = IngestionService(
+            ContentService(NoContentBlobStore(), RedactionPolicyV1()), session_factory(api)
+        )
+        outcome = await ingestion.ingest(
+            IngestBatchRequestV1(batch_id=new_uuid7(), events=tuple(drafts))
+        )
+        assert outcome.http_status == 200
+    finally:
+        await api.dispose()
+
+
+def new_session_drafts(count: int, prefix: str) -> list[EventDraftV1]:
+    """Fresh `agent.session.started` drafts: handled events the runner has not projected yet."""
+    template = draft_of(session_events()[2])
+    drafts = []
+    for index in range(count):
+        session = f"{prefix}-{index}"
+        data = template.model_dump()
+        data.update(
+            event_id=new_uuid7(),
+            stream_id=f"stream-{session}",
+            idempotency_key=f"key-{session}",
+            payload={**data["payload"], "session_id": session},
+            context={**data["context"], "session_id": session},
+        )
+        drafts.append(EventDraftV1.model_validate(data))
+    return drafts
+
+
+class BackgroundRunner:
+    """A projection runner polling in its own thread, as a deployed one would."""
+
+    def __init__(self, dsn: str) -> None:
+        self._dsn = dsn
+        self._stop = threading.Event()
+        self._thread = threading.Thread(target=lambda: asyncio.run(self._loop()), daemon=True)
+        self.delivered = 0
+
+    async def _loop(self) -> None:
+        engine = role_scoped_engine(self._dsn, "agent_context_projector")
+        try:
+            async with Neo4jStore(neo4j_integration_settings()) as store:
+                runner = ProjectionRunner(
+                    session_factory(engine), store, registered_projectors(), worker_id="e2e-race"
+                )
+                while not self._stop.is_set():
+                    self.delivered += (await runner.run_once(1)).delivered
+                    await asyncio.sleep(0.02)
+        finally:
+            await engine.dispose()
+
+    def __enter__(self) -> BackgroundRunner:
+        self._thread.start()
+        return self
+
+    def __exit__(self, *_exc: object) -> None:
+        self._stop.set()
+        self._thread.join(timeout=60)
 
 
 @dataclass
@@ -514,7 +582,17 @@ def test_in_place_rebuild_reproduces_digest_counts_and_ids(world: World) -> None
     assert refused.exit_code == 2  # no --confirm
 
     result = invoke(
-        ["projection", "rebuild", "--in-place", "--confirm", "neo4j", "--json"], world.env()
+        [
+            "projection",
+            "rebuild",
+            "--in-place",
+            "--confirm",
+            "neo4j",
+            "--runner-quiet-seconds",
+            "0",
+            "--json",
+        ],
+        world.env(),
     )
     assert result.exit_code == 0, result.output
     payload = report(result)
@@ -726,7 +804,18 @@ def test_projector_only_connection_is_enough_when_nothing_is_recorded(world: Wor
     assert standby.exit_code == 0, standby.output
     assert report(standby)["recorded"] is None and not report(standby)["record_error"]
     in_place = invoke(
-        ["projection", "rebuild", "--in-place", "--confirm", "neo4j", "--no-record", "--json"], env
+        [
+            "projection",
+            "rebuild",
+            "--in-place",
+            "--confirm",
+            "neo4j",
+            "--no-record",
+            "--runner-quiet-seconds",
+            "0",
+            "--json",
+        ],
+        env,
     )
     assert in_place.exit_code == 0, in_place.output
     assert report(in_place)["graph_digest"] == world.facts.digest
@@ -787,6 +876,95 @@ def test_a_recording_failure_does_not_mask_a_verified_rebuild(
     assert payload["verified_target"] and payload["graph_digest"] == world.facts.digest
     assert "error: record_failed" in result.stderr and "refused" not in result.output
     assert asyncio.run(graph_facts()) == world.facts
+
+
+def test_the_runner_guard_refuses_recent_outbox_activity_and_other_projector_connections(
+    world: World,
+) -> None:
+    args = ["projection", "rebuild", "--in-place", "--confirm", "neo4j", "--no-record"]
+
+    # Outbox rows were claimed and delivered moments ago by the fixture's runner.
+    recent = invoke([*args, "--runner-quiet-seconds", "86400"], world.env(api=None))
+    assert recent.exit_code == 1 and "outbox rows changed" in recent.stderr
+
+    # Another login that is a member of the projector role is connected: a runner may be running.
+    sync_dsn = world.roles["readonly"].replace("postgresql+psycopg", "postgresql")
+    with psycopg.connect(sync_dsn) as other:
+        other.execute("SELECT 1")
+        busy = invoke([*args, "--runner-quiet-seconds", "0"], world.env(api=None))
+    assert busy.exit_code == 1 and "another projector-role connection" in busy.stderr
+    assert asyncio.run(graph_facts()) == world.facts  # nothing was wiped
+
+
+def test_a_runner_racing_an_in_place_rebuild_never_rolls_checkpoints_back(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    """Bypass the best-effort guard to force the race it exists to prevent.
+
+    A runner keeps projecting new events while the graph is wiped and replayed. The rebuild must
+    either detect that and say so, or finish with checkpoints that agree with the outbox.
+    """
+
+    async def no_guard(*_args: Any, **_kwargs: Any) -> None:
+        return None
+
+    monkeypatch.setattr(verify, "ensure_runner_idle", no_guard)
+    asyncio.run(ingest_drafts(world.dsn, new_session_drafts(60, "race")))
+    rebuild = ["projection", "rebuild", "--in-place", "--confirm", "neo4j", "--no-record", "--json"]
+
+    with BackgroundRunner(world.dsn) as runner:
+        raced = invoke(rebuild, world.env(api=None))
+    assert runner.delivered > 0, "the runner was not projecting during the rebuild"
+    asyncio.run(project_everything(world.dsn))  # drain what the runner had not reached
+
+    if raced.exit_code == 0:
+        assert invoke(["projection", "verify", "--no-record"], world.env(api=None)).exit_code == 0
+    else:
+        assert "stop the projection runner" in raced.stderr
+    monkeypatch.undo()
+    # With the runner stopped the rebuild converges, and the graph equals a fresh replay.
+    settled = invoke([*rebuild, "--runner-quiet-seconds", "0"], world.env(api=None))
+    assert settled.exit_code == 0, settled.output
+    digest = report(settled)["graph_digest"]
+    again = invoke([*rebuild, "--runner-quiet-seconds", "0"], world.env(api=None))
+    assert report(again)["graph_digest"] == digest
+    assert invoke(["projection", "verify", "--no-record"], world.env(api=None)).exit_code == 0
+
+
+def test_a_standby_rebuild_skips_a_dead_lettered_event_like_the_live_projection(
+    world: World,
+) -> None:
+    [poison] = new_session_drafts(1, "poison")
+    asyncio.run(ingest_drafts(world.dsn, [poison]))
+    asyncio.run(
+        sql(
+            world.owner,
+            "UPDATE projection.outbox SET status = 'dead_lettered', retry_count = 5, "
+            "dead_lettered_at = now(), last_error_class = 'PoisonError', updated_at = now() "
+            "WHERE event_id = :event",
+            event=poison.event_id,
+        )
+    )
+    live = asyncio.run(graph_facts())  # the live runner never projected the poison event
+
+    result = invoke(
+        [
+            "projection",
+            "rebuild",
+            *world.target_args(),
+            "--wipe-target",
+            "--confirm",
+            "neo4j",
+            "--json",
+        ],
+        world.target_env(live_uri="bolt://live.invalid:7687"),
+    )
+
+    assert result.exit_code == 0, result.output
+    payload = report(result)
+    assert payload["skipped_dead_lettered"] == {"count": 1, "event_ids": [str(poison.event_id)]}
+    assert payload["graph_digest"] == live.digest
+    assert asyncio.run(graph_facts()) == live
 
 
 def test_the_digest_scales_and_ignores_batch_size(world: World) -> None:

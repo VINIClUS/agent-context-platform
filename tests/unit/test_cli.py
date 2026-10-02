@@ -5,8 +5,10 @@ from __future__ import annotations
 import json
 from collections.abc import AsyncIterator
 from contextlib import asynccontextmanager
+from dataclasses import replace
 from datetime import UTC, datetime
 from typing import Any
+from uuid import uuid4
 
 import pytest
 from agent_context_sdk.events.system import ProjectionOutcome
@@ -367,7 +369,7 @@ def test_rebuild_failure_modes_map_to_exit_codes_without_leaking_messages(
     refused = run("projection", "rebuild", *TARGET, *USER)
     assert refused.exit_code == 2 and "--wipe-target" in refused.stderr
 
-    patch_rebuild(monkeypatch, calls, RunnerActiveError("leases"))
+    patch_rebuild(monkeypatch, calls, RunnerActiveError("the runner may be running, stop it first"))
     active = run("projection", "rebuild", "--in-place", "--confirm", "neo4j")
     assert active.exit_code == 1 and "stop it first" in active.stderr
 
@@ -539,3 +541,38 @@ def test_server_keys_normalize_local_hosts_and_default_ports() -> None:
     assert cli._server_key(settings("neo4j://[::1]:7688", "x")) == ("127.0.0.1", 7688, "x")
     assert cli._server_key(settings(None)) == ("", 7687, "neo4j")
     assert cli._describe(settings("bolt://Host.Example:7000")) == "host.example:7000/neo4j"
+
+
+def test_the_runner_quiet_period_is_an_option_and_dead_letters_are_reported(
+    monkeypatch: pytest.MonkeyPatch, calls: Calls
+) -> None:
+    poison = uuid4()
+
+    async def fake(*args: Any, **kwargs: Any) -> RebuildReport:
+        calls.rebuild.append({"args": args, **kwargs})
+        return replace(
+            RebuildReport(
+                mode="in_place",
+                target="t",
+                projected_events=1,
+                verification=verification(),
+                wiped_nodes=0,
+                outcome=ProjectionOutcome.COMPLETED,
+                recorded=None,
+            ),
+            skipped_dead_lettered=(poison,) * 11,
+        )
+
+    monkeypatch.setattr(cli, "rebuild_projections", fake)
+
+    default = run("projection", "rebuild", "--in-place", "--confirm", "neo4j", "--json")
+    custom = run(
+        "projection", "rebuild", "--in-place", "--confirm", "neo4j", "--runner-quiet-seconds", "0"
+    )
+
+    assert calls.rebuild[0]["runner_quiet_seconds"] == 30
+    assert calls.rebuild[1]["runner_quiet_seconds"] == 0
+    skipped = json.loads(default.stdout)["skipped_dead_lettered"]
+    assert skipped["count"] == 11 and skipped["event_ids"][0] == str(poison)
+    assert "skipped 11 dead-lettered events" in custom.output and "..." in custom.output
+    assert "MUST be stopped" in run("projection", "rebuild", "--help").output.replace("\n", " ")

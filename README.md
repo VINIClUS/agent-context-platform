@@ -137,10 +137,19 @@ agent-context projection rebuild --in-place --confirm neo4j   # stop the project
   replay head fails verification with `delivered_after_replay`; one still pending is only lag),
   point the API and the projector at the verified target (deploy step, see the infrastructure
   runbook), then run `verify --replay-check` against it. A plain `verify` cannot notice events the
-  old graph received but the target lacks, because the checkpoints say they were delivered. `--in-place --confirm <database>` rebuilds the live graph instead: stop the
-  runner first (the command refuses while outbox leases are unexpired, the only signal the runtime
-  keeps), then it resets the registered checkpoints, wipes the graph, replays the delivered events,
-  rewrites the checkpoints and verifies. Events not yet delivered stay for the runner.
+  old graph received but the target lacks, because the checkpoints say they were delivered. `--in-place --confirm <database>` rebuilds the live graph instead. **Operator
+  precondition: stop the projection runner first and keep it stopped** (the runtime keeps no lock;
+  a runner maintenance flag is follow-up FU-62). The command only has best-effort guards, and
+  refuses (exit `1`) on an unexpired outbox lease, an outbox row changed within
+  `--runner-quiet-seconds` (default 30, `0` disables), or another connection of a projector-role
+  member; a runner idle between polls with no connection passes them. It resets the registered
+  checkpoints to `rebuilding`, wipes the graph, replays the delivered events, then under a row lock
+  catches up on events delivered meanwhile and writes each checkpoint as the greater of the live and
+  replayed position, with the processed count recomputed from the outbox, so a checkpoint never goes
+  backwards; if a delivered event was missed it fails and asks for a rerun with the runner stopped.
+  It then re-verifies the live projection. Events not yet delivered stay for the runner. Both
+  modes skip events the runner dead-lettered (the live graph never held them) and list them, with
+  their count, in the output and JSON (`skipped_dead_lettered`).
 
 ## Ingestion API contract
 

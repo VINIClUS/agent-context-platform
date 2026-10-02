@@ -31,7 +31,9 @@ from agent_context_platform.db import session_factory
 from agent_context_platform.projection.neo4j import Neo4jStore
 from agent_context_platform.projection.registry import registered_projectors
 from agent_context_platform.projection.verify import (
+    CLI_APPLICATION_NAME,
     DEFAULT_BATCH_SIZE,
+    DEFAULT_RUNNER_QUIET_SECONDS,
     MissingGrantError,
     ProjectionEventRecorder,
     RebuildReport,
@@ -126,7 +128,11 @@ def _load_settings() -> Settings:
 def _engine(dsn: Secret[PostgresDsn] | None, name: str) -> AsyncEngine:
     if dsn is None:
         raise CliUsageError(f"AGENT_CONTEXT_POSTGRESQL__{name} (or __DSN) is required")
-    return create_async_engine(dsn.get_secret_value().unicode_string(), pool_pre_ping=True)
+    return create_async_engine(
+        dsn.get_secret_value().unicode_string(),
+        pool_pre_ping=True,
+        connect_args={"application_name": CLI_APPLICATION_NAME},
+    )
 
 
 @asynccontextmanager
@@ -244,8 +250,8 @@ def _run(main: Callable[[], Coroutine[Any, Any, int]]) -> None:
     except MissingGrantError as error:
         typer.echo(f"error: {error}", err=True)
         code = EXIT_FAILED
-    except RunnerActiveError:
-        typer.echo("error: the projection runner holds outbox leases; stop it first", err=True)
+    except RunnerActiveError as error:
+        typer.echo(f"error: {error}", err=True)
         code = EXIT_FAILED
     except Exception as error:
         typer.echo(f"error: {public_error_class(error)}", err=True)
@@ -361,6 +367,13 @@ def _rebuild_lines(report: RebuildReport) -> list[str]:
         f"projected {report.projected_events} events, wiped {report.wiped_nodes} nodes",
     ]
     lines.extend(_verification_lines(report.verification, require_caught_up=False))
+    if report.skipped_dead_lettered:
+        skipped = report.skipped_dead_lettered
+        lines.append(
+            f"skipped {len(skipped)} dead-lettered events: "
+            + ", ".join(str(item) for item in skipped[:10])
+            + (" ..." if len(skipped) > 10 else "")
+        )
     if report.record_error is not None:
         lines.append(f"recording failed: {report.record_error}")
     if report.ok:
@@ -373,7 +386,12 @@ def _rebuild_lines(report: RebuildReport) -> list[str]:
 def rebuild_command(
     in_place: Annotated[
         bool,
-        typer.Option("--in-place", help="Rebuild the live graph (the runner must be stopped)."),
+        typer.Option(
+            "--in-place",
+            help="Rebuild the live graph. The projection runner MUST be stopped first: there is "
+            "no runner lock, so only leases, recent outbox activity and other projector-role "
+            "connections are checked.",
+        ),
     ] = False,
     target_uri: _TARGET_URI = None,
     target_database: _TARGET_DATABASE = None,
@@ -383,6 +401,14 @@ def rebuild_command(
     record: Annotated[
         bool, typer.Option("--record/--no-record", help="Record a projection.rebuilt event.")
     ] = True,
+    runner_quiet_seconds: Annotated[
+        int,
+        typer.Option(
+            "--runner-quiet-seconds",
+            min=0,
+            help="--in-place refuses if an outbox row changed this recently (0 disables).",
+        ),
+    ] = DEFAULT_RUNNER_QUIET_SECONDS,
     json_output: _JSON = False,
     batch_size: _BATCH = DEFAULT_BATCH_SIZE,
 ) -> None:
@@ -417,6 +443,7 @@ def rebuild_command(
                     wipe_target=wipe_target,
                     recorder=_recorder(runtime),
                     batch_size=batch_size,
+                    runner_quiet_seconds=runner_quiet_seconds,
                 )
             finally:
                 if not in_place:
