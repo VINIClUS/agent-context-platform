@@ -232,7 +232,7 @@ def test_cypher_is_static_and_uses_closed_tables() -> None:
         graph._ALTERNATIVES,
     ]
     allowed = {
-        "id", "ids", "repository_id", "visited", "limit", "depth",
+        "id", "ids", "repository_id", "visited", "limit",
         "source_id", "target_id", "predicates", "winners",
     }  # fmt: skip
     for query in queries:
@@ -241,7 +241,10 @@ def test_cypher_is_static_and_uses_closed_tables() -> None:
             "'repository'", ""
         ).replace("'module'", "").replace("'file'", "").replace("'symbol'", ""), query
     assert {kind.value for kind in graph.EdgeKind} >= {"CALLS", "IMPORTS", "DEFINES"}
-    assert "*1..4" in next(iter(graph._PATHS.values()))
+    assert {"*1..1]", "*1..2]", "*1..3]", "*1..4]"} == {
+        next(m for m in ("*1..1]", "*1..2]", "*1..3]", "*1..4]") if m in q)
+        for q in graph._PATHS.values()
+    }
 
 
 @pytest.mark.parametrize("field", ["revision", "valid_at", "recorded_at"])

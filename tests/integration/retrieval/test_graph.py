@@ -493,3 +493,36 @@ def test_foreign_dependency_nodes_and_emptied_modules_are_not_returned() -> None
             await service.dependencies(R1, "mod-1")
 
     with_graph(body)
+
+
+def test_a_dependency_node_shared_by_two_repositories_leaks_nothing() -> None:
+    async def body(store: Neo4jStore, service: GraphTraversalService, seed: GraphSeed) -> None:
+        await seed.file("repo-1", "file-1", "x.py", "mod-1")
+        await seed.file("repo-2", "file-2", "y.py", "mod-2")
+
+        async def write(tx: Neo4jTransaction) -> None:
+            await tx.run(
+                "MERGE (d:Dependency {dependency_id: 'json'}) SET d.repository_id = 'repo-1' "
+                "WITH d UNWIND [['file-1', 'repo-1'], ['file-2', 'repo-2']] AS row "
+                "MATCH (f:File {file_id: row[0]}) "
+                "CREATE (f)-[:CURRENT_REVISION]->(fr:FileRevision {file_revision_id: 'fr-' + row[0]}) "
+                "CREATE (a:Assertion {assertion_id: 'dep-' + row[0], repository_id: row[1], "
+                "family: 'dependency', current: true, dependency_kind: 'observed', "
+                "evidence_kind: 'tree_sitter', confidence: 0.9, "
+                "source_event_ids: ['ev-' + row[0]]}) "
+                "CREATE (a)-[:OBSERVED_IN]->(fr) CREATE (a)-[:DEPENDS_ON]->(d)",
+                parameters={},
+            )
+
+        await store.execute_write(write)  # one Dependency node, asserted from both repositories
+        mine = await service.dependencies(R1, "file-1")
+        assert [(d.dependency_id, d.evidence.assertion_id) for d in mine.external] == [
+            ("json", "dep-file-1")
+        ]
+        assert mine.external[0].evidence.source_event_ids == ("ev-file-1",)
+        # The node belongs to repo-1, so repo-2 gets none of it, and never repo-1's assertion.
+        assert (await service.dependencies(R2, "file-2")).external == ()
+        with pytest.raises(GraphAnchorNotFound):
+            await service.dependencies(R2, "file-1")
+
+    with_graph(body)

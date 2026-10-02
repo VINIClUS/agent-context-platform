@@ -23,9 +23,9 @@ Contract
   with `asyncio.timeout` (the server checks transaction timeouts only periodically, so the client
   clock is what makes short deadlines exact; the driver timeout stops what the client abandoned).
   Expiry raises `RetrievalDeadlineExceeded`.
-- All Cypher is static text. Labels and relationship types come from closed tables below, depth and
-  limits are passed as parameters or, for variable-length paths, fixed by the pattern (`*1..4`)
-  and checked with `$depth`. No input is ever interpolated.
+- All Cypher is static text. Labels and relationship types come from closed tables below, limits are
+  parameters, and variable-length paths use one static query per depth (`*1..1` to `*1..4`),
+  chosen from a closed table. No input is ever interpolated.
 - Order is deterministic: nodes by `(distance, node_id)`, edges by `(type, source, target)`,
   paths by `(length, node ids)`. When the node limit cuts a level, nodes are kept in
   `(kind, node_id)` order.
@@ -39,8 +39,9 @@ Mapping to the SDK `EvidenceRefV1` (PLATFORM-043)
 event IDs instead. P043 must resolve `source_event_ids` through the ledger (`event_content_refs`)
 to a content reference, or choose a metadata-only form, per event. `valid_from`/`valid_to` and
 `recorded` times are the P038 fixed-width UTC strings (`YYYY-MM-DDTHH:MM:SS.ffffffZ`);
-`evidence_kind` is `scip`/`tree_sitter`/`git`/`test` as stored (SCIP and `git` are deterministic
-and syntactic `tree_sitter` facts and heuristic ones differ by `confidence`, 0.9 vs 0.5).
+`evidence_kind` is `scip`, `tree_sitter`, `git` or `test` as stored. SCIP and `git` evidence is
+deterministic (confidence 1.0); `tree_sitter` evidence is inferred, and `confidence` tells
+syntactic facts (0.9) from heuristic ones (0.5).
 Structural nodes and `IN_MODULE`/`IN_REPOSITORY` edges have `evidence_kind=None` and no confidence.
 """
 
@@ -382,15 +383,16 @@ def _path_query(
     source_key: LiteralString,
     target_label: LiteralString,
     target_key: LiteralString,
+    hops: LiteralString,
 ) -> LiteralString:
     return (
         f"MATCH (a:{source_label} {{{source_key}: $source_id}}) "
         f"MATCH (b:{target_label} {{{target_key}: $target_id}}) "
         "WHERE a.repository_id = $repository_id AND b.repository_id = $repository_id "
         "AND a.current = true AND b.current = true "
-        "MATCH p = (a)-[:CALLS|REFERENCES|IMPORTS*1..4]->(b) "
-        "WITH p, nodes(p) AS ns WHERE length(p) <= $depth "
-        "AND all(x IN ns WHERE x.repository_id = $repository_id AND x.current = true) "
+        f"MATCH p = (a)-[:CALLS|REFERENCES|IMPORTS*{hops}]->(b) "
+        "WITH p, nodes(p) AS ns "
+        "WHERE all(x IN ns WHERE x.repository_id = $repository_id AND x.current = true) "
         "AND all(i IN range(0, size(ns) - 2) WHERE NOT ns[i] IN ns[i + 1..]) "
         "WITH p, ns, [x IN ns | coalesce(x.symbol_id, x.file_id)] AS ids "
         "RETURN ids, [x IN ns | labels(x)[0]] AS labels, "
@@ -401,10 +403,12 @@ def _path_query(
     )
 
 
-_PATHS: Final[dict[tuple[NodeKind, NodeKind], LiteralString]] = {
-    (source, target): _path_query(*_PATH_KINDS[source], *_PATH_KINDS[target])
+_HOPS: Final[dict[int, LiteralString]] = {1: "1..1", 2: "1..2", 3: "1..3", 4: "1..4"}
+_PATHS: Final[dict[tuple[NodeKind, NodeKind, int], LiteralString]] = {
+    (source, target, depth): _path_query(*_PATH_KINDS[source], *_PATH_KINDS[target], hops)
     for source in _PATH_KINDS
     for target in _PATH_KINDS
+    for depth, hops in _HOPS.items()
 }
 
 _IMPORT_TAIL: Final[LiteralString] = (
@@ -424,8 +428,12 @@ _IMPORTS: Final[dict[NodeKind, LiteralString]] = {
     ),
     NodeKind.MODULE: (
         "MATCH (m:Module {module_id: $id}) WHERE m.repository_id = $repository_id "
+        # Members are cut inside the database (500 files, then 500 file/symbol rows), so memory
+        # is bounded by the cap and not by the module size.
         "MATCH (m)<-[:IN_MODULE]-(f:File) WHERE f.current = true "
+        "WITH f ORDER BY f.file_id LIMIT 500 "
         "OPTIONAL MATCH (f)-[:DEFINES]->(d:Symbol) WHERE d.current = true "
+        "WITH f, d ORDER BY f.file_id, d.symbol_id LIMIT 500 "
         "WITH collect(DISTINCT f) + collect(DISTINCT d) AS subjects " + _IMPORT_TAIL
     ),
 }
@@ -911,12 +919,11 @@ async def _paths(
         kinds.append(kind)
     rows = (
         await tx.run(
-            _PATHS[(kinds[0], kinds[1])],
+            _PATHS[(kinds[0], kinds[1], max_depth)],
             parameters={
                 "source_id": source,
                 "target_id": target,
                 "repository_id": scope.repository_id,
-                "depth": max_depth,
                 "limit": max_paths + 1,
             },
         )
