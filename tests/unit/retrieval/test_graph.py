@@ -6,7 +6,7 @@ import asyncio
 import re
 from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime
-from types import TracebackType
+from types import SimpleNamespace, TracebackType
 from typing import Any
 
 import pytest
@@ -317,3 +317,210 @@ def test_every_bound_node_variable_is_scoped_to_the_repository() -> None:
             assert name in scoped, (name, query)
             checked += 1
     assert checked > 40
+
+
+# --- the request flows, against a scripted transaction (no database) ---
+
+
+class ScriptedTransaction:
+    """Answers each static query from a table; unknown queries return no rows."""
+
+    def __init__(
+        self, answers: dict[str, Callable[[dict[str, Any]], list[dict[str, Any]]]]
+    ) -> None:
+        self.answers = answers
+        self.calls: list[tuple[str, dict[str, Any]]] = []
+
+    async def run(self, query: str, *, parameters: dict[str, Any]) -> Any:
+        self.calls.append((query, parameters))
+        rows = self.answers.get(query, lambda _p: [])(parameters)
+
+        async def eager() -> Any:
+            return SimpleNamespace(records=rows)
+
+        return SimpleNamespace(to_eager_result=eager)
+
+
+def scripted(
+    answers: dict[str, Callable[[dict[str, Any]], list[dict[str, Any]]]],
+) -> tuple[GraphTraversalService, ScriptedTransaction]:
+    raw = ScriptedTransaction(answers)
+
+    async def behaviour(work: Callable[[Any], Awaitable[Any]]) -> Any:
+        return await work(raw)
+
+    return service(FakeDriver(behaviour)), raw
+
+
+def node_row(node_id: str, name: str | None = None, events: Any = ("ev",)) -> dict[str, Any]:
+    return {
+        "node_id": node_id,
+        "name": name,
+        "revision_id": "rev-" + node_id,
+        "extractor_name": "x",
+        "extractor_version": "1",
+        "valid_from": "t0",
+        "valid_to": None,
+        "events": [list(events)],
+    }
+
+
+def edge_row(kind: str, a: str, b: str, **props: Any) -> dict[str, Any]:
+    base = {"source_event_ids": ["ev-" + a], "evidence_kind": "scip", "confidence": 1.0}
+    return {
+        "type": kind,
+        "source_id": a,
+        "target_id": b,
+        "props": base | props,
+        "revisions": ["fr-2", "fr-1"],
+    }
+
+
+SYMBOL = graph.NodeKind.SYMBOL
+
+
+def test_neighborhood_flow_walks_levels_truncates_and_lists_alternatives() -> None:
+    levels = iter([[{"kind": "File", "node_id": "f1"}, {"kind": "Symbol", "node_id": "b"}]])
+    mode = graph._Mode.NEIGHBORHOOD
+    answers: dict[str, Callable[[dict[str, Any]], list[dict[str, Any]]]] = {
+        graph._RESOLVE: lambda _p: [{"kind": "symbol"}],
+        graph._LEVEL[(mode, SYMBOL)]: lambda _p: next(levels, []),
+        graph._NODE_EVIDENCE[SYMBOL]: lambda p: [node_row(i, f"n-{i}") for i in p["ids"]],
+        graph._NODE_EVIDENCE[graph.NodeKind.FILE]: lambda p: [node_row(i, "f.py") for i in p["ids"]],
+        graph._EDGES[(mode, SYMBOL)]: lambda _p: [edge_row("CALLS", "a", "b")],
+        graph._EDGES[(mode, graph.NodeKind.FILE)]: lambda _p: [
+            edge_row("IN_MODULE", "f1", "a"),
+            edge_row("DEFINES", "f1", "a"),
+        ],
+        graph._ALTERNATIVES: lambda _p: [
+            {
+                "assertion_id": "as-low", "predicate": "CALLS", "subject_id": "a",
+                "object_id": "b", "current": True, "props": {"source_event_ids": ["e"]},
+                "revisions": [],
+            },
+            {
+                "assertion_id": "as-old", "predicate": "CALLS", "subject_id": "a",
+                "object_id": "b", "current": False, "props": {}, "revisions": [],
+            },
+        ],
+    }  # fmt: skip
+    graph_service, raw = scripted(answers)
+    result = asyncio.run(
+        graph_service.neighborhood(GraphScope("r"), "a", 2, include_alternatives=True)
+    )
+    assert [n.node_id for n in result.nodes] == ["a", "b", "f1"]
+    assert [(e.kind.value, e.source_id) for e in result.edges] == [
+        ("CALLS", "a"), ("DEFINES", "f1"), ("IN_MODULE", "f1"),
+    ]  # fmt: skip
+    assert result.edges[0].evidence.revision_id == "fr-1"
+    assert [(a.evidence.assertion_id, a.status) for a in result.alternatives] == [
+        ("as-low", "lower_evidence"),
+        ("as-old", "not_current"),
+    ]
+    assert not result.truncated
+    assert all(parameters.get("repository_id") == "r" for _q, parameters in raw.calls)
+
+
+def test_neighborhood_flow_reports_every_cut() -> None:
+    mode = graph._Mode.CALLERS
+    many = [{"kind": "Symbol", "node_id": f"c{n:03d}"} for n in range(graph.MAX_NODES + 1)]
+    answers: dict[str, Callable[[dict[str, Any]], list[dict[str, Any]]]] = {
+        graph._RESOLVE: lambda _p: [{"kind": "symbol"}],
+        graph._LEVEL[(mode, SYMBOL)]: lambda p: many[: p["limit"]],
+        graph._NODE_EVIDENCE[SYMBOL]: lambda p: [node_row(i) for i in p["ids"]],
+        graph._EDGES[(mode, SYMBOL)]: lambda p: [
+            edge_row("CALLS", f"c{n:03d}", "a") for n in range(p["limit"])
+        ],
+    }
+    graph_service, _ = scripted(answers)
+    result = asyncio.run(graph_service.callers(GraphScope("r"), "a", 3))
+    assert len(result.nodes) == graph.MAX_NODES and result.truncated
+    assert len(result.edges) == graph.MAX_EDGES
+
+
+def test_flow_errors_are_typed() -> None:
+    graph_service, _ = scripted({})
+    scope = GraphScope("r")
+    with pytest.raises(graph.GraphAnchorNotFound):
+        asyncio.run(graph_service.neighborhood(scope, "nope", 1))
+    only = {graph._RESOLVE: lambda _p: [{"kind": "module"}]}
+    graph_service, _ = scripted(only)
+    for call in (
+        graph_service.callers(scope, "m"),
+        graph_service.callees(scope, "m"),
+        graph_service.dependency_paths(scope, "m", "m"),
+    ):
+        with pytest.raises(GraphRequestError):
+            asyncio.run(call)
+    graph_service, _ = scripted({graph._RESOLVE: lambda _p: [{"kind": "symbol"}]})
+    with pytest.raises(GraphRequestError):
+        asyncio.run(graph_service.dependencies(scope, "s"))
+
+
+def test_dependency_paths_flow() -> None:
+    path = SYMBOL, SYMBOL, 2
+    rel = {"type": "CALLS", "props": {"source_event_ids": ["e"]}, "revisions": ["fr"]}
+    rows = [
+        {"ids": ["a", "b"], "labels": ["Symbol", "Symbol"], "rels": [rel]},
+        {"ids": ["a", "c", "b"], "labels": ["Symbol"] * 3, "rels": [rel, rel]},
+    ]
+    answers: dict[str, Callable[[dict[str, Any]], list[dict[str, Any]]]] = {
+        graph._RESOLVE: lambda _p: [{"kind": "symbol"}],
+        graph._PATHS[path]: lambda p: rows[: p["limit"]],
+        graph._NODE_EVIDENCE[SYMBOL]: lambda p: [node_row(i) for i in p["ids"]],
+    }
+    graph_service, _ = scripted(answers)
+    found = asyncio.run(graph_service.dependency_paths(GraphScope("r"), "a", "b", max_depth=2))
+    assert [[n.node_id for n in p.nodes] for p in found.paths] == [["a", "b"], ["a", "c", "b"]]
+    assert not found.truncated
+    capped = asyncio.run(
+        graph_service.dependency_paths(GraphScope("r"), "a", "b", max_depth=2, max_paths=1)
+    )
+    assert len(capped.paths) == 1 and capped.truncated
+
+
+@pytest.mark.parametrize("members", [500, 501])
+def test_dependencies_flow_flags_a_cut_even_without_imports(members: int) -> None:
+    kind = graph.NodeKind.FILE
+    answers: dict[str, Callable[[dict[str, Any]], list[dict[str, Any]]]] = {
+        graph._RESOLVE: lambda _p: [{"kind": "file"}],
+        graph._IMPORTS[kind]: lambda _p: [],
+        graph._MEMBERS_CUT[kind]: lambda _p: [{"members": members}],
+        graph._NODE_EVIDENCE[kind]: lambda p: [node_row(i, "f.py") for i in p["ids"]],
+        graph._EXTERNAL[kind]: lambda _p: [
+            {
+                "dependency_id": "json", "revision_id": "fr-1",
+                "props": {"dependency_kind": "observed", "assertion_id": "dep-1",
+                          "source_event_ids": ["e"]},
+            }
+        ],
+    }  # fmt: skip
+    graph_service, _ = scripted(answers)
+    result = asyncio.run(graph_service.dependencies(GraphScope("r"), "f1"))
+    assert result.truncated is (members > graph.MAX_NODES)
+    assert result.edges == () and [d.dependency_id for d in result.external] == ["json"]
+    assert result.external[0].evidence.revision_id == "fr-1"
+
+
+def test_dependencies_flow_caps_targets_and_external() -> None:
+    kind = graph.NodeKind.MODULE
+    imports = [
+        {"source_id": "s", "target_id": f"t{n:03d}", "props": {"source_event_ids": ["e"]},
+         "revisions": []} for n in range(graph.MAX_NODES)
+    ]  # fmt: skip
+    external = [
+        {"dependency_id": f"d{n:03d}", "revision_id": None, "props": {}}
+        for n in range(graph.MAX_NODES + 1)
+    ]
+    answers: dict[str, Callable[[dict[str, Any]], list[dict[str, Any]]]] = {
+        graph._RESOLVE: lambda _p: [{"kind": "module"}],
+        graph._IMPORTS[kind]: lambda p: imports[: p["limit"]],
+        graph._MEMBERS_CUT[kind]: lambda _p: [{"members": 3}],
+        graph._NODE_EVIDENCE[kind]: lambda p: [node_row(i) for i in p["ids"]],
+        graph._NODE_EVIDENCE[SYMBOL]: lambda p: [node_row(i) for i in p["ids"]],
+        graph._EXTERNAL[kind]: lambda p: external[: p["limit"]],
+    }
+    graph_service, _ = scripted(answers)
+    result = asyncio.run(graph_service.dependencies(GraphScope("r"), "m"))
+    assert len(result.targets) == graph.MAX_NODES and len(result.edges) == graph.MAX_NODES - 1
+    assert len(result.external) == graph.MAX_NODES and result.truncated
