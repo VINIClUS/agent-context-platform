@@ -35,6 +35,7 @@ from agent_context_platform.indexing.emitter import (
     read_sources,
 )
 from agent_context_platform.indexing.identity import encode_components, repository_namespace
+from agent_context_platform.indexing.lineage import derive_lineage
 from agent_context_platform.indexing.scanner import (
     GitlinkChange,
     Rejection,
@@ -96,10 +97,9 @@ def parse(scan: RepositoryScan) -> list[ParsedFile]:
     return list(result.files)
 
 
-def lineage(scan: RepositoryScan, introducing: str) -> dict[str, uuid.UUID]:
-    return {
-        item.path: identity.file_logical_id(REPO_ID, item.path, introducing) for item in scan.files
-    }
+def lineage(scan: RepositoryScan, introducing: str = "") -> dict[str, uuid.UUID]:
+    """Lineage derived from the repository's first-parent history (never seeded from HEAD)."""
+    return dict(derive_lineage(scan, REPO_ID).file_logical_ids)
 
 
 def seed(repo: object, extra: dict[str, str] | None = None) -> None:

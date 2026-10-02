@@ -42,6 +42,7 @@ from agent_context_platform.indexing.emitter import (
     parse_structural,
     read_sources,
 )
+from agent_context_platform.indexing.lineage import derive_lineage
 from agent_context_platform.indexing.scanner import RepositoryScan, scan_repository
 from agent_context_platform.indexing.scip import import_scip
 from agent_context_platform.indexing.tree_sitter import python as python_adapter
@@ -191,7 +192,7 @@ def _seed(stack: Stack, tmp_path: Path) -> tuple[Path, str, RepositoryScan, dict
     _write_repo(root)
     commit = _commit(root, "seed")
     scan = scan_repository(root)
-    ids = {item.path: identity.file_logical_id(repo_id, item.path, commit) for item in scan.files}
+    ids = dict(derive_lineage(scan, repo_id).file_logical_ids)  # from history, never from HEAD
     return root, commit, scan, ids
 
 
