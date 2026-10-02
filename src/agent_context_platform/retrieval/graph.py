@@ -437,6 +437,15 @@ _IMPORTS: Final[dict[NodeKind, LiteralString]] = {
         "WITH collect(DISTINCT f) + collect(DISTINCT d) AS subjects " + _IMPORT_TAIL
     ),
 }
+# Same cut as `_IMPORTS[MODULE]` but one row further, so the cap being exceeded is observable.
+_MODULE_MEMBERS_CUT: Final[LiteralString] = (
+    "MATCH (m:Module {module_id: $id}) WHERE m.repository_id = $repository_id "
+    "MATCH (m)<-[:IN_MODULE]-(f:File) WHERE f.current = true "
+    "WITH f ORDER BY f.file_id LIMIT 501 "
+    "OPTIONAL MATCH (f)-[:DEFINES]->(d:Symbol) WHERE d.current = true "
+    "WITH f, d ORDER BY f.file_id, d.symbol_id LIMIT 501 "
+    "RETURN count(*) AS members"
+)
 _EXTERNAL_TAIL: Final[LiteralString] = (
     "MATCH (fr)<-[:OBSERVED_IN]-(a:Assertion {family: 'dependency'}) "
     "WHERE a.repository_id = $repository_id AND a.current = true "
@@ -960,6 +969,9 @@ async def _outgoing(tx: Neo4jTransaction, scope: GraphScope, anchor: str) -> Out
     # Edges are capped one below the node cap, so anchor plus targets never exceeds MAX_NODES.
     rows = (await tx.run(_IMPORTS[kind], parameters=params | {"limit": MAX_NODES})).records
     truncated = len(rows) >= MAX_NODES
+    if kind is NodeKind.MODULE:  # members beyond the in-database cut are never silent
+        members = (await tx.run(_MODULE_MEMBERS_CUT, parameters=params)).records[0]["members"]
+        truncated = truncated or int(members) > MAX_NODES
     rows = rows[: MAX_NODES - 1]
     targets = sorted({str(row["target_id"]) for row in rows})
     placed = [_Placed(kind, anchor, 0), *(_Placed(NodeKind.SYMBOL, t, 1) for t in targets)]

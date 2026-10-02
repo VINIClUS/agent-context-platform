@@ -526,3 +526,15 @@ def test_a_dependency_node_shared_by_two_repositories_leaks_nothing() -> None:
             await service.dependencies(R2, "file-1")
 
     with_graph(body)
+
+
+def test_a_module_larger_than_the_member_cut_is_flagged_truncated() -> None:
+    async def body(store: Neo4jStore, service: GraphTraversalService, seed: GraphSeed) -> None:
+        await seed.files("repo-1", MAX_NODES, "mod-exact")
+        exact = await service.dependencies(R1, "mod-exact")
+        assert not exact.truncated  # exactly at the cap is not a loss
+        await seed.files("repo-2", MAX_NODES + 1, "mod-big")
+        big = await service.dependencies(GraphScope("repo-2"), "mod-big")
+        assert big.truncated
+
+    with_graph(body)

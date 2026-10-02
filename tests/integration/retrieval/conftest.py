@@ -111,6 +111,19 @@ class GraphSeed:
         }
         await self._batches(_FILES, [row])
 
+    async def files(self, repository_id: str, count: int, module_id: str) -> None:
+        rows = [
+            {
+                "id": f"{repository_id}-file-{n:04d}",
+                "repository_id": repository_id,
+                "current": True,
+                "path": f"f{n}.py",
+                "module_id": module_id,
+            }
+            for n in range(count)
+        ]
+        await self._batches(_FILES, rows)
+
     async def calls(self, pairs: Sequence[tuple[str, str]], **evidence: Any) -> None:
         rows = [
             {"source": a, "target": b, "props": edge_props(f"{a}>{b}", **evidence)}
