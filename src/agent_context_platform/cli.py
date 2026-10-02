@@ -562,34 +562,94 @@ def _inside_git_work_tree(directory: Path) -> bool:
     return any((parent / ".git").exists() for parent in (directory, *directory.parents))
 
 
-def _create_secret_file(path: Path) -> Path:
-    """Create ``path`` (a new file only, mode 0600) before any credential is issued."""
-    parent = path.expanduser().absolute().parent
+class SecretFile:
+    """A new 0600 file whose descriptor is held from creation until the token is written.
+
+    The path is never reopened: a writer of the directory who swaps the name during the slow
+    hash/database step cannot receive the token, and cleanup unlinks only what is still ours.
+    """
+
+    def __init__(self, path: Path, descriptor: int) -> None:
+        self.path = path
+        self._descriptor: int | None = descriptor
+        status = os.fstat(descriptor)
+        self._identity = (status.st_dev, status.st_ino)
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or status.st_nlink != 1
+            or status.st_uid != os.geteuid()
+            or stat.S_IMODE(status.st_mode) != 0o600
+        ):
+            self.abandon()
+            raise CliUsageError("--output is not a private regular file")
+
+    @classmethod
+    def create(cls, path: Path) -> SecretFile:
+        """Create ``path`` (a new file only, mode 0600) before any credential is issued."""
+        parent = path.expanduser().absolute().parent
+        try:
+            parent = parent.resolve(strict=True)
+        except OSError:
+            raise CliUsageError("the --output directory does not exist") from None
+        if _inside_git_work_tree(parent):
+            raise CliUsageError("--output must not be inside a git work tree")
+        target = parent / path.name
+        try:
+            descriptor = os.open(
+                target,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                stat.S_IRUSR | stat.S_IWUSR,
+            )
+        except FileExistsError:
+            raise CliUsageError("--output already exists; it is never overwritten") from None
+        except OSError:
+            raise CliUsageError("--output cannot be created") from None
+        return cls(target, descriptor)
+
+    def write(self, token: str) -> None:
+        """Write through the held descriptor and close it."""
+        descriptor, self._descriptor = self._descriptor, None
+        if descriptor is None:
+            raise CliUsageError("--output was already written")
+        with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+            handle.write(token + "\n")
+
+    def abandon(self) -> None:
+        """Close and remove the file, but only if the path still names the file we created."""
+        descriptor, self._descriptor = self._descriptor, None
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            current = self.path.lstat()
+        except OSError:
+            return
+        if (current.st_dev, current.st_ino) != self._identity:
+            typer.echo("warning: --output was replaced meanwhile; left in place", err=True)
+            return
+        self.path.unlink(missing_ok=True)
+
+
+async def _issue(
+    output: Path | None,
+    json_output: bool,
+    issue: Callable[[], Coroutine[Any, Any, provisioning.IssuedCredential]],
+) -> int:
+    """Run ``issue`` and deliver its token to stdout or the held ``--output`` descriptor."""
+    destination = None if output is None else SecretFile.create(output)
     try:
-        parent = parent.resolve(strict=True)
-    except OSError:
-        raise CliUsageError("the --output directory does not exist") from None
-    if _inside_git_work_tree(parent):
-        raise CliUsageError("--output must not be inside a git work tree")
-    target = parent / path.name
-    try:
-        descriptor = os.open(
-            target,
-            os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
-            stat.S_IRUSR | stat.S_IWUSR,
-        )
-    except FileExistsError:
-        raise CliUsageError("--output already exists; it is never overwritten") from None
-    except OSError:
-        raise CliUsageError("--output cannot be created") from None
-    os.close(descriptor)
-    return target
+        credential = await issue()
+        _deliver(credential, destination, as_json=json_output)
+    except BaseException:
+        if destination is not None:
+            destination.abandon()
+        raise
+    return EXIT_OK
 
 
 def _deliver(
-    credential: provisioning.IssuedCredential, destination: Path | None, *, as_json: bool
+    credential: provisioning.IssuedCredential, destination: SecretFile | None, *, as_json: bool
 ) -> None:
-    """Hand the plaintext over exactly once: into the pre-created file, or on stdout."""
+    """Hand the plaintext over exactly once: into the held file, or on stdout."""
     document = {
         "kind": credential.kind,
         "id": credential.identifier,
@@ -599,10 +659,8 @@ def _deliver(
         "rotated": credential.rotated,
     }
     if destination is not None:
-        descriptor = os.open(destination, os.O_WRONLY | os.O_NOFOLLOW)
-        with os.fdopen(descriptor, "w", encoding="ascii") as handle:
-            handle.write(credential.token + "\n")
-        document["output"] = str(destination)
+        destination.write(credential.token)
+        document["output"] = str(destination.path)
     if as_json:
         if destination is None:
             document["token"] = credential.token
@@ -633,24 +691,20 @@ def producer_register_command(
 
     async def main() -> int:
         settings = _load_settings()
-        destination = None if output is None else _create_secret_file(output)
-        try:
+
+        async def issue() -> provisioning.IssuedCredential:
             async with _admin_sessions(
                 settings, tables=("operations.registered_producers",), write=True
             ) as sessions:
-                credential = await provisioning.register_producer(
+                return await provisioning.register_producer(
                     sessions,
                     producer_id=producer_id,
                     expires_in_days=expires_in,
                     cost=_hash_cost(settings),
                     rotate=rotate,
                 )
-        except BaseException:
-            if destination is not None:
-                destination.unlink(missing_ok=True)
-            raise
-        _deliver(credential, destination, as_json=json_output)
-        return EXIT_OK
+
+        return await _issue(output, json_output, issue)
 
     _run(main)
 
@@ -734,24 +788,20 @@ def mcp_token_create_command(
         if scope not in provisioning.MCP_SCOPES:
             raise CliUsageError("--scope must be one of: " + ", ".join(provisioning.MCP_SCOPES))
         settings = _load_settings()
-        destination = None if output is None else _create_secret_file(output)
-        try:
+
+        async def issue() -> provisioning.IssuedCredential:
             async with _admin_sessions(
                 settings, tables=("operations.mcp_tokens",), write=True
             ) as sessions:
-                credential = await provisioning.create_mcp_token(
+                return await provisioning.create_mcp_token(
                     sessions,
                     principal=principal,
                     scope=scope,
                     expires_in_days=expires_in,
                     cost=_hash_cost(settings),
                 )
-        except BaseException:
-            if destination is not None:
-                destination.unlink(missing_ok=True)
-            raise
-        _deliver(credential, destination, as_json=json_output)
-        return EXIT_OK
+
+        return await _issue(output, json_output, issue)
 
     _run(main)
 

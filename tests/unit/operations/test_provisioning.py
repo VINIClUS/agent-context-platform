@@ -62,19 +62,23 @@ def test_only_the_memory_read_scope_exists() -> None:
 
 
 def test_secret_file_is_new_private_and_outside_git(tmp_path: Path) -> None:
-    created = cli._create_secret_file(tmp_path / "token")
-    assert stat.S_IMODE(created.stat().st_mode) == 0o600
+    created = cli.SecretFile.create(tmp_path / "token")
+    assert stat.S_IMODE(created.path.stat().st_mode) == 0o600
+    created.abandon()
+    assert not created.path.exists()
+    kept = cli.SecretFile.create(tmp_path / "token")
     with pytest.raises(cli.CliUsageError):
-        cli._create_secret_file(tmp_path / "token")
+        cli.SecretFile.create(tmp_path / "token")
     (tmp_path / "work" / ".git").mkdir(parents=True)
     with pytest.raises(cli.CliUsageError):
-        cli._create_secret_file(tmp_path / "work" / "token")
+        cli.SecretFile.create(tmp_path / "work" / "token")
     with pytest.raises(cli.CliUsageError):
-        cli._create_secret_file(tmp_path / "missing" / "token")
+        cli.SecretFile.create(tmp_path / "missing" / "token")
     link = tmp_path / "link"
     os.symlink(tmp_path / "elsewhere", link)
     with pytest.raises(cli.CliUsageError):
-        cli._create_secret_file(link)
+        cli.SecretFile.create(link)
+    kept.abandon()
 
 
 def test_missing_admin_dsn_and_bad_options_are_usage_errors(
@@ -102,3 +106,22 @@ def test_missing_admin_dsn_and_bad_options_are_usage_errors(
         ],
     ):
         assert runner.invoke(cli.app, args).exit_code == 2
+
+
+def test_a_replaced_output_path_never_receives_the_token_and_is_not_unlinked(
+    tmp_path: Path,
+) -> None:
+    held = cli.SecretFile.create(tmp_path / "token")
+    # An account that can write the directory swaps the name during the slow provisioning step.
+    held.path.rename(tmp_path / "moved")
+    attacker = tmp_path / "token"
+    attacker.write_text("attacker")
+    held.write("prd_secret")
+    assert attacker.read_text() == "attacker"
+    assert (tmp_path / "moved").read_text() == "prd_secret\n"
+
+    other = cli.SecretFile.create(tmp_path / "second")
+    other.path.unlink()
+    other.path.write_text("attacker")
+    other.abandon()  # not ours any more: left in place
+    assert other.path.read_text() == "attacker"

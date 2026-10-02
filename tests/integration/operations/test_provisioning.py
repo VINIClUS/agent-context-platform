@@ -411,3 +411,33 @@ def test_admin_dsn_is_used_and_falls_back_to_dsn(
     }
     assert register(only_admin, "p039b-admin").exit_code == 0
     assert register(_env(postgres_dsn), "p039b-fallback").exit_code == 0
+
+
+def test_a_path_swapped_during_provisioning_never_receives_the_token(
+    operator: dict[str, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    path = tmp_path / "swapped.token"
+    real = provisioning.register_producer
+
+    async def swapping(*args: Any, **kwargs: Any) -> Any:
+        path.rename(tmp_path / "original")
+        path.write_text("attacker")
+        return await real(*args, **kwargs)
+
+    monkeypatch.setattr(provisioning, "register_producer", swapping)
+    result = register(operator, "p039b-swap", "--output", str(path))
+    assert result.exit_code == 0, result.output
+    token = (tmp_path / "original").read_text().strip()
+    assert token.startswith("prd_") and token not in result.output
+    assert path.read_text() == "attacker"
+
+    async def failing(*args: Any, **kwargs: Any) -> Any:
+        path2 = tmp_path / "second.token"
+        path2.unlink()
+        path2.write_text("attacker")
+        raise provisioning.ProvisioningError("producer_conflict")
+
+    monkeypatch.setattr(provisioning, "register_producer", failing)
+    second = register(operator, "p039b-swap2", "--output", str(tmp_path / "second.token"))
+    assert second.exit_code == 2
+    assert (tmp_path / "second.token").read_text() == "attacker"
