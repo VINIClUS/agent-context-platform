@@ -179,9 +179,11 @@ agent-context mcp-token revoke mcp_AbCd1234xyz            # prefix from `mcp-tok
 * **Namespaces.** Producer tokens start with `prd_`, MCP tokens with `mcp_` (a CHECK on
   `operations.mcp_tokens`; `registered_producers` has no prefix CHECK, so `prd_` is enforced here).
   Neither is accepted on the other plane. `--expires-in` is 1-3650 days.
-* **`register`** refuses an active id without `--rotate` (exit `2`); `--rotate` keeps the id and
-  `created_at` and replaces the prefix, verifier and expiry. An expired or revoked id is replaced
-  without `--rotate`. `revoke` sets `revoked_at` (the row stays); an MCP replica may keep serving a
+* **`register`** refuses an active or explicitly revoked id without `--rotate` (exit `2`); `--rotate` keeps the
+  id and `created_at` and replaces the prefix, verifier and expiry. An expired-only id is replaced
+  without `--rotate`. If writing `--output` fails after the credential was committed, the file is
+  removed (only if it is still the one created), the command exits `1` saying the credential was
+  not delivered, and `--rotate` recovers. `revoke` sets `revoked_at` (the row stays); an MCP replica may keep serving a
   revoked token for up to `mcp.principal_cache_ttl_seconds` (default 30 s).
 * **Database role.** These rows are written by an operator connection,
   `AGENT_CONTEXT_POSTGRESQL__ADMIN_DSN` (falls back to `AGENT_CONTEXT_POSTGRESQL__DSN`). The

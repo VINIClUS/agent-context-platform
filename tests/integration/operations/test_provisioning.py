@@ -261,9 +261,48 @@ def test_register_refuses_an_active_id_and_rotate_keeps_it(
         assert tuple(rows) == (1, True)
 
     asyncio.run(exercise())
-    # A revoked registration has no live credential to protect: re-registering needs no --rotate.
+    # A revoked id is an operator decision: only --rotate may undo it.
     run(operator, "producer", "revoke", "p039b-rotate")
-    assert register(operator, "p039b-rotate").exit_code == 0
+    assert register(operator, "p039b-rotate").exit_code == 2
+    assert register(operator, "p039b-rotate", "--rotate").exit_code == 0
+
+
+def test_an_expired_only_id_re_registers_without_rotate(operator: dict[str, str]) -> None:
+    async def expire() -> None:
+        engine = create_async_engine(operator["AGENT_CONTEXT_POSTGRESQL__DSN"], poolclass=NullPool)
+        try:
+            await provisioning.register_producer(
+                session_factory(engine),
+                producer_id="p039b-lapsed",
+                expires_in_days=1,
+                cost=provisioning.HashCost(**COST),
+                now=datetime.now(UTC) - timedelta(days=3),
+            )
+        finally:
+            await engine.dispose()
+
+    asyncio.run(expire())
+    assert register(operator, "p039b-lapsed").exit_code == 0
+    # Now active again: refused without --rotate.
+    assert register(operator, "p039b-lapsed").exit_code == 2
+
+
+def test_a_failed_output_write_is_reported_and_cleaned_up(
+    operator: dict[str, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken(self: cli.SecretFile, token: str) -> None:
+        raise OSError("disk full")
+
+    monkeypatch.setattr(cli.SecretFile, "write", broken)
+    path = tmp_path / "full.token"
+    result = register(operator, "p039b-undelivered", "--output", str(path))
+    assert result.exit_code == 1
+    assert "NOT delivered" in result.stderr and "--rotate" in result.stderr
+    assert not path.exists()
+    monkeypatch.undo()
+    # The credential exists, so a plain retry is refused and --rotate recovers.
+    assert register(operator, "p039b-undelivered").exit_code == 2
+    assert register(operator, "p039b-undelivered", "--rotate").exit_code == 0
 
 
 def test_mcp_tokens_authenticate_only_on_mcp(

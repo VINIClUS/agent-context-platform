@@ -166,10 +166,6 @@ async def check_grants(
         raise MissingProvisioningGrantError(missing)
 
 
-def _is_active(revoked_at: datetime | None, expires_at: datetime, now: datetime) -> bool:
-    return (revoked_at is None or revoked_at > now) and expires_at > now
-
-
 async def register_producer(
     sessions: async_sessionmaker[AsyncSession],
     *,
@@ -181,10 +177,10 @@ async def register_producer(
 ) -> IssuedCredential:
     """Register ``producer_id`` with a new ``events:ingest`` token.
 
-    An active registration is refused unless ``rotate``; ``rotate`` keeps the id and
+    An active or explicitly revoked registration is refused unless ``rotate`` (a revocation
+    is an operator decision that only an explicit rotation may undo); ``rotate`` keeps the id and
     ``created_at`` and replaces the prefix, verifier and expiry (clearing any revocation). An
-    expired or revoked registration is replaced the same way, since there is no live credential
-    to protect.
+    expired-only registration is replaced without it, since nothing live is displaced.
     """
     producer_id = _name(producer_id, "producer_id")
     moment = now or datetime.now(UTC)
@@ -213,7 +209,7 @@ async def register_producer(
                     )
                 )
             else:
-                if not rotate and _is_active(row.revoked_at, row.expires_at, moment):
+                if not rotate and (row.revoked_at is not None or row.expires_at > moment):
                     raise ProvisioningError("producer_exists")
                 row.token_prefix = prefix
                 row.token_verifier = verifier

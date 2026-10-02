@@ -124,6 +124,10 @@ _CONFIRM = Annotated[
 ]
 
 
+class DeliveryError(Exception):
+    """The credential was created but could not be written to ``--output``."""
+
+
 class CliUsageError(Exception):
     """A usage error, reported as exit code 2; the message never holds a secret."""
 
@@ -259,7 +263,7 @@ def _emit(payload: dict[str, Any], *, as_json: bool, lines: list[str]) -> None:
 
 
 _PROVISIONING_HINTS = {
-    "producer_exists": " (an active registration exists; use --rotate to replace its credential)",
+    "producer_exists": " (an active or revoked registration exists; use --rotate to replace it)",
     "producer_conflict": " (a concurrent registration won; retry)",
     "token_conflict": " (retry)",
     "invalid_expiry": " (--expires-in is 1-3650 days)",
@@ -281,6 +285,13 @@ def _run(main: Callable[[], Coroutine[Any, Any, int]]) -> None:
         code = EXIT_USAGE
     except provisioning.MissingProvisioningGrantError as error:
         typer.echo(f"error: {error}", err=True)
+        code = EXIT_FAILED
+    except DeliveryError:
+        typer.echo(
+            "error: the credential was created but NOT delivered (--output could not be written); "
+            "run the command again with --rotate to issue a new one",
+            err=True,
+        )
         code = EXIT_FAILED
     except provisioning.ProvisioningError as error:
         typer.echo(f"error: {error.code}{_PROVISIONING_HINTS.get(error.code, '')}", err=True)
@@ -659,7 +670,10 @@ def _deliver(
         "rotated": credential.rotated,
     }
     if destination is not None:
-        destination.write(credential.token)
+        try:
+            destination.write(credential.token)
+        except OSError:
+            raise DeliveryError from None
         document["output"] = str(destination.path)
     if as_json:
         if destination is None:
