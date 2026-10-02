@@ -716,7 +716,9 @@ def test_alternatives_never_label_a_winner_when_the_edge_output_is_capped() -> N
             "repo-1", "as-old", ids[2], ids[3], current=False, evidence_kind="tree_sitter",
             confidence=0.4,
         )  # fmt: skip
-        result = await service.neighborhood(R1, ids[0], 4, include_alternatives=True)
+        result = await service.neighborhood(
+            R1, ids[0], 4, include_alternatives=True, deadline_seconds=60
+        )
         assert result.truncated and len(result.edges) == 2000 and len(result.nodes) == MAX_NODES
         assert {(a.evidence.assertion_id, a.status) for a in result.alternatives} == {
             ("as-loser", "lower_evidence"),
