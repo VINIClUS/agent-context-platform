@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from pathlib import Path
 from typing import Annotated, Literal, Self
 
 from pydantic import (
@@ -190,6 +191,21 @@ class IngestionSettings(BaseModel):
     argon2_max_queue_depth: int = Field(default=16, gt=0)
 
 
+class SearchSettings(BaseModel):
+    """Local embedding model location and bounds (PLATFORM-042).
+
+    The service never downloads the model: `agent-context models fetch --dest <dir>` does, and
+    the service loads `model_dir`, failing closed on any digest mismatch. With no `model_dir`
+    the search projector cannot embed and refuses to index (it never silently skips).
+    """
+
+    model_config = _SECTION_CONFIG
+
+    model_dir: Path | None = Field(default=None, strict=False)
+    embedding_batch_size: int = Field(default=16, ge=1, le=256)
+    embedding_threads: int = Field(default=1, ge=1, le=16)
+
+
 class Settings(BaseSettings):
     """Single process boundary for the Agent Context environment namespace."""
 
@@ -209,6 +225,7 @@ class Settings(BaseSettings):
     s3: S3Settings = Field(default_factory=S3Settings)
     mcp: MCPSettings = Field(default_factory=MCPSettings)
     ingestion: IngestionSettings = Field(default_factory=IngestionSettings)
+    search: SearchSettings = Field(default_factory=SearchSettings)
     # Structural indexer (PLATFORM-032b). Adapters are confined with Landlock and the runner
     # refuses to run them when the kernel cannot enforce it; this is the dev-only escape hatch
     # (AGENT_CONTEXT_INDEXER_ALLOW_UNCONFINED_ADAPTERS). Never enable it in production.

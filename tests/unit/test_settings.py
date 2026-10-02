@@ -382,3 +382,30 @@ def test_role_dsns_fall_back_to_the_shared_dsn_and_never_print() -> None:
 def test_role_dsns_share_the_scheme_and_database_rules(field: str, dsn: str) -> None:
     with pytest.raises(ValidationError):
         Settings(postgresql={field: dsn})
+
+
+def test_search_settings_default_to_no_model_and_a_small_batch() -> None:
+    search = Settings().search
+
+    assert search.model_dir is None
+    assert (search.embedding_batch_size, search.embedding_threads) == (16, 1)
+
+
+def test_search_settings_load_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENT_CONTEXT_SEARCH__MODEL_DIR", "/models/minilm")
+    monkeypatch.setenv("AGENT_CONTEXT_SEARCH__EMBEDDING_BATCH_SIZE", "8")
+    monkeypatch.setenv("AGENT_CONTEXT_SEARCH__EMBEDDING_THREADS", "2")
+
+    search = Settings().search
+
+    assert str(search.model_dir) == "/models/minilm"
+    assert (search.embedding_batch_size, search.embedding_threads) == (8, 2)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("embedding_batch_size", 0), ("embedding_batch_size", 257), ("embedding_threads", 0)],
+)
+def test_search_settings_reject_unbounded_values(field: str, value: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(search={field: value})

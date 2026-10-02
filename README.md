@@ -244,6 +244,32 @@ agent-context mcp-token revoke mcp_AbCd1234xyz            # prefix from `mcp-tok
   connection must be the schema owner or a role granted `SELECT, INSERT, UPDATE` on them. The
   grants are checked before any write; a missing one exits `1` naming it. The DSN is never printed.
 
+## Search and embeddings
+
+Retrieval over sanitized content has two projections, both rebuildable from the ledger and never a
+source of truth: PostgreSQL full-text rows (`retrieval.search_documents`, a `simple`-configuration
+`tsvector` with a GIN index; the text itself is not stored twice) and 384-dimension vectors on
+Neo4j `ContentEmbedding` nodes behind a cosine vector index. The `search` projector writes both for
+every event that references sanitized content and removes both on `content.purged`. Search is
+always scoped to a project and a repository, bounded to 100 results and runs under a deadline
+(`retrieval/search.py`).
+
+Embeddings come from the multilingual MiniLM model run on `onnxruntime` (no torch). The model is
+pinned by revision and file digests in `src/agent_context_platform/retrieval/models.lock.json`.
+The service and the tests never download it; fetch it once and point the service at it:
+
+```bash
+agent-context models fetch --dest /var/lib/agent-context/models/minilm   # about 470 MB, sha256-checked
+export AGENT_CONTEXT_SEARCH__MODEL_DIR=/var/lib/agent-context/models/minilm
+```
+
+Loading re-checks every digest and fails closed on a mismatch. Without `MODEL_DIR` the search
+projector refuses to index (it dead-letters rather than silently skipping), and `projection
+rebuild|verify` need it to reproduce the `ContentEmbedding` nodes. `AGENT_CONTEXT_SEARCH__EMBEDDING_BATCH_SIZE`
+and `..._EMBEDDING_THREADS` bound the inference work. `tests/unit/retrieval/test_model_parity.py`
+compares the ONNX output with sentence-transformers and runs only when
+`AGENT_CONTEXT_TEST_MODEL_PARITY=1`.
+
 ## Ingestion API contract
 
 `openapi/agent-context-v1.json` freezes the ingestion v1 HTTP surface (`/v1/ingestion/*` and the

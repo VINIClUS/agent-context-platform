@@ -387,6 +387,8 @@ class World:
             if settings.password
             else "",
             "AGENT_CONTEXT_NEO4J__DATABASE": settings.database,
+            # These worlds hold no searchable content and no embedding model (PLATFORM-042).
+            "AGENT_CONTEXT_PROJECTION_WITHOUT_SEARCH": "1",
         }
 
     def target_env(self, *, live_uri: str | None, **roles: Any) -> dict[str, str]:
