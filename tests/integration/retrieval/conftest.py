@@ -20,7 +20,10 @@ from agent_context_platform.projection.schema import SCHEMA_STATEMENTS, ensure_s
 from agent_context_platform.retrieval.graph import GraphTraversalService
 from agent_context_platform.settings import Neo4jSettings
 
-from ..projection.conftest import neo4j_integration_settings
+from ..projection.conftest import (  # noqa: F401  (fixture)
+    neo4j_integration_settings,
+    projection_engine,
+)
 
 BATCH = 1000
 

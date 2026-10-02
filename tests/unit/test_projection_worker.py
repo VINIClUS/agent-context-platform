@@ -382,12 +382,25 @@ def test_run_usage_errors_exit_2(worker: dict[str, Any], tmp_path: Path) -> None
 def test_the_worker_builds_its_projectors_through_one_factory(
     worker: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    import asyncio
+    from types import SimpleNamespace
+
     from agent_context_platform.projection.registry import registered_projectors
     from agent_context_platform.settings import Settings
 
-    assert cli.build_projectors(Settings()) == registered_projectors()
+    # No model: the worker still starts, with a search projector that can purge but not index.
+    sessions = object()
+    bound = asyncio.run(cli.build_projectors(Settings(), SimpleNamespace(sessions=sessions)))  # type: ignore[arg-type]
+    assert [item.name for item in bound] == [item.name for item in registered_projectors()]
+    assert bound[-1]._purge_access.sessions is sessions  # type: ignore[attr-defined]
+    assert bound[-1]._backend is None  # type: ignore[attr-defined]
     built: list[object] = []
-    monkeypatch.setattr(cli, "build_projectors", lambda settings: built.append(settings) or ())
+
+    async def fake_build(settings: object, runtime: object) -> tuple[()]:
+        built.append(settings)
+        return ()
+
+    monkeypatch.setattr(cli, "build_projectors", fake_build)
     assert CliRunner().invoke(cli.app, ["projection", "run", "--once"]).exit_code == 0
     assert len(built) == 1
 

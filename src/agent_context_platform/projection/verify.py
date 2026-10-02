@@ -86,10 +86,13 @@ Clock = Callable[[], datetime]
 # --------------------------------------------------------------------------------------------
 
 # Properties a projector may write transiently and that must never reach the digest. The projectors
-# write no wall clock or run identity, so the only entry is the lock marker `lock_nodes` sets and
-# removes inside one statement. Extend this list, never the hashing code, when a projector gains a
-# volatile property.
-VOLATILE_PROPERTIES: Final[frozenset[str]] = frozenset({"_lock"})
+# write no wall clock or run identity, so the entries are the lock marker `lock_nodes` sets and
+# removes inside one statement, and `ContentEmbedding.embedding` (PLATFORM-042): ONNX floats can
+# differ in their last bits across CPUs and runtimes, and rounding only moves the boundary a few
+# values can flip across. The node's `content_id`, `model_id`, `model_revision`, scope and
+# `source_event_ids` stay digested, so what was embedded and with which model is still verified.
+# Extend this list, never the hashing code, when a projector gains a volatile property.
+VOLATILE_PROPERTIES: Final[frozenset[str]] = frozenset({"_lock", "embedding"})
 
 # Graph properties that point back at the ledger; every value must be an existing event ID.
 SOURCE_ID_PROPERTIES: Final[tuple[str, ...]] = ("source_event_id", "source_event_ids")
@@ -1583,8 +1586,12 @@ async def rebuild_projections(
     clock: Clock = lambda: datetime.now(UTC),
     batch_size: int = DEFAULT_BATCH_SIZE,
     runner_quiet_seconds: int = DEFAULT_RUNNER_QUIET_SECONDS,
+    before_replay: Callable[[], Awaitable[None]] | None = None,
 ) -> RebuildReport:
     """Rebuild the projection (see `_rebuild_projections`), serialized with other rebuilds.
+
+    `before_replay` runs for an in-place rebuild after every guard and before the graph is wiped
+    (the search tables, projections held outside Neo4j, are reset there).
 
     An in-place rebuild, or a standby rebuild with `wipe_target`, first takes the session-level
     rebuild advisory lock on a dedicated projector connection and holds it for the whole
@@ -1610,6 +1617,7 @@ async def rebuild_projections(
             batch_size=batch_size,
             runner_quiet_seconds=runner_quiet_seconds,
             own_pids=own_pids,
+            before_replay=before_replay,
         )
 
 
@@ -1626,6 +1634,7 @@ async def _rebuild_projections(
     batch_size: int,
     runner_quiet_seconds: int,
     own_pids: Collection[int],
+    before_replay: Callable[[], Awaitable[None]] | None = None,
 ) -> RebuildReport:
     """Rebuild the graph projection from the ledger into `target`, then verify it.
 
@@ -1669,6 +1678,8 @@ async def _rebuild_projections(
     verification: VerificationReport | None = None
     try:
         if in_place:
+            if before_replay is not None:
+                await before_replay()
             wiped = await wipe_graph(target)
         await ensure_schema(target)
         replay = await replay_ledger(session_factory, target, projectors, delivered_only=in_place)
@@ -1844,13 +1855,20 @@ async def preflight(
     recorder_sessions: async_sessionmaker[AsyncSession] | None,
     *,
     write_checkpoints: bool,
+    extra_grants: Sequence[GrantRequirement] = (),
 ) -> None:
     """Check both connections' grants; call before any target or checkpoint is mutated.
+
+    `extra_grants` are further projector-role privileges a bound projector needs (search).
 
     `recorder_sessions` is None when the report is not recorded. `write_checkpoints` is the
     in-place rebuild, which rewrites the live checkpoints.
     """
-    needed = PROJECTOR_READ_GRANTS + (PROJECTOR_CHECKPOINT_GRANTS if write_checkpoints else ())
+    needed = (
+        PROJECTOR_READ_GRANTS
+        + (PROJECTOR_CHECKPOINT_GRANTS if write_checkpoints else ())
+        + tuple(extra_grants)
+    )
     await check_grants(projector_sessions, needed, role="projector")
     if recorder_sessions is not None:
         await check_grants(recorder_sessions, RECORDER_GRANTS, role="api")

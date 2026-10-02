@@ -29,6 +29,11 @@ dependencies = [
     "tree-sitter-go==0.25.0",
     # Operator CLI (`agent-context`); exact pin, no earlier reviewed version existed in uv.lock.
     "typer==0.27.2",
+    # Local embedding runtime (PLATFORM-042): ONNX, not torch, to fit the small VPS profile.
+    # Exact pins; CPU manylinux wheels exist for cp312-cp314 on x86_64 and aarch64 (tokenizers is abi3).
+    "numpy>=2.2,<3",
+    "onnxruntime==1.30.0",
+    "tokenizers==0.23.2",
 ]
 
 [build-system]
@@ -78,7 +83,7 @@ strict = true
 warn_unreachable = true
 
 [[tool.mypy.overrides]]
-module = ["boto3", "botocore.*", "agent_context_sdk"]
+module = ["boto3", "botocore.*", "agent_context_sdk", "onnxruntime"]
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
