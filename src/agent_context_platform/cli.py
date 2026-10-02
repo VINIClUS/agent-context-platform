@@ -2,7 +2,8 @@
 
 It exposes `agent-context projection rebuild|verify|status` (PLATFORM-039) and the credential
 provisioning commands `agent-context producer register|revoke|list` and
-`agent-context mcp-token create|revoke|list` (PLATFORM-039B). Every command reads the process environment through `Settings` (`AGENT_CONTEXT_*`), runs in one `asyncio.run`,
+`agent-context mcp-token create|revoke|list` (PLATFORM-039B), plus `agent-context index` (PLATFORM-039C,
+which indexes one git checkout into the ledger as the indexer producer). Every command reads the process environment through `Settings` (`AGENT_CONTEXT_*`), runs in one `asyncio.run`,
 and never prints a DSN, a password or an exception message: failures are reported by class name.
 
 Exit codes: 0 success, 1 verification mismatch or a failed operation, 2 usage error (bad or
@@ -29,6 +30,7 @@ from pathlib import Path
 from typing import Annotated, Any
 
 import typer
+from agent_context_sdk import RedactionPolicyV1
 from pydantic import PostgresDsn, Secret, ValidationError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
@@ -37,7 +39,12 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from agent_context_platform.content.service import ContentService
 from agent_context_platform.db import session_factory
+from agent_context_platform.indexing.emitter import IndexingConfig, IndexingService
+from agent_context_platform.indexing.identity import repository_namespace
+from agent_context_platform.indexing.pipeline import IndexReport, IndexRequest, index_checkout
+from agent_context_platform.ledger.service import IngestionService
 from agent_context_platform.operations import provisioning
 from agent_context_platform.projection.neo4j import Neo4jStore
 from agent_context_platform.projection.registry import registered_projectors
@@ -46,6 +53,7 @@ from agent_context_platform.projection.verify import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_RUNNER_QUIET_SECONDS,
     MissingGrantError,
+    NoContentBlobStore,
     ProjectionEventRecorder,
     RebuildReport,
     RunnerActiveError,
@@ -545,6 +553,72 @@ def status_command(json_output: _JSON = False) -> None:
             {"projectors": [item.to_dict() for item in statuses]}, as_json=json_output, lines=lines
         )
         return EXIT_OK
+
+    _run(main)
+
+
+# --- indexing (PLATFORM-039C) ------------------------------------------------------------------
+
+
+def _index_lines(report: IndexReport) -> list[str]:
+    target = "no target" if report.target is None else f"{report.target_kind} {report.target}"
+    lines = [
+        f"index {report.index_id or 'none'} ({target})",
+        f"events: {report.submitted} submitted, {report.skipped} already present; "
+        f"files: {report.files} indexed, {report.files_not_indexed} not indexed",
+        "completed" if report.success else f"failed: {report.error_class or 'unsuccessful'}",
+    ]
+    if report.diagnostics:
+        lines.append(
+            "diagnostics: " + ", ".join(f"{k}={v}" for k, v in sorted(report.diagnostics.items()))
+        )
+    return lines
+
+
+@app.command("index")
+def index_command(
+    repository_id: Annotated[
+        str, typer.Option("--repository-id", help="Canonical platform repository id.")
+    ],
+    checkout: Annotated[Path, typer.Option("--checkout", help="Git checkout to index.")],
+    scip: Annotated[
+        Path | None, typer.Option("--scip", help="SCIP index of the checked-out HEAD commit.")
+    ] = None,
+    json_output: _JSON = False,
+) -> None:
+    """Index a git checkout (a commit, or the dirty snapshot) into the ledger.
+
+    Runs as the API role (`AGENT_CONTEXT_POSTGRESQL__API_DSN` or `__DSN`). Prints ids and counts
+    only; never file content, a DSN or a secret. Exit 0 on success, 1 when the index failed
+    (the counts are still printed), 2 on a usage error.
+    """
+
+    async def main() -> int:
+        try:
+            repository_namespace(repository_id)
+        except ValueError:
+            raise CliUsageError(
+                "--repository-id must be non-empty text without control characters"
+            ) from None
+        if not checkout.is_dir():
+            raise CliUsageError("--checkout must be an existing directory")
+        if scip is not None and not scip.is_file():
+            raise CliUsageError("--scip must be an existing file")
+        settings = _load_settings()
+        engine = _engine(settings.postgresql.effective_api_dsn, "API_DSN")
+        try:
+            sessions = session_factory(engine)
+            ingestion = IngestionService(
+                ContentService(NoContentBlobStore(), RedactionPolicyV1()), sessions
+            )
+            service = IndexingService(IndexingConfig(repository_id), ingestion, sessions)
+            report = await index_checkout(
+                IndexRequest(repository_id, checkout, scip), settings, service
+            )
+        finally:
+            await engine.dispose()
+        _emit(report.to_dict(), as_json=json_output, lines=_index_lines(report))
+        return EXIT_OK if report.success else EXIT_FAILED
 
     _run(main)
 

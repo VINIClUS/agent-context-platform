@@ -77,7 +77,7 @@ def test_an_edited_file_observes_only_the_assertions_it_still_produces(
     repo.write("pkg/b.py", "b\n")
     repo.commit("seed")
     first_scan = scan_of(repo)
-    ids = lineage(first_scan, first_scan.workspace.head_commit or "")
+    ids = lineage(first_scan)
     members = {"pkg/a.py": ("caller", "keeper"), "pkg/b.py": ("callee",)}
     calls = {
         "pkg/a.py": (
@@ -142,7 +142,7 @@ def test_an_unchanged_file_revision_at_a_new_commit_emits_no_new_observation(
     seed(repo, {"pkg/util.py": HELPER})
     repo.commit("seed")
     first_scan = scan_of(repo)
-    ids = lineage(first_scan, first_scan.workspace.head_commit or "")  # introduced at the first
+    ids = lineage(first_scan)  # introduced at the first
     first = service().index(first_scan, None, parse(first_scan), file_logical_ids=ids)
     repo.write("README.md", "docs\n")
     repo.commit("touch a non-source file")
@@ -167,7 +167,7 @@ def test_a_clean_file_is_complete_and_a_lossy_one_carries_its_losses(
     seed(repo, {"pkg/util.py": HELPER})
     repo.commit("seed")
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     lossy = {
         "pkg/util.py": (("work_budget_exceeded", "references_capped", "symbols_dropped"), None),
         "pkg/main.py": (("file_degraded", "work_budget_exceeded"), None),
@@ -218,7 +218,7 @@ def test_scip_evidence_dropped_for_a_file_not_at_the_commit_is_a_loss(
     repo.commit("seed")
     repo.write("pkg/main.py", "def run() -> None:\n    return None\n")  # uncommitted edit
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
 
     drafts = service().index(scan, semantic(scan, ids), parse(scan), file_logical_ids=ids)
     revisions = _revisions(drafts)
@@ -235,7 +235,7 @@ def test_a_file_without_lineage_is_not_reported_per_file(
     seed(repo, {"pkg/util.py": HELPER})
     repo.commit("seed")
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     ids.pop("pkg/util.py")
 
     drafts = service().index(scan, None, parse(scan), file_logical_ids=ids)
@@ -267,7 +267,7 @@ def test_a_clean_tracked_file_too_large_to_index_is_reported_not_indexed(
     repo.write("pkg/huge.py", "x = 1\n" * 200_000)  # over the 1 MiB scan cap: no bytes, no digest
     repo.commit("seed")
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
 
     drafts = service().index(scan, None, parse(scan), file_logical_ids=ids)
     coverage = _payloads(drafts, COVERAGE)
@@ -291,7 +291,7 @@ def test_go_files_get_membership_and_coverage_with_their_own_losses(
     repo.write("go/util/util.go", "package util\n")
     repo.commit("seed")
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     imports = {"go/main.go": (_reference("import", "example.invalid/mod/go/util"),)}
     adapters = {"go": TableAdapter("go", imports)}
     parsed = list(parse_structural(adapters, read_sources(scan)).files)  # type: ignore[arg-type]

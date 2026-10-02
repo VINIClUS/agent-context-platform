@@ -156,6 +156,32 @@ agent-context projection rebuild --in-place --confirm neo4j   # stop the project
   modes skip events the runner dead-lettered (the live graph never held them) and list them, with
   their count, in the output and JSON (`skipped_dead_lettered`).
 
+### Indexing a checkout
+
+`agent-context index --repository-id <id> --checkout <path> [--scip <file>] [--json]` indexes one
+git checkout into the ledger as the indexer producer (`agent-context-platform-indexer`), through the
+API-role connection (`AGENT_CONTEXT_POSTGRESQL__API_DSN`, falling back to `__DSN`). The same
+composition is `agent_context_platform.indexing.pipeline.index_checkout` for in-process callers.
+
+* **Target.** A clean checkout indexes its HEAD commit; a dirty one indexes the workspace snapshot.
+  Re-indexing an unchanged target submits nothing (`submitted 0`, every event `already present`).
+* **Lineage comes from history.** A file's logical ID is derived from the first-parent history of
+  HEAD (`indexing/lineage.py`): the commit that added the origin path, kept across edits and exact
+  renames, new after a delete and recreate. Nothing is persisted, so every checkout and every
+  starting commit agrees. A shallow clone fails with `shallow_history` and a history above 100,000
+  first-parent commits with `history_too_large`; no lineage is ever invented. Untracked and
+  dirty-only files get provisional IDs until they are committed.
+* **SCIP.** `--scip` is an index of the checked-out HEAD commit; evidence for files that differ from
+  it is dropped and counted.
+* **Sandbox.** Structural adapters run confined by Landlock, with the checkout added to the
+  readable-nowhere roots. Without Landlock the run fails unless
+  `AGENT_CONTEXT_INDEXER_ALLOW_UNCONFINED_ADAPTERS=true` (development only).
+* **Output and exit codes.** index id, target, events submitted and already present, files indexed
+  and not indexed, the completion `error_class` and a diagnostics summary (counts only: no file
+  content, path, DSN or secret). Exit `0` on success, `1` when the index failed or was refused
+  (`success=false`, `snapshot_incomplete`, `shallow_history`...; the counts are still printed), `2`
+  on a usage error.
+
 ### Provisioning credentials
 
 `agent-context producer register|revoke|list` and `agent-context mcp-token create|revoke|list`

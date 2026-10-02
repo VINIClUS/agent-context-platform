@@ -154,7 +154,7 @@ def test_typescript_and_go_imports_resolve_or_become_dependencies(
     repo.write("go/main.go", "package main\n")
     repo.commit("seed")
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     imports = {
         "src/app/main.ts": (
             _reference("import", "util", level=1),
@@ -201,7 +201,7 @@ def test_go_binds_names_per_package_and_imports_name_a_package(
         repo.write(path, "package x\n")
     repo.commit("seed")
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     table = {
         # An unqualified call to a sibling file's function resolves; one to a name that only a
         # _test file defines does not (the package never sees its test files).
@@ -256,7 +256,7 @@ def test_python_relative_levels(make_repo: Callable[[str], RepoBuilder]) -> None
         repo.write(path, "x\n")
     repo.commit("seed")
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     table = {
         "a/b/c.py": (
             _reference("import", "d", level=2),
@@ -374,7 +374,7 @@ def test_a_qualifier_resolves_only_through_a_name_the_file_binds(
         repo.write(path, "x\n")
     repo.commit("seed")
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     table = {
         # ``def g(util): util.helper()``: ``util`` is a parameter, never the module util.py.
         "param.py": (_reference("call", "helper", qualifier="util"),),
@@ -480,7 +480,7 @@ def test_resolution_builds_each_lookup_once_however_many_references(
         repo.write(f"pkg/m{index}.py", "x\n")
     repo.commit("seed")
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     table = {}
     for index in range(files):
         neighbour = f"m{(index + 1) % files}"
@@ -601,7 +601,7 @@ def test_go_package_names_are_indexed_once_however_many_references(
         repo.write(f"go/pkg/f{index}.go", "package x\n")
     repo.commit("seed")
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     names = tuple(f"F{n}" for n in range(members))
     table = {
         f"go/pkg/f{i}.go": tuple(_reference("call", f"F{n}") for n in range(members))
@@ -638,7 +638,7 @@ def _called(
         repo.write(path, "x\n")
     repo.commit("seed")
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     sources = {f.path: (repo.root / f.path).read_bytes() for f in scan.files}
     result = parse_structural(
         {"python": TableAdapter("python", table, members)},  # type: ignore[dict-item]

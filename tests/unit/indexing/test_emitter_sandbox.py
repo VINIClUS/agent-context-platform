@@ -175,7 +175,7 @@ def test_a_real_python_index_resolves_imports_calls_and_external_dependencies(
     )
     repo.commit("seed")
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     adapters = registry.build_adapters(_settings(tmp_path))
 
     structural = parse_structural(adapters, read_sources(scan))
@@ -208,7 +208,7 @@ def test_a_real_python_alias_and_dotted_import_bind_through_the_sandbox(
     repo.write("pkg/wrong.py", "import pkg.util\n\n\ndef run():\n    return util.helper()\n")
     repo.commit("seed")
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     structural = parse_structural(registry.build_adapters(_settings(tmp_path)), read_sources(scan))
 
     drafts = service().index(scan, None, list(structural.files), file_logical_ids=ids)
@@ -244,7 +244,7 @@ def test_a_ts_and_a_js_file_index_through_the_real_typescript_adapter(
     )
     repo.commit("seed")
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     structural = parse_structural(registry.build_adapters(_settings(tmp_path)), read_sources(scan))
 
     drafts = service().index(scan, None, list(structural.files), file_logical_ids=ids)
@@ -291,7 +291,7 @@ def test_a_ts_import_binds_the_local_name_not_the_exported_one(
     )
     repo.commit("seed")
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     structural = parse_structural(registry.build_adapters(_settings(tmp_path)), read_sources(scan))
 
     drafts = service().index(scan, None, list(structural.files), file_logical_ids=ids)
@@ -323,7 +323,7 @@ def test_a_scoped_package_import_keeps_its_scope_in_the_dependency(
     )
     repo.commit("seed")
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     structural = parse_structural(registry.build_adapters(_settings(tmp_path)), read_sources(scan))
 
     drafts = service().index(scan, None, list(structural.files), file_logical_ids=ids)
@@ -375,7 +375,7 @@ def test_a_real_go_index_resolves_siblings_imports_aliases_and_external_dependen
     )
     repo.commit("seed")
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     structural = parse_structural(registry.build_adapters(_settings(tmp_path)), read_sources(scan))
 
     drafts = service().index(scan, None, list(structural.files), file_logical_ids=ids)
@@ -411,7 +411,7 @@ def _go_facts(
         repo.write(path, text)
     repo.commit("seed")
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     structural = parse_structural(registry.build_adapters(_settings(tmp_path)), read_sources(scan))
     drafts_service = service()
     drafts = drafts_service.index(scan, None, list(structural.files), file_logical_ids=ids)
