@@ -25,7 +25,15 @@ import hashlib
 import json
 import re
 from collections import Counter
-from collections.abc import Awaitable, Callable, Collection, Iterable, Mapping, Sequence
+from collections.abc import (
+    AsyncIterator,
+    Awaitable,
+    Callable,
+    Collection,
+    Iterable,
+    Mapping,
+    Sequence,
+)
 from dataclasses import dataclass, replace
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final, LiteralString
@@ -49,7 +57,7 @@ from agent_context_sdk.events.system import (
 from sqlalchemy import String, and_, func, literal, select, text
 from sqlalchemy import cast as sql_cast
 from sqlalchemy.dialects.postgresql import insert
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
 
 from agent_context_platform.content.blob_store import BlobStoreError, StoredBlob
 from agent_context_platform.content.service import ContentService
@@ -170,15 +178,27 @@ def node_identity(labels: Iterable[str], props: Mapping[str, Any]) -> str:
     return f"~{':'.join(ordered)}:{content}"
 
 
+def _malformed(value: object) -> str:
+    return f"<non-string {type(value).__name__}>"
+
+
 def source_ids(props: Mapping[str, Any]) -> list[str]:
-    """Every ledger event ID a graph property set points back at."""
+    """Every ledger event ID a graph property set points back at.
+
+    A value that is not a string (a non-string `source_event_id`, a non-string member of
+    `source_event_ids`, or a scalar where a list belongs) is returned as a `<non-string ...>`
+    marker. It is never a valid event ID, so verification reports it as an orphan instead of
+    silently ignoring a corrupted provenance property.
+    """
     found: list[str] = []
     for name in SOURCE_ID_PROPERTIES:
         value = props.get(name)
-        if isinstance(value, str):
-            found.append(value)
-        elif isinstance(value, (list, tuple)):
-            found.extend(item for item in value if isinstance(item, str))
+        if value is None:
+            continue
+        if isinstance(value, (list, tuple)):
+            found.extend(item if isinstance(item, str) else _malformed(item) for item in value)
+        else:
+            found.append(value if isinstance(value, str) else _malformed(value))
     return found
 
 
@@ -1249,9 +1269,49 @@ _SKIPPED_LISTED: Final = 200
 _OTHER_PROJECTOR_CONNECTIONS = text(
     "SELECT count(*) FROM pg_stat_activity a JOIN pg_roles r ON r.rolname = a.usename "
     "WHERE a.datname = current_database() AND a.pid <> pg_backend_pid() "
-    "AND a.application_name IS DISTINCT FROM :own AND NOT r.rolsuper "
+    "AND a.pid <> ALL(CAST(:own AS integer[])) AND NOT r.rolsuper "
     "AND pg_has_role(r.oid, 'agent_context_projector', 'MEMBER')"
 )
+
+# One key for every rebuild that mutates a graph, derived from a fixed name.
+REBUILD_LOCK_NAME: Final = "agent-context.projection.rebuild"
+REBUILD_LOCK_KEY: Final = int.from_bytes(
+    hashlib.sha256(REBUILD_LOCK_NAME.encode()).digest()[:8], "big", signed=True
+)
+
+
+class RebuildInProgressError(RunnerActiveError):
+    """Another rebuild holds the rebuild lock."""
+
+
+@contextlib.asynccontextmanager
+async def rebuild_lock(
+    session_factory: async_sessionmaker[AsyncSession],
+) -> AsyncIterator[int]:
+    """Hold the session-level rebuild advisory lock on one dedicated connection; yield its pid.
+
+    Serializes every rebuild that mutates a graph (in-place, or standby with a wipe) across CLI
+    processes. The session stays open, without committing, so the connection (and so the lock)
+    is never handed back to the pool; the lock is released explicitly before it closes.
+    """
+    async with session_factory() as session:
+        row = (
+            await session.execute(
+                text("SELECT pg_try_advisory_lock(:key), pg_backend_pid()"),
+                {"key": REBUILD_LOCK_KEY},
+            )
+        ).one()
+        if not row[0]:
+            raise RebuildInProgressError(
+                "another rebuild holds the projection rebuild lock; wait for it to finish"
+            )
+        try:
+            yield int(row[1])
+        finally:
+            await session.rollback()  # the lock is session-level: it survives the rollback
+            await session.execute(
+                text("SELECT pg_advisory_unlock(:key)"), {"key": REBUILD_LOCK_KEY}
+            )
 
 
 async def dead_lettered_event_ids(session: AsyncSession) -> tuple[UUID, ...]:
@@ -1264,13 +1324,16 @@ async def dead_lettered_event_ids(session: AsyncSession) -> tuple[UUID, ...]:
     return tuple(rows)
 
 
-async def ensure_runner_idle(session: AsyncSession, *, quiet_seconds: int) -> None:
+async def ensure_runner_idle(
+    session: AsyncSession, *, quiet_seconds: int, own_pids: Collection[int] = ()
+) -> None:
     """Best-effort refusal while the projection runner may be running.
 
     The runtime keeps no runner lock (FU-62), so three weaker signals are used: an unexpired outbox
     lease, an outbox row claimed, retried or delivered within `quiet_seconds` (0 disables this),
-    and another connection of a role that is a member of `agent_context_projector` (this CLI's own
-    connections, named by `CLI_APPLICATION_NAME`, are excluded). A runner that is idle between
+    and another connection of a role that is a member of `agent_context_projector`. Only this
+    process's own backends are excluded (the calling session and `own_pids`, the rebuild lock's),
+    so a second CLI is seen; two rebuilds are also serialized by `rebuild_lock`. A runner that is idle between
     polls and holds no connection passes: stopping it is an operator precondition.
     """
     if await active_lease_count(session):
@@ -1289,7 +1352,7 @@ async def ensure_runner_idle(session: AsyncSession, *, quiet_seconds: int) -> No
                 f"outbox rows changed in the last {quiet_seconds}s; the projection runner may "
                 "be running, stop it first"
             )
-    if await session.scalar(_OTHER_PROJECTOR_CONNECTIONS, {"own": CLI_APPLICATION_NAME}):
+    if await session.scalar(_OTHER_PROJECTOR_CONNECTIONS, {"own": sorted(own_pids)}):
         raise RunnerActiveError(
             "another projector-role connection is open; stop the projection runner first"
         )
@@ -1500,6 +1563,49 @@ async def rebuild_projections(
     batch_size: int = DEFAULT_BATCH_SIZE,
     runner_quiet_seconds: int = DEFAULT_RUNNER_QUIET_SECONDS,
 ) -> RebuildReport:
+    """Rebuild the projection (see `_rebuild_projections`), serialized with other rebuilds.
+
+    An in-place rebuild, or a standby rebuild with `wipe_target`, first takes the session-level
+    rebuild advisory lock on a dedicated projector connection and holds it for the whole
+    operation; a rebuild that finds it held is refused (`RebuildInProgressError`). The pool is
+    disposed first so that no idle connection of this process is mistaken for another projector.
+    """
+    async with contextlib.AsyncExitStack() as stack:
+        own_pids: tuple[int, ...] = ()
+        if in_place or wipe_target:
+            bind = getattr(session_factory, "kw", {}).get("bind")
+            if isinstance(bind, AsyncEngine):
+                await bind.dispose()
+            own_pids = (await stack.enter_async_context(rebuild_lock(session_factory)),)
+        return await _rebuild_projections(
+            session_factory,
+            target,
+            projectors,
+            target_description=target_description,
+            in_place=in_place,
+            wipe_target=wipe_target,
+            recorder=recorder,
+            clock=clock,
+            batch_size=batch_size,
+            runner_quiet_seconds=runner_quiet_seconds,
+            own_pids=own_pids,
+        )
+
+
+async def _rebuild_projections(
+    session_factory: async_sessionmaker[AsyncSession],
+    target: Neo4jStore,
+    projectors: Sequence[Projector],
+    *,
+    target_description: str,
+    in_place: bool,
+    wipe_target: bool,
+    recorder: ProjectionEventRecorder | None,
+    clock: Clock,
+    batch_size: int,
+    runner_quiet_seconds: int,
+    own_pids: Collection[int],
+) -> RebuildReport:
     """Rebuild the graph projection from the ledger into `target`, then verify it.
 
     Neo4j Community has a single user database per instance, so a rebuild cannot sit beside the
@@ -1527,7 +1633,7 @@ async def rebuild_projections(
     wiped = 0
     if in_place:
         async with session_factory() as session:
-            await ensure_runner_idle(session, quiet_seconds=runner_quiet_seconds)
+            await ensure_runner_idle(session, quiet_seconds=runner_quiet_seconds, own_pids=own_pids)
         await _write_checkpoints(
             session_factory, projectors, {}, state=ProjectionState.REBUILDING, now=started
         )
@@ -1653,14 +1759,27 @@ PROJECTOR_CHECKPOINT_GRANTS: Final = (
     ),
 )
 # Recording `projection.rebuilt` through `IngestionService`: the API role.
+# Derived from the ingest path (`ContentService.attach` with no content, then
+# `LedgerRepository.append_with_outcome`): it locks the stream row (`FOR UPDATE`), inserts the
+# stream, event, content refs, redaction reports and outbox row, and `_update_stream_head` writes
+# the four stream-head columns below.
+_STREAM_HEAD_COLUMNS: Final = ("last_sequence", "last_event_id", "last_event_sha256", "updated_at")
 RECORDER_GRANTS: Final = (
-    GrantRequirement("table", "ledger.events", "SELECT"),
-    GrantRequirement("table", "ledger.events", "INSERT"),
-    GrantRequirement("table", "ledger.event_streams", "SELECT"),
-    GrantRequirement("table", "ledger.event_streams", "INSERT"),
-    GrantRequirement("column", "ledger.event_streams", "UPDATE", "last_sequence"),
-    GrantRequirement("table", "ledger.event_content_refs", "SELECT"),
+    *(
+        GrantRequirement("table", table, privilege)
+        for table in (
+            "ledger.events",
+            "ledger.event_streams",
+            "ledger.event_content_refs",
+            "ledger.redaction_reports",
+        )
+        for privilege in ("SELECT", "INSERT")
+    ),
     GrantRequirement("table", "projection.outbox", "INSERT"),
+    *(
+        GrantRequirement("column", "ledger.event_streams", "UPDATE", column)
+        for column in _STREAM_HEAD_COLUMNS
+    ),
     GrantRequirement("sequence", "projection.outbox_outbox_id_seq", "USAGE"),
 )
 
@@ -1789,6 +1908,7 @@ __all__ = [
     "DEFAULT_RUNNER_QUIET_SECONDS",
     "NODE_KEYS",
     "PLATFORM_PRODUCER_ID",
+    "REBUILD_LOCK_KEY",
     "RECORD_FAILED",
     "SOURCE_ID_PROPERTIES",
     "VOLATILE_PROPERTIES",
@@ -1804,6 +1924,7 @@ __all__ = [
     "ProjectionOperationError",
     "ProjectorStatus",
     "ProjectorVerification",
+    "RebuildInProgressError",
     "RebuildReport",
     "RecordResult",
     "RecordingError",
@@ -1825,6 +1946,7 @@ __all__ = [
     "preflight",
     "primary_label",
     "projection_status",
+    "rebuild_lock",
     "rebuild_projections",
     "replay_ledger",
     "source_ids",

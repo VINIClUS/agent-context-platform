@@ -896,6 +896,37 @@ def test_the_runner_guard_refuses_recent_outbox_activity_and_other_projector_con
     assert asyncio.run(graph_facts()) == world.facts  # nothing was wiped
 
 
+def test_a_second_rebuild_is_refused_while_one_holds_the_rebuild_lock(world: World) -> None:
+    """Two rebuilds must not interleave: the one that finds the advisory lock held is refused."""
+    in_place = ["projection", "rebuild", "--in-place", "--confirm", "neo4j", "--no-record"]
+    standby = ["projection", "rebuild", *world.target_args(), "--wipe-target", "--confirm", "neo4j"]
+    live = "bolt://live.invalid:7687"
+    sync_dsn = world.roles["readonly"].replace("postgresql+psycopg", "postgresql")
+    checkpoints = asyncio.run(sql(world.owner, "SELECT * FROM projection.projection_checkpoints"))
+
+    # The first rebuild's connection: a session-level lock on the CLI's fixed key.
+    with psycopg.connect(sync_dsn, autocommit=True) as first:
+        first.execute("SELECT pg_advisory_lock(%s)", (verify.REBUILD_LOCK_KEY,))
+        refused = invoke([*in_place, "--runner-quiet-seconds", "0"], world.env(api=None))
+        refused_standby = invoke(standby, world.target_env(live_uri=live))
+        first.execute("SELECT pg_advisory_unlock(%s)", (verify.REBUILD_LOCK_KEY,))
+
+    assert refused.exit_code == 1 and "rebuild lock" in refused.stderr
+    assert refused_standby.exit_code == 1 and "rebuild lock" in refused_standby.stderr
+    assert asyncio.run(graph_facts()) == world.facts  # nothing was wiped
+    assert (
+        asyncio.run(sql(world.owner, "SELECT * FROM projection.projection_checkpoints"))
+        == checkpoints
+    )
+    # Once it is released, a rebuild runs, and releases the lock again when it ends.
+    done = invoke([*in_place, "--runner-quiet-seconds", "0"], world.env(api=None))
+    assert done.exit_code == 0, done.output
+    held = asyncio.run(
+        sql(world.owner, "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory'")
+    )
+    assert held[0][0] == 0
+
+
 def test_a_runner_racing_an_in_place_rebuild_never_rolls_checkpoints_back(
     world: World, monkeypatch: pytest.MonkeyPatch
 ) -> None:

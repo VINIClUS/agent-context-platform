@@ -142,7 +142,10 @@ agent-context projection rebuild --in-place --confirm neo4j   # stop the project
   a runner maintenance flag is follow-up FU-62). The command only has best-effort guards, and
   refuses (exit `1`) on an unexpired outbox lease, an outbox row changed within
   `--runner-quiet-seconds` (default 30, `0` disables), or another connection of a projector-role
-  member; a runner idle between polls with no connection passes them. It resets the registered
+  member (only this process's own connections are excluded, so a second CLI is seen); a runner idle between polls with no connection passes them. Every in-place rebuild (and a standby rebuild with `--wipe-target`) first takes a
+  session-level PostgreSQL advisory lock (key derived from `agent-context.projection.rebuild`) on the
+  projector connection and holds it until it ends; a second rebuild is refused with exit `1`.
+  It resets the registered
   checkpoints to `rebuilding`, wipes the graph, replays the delivered events, then under a row lock
   catches up on events delivered meanwhile and writes each checkpoint as the greater of the live and
   replayed position, with the processed count recomputed from the outbox, so a checkpoint never goes

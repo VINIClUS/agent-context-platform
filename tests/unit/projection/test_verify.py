@@ -7,6 +7,8 @@ are proven by `tests/e2e/test_rebuild.py`; these tests pin the logic around them
 
 from __future__ import annotations
 
+import contextlib
+import hashlib
 import re
 from collections.abc import Callable
 from dataclasses import replace
@@ -275,13 +277,36 @@ def test_identity_primary_label_and_source_ids() -> None:
     assert node_identity(["Commit"], {"commit_id": "c"}) == "Commit:c"
     assert node_identity(["B", "A"], {"x": 1}).startswith("~A:B:")
     assert node_identity(["A"], {"x": 1, "_lock": True}) == node_identity(["A"], {"x": 1})
-    assert source_ids({"source_event_id": "a", "source_event_ids": ["b", 3, "c"]}) == [
+    assert source_ids({"source_event_id": "a", "source_event_ids": ["b", "c"]}) == [
         "a",
         "b",
         "c",
     ]
     assert source_ids({"source_event_ids": ("d",)}) == ["d"]
-    assert source_ids({"source_event_id": 7}) == []
+    assert source_ids({"source_event_id": None, "source_event_ids": None}) == []
+
+
+def test_non_string_source_ids_are_reported_as_malformed_markers() -> None:
+    assert source_ids({"source_event_id": 7}) == ["<non-string int>"]
+    assert source_ids({"source_event_ids": ["a", 3, None]}) == [
+        "a",
+        "<non-string int>",
+        "<non-string NoneType>",
+    ]
+    assert source_ids({"source_event_ids": "not-a-list-but-a-string"}) == [
+        "not-a-list-but-a-string"
+    ]
+    assert source_ids({"source_event_ids": 5}) == ["<non-string int>"]
+
+
+async def test_a_malformed_source_id_is_an_orphan_and_fails_the_scan() -> None:
+    graph = sample_graph()
+    graph.node("Commit", commit_id="c9", source_event_id=42)
+    make = factory(lambda *_: [])
+
+    _digest, collector = await verify._scan_with_orphans(FakeStore(graph), make, 10)  # type: ignore[arg-type]
+
+    assert "<non-string int>" in collector.orphans
 
 
 # --------------------------------------------------------------------------------------------
@@ -307,7 +332,10 @@ class FakeSession:
     def begin(self) -> FakeSession:
         return self
 
-    async def execute(self, statement: Any) -> Any:
+    async def rollback(self) -> None:
+        self.statements.append("ROLLBACK")
+
+    async def execute(self, statement: Any, _params: Any = None) -> Any:
         self.statements.append(sql_of(statement))
         return self._answer("execute", self.statements[-1])
 
@@ -1148,14 +1176,25 @@ class Steps:
         self.projectors = [FakeProjector("p", "t.a"), FakeProjector("q", "t.a")]
         self.ok = ok
         self.fail_replay = False
+        self.lock_held = False
         self.skipped: tuple[Any, ...] = ()
         progress = {
             ("p", "1"): ReplayProgress(3, 7, EVENT_B),
             ("q", "1"): ReplayProgress(3, 7, EVENT_B),
         }
 
-        async def idle(_session: Any, *, quiet_seconds: int) -> None:
-            self.calls.append(f"idle {quiet_seconds}")
+        @contextlib.asynccontextmanager
+        async def lock(_factory: Any) -> Any:
+            if self.lock_held:
+                raise verify.RebuildInProgressError("held")
+            self.calls.append("lock")
+            try:
+                yield 4242
+            finally:
+                self.calls.append("unlock")
+
+        async def idle(_session: Any, *, quiet_seconds: int, own_pids: Any = ()) -> None:
+            self.calls.append(f"idle {quiet_seconds} own={sorted(own_pids)}")
             if leases:
                 raise verify.RunnerActiveError("busy")
 
@@ -1197,6 +1236,7 @@ class Steps:
             self.calls.append("wipe")
             return 9
 
+        monkeypatch.setattr(verify, "rebuild_lock", lock)
         monkeypatch.setattr(verify, "ensure_runner_idle", idle)
         monkeypatch.setattr(verify, "_finalize_checkpoints", finalize)
         monkeypatch.setattr(verify, "dead_lettered_event_ids", skipped)
@@ -1244,13 +1284,15 @@ async def test_an_in_place_rebuild_resets_checkpoints_before_wiping_then_replays
     result = await rebuild(steps, in_place=True, recorder=recorder)
 
     assert steps.calls == [
-        "idle 30",
+        "lock",
+        "idle 30 own=[4242]",
         "checkpoints rebuilding",
         "wipe",
         "schema",
         "replay delivered_only=True",
         "finalize checkpoints",
         "verify live",
+        "unlock",
     ]
     assert result.projected_events == 8
     assert result.ok and result.mode == "in_place" and result.wiped_nodes == 9
@@ -1269,7 +1311,72 @@ async def test_an_in_place_rebuild_refuses_while_the_runner_holds_leases(
     with pytest.raises(verify.RunnerActiveError):
         await rebuild(steps, in_place=True, runner_quiet_seconds=5)
 
-    assert steps.calls == ["idle 5"]
+    assert steps.calls == ["lock", "idle 5 own=[4242]", "unlock"]
+
+
+async def test_a_rebuild_is_refused_while_another_holds_the_rebuild_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    steps = Steps(monkeypatch)
+    steps.lock_held = True
+
+    with pytest.raises(verify.RebuildInProgressError):
+        await rebuild(steps, in_place=True)
+    with pytest.raises(verify.RebuildInProgressError):
+        await rebuild(steps, in_place=False, wipe_target=True)
+
+    assert steps.calls == []
+    assert issubclass(verify.RebuildInProgressError, verify.RunnerActiveError)
+
+
+async def test_a_standby_rebuild_without_a_wipe_takes_no_lock(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    steps = Steps(monkeypatch)
+    steps.lock_held = True
+
+    await rebuild(steps, in_place=False)
+
+    assert "lock" not in steps.calls
+
+
+async def test_the_rebuild_lock_is_held_for_the_operation_and_released_after() -> None:
+    make = factory(lambda *_: type("R", (), {"one": lambda _s: (True, 77)})())
+
+    async with verify.rebuild_lock(make) as pid:  # type: ignore[arg-type]
+        assert pid == 77
+        assert not any("pg_advisory_unlock" in t for t in make.sessions[0].statements)  # type: ignore[attr-defined]
+
+    texts = make.sessions[0].statements  # type: ignore[attr-defined]
+    assert "pg_try_advisory_lock" in texts[0] and "pg_advisory_unlock" in texts[-1]
+    assert (
+        int.from_bytes(
+            hashlib.sha256(b"agent-context.projection.rebuild").digest()[:8], "big", signed=True
+        )
+        == verify.REBUILD_LOCK_KEY
+    )
+
+
+async def test_the_rebuild_lock_refuses_when_held_and_releases_it_when_the_body_fails() -> None:
+    held = factory(lambda *_: type("R", (), {"one": lambda _s: (False, 5)})())
+    with pytest.raises(verify.RebuildInProgressError):
+        async with verify.rebuild_lock(held):  # type: ignore[arg-type]
+            raise AssertionError("must not run")
+
+    make = factory(lambda *_: type("R", (), {"one": lambda _s: (True, 5)})())
+    with pytest.raises(RuntimeError):
+        async with verify.rebuild_lock(make):  # type: ignore[arg-type]
+            raise RuntimeError("body")
+    assert "pg_advisory_unlock" in make.sessions[0].statements[-1]  # type: ignore[attr-defined]
+
+
+async def test_the_runner_guard_excludes_only_its_own_backends() -> None:
+    session = factory(idle_answer())()
+
+    await verify.ensure_runner_idle(session, quiet_seconds=0, own_pids=[9, 3])
+
+    assert not any("application_name" in t for t in session.statements)
+    assert any("pg_stat_activity" in t for t in session.statements)
 
 
 async def test_a_standby_rebuild_never_touches_checkpoints_and_replays_everything(
@@ -1296,7 +1403,7 @@ async def test_a_standby_rebuild_refuses_a_non_empty_target_unless_wiping(
 
     result = await rebuild(steps, in_place=False, target=full, wipe_target=True)
 
-    assert steps.calls[0] == "wipe" and result.wiped_nodes == 9
+    assert steps.calls[:3] == ["lock", "wipe", "schema"] and result.wiped_nodes == 9
 
 
 async def test_a_failed_verification_makes_the_rebuild_failed_and_is_recorded(
@@ -1454,6 +1561,42 @@ async def test_preflight_passes_when_every_grant_is_held() -> None:
     assert any("has_table_privilege" in t for t in texts)
     assert any("has_column_privilege" in t for t in texts)
     assert any("has_sequence_privilege" in t for t in texts)
+
+
+def test_the_recorder_grants_cover_every_stream_head_column_the_ingest_path_writes() -> None:
+    labels = {grant.label for grant in verify.RECORDER_GRANTS}
+
+    for column in ("last_sequence", "last_event_id", "last_event_sha256", "updated_at"):
+        assert f"UPDATE on ledger.event_streams.{column}" in labels
+    for table in ("events", "event_streams", "event_content_refs", "redaction_reports"):
+        assert {f"SELECT on ledger.{table}", f"INSERT on ledger.{table}"} <= labels
+    assert "INSERT on projection.outbox" in labels
+
+
+class RevokingSession(FakeSession):
+    """Answers every `has_*_privilege` query true except for one revoked (object, column, privilege)."""
+
+    def __init__(self, revoked: tuple[Any, ...]) -> None:
+        super().__init__(lambda *_: True)
+        self._revoked = revoked
+
+    async def scalar(self, statement: Any, params: Any = None) -> Any:
+        params = params or {}
+        return (params.get("obj"), params.get("col"), params["priv"]) != self._revoked
+
+
+@pytest.mark.parametrize("grant", verify.RECORDER_GRANTS, ids=lambda g: g.label)
+async def test_revoking_any_one_recorder_grant_fails_the_preflight(grant: Any) -> None:
+    revoking = lambda: RevokingSession((grant.obj, grant.column, grant.privilege))  # noqa: E731
+
+    with pytest.raises(verify.MissingGrantError) as error:
+        await verify.preflight(
+            factory(grant_answer(set())),  # type: ignore[arg-type]
+            revoking,  # type: ignore[arg-type]
+            write_checkpoints=False,
+        )
+
+    assert error.value.role == "api" and list(error.value.missing) == [grant.label]
 
 
 async def test_preflight_names_every_missing_grant_per_role() -> None:
