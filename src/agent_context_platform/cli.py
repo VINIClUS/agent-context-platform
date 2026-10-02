@@ -20,6 +20,7 @@ import asyncio
 import json
 import os
 import stat
+import sys
 from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
@@ -262,6 +263,21 @@ def _emit(payload: dict[str, Any], *, as_json: bool, lines: list[str]) -> None:
     typer.echo(json.dumps(payload, sort_keys=True) if as_json else "\n".join(lines))
 
 
+def _recovery_message(error: provisioning.CommitAfterDeliveryError) -> str:
+    """What to do when the token was delivered but the commit failed (its outcome is unknown)."""
+    head = f"the token with prefix {error.prefix} was delivered but the database commit failed"
+    if error.kind == "producer":
+        return (
+            f"{head}, so it is probably not valid: discard it, check `producer list`, and if the "
+            "registration shows prefix " + error.prefix + " or the producer is missing, run "
+            "`producer register ... --rotate` again for a credential you can rely on"
+        )
+    return (
+        f"{head}, so it is probably not valid: discard it, run `mcp-token list`, and if prefix "
+        f"{error.prefix} is listed run `mcp-token revoke {error.prefix}`; then create a new token"
+    )
+
+
 _PROVISIONING_HINTS = {
     "producer_exists": " (an active or revoked registration exists; use --rotate to replace it)",
     "producer_conflict": " (a concurrent registration won; retry)",
@@ -288,10 +304,13 @@ def _run(main: Callable[[], Coroutine[Any, Any, int]]) -> None:
         code = EXIT_FAILED
     except DeliveryError:
         typer.echo(
-            "error: the credential was created but NOT delivered (--output could not be written); "
-            "run the command again with --rotate to issue a new one",
+            "error: the token could not be delivered, so nothing was changed "
+            "(a rotated producer keeps its previous credential)",
             err=True,
         )
+        code = EXIT_FAILED
+    except provisioning.CommitAfterDeliveryError as error:
+        typer.echo(f"error: {_recovery_message(error)}", err=True)
         code = EXIT_FAILED
     except provisioning.ProvisioningError as error:
         typer.echo(f"error: {error.code}{_PROVISIONING_HINTS.get(error.code, '')}", err=True)
@@ -640,28 +659,40 @@ class SecretFile:
         self.path.unlink(missing_ok=True)
 
 
+def _flush_stdout() -> None:
+    sys.stdout.flush()
+
+
 async def _issue(
     output: Path | None,
     json_output: bool,
-    issue: Callable[[], Coroutine[Any, Any, provisioning.IssuedCredential]],
+    issue: Callable[[provisioning.Deliver], Coroutine[Any, Any, provisioning.IssuedCredential]],
 ) -> int:
-    """Run ``issue`` and deliver its token to stdout or the held ``--output`` descriptor."""
+    """Run ``issue``, delivering the token INSIDE its still-open transaction.
+
+    ``deliver`` writes the plaintext (to the held ``--output`` descriptor, or flushed stdout)
+    before the commit, so a delivery failure rolls back and no undeliverable credential exists.
+    If the commit fails afterwards the delivered file is removed; the token is unusable.
+    """
     destination = None if output is None else SecretFile.create(output)
+
+    def deliver(credential: provisioning.IssuedCredential) -> None:
+        _hand_over(credential, destination, as_json=json_output)
+
     try:
-        credential = await issue()
-        _deliver(credential, destination, as_json=json_output)
+        credential = await issue(deliver)
     except BaseException:
         if destination is not None:
             destination.abandon()
         raise
+    _report(credential, destination, as_json=json_output)
     return EXIT_OK
 
 
-def _deliver(
-    credential: provisioning.IssuedCredential, destination: SecretFile | None, *, as_json: bool
-) -> None:
-    """Hand the plaintext over exactly once: into the held file, or on stdout."""
-    document = {
+def _document(
+    credential: provisioning.IssuedCredential, destination: SecretFile | None
+) -> dict[str, Any]:
+    document: dict[str, Any] = {
         "kind": credential.kind,
         "id": credential.identifier,
         "prefix": credential.prefix,
@@ -670,20 +701,41 @@ def _deliver(
         "rotated": credential.rotated,
     }
     if destination is not None:
-        try:
-            destination.write(credential.token)
-        except OSError:
-            raise DeliveryError from None
         document["output"] = str(destination.path)
+    return document
+
+
+def _hand_over(
+    credential: provisioning.IssuedCredential, destination: SecretFile | None, *, as_json: bool
+) -> None:
+    """Deliver the plaintext exactly once: into the held file, or flushed on stdout."""
+    try:
+        if destination is not None:
+            destination.write(credential.token)
+            return
+        if as_json:
+            typer.echo(
+                json.dumps(
+                    {**_document(credential, None), "token": credential.token}, sort_keys=True
+                )
+            )
+        else:
+            typer.echo(credential.token)
+        _flush_stdout()
+    except OSError:
+        raise DeliveryError from None
+
+
+def _report(
+    credential: provisioning.IssuedCredential, destination: SecretFile | None, *, as_json: bool
+) -> None:
+    """Everything that is not the plaintext, after the commit."""
+    document = _document(credential, destination)
     if as_json:
-        if destination is None:
-            document["token"] = credential.token
-        typer.echo(json.dumps(document, sort_keys=True))
+        if destination is not None:
+            typer.echo(json.dumps(document, sort_keys=True))
         return
-    detail = ", ".join(f"{key} {value}" for key, value in document.items())
-    typer.echo(detail, err=True)
-    if destination is None:
-        typer.echo(credential.token)
+    typer.echo(", ".join(f"{key} {value}" for key, value in document.items()), err=True)
 
 
 def _iso(value: datetime | None) -> str | None:
@@ -706,7 +758,9 @@ def producer_register_command(
     async def main() -> int:
         settings = _load_settings()
 
-        async def issue() -> provisioning.IssuedCredential:
+        async def issue(
+            deliver: provisioning.Deliver,
+        ) -> provisioning.IssuedCredential:
             async with _admin_sessions(
                 settings, tables=("operations.registered_producers",), write=True
             ) as sessions:
@@ -716,6 +770,7 @@ def producer_register_command(
                     expires_in_days=expires_in,
                     cost=_hash_cost(settings),
                     rotate=rotate,
+                    deliver=deliver,
                 )
 
         return await _issue(output, json_output, issue)
@@ -803,7 +858,9 @@ def mcp_token_create_command(
             raise CliUsageError("--scope must be one of: " + ", ".join(provisioning.MCP_SCOPES))
         settings = _load_settings()
 
-        async def issue() -> provisioning.IssuedCredential:
+        async def issue(
+            deliver: provisioning.Deliver,
+        ) -> provisioning.IssuedCredential:
             async with _admin_sessions(
                 settings, tables=("operations.mcp_tokens",), write=True
             ) as sessions:
@@ -813,6 +870,7 @@ def mcp_token_create_command(
                     scope=scope,
                     expires_in_days=expires_in,
                     cost=_hash_cost(settings),
+                    deliver=deliver,
                 )
 
         return await _issue(output, json_output, issue)

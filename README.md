@@ -181,9 +181,12 @@ agent-context mcp-token revoke mcp_AbCd1234xyz            # prefix from `mcp-tok
   Neither is accepted on the other plane. `--expires-in` is 1-3650 days.
 * **`register`** refuses an active or explicitly revoked id without `--rotate` (exit `2`); `--rotate` keeps the
   id and `created_at` and replaces the prefix, verifier and expiry. An expired-only id is replaced
-  without `--rotate`. If writing `--output` fails after the credential was committed, the file is
-  removed (only if it is still the one created), the command exits `1` saying the credential was
-  not delivered, and `--rotate` recovers. `revoke` sets `revoked_at` (the row stays); an MCP replica may keep serving a
+  without `--rotate`. The token is delivered (written to `--output`, or flushed to stdout) BEFORE the database commit: if
+  delivery fails (disk full, broken pipe) the transaction rolls back, nothing changes and a rotated
+  producer keeps its previous credential (exit `1`). If the commit itself fails after delivery, the
+  `--output` file is removed (only if it is still the one created) and the error names the prefix
+  and the recovery: `producer register ... --rotate` for a producer, `mcp-token revoke <prefix>`
+  then a new `mcp-token create` for an MCP token (the commit outcome may be ambiguous). `revoke` sets `revoked_at` (the row stays); an MCP replica may keep serving a
   revoked token for up to `mcp.principal_cache_ttl_seconds` (default 30 s).
 * **Database role.** These rows are written by an operator connection,
   `AGENT_CONTEXT_POSTGRESQL__ADMIN_DSN` (falls back to `AGENT_CONTEXT_POSTGRESQL__DSN`). The

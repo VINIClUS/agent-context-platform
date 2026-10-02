@@ -20,7 +20,7 @@ from __future__ import annotations
 import asyncio
 import secrets
 import uuid
-from collections.abc import Sequence
+from collections.abc import Callable, Sequence
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Final
@@ -50,6 +50,19 @@ class ProvisioningError(Exception):
         self.code = code
 
 
+class CommitAfterDeliveryError(ProvisioningError):
+    """The token was already handed to the operator but the commit failed.
+
+    The outcome of the commit may be ambiguous (a connection can drop after the server applied
+    it), so the error carries what the operator needs to check or clean up, never the token.
+    """
+
+    def __init__(self, kind: str, prefix: str) -> None:
+        super().__init__("commit_failed_after_delivery")
+        self.kind = kind
+        self.prefix = prefix
+
+
 class MissingProvisioningGrantError(ProvisioningError):
     """The operator connection lacks privileges on ``operations.*``."""
 
@@ -59,6 +72,11 @@ class MissingProvisioningGrantError(ProvisioningError):
 
     def __str__(self) -> str:
         return "the admin connection lacks: " + "; ".join(self.missing)
+
+
+# Called with the credential INSIDE the open transaction, after the row is flushed and before the
+# commit: if it raises the transaction rolls back, so no undeliverable token ever exists.
+Deliver = Callable[["IssuedCredential"], None]
 
 
 @dataclass(frozen=True, slots=True)
@@ -174,6 +192,7 @@ async def register_producer(
     cost: HashCost,
     rotate: bool = False,
     now: datetime | None = None,
+    deliver: Deliver | None = None,
 ) -> IssuedCredential:
     """Register ``producer_id`` with a new ``events:ingest`` token.
 
@@ -181,12 +200,16 @@ async def register_producer(
     is an operator decision that only an explicit rotation may undo); ``rotate`` keeps the id and
     ``created_at`` and replaces the prefix, verifier and expiry (clearing any revocation). An
     expired-only registration is replaced without it, since nothing live is displaced.
+
+    ``deliver`` hands the plaintext over before the commit (see :data:`Deliver`); a failure there
+    rolls back, leaving a rotated producer's old credential valid.
     """
     producer_id = _name(producer_id, "producer_id")
     moment = now or datetime.now(UTC)
     expires_at = _expiry(moment, expires_in_days)
     prefix, token = _new_token(PRODUCER_TOKEN_PREFIX)
     verifier = await _hash(token, cost)
+    delivered = False
     try:
         async with sessions.begin() as session:
             row = await session.scalar(
@@ -216,12 +239,21 @@ async def register_producer(
                 row.expires_at = expires_at
                 row.revoked_at = None
                 row.updated_at = max(moment, row.created_at)
-    except IntegrityError:
-        # A concurrent registration of the same id (or, vanishingly, the same prefix).
-        raise ProvisioningError("producer_conflict") from None
-    return IssuedCredential(
-        "producer", producer_id, prefix, token, INGEST_SCOPE, expires_at, rotated=rotated
-    )
+            credential = IssuedCredential(
+                "producer", producer_id, prefix, token, INGEST_SCOPE, expires_at, rotated=rotated
+            )
+            await session.flush()  # constraint failures surface before anything is delivered
+            if deliver is not None:
+                deliver(credential)
+                delivered = True
+    except Exception as error:
+        if delivered:
+            raise CommitAfterDeliveryError("producer", prefix) from None
+        if isinstance(error, IntegrityError):
+            # A concurrent registration of the same id (or, vanishingly, the same prefix).
+            raise ProvisioningError("producer_conflict") from None
+        raise
+    return credential
 
 
 async def revoke_producer(
@@ -271,8 +303,9 @@ async def create_mcp_token(
     expires_in_days: int,
     cost: HashCost,
     now: datetime | None = None,
+    deliver: Deliver | None = None,
 ) -> IssuedCredential:
-    """Create a ``memory:read`` MCP token for ``principal``."""
+    """Create a ``memory:read`` MCP token for ``principal`` (``deliver``: see :data:`Deliver`)."""
     principal = _name(principal, "principal")
     if scope not in MCP_SCOPES:
         raise ProvisioningError("invalid_scope")
@@ -281,6 +314,8 @@ async def create_mcp_token(
     prefix, token = _new_token(MCP_TOKEN_PREFIX)
     verifier = await _hash(token, cost)
     token_id = uuid.uuid4()
+    credential = IssuedCredential("mcp-token", str(token_id), prefix, token, scope, expires_at)
+    delivered = False
     try:
         async with sessions.begin() as session:
             session.add(
@@ -295,9 +330,17 @@ async def create_mcp_token(
                     revoked_at=None,
                 )
             )
-    except IntegrityError:
-        raise ProvisioningError("token_conflict") from None
-    return IssuedCredential("mcp-token", str(token_id), prefix, token, scope, expires_at)
+            await session.flush()  # constraint failures surface before anything is delivered
+            if deliver is not None:
+                deliver(credential)
+                delivered = True
+    except Exception as error:
+        if delivered:
+            raise CommitAfterDeliveryError("mcp-token", prefix) from None
+        if isinstance(error, IntegrityError):
+            raise ProvisioningError("token_conflict") from None
+        raise
+    return credential
 
 
 async def revoke_mcp_token(

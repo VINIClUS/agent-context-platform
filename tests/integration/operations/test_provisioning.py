@@ -30,6 +30,7 @@ from agent_context_sdk.ids import new_uuid7
 from sqlalchemy import text
 from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.orm.session import SessionTransaction
 from sqlalchemy.pool import NullPool
 from typer.testing import CliRunner
 
@@ -287,22 +288,87 @@ def test_an_expired_only_id_re_registers_without_rotate(operator: dict[str, str]
     assert register(operator, "p039b-lapsed").exit_code == 2
 
 
-def test_a_failed_output_write_is_reported_and_cleaned_up(
-    operator: dict[str, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+def _rows(owner_engine: AsyncEngine, query: str) -> list[tuple[Any, ...]]:
+    async def read() -> list[tuple[Any, ...]]:
+        async with owner_engine.connect() as connection:
+            return [tuple(row) for row in await connection.execute(text(query))]
+
+    return asyncio.run(read())
+
+
+def test_a_failed_delivery_rolls_back_and_a_rotation_keeps_the_old_credential(
+    operator: dict[str, str],
+    owner_engine: AsyncEngine,
+    api_engine: AsyncEngine,
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
 ) -> None:
+    first = json.loads(register(operator, "p039b-undelivered").stdout)
+
     def broken(self: cli.SecretFile, token: str) -> None:
         raise OSError("disk full")
 
-    monkeypatch.setattr(cli.SecretFile, "write", broken)
-    path = tmp_path / "full.token"
-    result = register(operator, "p039b-undelivered", "--output", str(path))
-    assert result.exit_code == 1
-    assert "NOT delivered" in result.stderr and "--rotate" in result.stderr
-    assert not path.exists()
-    monkeypatch.undo()
-    # The credential exists, so a plain retry is refused and --rotate recovers.
-    assert register(operator, "p039b-undelivered").exit_code == 2
-    assert register(operator, "p039b-undelivered", "--rotate").exit_code == 0
+    with monkeypatch.context() as patch:
+        patch.setattr(cli.SecretFile, "write", broken)
+        path = tmp_path / "full.token"
+        # A rotation whose delivery fails changes nothing.
+        result = register(operator, "p039b-undelivered", "--rotate", "--output", str(path))
+        assert result.exit_code == 1 and "could not be delivered" in result.stderr
+        assert not path.exists()
+        # A brand-new id leaves no row at all.
+        fresh = register(operator, "p039b-never", "--output", str(tmp_path / "x.token"))
+        assert fresh.exit_code == 1
+    assert _rows(owner_engine, "SELECT 1 FROM operations.registered_producers "
+                 "WHERE producer_id = 'p039b-never'") == []  # fmt: skip
+    assert asyncio.run(_post_ingest(_app(api_engine), first["token"], "p039b-undelivered")) == 200
+    prefixes = _rows(
+        owner_engine,
+        "SELECT token_prefix FROM operations.registered_producers "
+        "WHERE producer_id = 'p039b-undelivered'",
+    )
+    assert prefixes == [(first["prefix"],)]
+
+
+def test_a_broken_stdout_leaves_no_new_row(
+    operator: dict[str, str], owner_engine: AsyncEngine, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def broken_pipe() -> None:
+        raise BrokenPipeError
+
+    monkeypatch.setattr(cli, "_flush_stdout", broken_pipe)
+    assert register(operator, "p039b-pipe").exit_code == 1
+    assert create(operator, "p039b-pipe-reader").exit_code == 1
+    assert _rows(owner_engine, "SELECT 1 FROM operations.registered_producers "
+                 "WHERE producer_id = 'p039b-pipe'") == []  # fmt: skip
+    assert _rows(owner_engine, "SELECT 1 FROM operations.mcp_tokens "
+                 "WHERE principal = 'p039b-pipe-reader'") == []  # fmt: skip
+
+
+def test_a_failed_commit_removes_the_delivered_file_and_names_the_recovery(
+    operator: dict[str, str], tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    real_commit = SessionTransaction.commit
+
+    def failing_commit(self: Any, *args: Any, **kwargs: Any) -> None:
+        if self._parent is not None:  # flush commits a subtransaction: only the real commit fails
+            return real_commit(self, *args, **kwargs)
+        raise RuntimeError("connection lost")
+
+    with monkeypatch.context() as patch:
+        patch.setattr(SessionTransaction, "commit", failing_commit)
+        path = tmp_path / "commit.token"
+        producer = register(operator, "p039b-commit", "--output", str(path))
+        assert producer.exit_code == 1 and not path.exists()
+        assert "producer list" in producer.stderr and "--rotate" in producer.stderr
+        assert "prd_" in producer.stderr and "mcp-token revoke" not in producer.stderr
+
+        mcp_path = tmp_path / "mcp-commit.token"
+        mcp = create(operator, "p039b-commit-reader", "--output", str(mcp_path))
+        assert mcp.exit_code == 1 and not mcp_path.exists()
+        assert "mcp-token revoke mcp_" in mcp.stderr and "--rotate" not in mcp.stderr
+        # Without a file the token was already printed once: the message says to discard it.
+        printed = create(operator, "p039b-commit-reader")
+        assert printed.exit_code == 1 and "discard" in printed.stderr
 
 
 def test_mcp_tokens_authenticate_only_on_mcp(
