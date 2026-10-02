@@ -97,7 +97,7 @@ def parse(scan: RepositoryScan) -> list[ParsedFile]:
     return list(result.files)
 
 
-def lineage(scan: RepositoryScan, introducing: str = "") -> dict[str, uuid.UUID]:
+def lineage(scan: RepositoryScan) -> dict[str, uuid.UUID]:
     """Lineage derived from the repository's first-parent history (never seeded from HEAD)."""
     return dict(derive_lineage(scan, REPO_ID).file_logical_ids)
 
@@ -141,7 +141,7 @@ def _events(
     repo: RepoBuilder, *, with_scip: bool = True
 ) -> tuple[list[EventDraftV1], list[ParsedFile]]:
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     parsed = parse(scan)
     sem = semantic(scan, ids) if with_scip else None
     return service().index(scan, sem, parsed, file_logical_ids=ids), parsed
@@ -207,7 +207,7 @@ def test_relative_import_resolves_at_syntactic_confidence(
     indexed: RepoBuilder,
 ) -> None:
     scan = scan_of(indexed)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     parsed = parse(scan)
     reference = ParsedReference(
         source=None,
@@ -252,7 +252,7 @@ def test_unresolved_imports_become_dependencies_and_calls_never_claim_scip(
     indexed: RepoBuilder,
 ) -> None:
     scan = scan_of(indexed)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     parsed = parse(scan)
 
     def ref(kind: str, name: str, **extra: object) -> ParsedReference:
@@ -291,7 +291,7 @@ def test_unresolved_imports_become_dependencies_and_calls_never_claim_scip(
 
 def test_scip_and_treesitter_claims_about_one_edge_are_both_kept(indexed: RepoBuilder) -> None:
     scan = scan_of(indexed)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     parsed = parse(scan)
     main = next(p for p in parsed if p.path == "pkg/main.py")
     run = next(s for s in main.symbols if s.qualified_name.endswith("run"))
@@ -335,7 +335,7 @@ def test_scip_and_treesitter_claims_about_one_edge_are_both_kept(indexed: RepoBu
 
 def test_scip_only_file_uses_scip_digests(indexed: RepoBuilder) -> None:
     scan = scan_of(indexed)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     sem = semantic(scan, ids)
     parsed = [p for p in parse(scan) if p.path != "pkg/shapes.py"]
 
@@ -356,7 +356,7 @@ def test_dirty_workspace_targets_a_snapshot_and_needs_a_lineage(
     indexed.write("pkg/util.py", HELPER + "\n\ndef more() -> None:\n    pass\n")
     indexed.write("pkg/new.py", "def fresh() -> None:\n    pass\n")
     scan = scan_of(indexed)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     ids.pop("pkg/main.py")
 
     drafts = service().index(scan, None, parse(scan), file_logical_ids=ids)
@@ -369,7 +369,7 @@ def test_dirty_workspace_targets_a_snapshot_and_needs_a_lineage(
 
 def test_a_mismatched_semantic_target_is_refused(indexed: RepoBuilder) -> None:
     scan = scan_of(indexed)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     sem = semantic(scan, ids)
     other = service().config.__class__(repository_id="other")
 
@@ -380,7 +380,7 @@ def test_a_mismatched_semantic_target_is_refused(indexed: RepoBuilder) -> None:
 
 def test_supersession_is_only_emitted_at_full_confidence(indexed: RepoBuilder) -> None:
     scan = scan_of(indexed)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     old, new = uuid.uuid4(), uuid.uuid4()
     sure = identity.Supersession(old, new, 1.0, "git", "provisional_committed")
     weak = identity.Supersession(old, uuid.uuid4(), 0.5, "git", "path_reuse")
@@ -547,7 +547,7 @@ def test_scip_evidence_binds_only_files_whose_bytes_are_the_scip_commits(
     )
     scan = scan_of(indexed)
     assert scan.workspace.is_dirty
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
 
     with caplog.at_level(logging.INFO):
         drafts = service().index(scan, semantic(scan, ids), parse(scan), file_logical_ids=ids)
@@ -568,7 +568,7 @@ def test_scip_evidence_binds_only_files_whose_bytes_are_the_scip_commits(
 def test_a_dirty_or_untracked_file_loses_its_scip_symbols_too(indexed: RepoBuilder) -> None:
     indexed.write("pkg/shapes.py", (SCIP_SOURCES / "shapes.py").read_text() + "\nEXTRA = 1\n")
     scan = scan_of(indexed)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     parsed = [p for p in parse(scan) if p.path != "pkg/shapes.py"]  # would be SCIP-only
 
     drafts = service().index(scan, semantic(scan, ids), parsed, file_logical_ids=ids)
@@ -581,7 +581,7 @@ def test_a_dirty_or_untracked_file_loses_its_scip_symbols_too(indexed: RepoBuild
 
 def test_a_scip_occurrence_without_a_valid_location_makes_no_claim(indexed: RepoBuilder) -> None:
     scan = scan_of(indexed)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     sem = semantic(scan, ids)
     broken = SourceRange(400, 0, 400, 1)  # a line the file does not have
     documents = tuple(
@@ -614,7 +614,7 @@ def test_two_checkouts_with_the_same_untracked_file_share_one_snapshot_and_membe
 ) -> None:
     indexed.write("pkg/new.py", "def fresh() -> None:\n    pass\n")
     scan = scan_of(indexed)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
 
     def index(checkout: str) -> list[EventDraftV1]:
         config = dataclasses.replace(service().config, checkout_id=checkout)
@@ -647,7 +647,7 @@ def test_a_codex_snapshot_built_from_the_same_scan_joins_the_indexed_revisions(
     indexed.write("pkg/util.py", HELPER + "\n\ndef more() -> None:\n    pass\n")
     indexed.write("pkg/new.py", "def fresh() -> None:\n    pass\n")
     scan = scan_of(indexed)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     tracked = {f.path: f for f in scan.files}
     modified = sorted(
         {str(tracked[p].content_sha256) for p in scan.workspace.modified_paths if p in tracked}
@@ -697,7 +697,7 @@ def test_a_scan_that_omitted_files_is_never_a_success(
     repo.commit("seed")
     scan = scan_repository(repo.root, ScanLimits(max_files=2))
     assert scan.truncated and scan.omitted_files == 1
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
 
     drafts = service().index(scan, None, parse(scan), file_logical_ids=ids)
 
@@ -714,7 +714,7 @@ def test_a_scan_skip_that_cannot_hide_a_source_file_stays_a_success(
     repo.commit("seed")
     scan = scan_repository(repo.root, ScanLimits(max_file_bytes=10))
     assert scan.truncated and not scan.omitted_files  # too large, but it is not source
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
 
     drafts = service().index(scan, None, parse(scan), file_logical_ids=ids)
 
@@ -728,7 +728,7 @@ def test_a_rejected_path_hides_a_source_file_unless_its_name_says_otherwise(
     repo.write("a.py", "a = 1\n")
     repo.commit("seed")
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
 
     def outcome(*rejections: Rejection) -> tuple[bool, str | None]:
         rejected = dataclasses.replace(scan, rejections=rejections)
@@ -752,7 +752,7 @@ def test_a_path_the_worktree_changed_without_a_status_is_not_at_the_commit(
     scan = scan_of(indexed)
     tracked = {f.path: f for f in scan.files}["pkg/main.py"]
     assert tracked.change is None and "pkg/main.py" in scan.workspace.modified_paths
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
 
     drafts = service().index(scan, semantic(scan, ids), parse(scan), file_logical_ids=ids)
 
@@ -771,7 +771,7 @@ def test_a_clean_tracked_path_keeps_its_scip_evidence(indexed: RepoBuilder) -> N
 
 def test_a_scip_import_diagnostic_makes_the_run_degraded(indexed: RepoBuilder) -> None:
     scan = scan_of(indexed)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     sem = dataclasses.replace(
         semantic(scan, ids),
         diagnostics=(ImportDiagnostic("unknown_position_encoding", "pkg/main.py"),),
@@ -796,7 +796,7 @@ def _calls(make_repo: Callable[[str], RepoBuilder], files: dict[str, str]) -> se
         repo.write(path, text)
     repo.commit("seed")
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     drafts = service().index(scan, None, parse(scan), file_logical_ids=ids)
     names = {
         p["symbol_id"]: str(p["qualified_name"]) for p in _payloads(drafts, "code.symbol.indexed")
@@ -859,7 +859,7 @@ def test_a_scip_definition_without_a_valid_location_is_counted_and_degrades(
     indexed: RepoBuilder,
 ) -> None:
     scan = scan_of(indexed)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     sem = semantic(scan, ids)
     broken = SourceRange(400, 0, 400, 1)
     documents = tuple(
@@ -951,7 +951,7 @@ def test_a_dirty_file_that_cannot_be_hashed_leaves_the_snapshot_incomplete(
     indexed.write("pkg/big.py", b"x = 1\n" * (400 * 1024))
     monkeypatch.setattr(emitter, "IDENTITY_HASH_CAP", 1024)
     scan = scan_of(indexed)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
 
     drafts = service().index(scan, None, parse(scan), file_logical_ids=ids)
 
@@ -970,7 +970,7 @@ def _imports(make_repo: Callable[[str], RepoBuilder], files: dict[str, str]) -> 
         repo.write(path, text)
     repo.commit("seed")
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     drafts = service().index(scan, None, parse(scan), file_logical_ids=ids)
     names = {
         str(p["symbol_id"]): str(p["qualified_name"])
@@ -1018,7 +1018,7 @@ def test_every_adapter_loss_diagnostic_degrades_the_run(
     indexed: RepoBuilder, code: str, degrades: bool
 ) -> None:
     scan = scan_of(indexed)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     parsed = [
         p.model_copy(update={"diagnostics": (ParsedDiagnostic(code=code, count=1),)})
         if p.path == "pkg/util.py"
@@ -1040,7 +1040,7 @@ def _started(drafts: list[EventDraftV1]) -> dict[str, object]:
 
 def _index(repo: RepoBuilder) -> tuple[RepositoryScan, list[EventDraftV1]]:
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     return scan, service().index(scan, None, parse(scan), file_logical_ids=ids)
 
 

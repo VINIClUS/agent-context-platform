@@ -175,7 +175,8 @@ def derive_lineage(
 
     ``scan`` supplies the checkout whose object store is read (its identity is re-verified);
     an unborn HEAD has no files and no lineage. Raises ``IndexingError`` ``history_too_large``
-    above ``max_commits`` first-parent commits, ``shallow_history`` for an incomplete clone, and
+    above ``max_commits`` first-parent commits, ``commit_diff_too_large`` when one commit's diff
+    exceeds the output cap, ``shallow_history`` for an incomplete clone, and
     ``ScanError`` for anything the safe Git runner refuses.
     """
     identity.repository_namespace(repository_id)  # validates the ID before any git runs
@@ -264,7 +265,7 @@ def _walk(
                 )
             except ScanError as error:
                 if error.reason is ScanFailure.OUTPUT_TOO_LARGE:
-                    raise IndexingError("history_too_large") from None
+                    raise IndexingError("commit_diff_too_large") from None
                 raise
             state.apply(commit, _parse_raw(raw))
             previous = commit

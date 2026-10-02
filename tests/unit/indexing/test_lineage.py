@@ -15,7 +15,7 @@ from agent_context_platform.indexing import identity
 from agent_context_platform.indexing.emitter import IndexingError, blob_oid
 from agent_context_platform.indexing.identity import ProvisionalFile
 from agent_context_platform.indexing.lineage import Lineage, derive_lineage
-from agent_context_platform.indexing.scanner import scan_repository
+from agent_context_platform.indexing.scanner import ScanLimits, scan_repository
 
 from .conftest import RepoBuilder
 
@@ -401,3 +401,12 @@ def test_a_hostile_repository_config_runs_nothing(make_repo: Factory, tmp_path: 
     result = lineage_of(repo)
     assert set(result.file_logical_ids) == {"a.py", ".gitattributes"}
     assert not marker.exists()
+
+
+def test_one_oversized_commit_diff_has_its_own_error_code(make_repo: Factory) -> None:
+    repo = make_repo("repo")
+    repo.write("a.py", A)
+    repo.commit("one")
+    with pytest.raises(IndexingError) as refused:
+        lineage_of(repo, limits=ScanLimits(max_command_output_bytes=40))
+    assert refused.value.code == "commit_diff_too_large"

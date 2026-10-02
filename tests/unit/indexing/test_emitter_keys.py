@@ -90,7 +90,7 @@ def test_an_incomplete_index_reports_failure_and_a_clean_one_does_not(
     seed(repo, {"pkg/util.py": HELPER})
     repo.commit("seed")
     scan = scan_of(repo)
-    ids = lineage(scan, scan.workspace.head_commit or "")
+    ids = lineage(scan)
     clean = parse(scan)
 
     degraded = [
@@ -143,7 +143,7 @@ def test_removing_a_call_between_surviving_symbols_is_visible_per_file_revision(
     repo.write("pkg/b.py", "b\n")
     repo.commit("seed")
     first_scan = scan_of(repo)
-    ids = lineage(first_scan, first_scan.workspace.head_commit or "")
+    ids = lineage(first_scan)
     members = {"pkg/a.py": ("caller",), "pkg/b.py": ("callee",)}
     calls = {
         "pkg/a.py": (
