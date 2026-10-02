@@ -304,3 +304,22 @@ def test_the_installed_entry_point_indexes_a_checkout(
     assert make_url(env["AGENT_CONTEXT_POSTGRESQL__API_DSN"]).password not in (
         done.stdout + done.stderr
     )
+
+
+def test_a_structural_refusal_exits_1_with_a_json_report(
+    env: dict[str, str], repo: Path, repository_id: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agent_context_platform.indexing.tree_sitter.base import (
+        StructuralError,
+        StructuralErrorCode,
+    )
+
+    def refuse(*_args: object, **_kwargs: object) -> object:
+        raise StructuralError(StructuralErrorCode.SANDBOX_UNAVAILABLE)
+
+    monkeypatch.setattr("agent_context_platform.indexing.pipeline.parse_structural", refuse)
+    result = index(env, repository_id, repo)
+    assert result.exit_code == 1
+    body = report(result)
+    assert body["success"] is False and body["error_class"] == "structural_sandbox_unavailable"
+    assert body["submitted"] == 0

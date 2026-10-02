@@ -40,6 +40,7 @@ from agent_context_platform.indexing.scip import (
     SemanticIndex,
     import_scip,
 )
+from agent_context_platform.indexing.tree_sitter.base import StructuralError
 from agent_context_platform.settings import Settings
 
 _LOG = logging.getLogger(__name__)
@@ -52,12 +53,16 @@ SCIP_NEEDS_COMMIT: Final = "scip_requires_commit"
 
 @dataclass(frozen=True, slots=True)
 class IndexRequest:
-    """What to index. ``provisional`` are earlier uncommitted observations to link to history."""
+    """What to index. ``provisional`` are earlier uncommitted observations to link to history.
+
+    The checkout id (and workspace and project) come from the ``IndexingConfig`` of the service the
+    caller passes to ``index_checkout``; the request carries no second copy of them. The service's
+    ``repository_id`` must equal ``repository_id`` here (``repository_mismatch`` otherwise).
+    """
 
     repository_id: str
     checkout: Path
     scip: Path | None = None
-    checkout_id: str | None = None
     max_commits: int = DEFAULT_MAX_COMMITS
     provisional: tuple[ProvisionalFile, ...] = ()
 
@@ -177,10 +182,19 @@ async def index_checkout(
     so far. A bad ``repository_id`` raises ``ValueError`` and a missing checkout ``OSError``
     (usage errors the caller reports before running).
     """
+    if service.config.repository_id != request.repository_id:
+        return _failure(request, "repository_mismatch")
     try:
         drafts, diagnostics = await asyncio.to_thread(_build, request, settings, service)
     except IndexingError as error:
         return _failure(request, error.code)
+    except StructuralError as error:
+        # Landlock unavailable, an adapter that cannot spawn, a rejected read set: content-free.
+        return _failure(
+            request,
+            f"structural_{error.code.value}",
+            diagnostics={f"structural_{error.code.value}": 1},
+        )
     except ScanError as error:
         _LOG.warning("scan refused: %s", error.reason.value)
         return _failure(request, SCAN_FAILED, diagnostics={f"scan_{error.reason.value}": 1})

@@ -30,6 +30,7 @@ from agent_context_platform.indexing.emitter import (
 )
 from agent_context_platform.indexing.pipeline import IndexReport, IndexRequest, index_checkout
 from agent_context_platform.indexing.tree_sitter import landlock
+from agent_context_platform.indexing.tree_sitter.base import StructuralError, StructuralErrorCode
 from agent_context_platform.ledger.service import IngestionService
 from agent_context_platform.projection.verify import NoContentBlobStore
 from agent_context_platform.settings import Settings
@@ -272,3 +273,26 @@ def test_an_unusable_scip_index_is_a_failed_report(
     report = stack.index(repo, scip=junk)
     assert not report.success and (report.error_class or "").startswith("scip_")
     assert report.submitted == 0
+
+
+def test_a_service_for_another_repository_is_refused_before_anything_is_built(
+    stack: Stack, repo: Path
+) -> None:
+    other = IndexRequest(f"{stack.repository_id}-other", repo)
+    report = stack.run(other)
+    assert not report.success and report.error_class == "repository_mismatch"
+    assert report.submitted == 0 and report.index_id is None
+    assert stack.file_ids() == {}
+
+
+def test_a_structural_refusal_is_a_failed_report_not_an_exception(
+    stack: Stack, repo: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    def refuse(*_args: object, **_kwargs: object) -> object:
+        raise StructuralError(StructuralErrorCode.SANDBOX_UNAVAILABLE)
+
+    monkeypatch.setattr("agent_context_platform.indexing.pipeline.parse_structural", refuse)
+    report = stack.index(repo)
+    assert not report.success and report.error_class == "structural_sandbox_unavailable"
+    assert report.submitted == 0 and report.diagnostics == {"structural_sandbox_unavailable": 1}
+    assert stack.file_ids() == {}
