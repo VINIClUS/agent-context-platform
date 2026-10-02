@@ -363,10 +363,18 @@ def test_role_dsns_fall_back_to_the_shared_dsn_and_never_print() -> None:
     assert split.postgresql.effective_projector_dsn.get_secret_value().unicode_string() == projector
     assert split.postgresql.effective_api_dsn is split.postgresql.dsn
     assert Settings().postgresql.effective_api_dsn is None
+    assert only_shared.postgresql.effective_admin_dsn is only_shared.postgresql.dsn
+    assert Settings().postgresql.effective_admin_dsn is None
+    admin = "postgresql+psycopg://operator:admin-secret@postgres/agent_context"
+    operator = Settings(postgresql={"dsn": shared, "admin_dsn": admin})
+    assert operator.postgresql.effective_admin_dsn is not None
+    assert operator.postgresql.effective_admin_dsn.get_secret_value().unicode_string() == admin
+    assert operator.postgresql.effective_api_dsn is operator.postgresql.dsn
+    assert "admin-secret" not in repr(operator)
     assert "projector-secret" not in repr(split) and "shared-secret" not in repr(split)
 
 
-@pytest.mark.parametrize("field", ["projector_dsn", "api_dsn"])
+@pytest.mark.parametrize("field", ["projector_dsn", "api_dsn", "admin_dsn"])
 @pytest.mark.parametrize(
     "dsn",
     ["postgresql://u:p@postgres/agent", "postgresql+psycopg://u:p@postgres", "mysql://u:p@h/d"],

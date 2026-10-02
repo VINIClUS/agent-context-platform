@@ -89,7 +89,9 @@ tears the stack down afterwards. `scripts/test-services.sh status` shows the run
 `AGENT_CONTEXT_TEST_PROJECT` overrides the derived Compose project name, which otherwise comes from
 this checkout's path so concurrent worktrees never collide.
 
-## Operating projections
+## Operator CLI
+
+### Operating projections
 
 `agent-context projection` (installed by `uv sync`) rebuilds, verifies and inspects the Neo4j graph,
 which is always derivable from the ledger. It reads the usual `AGENT_CONTEXT_*` settings (PostgreSQL
@@ -153,6 +155,45 @@ agent-context projection rebuild --in-place --confirm neo4j   # stop the project
   It then re-verifies the live projection. Events not yet delivered stay for the runner. Both
   modes skip events the runner dead-lettered (the live graph never held them) and list them, with
   their count, in the output and JSON (`skipped_dead_lettered`).
+
+### Provisioning credentials
+
+`agent-context producer register|revoke|list` and `agent-context mcp-token create|revoke|list`
+write `operations.registered_producers` and `operations.mcp_tokens`. A credential is
+`<prefix>.<secret>`; only an Argon2id verifier (at the cost `AGENT_CONTEXT_INGESTION__ARGON2_*`
+configures) is stored, so the plaintext is shown once and never logged.
+
+```bash
+agent-context producer register --producer-id codex-laptop --expires-in 90 --output ~/.codex-token
+agent-context producer register --producer-id codex-laptop --expires-in 90 --rotate   # replaces it
+agent-context producer revoke codex-laptop
+agent-context mcp-token create --principal codex-reader --scope memory:read --expires-in 90
+agent-context mcp-token revoke mcp_AbCd1234xyz            # prefix from `mcp-token list`
+```
+
+* **Delivery.** Without `--output` the token is the only thing on stdout (`$(...)` captures it;
+  the id, prefix, scope and expiry go to stderr). `--json` prints one document that includes the
+  token, or `output` (the path) instead with `--output`. `--output` creates a NEW file with mode
+  `0600`, refuses an existing path or a path inside a git work tree, and removes it again if
+  provisioning fails.
+* **Namespaces.** Producer tokens start with `prd_`, MCP tokens with `mcp_` (a CHECK on
+  `operations.mcp_tokens`; `registered_producers` has no prefix CHECK, so `prd_` is enforced here).
+  Neither is accepted on the other plane. `--expires-in` is 1-3650 days.
+* **`register`** refuses an active or explicitly revoked id without `--rotate` (exit `2`); `--rotate` keeps the
+  id and `created_at` and replaces the prefix, verifier and expiry. An expired-only id is replaced
+  without `--rotate`. The token is delivered (written to `--output`, or flushed to stdout) BEFORE the database commit: if
+  delivery fails (disk full, broken pipe) the transaction rolls back, nothing changes and a rotated
+  producer keeps its previous credential (exit `1`). If the commit itself fails after delivery, the
+  `--output` file is removed (only if it is still the one created) and the error names the prefix
+  and the recovery: `producer register ... --rotate` for a producer, `mcp-token revoke <prefix>`
+  then a new `mcp-token create` for an MCP token (the commit outcome may be ambiguous). `revoke` sets `revoked_at` (the row stays); an MCP replica may keep serving a
+  revoked token for up to `mcp.principal_cache_ttl_seconds` (default 30 s).
+* **Database role.** These rows are written by an operator connection,
+  `AGENT_CONTEXT_POSTGRESQL__ADMIN_DSN` (falls back to `AGENT_CONTEXT_POSTGRESQL__DSN`). The
+  migrations grant the API role only `SELECT` on both tables (plus a column `UPDATE` of
+  `last_used_at`/`updated_at` on producers) and the projector role nothing, so the admin
+  connection must be the schema owner or a role granted `SELECT, INSERT, UPDATE` on them. The
+  grants are checked before any write; a missing one exits `1` naming it. The DSN is never printed.
 
 ## Ingestion API contract
 

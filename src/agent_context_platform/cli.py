@@ -1,11 +1,17 @@
 """`agent-context`: the operator command line.
 
-Today it exposes `agent-context projection rebuild|verify|status` (PLATFORM-039). Every command
-reads the process environment through `Settings` (`AGENT_CONTEXT_*`), runs in one `asyncio.run`,
+It exposes `agent-context projection rebuild|verify|status` (PLATFORM-039) and the credential
+provisioning commands `agent-context producer register|revoke|list` and
+`agent-context mcp-token create|revoke|list` (PLATFORM-039B). Every command reads the process environment through `Settings` (`AGENT_CONTEXT_*`), runs in one `asyncio.run`,
 and never prints a DSN, a password or an exception message: failures are reported by class name.
 
 Exit codes: 0 success, 1 verification mismatch or a failed operation, 2 usage error (bad or
-missing options, an unsafe refusal such as a non-empty target without `--wipe-target`).
+missing options, an unsafe refusal such as a non-empty target without `--wipe-target` or a
+`producer register` of an active id without `--rotate`).
+
+A freshly issued bearer is printed ONCE: to stdout (metadata goes to stderr, so `$(...)` captures
+just the token) or, with `--output`, to a new 0600 file outside any git work tree. It is never
+logged.
 """
 
 from __future__ import annotations
@@ -13,9 +19,13 @@ from __future__ import annotations
 import asyncio
 import json
 import os
-from collections.abc import AsyncIterator, Callable, Coroutine
+import stat
+import sys
+from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from contextlib import asynccontextmanager
 from dataclasses import dataclass
+from datetime import UTC, datetime
+from pathlib import Path
 from typing import Annotated, Any
 
 import typer
@@ -28,6 +38,7 @@ from sqlalchemy.ext.asyncio import (
 )
 
 from agent_context_platform.db import session_factory
+from agent_context_platform.operations import provisioning
 from agent_context_platform.projection.neo4j import Neo4jStore
 from agent_context_platform.projection.registry import registered_projectors
 from agent_context_platform.projection.verify import (
@@ -69,6 +80,20 @@ projection_app = typer.Typer(
     pretty_exceptions_enable=False,
 )
 app.add_typer(projection_app, name="projection")
+producer_app = typer.Typer(
+    help="Register, revoke and list ingestion producers.",
+    no_args_is_help=True,
+    add_completion=False,
+    pretty_exceptions_enable=False,
+)
+app.add_typer(producer_app, name="producer")
+mcp_token_app = typer.Typer(
+    help="Create, revoke and list read-only MCP tokens.",
+    no_args_is_help=True,
+    add_completion=False,
+    pretty_exceptions_enable=False,
+)
+app.add_typer(mcp_token_app, name="mcp-token")
 
 _JSON = Annotated[bool, typer.Option("--json", help="Machine-readable output.")]
 _BATCH = Annotated[int, typer.Option("--batch-size", min=1, help="Graph scan page size.")]
@@ -98,6 +123,10 @@ _CONFIRM = Annotated[
     str | None,
     typer.Option("--confirm", help="Repeat the database name to confirm a destructive step."),
 ]
+
+
+class DeliveryError(Exception):
+    """The credential was created but could not be written to ``--output``."""
 
 
 class CliUsageError(Exception):
@@ -234,6 +263,29 @@ def _emit(payload: dict[str, Any], *, as_json: bool, lines: list[str]) -> None:
     typer.echo(json.dumps(payload, sort_keys=True) if as_json else "\n".join(lines))
 
 
+def _recovery_message(error: provisioning.CommitAfterDeliveryError) -> str:
+    """What to do when the token was delivered but the commit failed (its outcome is unknown)."""
+    head = f"the token with prefix {error.prefix} was delivered but the database commit failed"
+    if error.kind == "producer":
+        return (
+            f"{head}, so it is probably not valid: discard it, check `producer list`, and if the "
+            "registration shows prefix " + error.prefix + " or the producer is missing, run "
+            "`producer register ... --rotate` again for a credential you can rely on"
+        )
+    return (
+        f"{head}, so it is probably not valid: discard it, run `mcp-token list`, and if prefix "
+        f"{error.prefix} is listed run `mcp-token revoke {error.prefix}`; then create a new token"
+    )
+
+
+_PROVISIONING_HINTS = {
+    "producer_exists": " (an active or revoked registration exists; use --rotate to replace it)",
+    "producer_conflict": " (a concurrent registration won; retry)",
+    "token_conflict": " (retry)",
+    "invalid_expiry": " (--expires-in is 1-3650 days)",
+}
+
+
 def _run(main: Callable[[], Coroutine[Any, Any, int]]) -> None:
     """Run one command in one event loop and translate failures to exit codes."""
     code: int
@@ -246,6 +298,22 @@ def _run(main: Callable[[], Coroutine[Any, Any, int]]) -> None:
         typer.echo(
             "error: the target holds graph data; use --wipe-target --confirm <database>", err=True
         )
+        code = EXIT_USAGE
+    except provisioning.MissingProvisioningGrantError as error:
+        typer.echo(f"error: {error}", err=True)
+        code = EXIT_FAILED
+    except DeliveryError:
+        typer.echo(
+            "error: the token could not be delivered, so nothing was changed "
+            "(a rotated producer keeps its previous credential)",
+            err=True,
+        )
+        code = EXIT_FAILED
+    except provisioning.CommitAfterDeliveryError as error:
+        typer.echo(f"error: {_recovery_message(error)}", err=True)
+        code = EXIT_FAILED
+    except provisioning.ProvisioningError as error:
+        typer.echo(f"error: {error.code}{_PROVISIONING_HINTS.get(error.code, '')}", err=True)
         code = EXIT_USAGE
     except MissingGrantError as error:
         typer.echo(f"error: {error}", err=True)
@@ -476,6 +544,392 @@ def status_command(json_output: _JSON = False) -> None:
         _emit(
             {"projectors": [item.to_dict() for item in statuses]}, as_json=json_output, lines=lines
         )
+        return EXIT_OK
+
+    _run(main)
+
+
+# --- credential provisioning (PLATFORM-039B) ---------------------------------------------------
+
+_EXPIRES_IN = Annotated[
+    int,
+    typer.Option(
+        "--expires-in", min=1, max=3650, help="Days until the credential expires (required)."
+    ),
+]
+_OUTPUT = Annotated[
+    Path | None,
+    typer.Option(
+        "--output",
+        help="Write the token to this NEW file (mode 0600, outside any git work tree) instead of "
+        "stdout.",
+    ),
+]
+
+
+@asynccontextmanager
+async def _admin_sessions(
+    settings: Settings, *, tables: Sequence[str], write: bool
+) -> AsyncIterator[async_sessionmaker[AsyncSession]]:
+    """The operator connection, with its `operations.*` grants verified before any write."""
+    engine = _engine(settings.postgresql.effective_admin_dsn, "ADMIN_DSN")
+    try:
+        sessions = session_factory(engine)
+        await provisioning.check_grants(sessions, tables=tables, write=write)
+        yield sessions
+    finally:
+        await engine.dispose()
+
+
+def _hash_cost(settings: Settings) -> provisioning.HashCost:
+    ingestion = settings.ingestion
+    return provisioning.HashCost(
+        ingestion.argon2_time_cost, ingestion.argon2_memory_cost_kib, ingestion.argon2_parallelism
+    )
+
+
+def _inside_git_work_tree(directory: Path) -> bool:
+    return any((parent / ".git").exists() for parent in (directory, *directory.parents))
+
+
+class SecretFile:
+    """A new 0600 file whose descriptor is held from creation until the token is written.
+
+    The path is never reopened: a writer of the directory who swaps the name during the slow
+    hash/database step cannot receive the token, and cleanup unlinks only what is still ours.
+    """
+
+    def __init__(self, path: Path, descriptor: int) -> None:
+        self.path = path
+        self._descriptor: int | None = descriptor
+        status = os.fstat(descriptor)
+        self._identity = (status.st_dev, status.st_ino)
+        if (
+            not stat.S_ISREG(status.st_mode)
+            or status.st_nlink != 1
+            or status.st_uid != os.geteuid()
+            or stat.S_IMODE(status.st_mode) != 0o600
+        ):
+            self.abandon()
+            raise CliUsageError("--output is not a private regular file")
+
+    @classmethod
+    def create(cls, path: Path) -> SecretFile:
+        """Create ``path`` (a new file only, mode 0600) before any credential is issued."""
+        parent = path.expanduser().absolute().parent
+        try:
+            parent = parent.resolve(strict=True)
+        except OSError:
+            raise CliUsageError("the --output directory does not exist") from None
+        if _inside_git_work_tree(parent):
+            raise CliUsageError("--output must not be inside a git work tree")
+        target = parent / path.name
+        try:
+            descriptor = os.open(
+                target,
+                os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW,
+                stat.S_IRUSR | stat.S_IWUSR,
+            )
+        except FileExistsError:
+            raise CliUsageError("--output already exists; it is never overwritten") from None
+        except OSError:
+            raise CliUsageError("--output cannot be created") from None
+        return cls(target, descriptor)
+
+    def write(self, token: str) -> None:
+        """Write through the held descriptor and close it."""
+        descriptor, self._descriptor = self._descriptor, None
+        if descriptor is None:
+            raise CliUsageError("--output was already written")
+        with os.fdopen(descriptor, "w", encoding="ascii") as handle:
+            handle.write(token + "\n")
+
+    def abandon(self) -> None:
+        """Close and remove the file, but only if the path still names the file we created."""
+        descriptor, self._descriptor = self._descriptor, None
+        if descriptor is not None:
+            os.close(descriptor)
+        try:
+            current = self.path.lstat()
+        except OSError:
+            return
+        if (current.st_dev, current.st_ino) != self._identity:
+            typer.echo("warning: --output was replaced meanwhile; left in place", err=True)
+            return
+        self.path.unlink(missing_ok=True)
+
+
+def _flush_stdout() -> None:
+    sys.stdout.flush()
+
+
+async def _issue(
+    output: Path | None,
+    json_output: bool,
+    issue: Callable[[provisioning.Deliver], Coroutine[Any, Any, provisioning.IssuedCredential]],
+) -> int:
+    """Run ``issue``, delivering the token INSIDE its still-open transaction.
+
+    ``deliver`` writes the plaintext (to the held ``--output`` descriptor, or flushed stdout)
+    before the commit, so a delivery failure rolls back and no undeliverable credential exists.
+    If the commit fails afterwards the delivered file is removed; the token is unusable.
+    """
+    destination = None if output is None else SecretFile.create(output)
+
+    def deliver(credential: provisioning.IssuedCredential) -> None:
+        _hand_over(credential, destination, as_json=json_output)
+
+    try:
+        credential = await issue(deliver)
+    except BaseException:
+        if destination is not None:
+            destination.abandon()
+        raise
+    _report(credential, destination, as_json=json_output)
+    return EXIT_OK
+
+
+def _document(
+    credential: provisioning.IssuedCredential, destination: SecretFile | None
+) -> dict[str, Any]:
+    document: dict[str, Any] = {
+        "kind": credential.kind,
+        "id": credential.identifier,
+        "prefix": credential.prefix,
+        "scope": credential.scope,
+        "expires_at": credential.expires_at.isoformat(),
+        "rotated": credential.rotated,
+    }
+    if destination is not None:
+        document["output"] = str(destination.path)
+    return document
+
+
+def _hand_over(
+    credential: provisioning.IssuedCredential, destination: SecretFile | None, *, as_json: bool
+) -> None:
+    """Deliver the plaintext exactly once: into the held file, or flushed on stdout."""
+    try:
+        if destination is not None:
+            destination.write(credential.token)
+            return
+        if as_json:
+            typer.echo(
+                json.dumps(
+                    {**_document(credential, None), "token": credential.token}, sort_keys=True
+                )
+            )
+        else:
+            typer.echo(credential.token)
+        _flush_stdout()
+    except OSError:
+        raise DeliveryError from None
+
+
+def _report(
+    credential: provisioning.IssuedCredential, destination: SecretFile | None, *, as_json: bool
+) -> None:
+    """Everything that is not the plaintext, after the commit."""
+    document = _document(credential, destination)
+    if as_json:
+        if destination is not None:
+            typer.echo(json.dumps(document, sort_keys=True))
+        return
+    typer.echo(", ".join(f"{key} {value}" for key, value in document.items()), err=True)
+
+
+def _iso(value: datetime | None) -> str | None:
+    return None if value is None else value.isoformat()
+
+
+@producer_app.command("register")
+def producer_register_command(
+    producer_id: Annotated[str, typer.Option("--producer-id", help="Producer to register.")],
+    expires_in: _EXPIRES_IN,
+    rotate: Annotated[
+        bool,
+        typer.Option("--rotate", help="Replace the credential of an active registration."),
+    ] = False,
+    output: _OUTPUT = None,
+    json_output: _JSON = False,
+) -> None:
+    """Register a producer and print its `events:ingest` bearer once."""
+
+    async def main() -> int:
+        settings = _load_settings()
+
+        async def issue(
+            deliver: provisioning.Deliver,
+        ) -> provisioning.IssuedCredential:
+            async with _admin_sessions(
+                settings, tables=("operations.registered_producers",), write=True
+            ) as sessions:
+                return await provisioning.register_producer(
+                    sessions,
+                    producer_id=producer_id,
+                    expires_in_days=expires_in,
+                    cost=_hash_cost(settings),
+                    rotate=rotate,
+                    deliver=deliver,
+                )
+
+        return await _issue(output, json_output, issue)
+
+    _run(main)
+
+
+@producer_app.command("revoke")
+def producer_revoke_command(
+    producer_id: Annotated[str, typer.Argument(help="Producer to revoke.")],
+    json_output: _JSON = False,
+) -> None:
+    """Revoke a producer's credential (the registration row is kept)."""
+
+    async def main() -> int:
+        settings = _load_settings()
+        async with _admin_sessions(
+            settings, tables=("operations.registered_producers",), write=True
+        ) as sessions:
+            changed = await provisioning.revoke_producer(sessions, producer_id)
+        _emit(
+            {"producer_id": producer_id, "revoked": True, "changed": changed},
+            as_json=json_output,
+            lines=[f"producer {producer_id}: " + ("revoked" if changed else "already revoked")],
+        )
+        return EXIT_OK
+
+    _run(main)
+
+
+@producer_app.command("list")
+def producer_list_command(json_output: _JSON = False) -> None:
+    """List registered producers (never their verifiers)."""
+
+    async def main() -> int:
+        settings = _load_settings()
+        async with _admin_sessions(
+            settings, tables=("operations.registered_producers",), write=False
+        ) as sessions:
+            items = await provisioning.list_producers(sessions)
+        now = datetime.now(UTC)
+        records = [
+            {
+                "producer_id": item.producer_id,
+                "token_prefix": item.token_prefix,
+                "scope": item.scope,
+                "created_at": _iso(item.created_at),
+                "expires_at": _iso(item.expires_at),
+                "revoked_at": _iso(item.revoked_at),
+                "last_used_at": _iso(item.last_used_at),
+            }
+            for item in items
+        ]
+        lines = [
+            f"{item.producer_id} {item.token_prefix} {item.scope} "
+            f"{_state(item.revoked_at, item.expires_at, now)} expires {item.expires_at.isoformat()}"
+            for item in items
+        ]
+        _emit({"producers": records}, as_json=json_output, lines=lines)
+        return EXIT_OK
+
+    _run(main)
+
+
+def _state(revoked_at: datetime | None, expires_at: datetime, now: datetime) -> str:
+    if revoked_at is not None and revoked_at <= now:
+        return "revoked"
+    return "expired" if expires_at <= now else "active"
+
+
+@mcp_token_app.command("create")
+def mcp_token_create_command(
+    principal: Annotated[str, typer.Option("--principal", help="Who the token identifies.")],
+    expires_in: _EXPIRES_IN,
+    scope: Annotated[
+        str, typer.Option("--scope", help="Token scope (memory:read).")
+    ] = "memory:read",
+    output: _OUTPUT = None,
+    json_output: _JSON = False,
+) -> None:
+    """Create a read-only MCP bearer and print it once."""
+
+    async def main() -> int:
+        if scope not in provisioning.MCP_SCOPES:
+            raise CliUsageError("--scope must be one of: " + ", ".join(provisioning.MCP_SCOPES))
+        settings = _load_settings()
+
+        async def issue(
+            deliver: provisioning.Deliver,
+        ) -> provisioning.IssuedCredential:
+            async with _admin_sessions(
+                settings, tables=("operations.mcp_tokens",), write=True
+            ) as sessions:
+                return await provisioning.create_mcp_token(
+                    sessions,
+                    principal=principal,
+                    scope=scope,
+                    expires_in_days=expires_in,
+                    cost=_hash_cost(settings),
+                    deliver=deliver,
+                )
+
+        return await _issue(output, json_output, issue)
+
+    _run(main)
+
+
+@mcp_token_app.command("revoke")
+def mcp_token_revoke_command(
+    prefix: Annotated[str, typer.Argument(help="Token prefix (see `mcp-token list`).")],
+    json_output: _JSON = False,
+) -> None:
+    """Revoke an MCP token by its prefix. A replica may honour it for up to the cache TTL."""
+
+    async def main() -> int:
+        settings = _load_settings()
+        async with _admin_sessions(
+            settings, tables=("operations.mcp_tokens",), write=True
+        ) as sessions:
+            changed = await provisioning.revoke_mcp_token(sessions, prefix)
+        _emit(
+            {"prefix": prefix, "revoked": True, "changed": changed},
+            as_json=json_output,
+            lines=[f"mcp token {prefix}: " + ("revoked" if changed else "already revoked")],
+        )
+        return EXIT_OK
+
+    _run(main)
+
+
+@mcp_token_app.command("list")
+def mcp_token_list_command(json_output: _JSON = False) -> None:
+    """List MCP tokens (never their verifiers)."""
+
+    async def main() -> int:
+        settings = _load_settings()
+        async with _admin_sessions(
+            settings, tables=("operations.mcp_tokens",), write=False
+        ) as sessions:
+            items = await provisioning.list_mcp_tokens(sessions)
+        now = datetime.now(UTC)
+        records = [
+            {
+                "token_id": str(item.token_id),
+                "token_prefix": item.token_prefix,
+                "principal": item.principal,
+                "scopes": list(item.scopes),
+                "created_at": _iso(item.created_at),
+                "expires_at": _iso(item.expires_at),
+                "revoked_at": _iso(item.revoked_at),
+            }
+            for item in items
+        ]
+        lines = [
+            f"{item.token_prefix} {item.principal} {','.join(item.scopes)} "
+            f"{_state(item.revoked_at, item.expires_at, now)} expires {item.expires_at.isoformat()}"
+            for item in items
+        ]
+        _emit({"tokens": records}, as_json=json_output, lines=lines)
         return EXIT_OK
 
     _run(main)
