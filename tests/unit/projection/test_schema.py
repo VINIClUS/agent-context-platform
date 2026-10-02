@@ -43,6 +43,7 @@ EXPECTED_CONSTRAINTS = {
     "uq_artifact_artifact_id": ("Artifact", "artifact_id"),
     "uq_finding_finding_id": ("Finding", "finding_id"),
     "uq_decision_decision_id": ("Decision", "decision_id"),
+    "uq_decision_version_event_id": ("DecisionVersion", "event_id"),
     "uq_constraint_constraint_id": ("Constraint", "constraint_id"),
     "uq_failure_failure_id": ("Failure", "failure_id"),
     "uq_summary_summary_id": ("Summary", "summary_id"),

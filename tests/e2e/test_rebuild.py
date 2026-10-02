@@ -111,7 +111,7 @@ GO_MAIN = (
 
 # The G3 golden graph of this ledger. Every ID in it derives from pinned inputs (git dates, the
 # indexer clock, fixed fixture event IDs), so a change here is a real change of the projection.
-GOLDEN_DIGEST = "f631bf218b10fbc44d336c1d9f6dfe5cfc8b3a2b55de1515bc3bee53a68e18f1"
+GOLDEN_DIGEST = "b4491be9440a91251beb85768864ef68246b4f2578b2919670e5394f360f9fbf"
 GOLDEN_EVENTS = 135
 GOLDEN_NODES = {
     "Assertion": 31,
@@ -121,6 +121,7 @@ GOLDEN_NODES = {
     "Commit": 5,
     "Constraint": 1,
     "Decision": 2,
+    "DecisionVersion": 2,
     "Dependency": 1,
     "Failure": 1,
     "File": 4,
@@ -153,6 +154,7 @@ GOLDEN_RELATIONSHIPS = {
     "HAS_REVISION": 25,
     "HAS_SNAPSHOT": 1,
     "HAS_TURN": 1,
+    "HAS_VERSION": 2,
     "IMPORTS": 1,
     "INDEXED": 3,
     "INVOKED": 1,

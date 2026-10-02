@@ -118,6 +118,7 @@ def test_golden_state_of_each_quality_event_type() -> None:
             "output_content_id": "out_tr_1",
             "commit_id": OID_B,
             "completed_at": "2026-08-13T13:00:01.000000Z",
+            "repository_id": "repo_1",
             "result_order": f"2026-08-13T13:00:01.000000|{event_uuid(1)}",
             **COUNTS,
         }
@@ -134,6 +135,8 @@ def test_golden_state_of_each_quality_event_type() -> None:
             "error_class": "TestFailure",
             "commit_id": OID_A,
             "completed_at": "2026-08-13T13:00:03.000000Z",
+            "recorded_at": "2026-08-16T13:00:00.000000Z",
+            "repository_id": "repo_1",
             "result_order": f"2026-08-13T13:00:03.000000|{event_uuid(3)}",
         }
         assert node(state, "Finding:find_1") == {

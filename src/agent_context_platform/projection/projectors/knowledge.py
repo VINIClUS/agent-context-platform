@@ -26,6 +26,20 @@ a turn or tool call (§9.2 relates a failure only to a session, test run or CI r
 supersession is kept as the `supersedes_id` property: §9.2 defines `SUPERSEDES` for decisions only.
 Only content IDs enter the graph, never text.
 
+History. The current record above forgets what an earlier recording said, which a read "as known
+at record time T" needs. So every decision recording is also kept as one immutable
+`(:Decision)-[:HAS_VERSION]->(:DecisionVersion)` node keyed by the recording event's `event_id`
+(design §9.2 names no such label; it is a projection-internal bi-temporal history node). It holds
+the payload's status, subjects, `valid_from`, `valid_to`, `supersedes_id` and `payload_recorded_at`,
+the envelope `recorded_at` (`observed_at`), the `state_order` of the event and its
+`source_event_ids`. It is written once and never changed, so it commutes in any delivery order.
+
+Scope. Decision, DecisionVersion and Failure nodes (and the TestRun and CIRun nodes in
+`quality.py`) carry the envelope `context.project_id` and `context.repository_id` as
+`project_id`/`repository_id`, when the context has them. They are written with the smallest
+non-null value winning, so a later event that disagrees cannot move them and any delivery order
+converges. A node without scope belongs to no scope.
+
 `active_decisions` is the pure bi-temporal read: which decisions were active for a scope at a
 valid time, as known at a recorded time.
 """
@@ -49,12 +63,14 @@ from agent_context_platform.projection.neo4j import Neo4jTransaction
 from agent_context_platform.projection.projectors import (
     assert_link,
     event_order,
+    fill_once,
     lock_event_nodes,
     lock_nodes,
     min_non_null,
     newest_wins,
     node_statement,
     relationship_statement,
+    scope_parameters,
 )
 from agent_context_platform.projection.projectors.agent import session_node_id
 from agent_context_platform.projection.projectors.code import timestamp
@@ -62,16 +78,49 @@ from agent_context_platform.projection.projectors.code import timestamp
 # Decision statuses whose supersession is asserted, and that count as active when still open.
 _SUPERSEDING: Final = frozenset({"accepted", "superseded"})
 
-_DECISION: Final = node_statement("Decision", "decision_id") + newest_wins(
-    "state",
-    "subjects",
-    "content_id",
+_DECISION: Final = (
+    node_statement("Decision", "decision_id")
+    + newest_wins(
+        "state",
+        "subjects",
+        "content_id",
+        "status",
+        "supersedes_id",
+        "valid_from",
+        "valid_to",
+        "recorded_at",
+        "payload_recorded_at",
+    )
+    + (" WITH n " + min_non_null("project_id", "repository_id"))
+)
+# One immutable node per decision recording, keyed by the event that recorded it.
+_DECISION_VERSION: Final = node_statement("DecisionVersion", "event_id") + fill_once(
+    "decision_id",
     "status",
+    "subjects",
     "supersedes_id",
     "valid_from",
     "valid_to",
     "recorded_at",
     "payload_recorded_at",
+    "state_order",
+    "source_event_ids",
+    "project_id",
+    "repository_id",
+)
+_VERSION_FIELDS: Final = (
+    "status",
+    "subjects",
+    "supersedes_id",
+    "valid_from",
+    "valid_to",
+    "recorded_at",
+    "payload_recorded_at",
+    "project_id",
+    "repository_id",
+)
+_HAS_VERSION: Final = relationship_statement(
+    "Decision", "decision_id", "HAS_VERSION", "DecisionVersion", "event_id"
 )
 _CONSTRAINT: Final = node_statement("Constraint", "constraint_id") + newest_wins(
     "state",
@@ -102,6 +151,8 @@ _FAILURE: Final = node_statement("Failure", "failure_id") + min_non_null(
     "details_content_id",
     "valid_from",
     "recorded_at",
+    "project_id",
+    "repository_id",
 )
 
 _SUPERSEDES: Final = relationship_statement(
@@ -168,8 +219,22 @@ async def _decision_recorded(tx: Neo4jTransaction, event: StoredEventV1) -> None
         "node_id": payload.decision_id,
         "status": payload.status,
         "supersedes_id": payload.supersedes_id,
+        **scope_parameters(event),
     }
     await tx.run(_DECISION, parameters=parameters)
+    # The recording itself is history: written once, whatever its order against the others.
+    version = str(event.event_id)
+    await tx.run(
+        _DECISION_VERSION,
+        parameters={
+            **{key: parameters[key] for key in _VERSION_FIELDS},
+            "node_id": version,
+            "decision_id": payload.decision_id,
+            "state_order": order,
+            "source_event_ids": [version],
+        },
+    )
+    await assert_link(tx, _HAS_VERSION, event, payload.decision_id, version)
     if newer:
         # This record is now the superseder's current one: replace what the old one asserted.
         old = (await tx.run(_OLD_TARGETS, parameters={"node_id": payload.decision_id})).records
@@ -220,6 +285,7 @@ async def _failure_observed(tx: Neo4jTransaction, event: StoredEventV1) -> None:
             "details_content_id": payload.details_content_id,
             "valid_from": timestamp(event.occurred_at),
             "recorded_at": timestamp(event.observed_at),
+            **scope_parameters(event),
         },
     )
     failure = payload.failure_id
@@ -248,7 +314,10 @@ def lock_keys(event: StoredEventV1) -> list[tuple[str, str]]:
     kind = event.event_type
     if kind == "knowledge.decision.recorded":
         decision = DecisionRecordedV1.model_validate(dict(event.payload))
-        keys = [("Decision", decision.decision_id)]
+        keys = [
+            ("Decision", decision.decision_id),
+            ("DecisionVersion", str(event.event_id)),
+        ]
         if decision.supersedes_id is not None and decision.status in _SUPERSEDING:
             keys.append(("Decision", decision.supersedes_id))
         return keys
@@ -319,6 +388,56 @@ def decision_version(event: StoredEventV1) -> DecisionVersion:
     )
 
 
+@dataclass(frozen=True, slots=True)
+class DecisionState:
+    """A decision as known at one record time: its newest version and what closes it."""
+
+    version: DecisionVersion
+    superseded_by: str | None  # the current superseder with the earliest `valid_from`
+    closed_at: datetime | None  # that superseder's `valid_from`
+    end: datetime | None  # the earlier of `version.valid_to` and `closed_at`
+
+    @property
+    def asserted(self) -> bool:
+        """Whether the decision was ever in force: `accepted`, or `superseded` with a known end."""
+        status = self.version.status
+        return status in _SUPERSEDING and not (status == "superseded" and self.end is None)
+
+
+def decision_states(
+    versions: Iterable[DecisionVersion], *, recorded_at: datetime
+) -> dict[str, DecisionState]:
+    """Every decision known at `recorded_at`, with its closure; the one place that rule lives.
+
+    Only versions recorded at or before `recorded_at` exist. Each decision is its newest known
+    version (by `order`, then recording time, like the graph's current pointer). It is closed at
+    its own `valid_to` or at the earliest `valid_from` of a decision whose NEWEST known version is
+    `accepted` or `superseded` and names it in `supersedes_id`, whichever comes first.
+    """
+    current: dict[str, DecisionVersion] = {}
+    for version in versions:
+        if version.recorded_at > recorded_at:
+            continue
+        best = current.get(version.decision_id)
+        if best is None or (version.order, version.recorded_at) > (best.order, best.recorded_at):
+            current[version.decision_id] = version
+    closing: dict[str, tuple[datetime, str]] = {}
+    for version in current.values():
+        if version.supersedes_id is not None and version.status in _SUPERSEDING:
+            candidate = (version.valid_from, version.decision_id)
+            earlier = closing.get(version.supersedes_id)
+            if earlier is None or candidate < earlier:
+                closing[version.supersedes_id] = candidate
+    states: dict[str, DecisionState] = {}
+    for decision_id, version in current.items():
+        closed_at, superseded_by = closing.get(decision_id, (None, None))
+        ends = [moment for moment in (version.valid_to, closed_at) if moment]
+        states[decision_id] = DecisionState(
+            version, superseded_by, closed_at, min(ends) if ends else None
+        )
+    return states
+
+
 def active_decisions(
     versions: Iterable[DecisionVersion],
     *,
@@ -328,36 +447,19 @@ def active_decisions(
 ) -> list[str]:
     """IDs of the decisions active for `scope` at valid time `valid_at`, as known at `recorded_at`.
 
-    Only versions recorded at or before `recorded_at` exist. Each decision is its newest known
-    version (by `order`, then recording time, like the graph's current pointer). It is closed at
-    its own `valid_to` or at the earliest `valid_from` of a decision whose NEWEST known version is
-    `accepted` or `superseded` and names it in `supersedes_id`, whichever comes first; a superseder
-    later re-recorded as `rejected` or `proposed` closes nothing, exactly like the graph edge it
-    would delete. A `superseded` decision with no known closing time is not active: nothing says
-    when it stopped holding. `proposed` and `rejected` decisions never are.
+    See `decision_states` for what is known and how a decision closes. A superseder later
+    re-recorded as `rejected` or `proposed` closes nothing, exactly like the graph edge it would
+    delete. A `superseded` decision with no known closing time is not active: nothing says when it
+    stopped holding. `proposed` and `rejected` decisions never are.
     """
-    known = [version for version in versions if version.recorded_at <= recorded_at]
-    current: dict[str, DecisionVersion] = {}
-    closing: dict[str, datetime] = {}
-    for version in known:
-        best = current.get(version.decision_id)
-        if best is None or (version.order, version.recorded_at) > (best.order, best.recorded_at):
-            current[version.decision_id] = version
-    for version in current.values():
-        if version.supersedes_id is not None and version.status in _SUPERSEDING:
-            earlier = closing.get(version.supersedes_id)
-            if earlier is None or version.valid_from < earlier:
-                closing[version.supersedes_id] = version.valid_from
     active: list[str] = []
-    for decision_id, version in current.items():
-        ends = [moment for moment in (version.valid_to, closing.get(decision_id)) if moment]
-        end = min(ends) if ends else None
-        if version.status not in _SUPERSEDING or (version.status == "superseded" and end is None):
-            continue
+    for decision_id, state in decision_states(versions, recorded_at=recorded_at).items():
+        version = state.version
         if (
-            scope in version.subjects
+            state.asserted
+            and scope in version.subjects
             and version.valid_from <= valid_at
-            and (end is None or valid_at < end)
+            and (state.end is None or valid_at < state.end)
         ):
             active.append(decision_id)
     return sorted(active)

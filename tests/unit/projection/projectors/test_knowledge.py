@@ -102,9 +102,15 @@ def test_projector_handles_exactly_the_knowledge_event_types() -> None:
 
 def test_a_superseding_decision_locks_the_superseded_decision() -> None:
     event = _decision("dec_b", supersedes="dec_a")
-    assert event_lock_keys(event) == [("Decision", "dec_a"), ("Decision", "dec_b")]
-    assert event_lock_keys(_decision("dec_b", status="proposed", supersedes="dec_a")) == [
-        ("Decision", "dec_b")
+    assert event_lock_keys(event) == [
+        ("Decision", "dec_a"),
+        ("Decision", "dec_b"),
+        ("DecisionVersion", str(event.event_id)),
+    ]
+    proposed = _decision("dec_b", status="proposed", supersedes="dec_a")
+    assert event_lock_keys(proposed) == [
+        ("Decision", "dec_b"),
+        ("DecisionVersion", str(proposed.event_id)),
     ]
 
 
