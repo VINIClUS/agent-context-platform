@@ -249,3 +249,23 @@ def test_a_rename_closes_items_whose_identity_spells_the_old_path() -> None:
         "scip-typescript": True,
         "go": False,  # a package-path symbol is not changed by a rename within its package
     }
+
+
+def test_an_assertion_that_starts_after_the_latest_run_is_not_current() -> None:
+    state = _relation_state()
+    after = "2026-03-01T12:30:00.000000Z"
+    state.assertions["a"] = fact(valid_from=after, revisions={"g1": run(1).occurred_at})
+    intervals = derive_assertion(state, "a")
+    assert intervals and not is_current(intervals, state.horizon)
+
+
+def test_the_edge_starts_where_the_assertion_became_live() -> None:
+    declared = _current("a1", "f", "CALLS", "g", "scip", 1.0)
+    declared |= {
+        "valid_from": "t1",
+        "recorded_from": "r1",
+        "current_from": "t2",
+        "current_recorded_from": "r2",
+    }
+    (edge,) = resolve_edges([declared]).values()
+    assert (edge["valid_from"], edge["recorded_from"]) == ("t2", "r2")

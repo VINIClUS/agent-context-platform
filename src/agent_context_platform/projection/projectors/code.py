@@ -414,8 +414,10 @@ def derive_assertion(facts: Facts, assertion_id: str) -> list[Interval]:
 def is_current(intervals: list[Interval], horizon: str) -> bool:
     """Valid at the latest valid time the graph knows (`horizon`). An end declared in the future,
     past every run, is not a closure yet."""
-    return bool(intervals) and (
-        intervals[-1].end is None or intervals[-1].end.occurred_at > horizon
+    return (
+        bool(intervals)
+        and intervals[-1].start.occurred_at <= horizon
+        and (intervals[-1].end is None or intervals[-1].end.occurred_at > horizon)
     )
 
 
@@ -1084,7 +1086,8 @@ _SYMBOL_FLAGS: Final[LiteralString] = (
 )
 _ASSERTION_FLAGS: Final[LiteralString] = (
     "MATCH (n:Assertion {assertion_id: $id}) SET n.current = $current, n.valid_to = $valid_to, "
-    "n.recorded_to = $recorded_to, n.valid_intervals = $intervals"
+    "n.recorded_to = $recorded_to, n.valid_intervals = $intervals, "
+    "n.current_from = $current_from, n.current_recorded_from = $current_recorded_from"
 )
 
 
@@ -1162,6 +1165,9 @@ async def _write_assertion_state(tx: Neo4jTransaction, facts: Facts, assertion_i
             "valid_to": None if last is None or last.end is None else last.end.occurred_at,
             "recorded_to": None if last is None else last.recorded_to,
             "intervals": [_text(item) for item in intervals],
+            # the interval that made it live: the start of its edge, not its declared valid_from
+            "current_from": last.start.occurred_at if current and last is not None else None,
+            "current_recorded_from": last.recorded_from if current and last is not None else None,
         },
     )
 
@@ -1248,8 +1254,10 @@ def resolve_edges(
             "extractor_name": winner["extractor_name"],
             "extractor_version": winner["extractor_version"],
             "confidence": winner["confidence"],
-            "valid_from": winner["valid_from"],
-            "recorded_from": winner.get("recorded_from"),
+            "valid_from": winner.get("current_from") or winner["valid_from"],
+            "recorded_from": winner.get("current_recorded_from") or winner.get("recorded_from"),
+            "valid_to": winner.get("valid_to"),
+            "recorded_to": winner.get("recorded_to"),
             "review_status": winner["review_status"],
             "resolved": True,
             "resolved_assertion_id": winner["assertion_id"],

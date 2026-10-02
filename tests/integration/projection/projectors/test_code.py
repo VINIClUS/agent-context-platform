@@ -603,7 +603,7 @@ def test_golden_graph_after_each_index(tmp_path: Path) -> None:
         assert await edge_types(store) == {"DEFINES": 4}  # only current assertions are edges
 
         # supersession is not file-bound: current from its valid_from
-        await deliver(store, supersession_events(line))
+        await deliver(store, supersession_events(line, valid_from=at(5)))
         assert await edge_types(store) == {"DEFINES": 4, "POSSIBLY_SUPERSEDES": 1}
         assert (await summary(store, names))["counts"]["Assertion"] == 13
 
@@ -1080,5 +1080,44 @@ def test_a_rename_closes_path_bound_scip_symbols_and_keeps_path_free_ones(
         assert state["symbols"]["pkg.c.k"] == {"current": stays, "rows": rows}
         incoming = [e for e in state["assertions"] if e[0] == "CALLS" and e[2] == "pkg.c.k"]
         assert [e[4] for e in incoming] == [stays]  # and so does the relation into it
+
+    with_graph(body)
+
+
+def test_the_edge_starts_at_the_run_that_made_the_relation_live(tmp_path: Path) -> None:
+    line = Timeline(tmp_path)
+    repo = line.repo
+    repo.write("pkg/a.py", A0)
+    repo.write("pkg/b.py", B)
+    repo.commit()
+    # the first run records b's call to f, but f's symbol is not indexed yet
+    first = [
+        e
+        for e in line.index(1)
+        if not (e.event_type == "code.symbol.indexed" and e.payload["qualified_name"] == "pkg.a.f")
+    ]
+    repo.write("pkg/a.py", A1)  # f is indexed (a new revision of a) at t2
+    repo.commit()
+    second = line.index(2)
+
+    async def body(store: Neo4jStore) -> None:
+        digests = set()
+        for ordered in orders([*first, *second]).values():
+            await wipe(store)
+            await deliver(store, ordered)
+            digests.add(digest(await graph_state(store)))
+        assert len(digests) == 1
+
+        async def read(tx: Neo4jTransaction) -> list[Any]:
+            rows = (
+                await tx.run(
+                    "MATCH ()-[r:CALLS]->() RETURN r.valid_from AS vf, r.recorded_from AS rf",
+                    parameters={},
+                )
+            ).records
+            return [(r["vf"], r["rf"]) for r in rows]
+
+        # declared at t1, live only from t2 (when its target exists)
+        assert await store.execute_read(read) == [(timestamp(at(2)), timestamp(at(2)))]
 
     with_graph(body)
