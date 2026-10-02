@@ -23,8 +23,6 @@ back from, using real SDK-sealed `StoredEventV1` instances built through
 from __future__ import annotations
 
 import asyncio
-import hashlib
-import json
 import os
 from collections.abc import Awaitable, Callable, Iterator, Mapping
 from datetime import UTC, datetime, timedelta
@@ -55,6 +53,7 @@ from agent_context_platform.projection.models import (
     ProjectionCheckpointRow,
 )
 from agent_context_platform.projection.neo4j import Neo4jStore, Neo4jTransaction
+from agent_context_platform.projection.verify import compute_graph_digest
 from agent_context_platform.settings import Neo4jSettings
 from alembic import command
 
@@ -71,9 +70,6 @@ _ALLOWED_SCOPED_ROLES = frozenset({"agent_context_projector"})
 
 _CLEANUP_QUERY: LiteralString = (
     "MATCH (n:ProjectionRuntimeTestNode {run_id: $run_id}) DETACH DELETE n"
-)
-_DIGEST_QUERY: LiteralString = (
-    "MATCH (n:ProjectionRuntimeTestNode {run_id: $run_id}) RETURN properties(n) AS props"
 )
 _MERGE_NODE_QUERY: LiteralString = (
     "MERGE (n:ProjectionRuntimeTestNode {event_id: $event_id}) "
@@ -361,22 +357,17 @@ async def cleanup_test_nodes(store: Neo4jStore, run_id: str) -> None:
 
 
 async def graph_digest(store: Neo4jStore, run_id: str) -> tuple[str, int]:
-    """Hash sorted node properties for every test-labelled node in this run.
+    """The production graph digest and node count of the (test-owned) database.
 
-    Hashing `properties(n)` wholesale (rather than a hand-picked field
-    tuple) means the digest notices *any* property drift between the two
-    passes it is used to compare, not just the fields the test author
-    thought to check.
+    Delegates to `agent_context_platform.projection.verify.compute_graph_digest`, which hashes
+    every node's labels and properties wholesale, so any drift between two passes is noticed, not
+    just the fields a test author thought to check. `run_id` is kept for the call sites: the
+    digest covers the whole database, which each test here empties before and after (`cleanup_test_nodes`
+    runs in each test's `finally`), so the test nodes are all it sees.
     """
-
-    async def _read(tx: Neo4jTransaction) -> list[dict[str, object]]:
-        result = await tx.run(_DIGEST_QUERY, parameters={"run_id": run_id})
-        return [dict(record["props"]) for record in result.records]
-
-    records = await store.execute_read(_read)
-    canonical = sorted(json.dumps(record, sort_keys=True, default=str) for record in records)
-    digest = hashlib.sha256("\n".join(canonical).encode()).hexdigest()
-    return digest, len(records)
+    del run_id
+    result = await compute_graph_digest(store)
+    return result.digest, result.node_count
 
 
 class GraphNodeProjector:
