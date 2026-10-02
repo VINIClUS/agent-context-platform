@@ -89,6 +89,71 @@ tears the stack down afterwards. `scripts/test-services.sh status` shows the run
 `AGENT_CONTEXT_TEST_PROJECT` overrides the derived Compose project name, which otherwise comes from
 this checkout's path so concurrent worktrees never collide.
 
+## Operating projections
+
+`agent-context projection` (installed by `uv sync`) rebuilds, verifies and inspects the Neo4j graph,
+which is always derivable from the ledger. It reads the usual `AGENT_CONTEXT_*` settings (PostgreSQL
+DSN and the live Neo4j connection) and never prints a DSN, password or exception message. Exit
+codes: `0` ok, `1` verification mismatch or failed operation, `2` usage error. `--json` prints one
+machine-readable document.
+
+```bash
+agent-context projection status                      # checkpoint, lag, last error class, last run
+agent-context projection verify [--require-caught-up] [--no-record]
+agent-context projection rebuild --target-uri bolt://standby:7687 --target-database neo4j \
+  --target-username neo4j                            # password: $AGENT_CONTEXT_REBUILD_TARGET_NEO4J_PASSWORD
+agent-context projection rebuild --in-place --confirm neo4j   # stop the projection runner first
+```
+
+* **Database roles.** The CLI uses two connections, each falling back to
+  `AGENT_CONTEXT_POSTGRESQL__DSN` when unset. `AGENT_CONTEXT_POSTGRESQL__PROJECTOR_DSN` reads
+  checkpoints, dead letters, stream heads and the ledger, and rewrites checkpoints for
+  `--in-place`. `AGENT_CONTEXT_POSTGRESQL__API_DSN` is used only to record `projection.rebuilt`
+  through the ingestion service, and is not needed with `--no-record`. Production needs two login
+  roles, members of the `NOLOGIN` roles `agent_context_projector` and `agent_context_api`
+  (provisioned by INFRA, I040); the owner or a shared DSN is not required. Both connections'
+  grants are checked before any target is wiped or checkpoint reset, and a missing grant exits `1`
+  naming the privilege. If the verification or rebuild succeeds but the report cannot be recorded,
+  the result (verified target and digest) is still printed, the JSON carries
+  `"record_error": "record_failed"`, and the exit code is `1`.
+* `verify` is read-only. Per projector it checks checkpoint continuity (no regression, no dead
+  letter below the checkpoint, processed count equals delivered events) and event coverage (lag is
+  reported, and fails only with `--require-caught-up`); across the graph it checks that every
+  `source_event_id(s)` exists in the ledger and that stream heads match the stored events. Run it
+  with the runner idle. `--replay-check` also replays the delivered events into a scratch target
+  (`--target-*`, wipe with `--wipe-target --confirm <database>`) and compares digests with the live
+  graph. The graph digest is a SHA-256 over every node and relationship; the volatile properties
+  excluded from it are listed in `projection/verify.py`. The outcome is recorded as a
+  `projection.rebuilt` ledger event per projector (`--no-record` skips it); re-running on an
+  unchanged state appends nothing.
+* `rebuild` needs an explicit target. Neo4j Community has a single user database per instance, so
+  the target is a separate connection (`--target-uri`, `--target-database`, username and the
+  password from the environment only), never a second database beside the live graph, and it must
+  not be the live projection. It refuses a non-empty target unless `--wipe-target --confirm
+  <database>`, creates the schema, replays every ledger event in ledger order through the
+  registered projectors, verifies coverage, orphans and digest, and prints the verified target and
+  digest. It never touches the live checkpoints. **Cutover is manual:** keep the projection runner
+  stopped from the start of the rebuild until cutover (an event the old graph received after the
+  replay head fails verification with `delivered_after_replay`; one still pending is only lag),
+  point the API and the projector at the verified target (deploy step, see the infrastructure
+  runbook), then run `verify --replay-check` against it. A plain `verify` cannot notice events the
+  old graph received but the target lacks, because the checkpoints say they were delivered. `--in-place --confirm <database>` rebuilds the live graph instead. **Operator
+  precondition: stop the projection runner first and keep it stopped** (the runtime keeps no lock;
+  a runner maintenance flag is follow-up FU-62). The command only has best-effort guards, and
+  refuses (exit `1`) on an unexpired outbox lease, an outbox row changed within
+  `--runner-quiet-seconds` (default 30, `0` disables), or another connection of a projector-role
+  member (only this process's own connections are excluded, so a second CLI is seen); a runner idle between polls with no connection passes them. Every in-place rebuild (and a standby rebuild with `--wipe-target`) first takes a
+  session-level PostgreSQL advisory lock (key derived from `agent-context.projection.rebuild`) on the
+  projector connection and holds it until it ends; a second rebuild is refused with exit `1`.
+  It resets the registered
+  checkpoints to `rebuilding`, wipes the graph, replays the delivered events, then under a row lock
+  catches up on events delivered meanwhile and writes each checkpoint as the greater of the live and
+  replayed position, with the processed count recomputed from the outbox, so a checkpoint never goes
+  backwards; if a delivered event was missed it fails and asks for a rerun with the runner stopped.
+  It then re-verifies the live projection. Events not yet delivered stay for the runner. Both
+  modes skip events the runner dead-lettered (the live graph never held them) and list them, with
+  their count, in the output and JSON (`skipped_dead_lettered`).
+
 ## Ingestion API contract
 
 `openapi/agent-context-v1.json` freezes the ingestion v1 HTTP surface (`/v1/ingestion/*` and the
