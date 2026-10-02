@@ -18,20 +18,25 @@ logged.
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
+import signal
 import stat
 import sys
+import time
 from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
-from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
+from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
-from typing import Annotated, Any
+from typing import Annotated, Any, Protocol
+from uuid import uuid4
 
 import typer
 from agent_context_sdk import RedactionPolicyV1
 from pydantic import PostgresDsn, Secret, ValidationError
+from sqlalchemy import text
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -48,13 +53,21 @@ from agent_context_platform.ledger.service import IngestionService
 from agent_context_platform.operations import provisioning
 from agent_context_platform.projection.neo4j import Neo4jStore
 from agent_context_platform.projection.registry import registered_projectors
+from agent_context_platform.projection.runtime import (
+    OutboxBacklog,
+    ProjectionRunner,
+    ProjectionRunReport,
+    Projector,
+)
 from agent_context_platform.projection.verify import (
     CLI_APPLICATION_NAME,
     DEFAULT_BATCH_SIZE,
     DEFAULT_RUNNER_QUIET_SECONDS,
+    REBUILD_LOCK_KEY,
     MissingGrantError,
     NoContentBlobStore,
     ProjectionEventRecorder,
+    ProjectorStatus,
     RebuildReport,
     RunnerActiveError,
     TargetNotEmptyError,
@@ -553,6 +566,309 @@ def status_command(json_output: _JSON = False) -> None:
             {"projectors": [item.to_dict() for item in statuses]}, as_json=json_output, lines=lines
         )
         return EXIT_OK
+
+    _run(main)
+
+
+# --- projection worker (PLATFORM-039D) ---------------------------------------------------------
+# `agent-context projection run`: the process that drains the outbox through `ProjectionRunner`.
+# Self-contained block: the loop (`_drive_worker`) takes its collaborators as arguments so it is
+# unit-testable without services; `run_command` wires the real runner, probe and signals.
+
+WORKER_MAX_IDLE_SECONDS = 5.0
+
+
+class _WorkerRunner(Protocol):
+    async def run_once(self, limit: int) -> ProjectionRunReport: ...
+
+    async def backlog(self) -> OutboxBacklog: ...
+
+
+@dataclass(slots=True)
+class WorkerTotals:
+    """What one `projection run` did; counts only, never content."""
+
+    claimed: int = 0
+    delivered: int = 0
+    retried: int = 0
+    dead_lettered: int = 0
+    lost_leases: int = 0
+    iterations: int = 0
+    paused_for_rebuild: int = 0
+    outcome: str = "stopped"  # drained | timeout | stopped | interrupted
+
+    def add(self, report: ProjectionRunReport) -> None:
+        self.claimed += report.claimed
+        self.delivered += report.delivered
+        self.retried += report.retried
+        self.dead_lettered += report.dead_lettered
+        self.lost_leases += report.lost_leases
+
+
+def build_projectors(settings: Settings) -> tuple[Projector, ...]:
+    """The projector set the worker runs: the ONE place a projector needing configuration binds.
+
+    Today that is the registry as is. A projector that needs a backend built from `settings` (the
+    search projector's embedding provider and PostgreSQL writer, PLATFORM-042) is added here, so
+    the worker never assembles projectors anywhere else. It must fail closed with a clear error
+    when its configuration is missing.
+    """
+    del settings  # no registered projector needs configuration yet
+    return registered_projectors()
+
+
+def _worker_exit_code(totals: WorkerTotals, *, once: bool) -> int:
+    """1 on timeout, an interrupted `--once`, or (`--once` only) a dead-lettered event; else 0.
+
+    A long-running worker that is told to stop exits 0 whatever it dead-lettered meanwhile: a
+    routine deploy stop must not look like a failure.
+    """
+    if totals.outcome in {"timeout", "interrupted"} or (once and totals.dead_lettered):
+        return EXIT_FAILED
+    return EXIT_OK
+
+
+def _idle_delay(poll_seconds: float, idle_polls: int) -> float:
+    """Idle poll interval: doubles per empty poll up to `WORKER_MAX_IDLE_SECONDS`.
+
+    The exponent is capped before the power, so a worker idle for days cannot overflow a float.
+    """
+    return max(
+        poll_seconds, min(poll_seconds * float(2 ** min(idle_polls, 30)), WORKER_MAX_IDLE_SECONDS)
+    )
+
+
+@asynccontextmanager
+async def _shared_rebuild_lock(
+    sessions: async_sessionmaker[AsyncSession],
+) -> AsyncIterator[bool]:
+    """Hold the rebuild lock SHARED for the body; yield whether a rebuild blocks us (FU-62).
+
+    A rebuild takes the exclusive session-level lock, so a shared try-lock fails exactly while one
+    is held (yield True, nothing held). Otherwise the shared lock stays held on this dedicated
+    connection for the whole body (a claim and its batch), and is released afterwards, also on a
+    stop or an error: a rebuild's exclusive try-lock is refused meanwhile, which is retryable.
+    Workers share the lock with each other.
+    """
+    async with sessions() as session:
+        free = bool(
+            await session.scalar(
+                text("SELECT pg_try_advisory_lock_shared(:key)"), {"key": REBUILD_LOCK_KEY}
+            )
+        )
+        try:
+            yield not free
+        finally:
+            if free:
+                try:
+                    await session.rollback()  # session-level: the lock survives the rollback
+                    await session.scalar(
+                        text("SELECT pg_advisory_unlock_shared(:key)"), {"key": REBUILD_LOCK_KEY}
+                    )
+                except BaseException:
+                    # Never hand a connection that may still hold the lock back to the pool.
+                    await session.invalidate()
+                    raise
+            await session.rollback()
+
+
+async def _drive_worker(
+    runner: _WorkerRunner,
+    rebuild_guard: Callable[[], AbstractAsyncContextManager[bool]],
+    stop: asyncio.Event,
+    *,
+    once: bool,
+    batch_size: int,
+    poll_seconds: float,
+    max_seconds: float | None,
+    log_seconds: float,
+    touch: Callable[[], None],
+    log: Callable[[str], None],
+    now: Callable[[], float] = time.monotonic,
+) -> WorkerTotals:
+    """Poll the outbox until drained (`once`), timed out or told to stop.
+
+    Each iteration: pause while a rebuild holds its lock, else claim and project one batch with
+    the lock held shared throughout. A
+    batch is always finished (never abandoned mid-way), so a stop request leaves no lease behind.
+    """
+    totals = WorkerTotals()
+    started = last_log = now()
+    paused = False
+    idle = 0
+
+    async def nap(seconds: float) -> None:
+        if max_seconds is not None:
+            seconds = min(seconds, max(started + max_seconds - now(), 0.0))
+        with contextlib.suppress(TimeoutError):
+            await asyncio.wait_for(stop.wait(), timeout=seconds)
+
+    while not stop.is_set():
+        if max_seconds is not None and now() - started >= max_seconds:
+            totals.outcome = "timeout"
+            return totals
+        totals.iterations += 1
+        # The shared rebuild lock is held from before the claim until the batch is finalized.
+        async with rebuild_guard() as blocked:
+            if not blocked:
+                if paused:
+                    log("resumed_after_rebuild")
+                    paused = False
+                # Entering the guard is a round trip: a stop or the deadline may have arrived.
+                if stop.is_set():
+                    break
+                if max_seconds is not None and now() - started >= max_seconds:
+                    totals.outcome = "timeout"
+                    return totals
+                report = await runner.run_once(batch_size)
+        if blocked:
+            if not paused:
+                log("paused_for_rebuild")
+                paused = True
+            totals.paused_for_rebuild += 1
+            touch()
+            await nap(poll_seconds)
+            continue
+        totals.add(report)
+        touch()
+        if report.claimed:
+            idle = 0
+        else:
+            if once and (await runner.backlog()).outstanding == 0:
+                totals.outcome = "drained"
+                return totals
+            idle += 1
+            # Idle polls back off; a `once` drain waiting out a retry delay polls steadily.
+            await nap(poll_seconds if once else _idle_delay(poll_seconds, idle))
+        if now() - last_log >= log_seconds:
+            last_log = now()
+            backlog = await runner.backlog()
+            log(
+                f"progress delivered={totals.delivered} retried={totals.retried} "
+                f"dead_lettered={totals.dead_lettered} lag={backlog.outstanding} "
+                f"leased={backlog.leased} dead_letters_total={backlog.dead_lettered}"
+            )
+    # Only a stop request leaves the loop here: a `--once` drain cut short is not a drain.
+    totals.outcome = "interrupted" if once else "stopped"
+    return totals
+
+
+def _worker_lines(totals: WorkerTotals, statuses: Sequence[ProjectorStatus]) -> list[str]:
+    lines = [
+        f"{totals.outcome}: claimed {totals.claimed}, delivered {totals.delivered}, "
+        f"retried {totals.retried}, dead-lettered {totals.dead_lettered}, "
+        f"lost leases {totals.lost_leases}"
+    ]
+    lines.extend(
+        f"{item.name} {item.version}: checkpoint {item.checkpoint_outbox_id}/"
+        f"{item.ledger_head_outbox_id}, lag {item.lag}"
+        for item in statuses
+    )
+    return lines
+
+
+@projection_app.command("run")
+def run_command(
+    once: Annotated[
+        bool,
+        typer.Option(
+            "--once",
+            help="Drain the outbox (waiting out retry delays), print a summary and exit.",
+        ),
+    ] = False,
+    max_seconds: Annotated[
+        float | None,
+        typer.Option("--max-seconds", min=0.001, help="Stop after N seconds: exit 1, `timeout`."),
+    ] = None,
+    health_file: Annotated[
+        Path | None,
+        typer.Option(
+            "--health-file",
+            help="Touch this file after every loop iteration; removed on shutdown.",
+        ),
+    ] = None,
+    batch_size: Annotated[
+        int, typer.Option("--batch-size", min=1, max=1000, help="Outbox rows claimed per poll.")
+    ] = 10,
+    poll_seconds: Annotated[
+        float,
+        typer.Option("--poll-seconds", min=0.01, help="Idle poll interval (idle polls back off)."),
+    ] = 1.0,
+    log_seconds: Annotated[
+        float,
+        typer.Option("--log-seconds", min=0.1, help="At most one progress line per N seconds."),
+    ] = 30.0,
+    json_output: _JSON = False,
+) -> None:
+    """Run the projection worker: claim outbox rows and project them into the graph.
+
+    Without `--once` it runs until SIGTERM or SIGINT: it stops claiming, finishes the batch in
+    hand (no lease outlives the process), closes its connections and exits 0. With `--once` it
+    drains the outbox and exits 0, or 1 when an event was dead-lettered during the run, or on
+    `--max-seconds` expiring (`timeout`), or when SIGTERM/SIGINT cuts it short (`interrupted`). Pauses (`paused_for_rebuild`) while a rebuild holds the
+    rebuild lock. Uses the projector role. Progress and the summary are counts only; never a DSN
+    or event content.
+    """
+
+    async def main() -> int:
+        if health_file is not None and not health_file.parent.is_dir():
+            raise CliUsageError("--health-file must be in an existing directory")
+        settings = _load_settings()
+        stop = asyncio.Event()
+        loop = asyncio.get_running_loop()
+        handled: list[signal.Signals] = []
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+                loop.add_signal_handler(sig, stop.set)
+                handled.append(sig)
+
+        def touch() -> None:
+            if health_file is not None:
+                health_file.touch()
+
+        def log(message: str) -> None:
+            typer.echo(f"projection_worker {message}", err=True)
+
+        worker_id = f"projection-worker-{os.getpid()}-{uuid4().hex[:8]}"
+        runner: ProjectionRunner | None = None
+        try:
+            async with _runtime(settings) as runtime:
+                projectors = build_projectors(settings)
+                runner = ProjectionRunner(
+                    runtime.sessions, runtime.store, projectors, worker_id=worker_id
+                )
+                touch()
+                log("started")
+                try:
+                    totals = await _drive_worker(
+                        runner,
+                        lambda: _shared_rebuild_lock(runtime.sessions),
+                        stop,
+                        once=once,
+                        batch_size=batch_size,
+                        poll_seconds=poll_seconds,
+                        max_seconds=max_seconds,
+                        log_seconds=log_seconds,
+                        touch=touch,
+                        log=log,
+                    )
+                finally:
+                    # Never leave a lease behind, even when the loop died on an error.
+                    with contextlib.suppress(Exception):
+                        await asyncio.shield(runner.release_leases())
+                statuses = await projection_status(runtime.sessions, projectors)
+        finally:
+            for sig in handled:
+                loop.remove_signal_handler(sig)
+            if health_file is not None:
+                health_file.unlink(missing_ok=True)
+        log("stopped")
+        _emit(
+            {**asdict(totals), "projectors": [item.to_dict() for item in statuses]},
+            as_json=json_output,
+            lines=_worker_lines(totals, statuses),
+        )
+        return _worker_exit_code(totals, once=once)
 
     _run(main)
 

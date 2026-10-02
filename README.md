@@ -107,6 +107,29 @@ agent-context projection rebuild --target-uri bolt://standby:7687 --target-datab
 agent-context projection rebuild --in-place --confirm neo4j   # stop the projection runner first
 ```
 
+* **Running the projector.** `agent-context projection run` is the worker process: it drives the
+  existing `ProjectionRunner` over the registered projectors with the projector-role connection
+  (`AGENT_CONTEXT_POSTGRESQL__PROJECTOR_DSN`, falling back to `__DSN`) and the live Neo4j settings.
+  Without `--once` it polls (idle polls back off to 5 s; `--poll-seconds`, `--batch-size`) until
+  SIGTERM or SIGINT, then stops claiming, finishes the batch in hand, releases any lease it still
+  holds, closes its connections and exits `0`. A progress line (counts, lag, dead letters; never
+  content) goes to stderr at most every `--log-seconds`. `--once` drains the outbox, waiting out
+  retry delays so a poison event reaches the dead-letter queue, then prints a summary (claimed,
+  delivered, retried, dead-lettered, per-projector checkpoints; `--json` for JSON on stdout) and
+  exits `0`; it exits `1` if any event was dead-lettered during the run, or when `--max-seconds`
+  (approximate: checked once per loop iteration) expires (`outcome: timeout`), or when SIGTERM/SIGINT interrupts it before it has drained (`outcome: interrupted`), and `2` on a usage error. E2E scenarios use `run --once` to project
+  deterministically. The worker takes the rebuild advisory lock
+  SHARED (`pg_try_advisory_lock_shared`, same key as `rebuild`) before each claim and holds it
+  until that batch is finalized, so a claim never overlaps a rebuild. While a rebuild holds the
+  lock, nothing is claimed and `paused_for_rebuild` is logged; claiming resumes when it is
+  released. Conversely a rebuild started while a batch is in flight is refused ("another rebuild
+  holds the lock", exit `1`) and can simply be retried.
+  `--health-file <path>` is touched after every loop iteration (a paused one too) and removed on
+  shutdown. For a container healthcheck, use the file age; a Compose service with the default
+  `--poll-seconds` can use
+  `healthcheck: {test: ["CMD-SHELL", "test -n \"$(find /tmp/projector.health -mmin -1)\""], interval: 30s}`
+  (healthy while the file was touched in the last minute; allow longer if one batch can take that
+  long). There is no HTTP server.
 * **Database roles.** The CLI uses two connections, each falling back to
   `AGENT_CONTEXT_POSTGRESQL__DSN` when unset. `AGENT_CONTEXT_POSTGRESQL__PROJECTOR_DSN` reads
   checkpoints, dead letters, stream heads and the ledger, and rewrites checkpoints for

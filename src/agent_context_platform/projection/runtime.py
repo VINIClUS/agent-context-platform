@@ -10,7 +10,7 @@ from typing import Literal, Protocol, runtime_checkable
 from uuid import UUID
 
 from agent_context_sdk import StoredEventV1, verify_event
-from sqlalchemy import and_, or_, select, update
+from sqlalchemy import and_, func, or_, select, update
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
@@ -102,6 +102,23 @@ class ProjectionRunReport:
     retried: int = 0
     dead_lettered: int = 0
     lost_leases: int = 0
+
+
+@dataclass(frozen=True, slots=True)
+class OutboxBacklog:
+    """Counts of the outbox rows that are not delivered: what a long-running worker reports as lag.
+
+    `pending` includes rows still waiting out a retry backoff, which are not claimable yet.
+    """
+
+    pending: int = 0
+    leased: int = 0
+    dead_lettered: int = 0
+
+    @property
+    def outstanding(self) -> int:
+        """Rows that are neither delivered nor dead-lettered: work that can still happen."""
+        return self.pending + self.leased
 
 
 @dataclass(frozen=True, slots=True)
@@ -228,6 +245,58 @@ class ProjectionRunner:
             dead_lettered=outcomes["dead_lettered"],
             lost_leases=outcomes["lost_lease"],
         )
+
+    async def backlog(self) -> OutboxBacklog:
+        """Count the pending, leased and dead-lettered rows (content-free).
+
+        Delivered rows, the bulk of the table, are never counted: the status filter is served by
+        `ix_outbox_status` (status, available_at, outbox_id), so the cost follows the backlog and
+        not the total number of events.
+        """
+        async with self._session_factory() as session:
+            rows = await session.execute(
+                select(OutboxRow.status, func.count())
+                .where(
+                    OutboxRow.status.in_(
+                        (OutboxStatus.PENDING, OutboxStatus.LEASED, OutboxStatus.DEAD_LETTERED)
+                    )
+                )
+                .group_by(OutboxRow.status)
+            )
+            counts = {OutboxStatus(status): int(count) for status, count in rows.all()}
+        return OutboxBacklog(
+            pending=counts.get(OutboxStatus.PENDING, 0),
+            leased=counts.get(OutboxStatus.LEASED, 0),
+            dead_lettered=counts.get(OutboxStatus.DEAD_LETTERED, 0),
+        )
+
+    async def release_leases(self) -> int:
+        """Return every row still leased to this worker to `pending`; return how many.
+
+        `run_once` finalizes every row it claims, so this only matters after a run was cut short
+        (an unexpected error mid-batch): a worker shutting down calls it so that no lease outlives
+        the process and the rows are claimable at once instead of after `lease_duration`. A
+        release is not a failed attempt, so `retry_count` is left alone.
+        """
+        now = self._now()
+        async with self._session_factory() as session:
+            released = await session.execute(
+                update(OutboxRow)
+                .where(
+                    OutboxRow.status == OutboxStatus.LEASED,
+                    OutboxRow.lease_owner == self._worker_id,
+                )
+                .values(
+                    status=OutboxStatus.PENDING,
+                    lease_owner=None,
+                    lease_expires_at=None,
+                    updated_at=now,
+                )
+                .returning(OutboxRow.outbox_id)
+            )
+            count = len(released.all())
+            await session.commit()
+            return count
 
     def _now(self) -> datetime:
         value = self._clock()
