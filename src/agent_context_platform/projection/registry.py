@@ -4,16 +4,21 @@
 the live projection, a rebuild and a verification can never disagree about which projectors exist
 or in which order they run.
 
-Order: portfolio, agent, git, code. Delivery is at-least-once and unordered, so no projector may
-depend on another having run first (every write commutes, see `projectors/__init__.py`); the order
-therefore only fixes the sequence the matching projectors run in inside one Neo4j transaction. It
-follows the data's dependency direction, so a transaction touches roots before leaves and a replay
-reads like the system grew: the portfolio owns the workspace, project and repository roots every
-other event is scoped to; the agent projector hangs sessions, turns and tool calls on those
-roots; the git projector adds branches, commits, checkouts and snapshots the agent and code
-projections point at; the code projector is last because its file, symbol and assertion revisions
-hang on the repository, commit and snapshot nodes. Every projector takes the same global node-lock
-order first (`event_lock_keys`), so this sequence can never cause a deadlock.
+Order: portfolio, agent, git, code, knowledge, quality. Delivery is at-least-once and unordered, so
+no projector may depend on another having run first (every write commutes, see
+`projectors/__init__.py`); the order therefore only fixes the sequence the matching projectors run
+in inside one Neo4j transaction. It follows the data's dependency direction, so a transaction
+touches roots before leaves and a replay reads like the system grew: the portfolio owns the
+workspace, project and repository roots every other event is scoped to; the agent projector hangs
+sessions, turns and tool calls on those roots; the git projector adds branches, commits, checkouts
+and snapshots the agent and code projections point at; the code projector comes next because its
+file, symbol and assertion revisions hang on the repository, commit and snapshot nodes. Knowledge
+and quality come right after code, because a decision, failure, test run or finding points at the
+session, commit, snapshot and test or CI run nodes the earlier projectors own (as identity-only
+stubs when they have not arrived). Every projector takes the same global node-lock order first
+(`event_lock_keys`). Only the knowledge and quality projectors then lock a few more nodes they read
+from the graph (the old targets of an edge they replace); a deadlock there is a transient error the
+driver retries.
 
 Registration rejects a duplicate projector name (checkpoints and dead letters are attributed by
 name) and a duplicate (name, version) pair, each with its own typed error.
@@ -26,7 +31,9 @@ from collections.abc import Iterable
 from agent_context_platform.projection.projectors.agent import AgentProjector
 from agent_context_platform.projection.projectors.code import CodeProjector
 from agent_context_platform.projection.projectors.git import GitProjector
+from agent_context_platform.projection.projectors.knowledge import KnowledgeProjector
 from agent_context_platform.projection.projectors.portfolio import PortfolioProjector
+from agent_context_platform.projection.projectors.quality import QualityProjector
 from agent_context_platform.projection.runtime import Projector
 
 
@@ -69,7 +76,14 @@ def register_projectors(projectors: Iterable[Projector]) -> tuple[Projector, ...
 
 
 PROJECTORS: tuple[Projector, ...] = register_projectors(
-    (PortfolioProjector(), AgentProjector(), GitProjector(), CodeProjector())
+    (
+        PortfolioProjector(),
+        AgentProjector(),
+        GitProjector(),
+        CodeProjector(),
+        KnowledgeProjector(),
+        QualityProjector(),
+    )
 )
 
 
