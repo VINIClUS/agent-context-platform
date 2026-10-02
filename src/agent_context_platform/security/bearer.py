@@ -83,6 +83,18 @@ def parse_bearer(authorization: str | None) -> BearerToken | None:
     return BearerToken(prefix=match["prefix"], token=token)
 
 
+def hash_verifier(token: str, *, time_cost: int, memory_cost_kib: int, parallelism: int) -> str:
+    """The Argon2id verifier to store for a newly provisioned ``token``.
+
+    Operators pass the same cost the app is configured with (``IngestionSettings.argon2_*``), so
+    a provisioned credential costs as much to guess as the dummy verifier of an unknown prefix.
+    """
+    hasher = PasswordHasher(
+        time_cost=time_cost, memory_cost=memory_cost_kib, parallelism=parallelism
+    )
+    return hasher.hash(token)
+
+
 class Argon2Verifier:
     """Argon2id verification in worker threads, bounded by ``max_concurrency``.
 
