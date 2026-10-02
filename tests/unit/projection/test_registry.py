@@ -27,7 +27,7 @@ class Stub:
         return None
 
 
-def test_registered_projectors_are_the_four_domain_projectors_in_dependency_order() -> None:
+def test_registered_projectors_are_the_domain_projectors_in_dependency_order() -> None:
     projectors = registered_projectors()
 
     assert [(item.name, item.version) for item in projectors] == [
@@ -35,6 +35,8 @@ def test_registered_projectors_are_the_four_domain_projectors_in_dependency_orde
         ("agent", "1"),
         ("git", "1"),
         ("code", "1"),
+        ("knowledge", "1"),
+        ("quality", "1"),
     ]
     assert all(isinstance(item, Projector) for item in projectors)
     assert registered_projectors() is registry.PROJECTORS

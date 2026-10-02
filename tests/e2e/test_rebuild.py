@@ -31,12 +31,16 @@ from urllib.parse import urlsplit
 import psycopg
 import pytest
 from agent_context_sdk import (
+    EventContextV1,
     EventDraftV1,
+    EventRedactionSummaryV1,
     IngestBatchRequestV1,
+    ProducerV1,
     RedactionPolicyV1,
     StoredEventV1,
     new_uuid7,
 )
+from agent_context_sdk.content import ContentDisposition
 from integration.projection.conftest import neo4j_integration_settings, role_scoped_engine
 from integration.projection.projectors.fixtures import session_events
 from sqlalchemy import text
@@ -107,22 +111,29 @@ GO_MAIN = (
 
 # The G3 golden graph of this ledger. Every ID in it derives from pinned inputs (git dates, the
 # indexer clock, fixed fixture event IDs), so a change here is a real change of the projection.
-GOLDEN_DIGEST = "96ce5a138aa4bd6cfd5a97af1ba610f0697df3bb5309600135b95c02d35f5b01"
-GOLDEN_EVENTS = 127
+GOLDEN_DIGEST = "f631bf218b10fbc44d336c1d9f6dfe5cfc8b3a2b55de1515bc3bee53a68e18f1"
+GOLDEN_EVENTS = 135
 GOLDEN_NODES = {
     "Assertion": 31,
     "Branch": 1,
+    "CIRun": 1,
     "Checkout": 1,
     "Commit": 5,
+    "Constraint": 1,
+    "Decision": 2,
     "Dependency": 1,
+    "Failure": 1,
     "File": 4,
     "FileRevision": 5,
+    "Finding": 1,
     "Module": 3,
     "Project": 1,
     "Repository": 2,
     "Session": 1,
+    "Summary": 1,
     "Symbol": 18,
     "SymbolRevision": 19,
+    "TestRun": 1,
     "ToolCall": 1,
     "Turn": 1,
     "Workspace": 1,
@@ -149,12 +160,14 @@ GOLDEN_RELATIONSHIPS = {
     "IN_REPOSITORY": 29,
     "MEMBER_OF": 12,
     "OBSERVED_AT": 2,
-    "OBSERVED_IN": 31,
+    "OBSERVED_IN": 34,
     "OBSERVED_ON": 1,
     "PRODUCED": 2,
     "REFERENCES": 1,
+    "SUPERSEDES": 1,
     "TARGETED": 1,
     "USES_REPOSITORY": 1,
+    "VALIDATES": 1,
 }
 
 
@@ -433,6 +446,142 @@ async def project_everything(owner_dsn: str) -> None:
     raise AssertionError("the projection runner did not drain the outbox")
 
 
+def knowledge_quality_drafts() -> list[EventDraftV1]:
+    """Knowledge and quality events that point at the session and commits of `session_events`.
+
+    Fixed event IDs and times, so the graph digest stays deterministic. The decision chain, the
+    failure's session, test run and CI run, and the test run's commit exercise the stubs the
+    knowledge and quality projectors create for nodes owned by other projectors.
+    """
+    sha = "e" * 64
+    commit = "b" * 40
+    day = datetime(2026, 8, 13, 13, 0, 0, tzinfo=UTC)
+
+    def draft(number: int, event_type: str, payload: dict[str, object]) -> EventDraftV1:
+        return EventDraftV1(
+            event_id=uuid.UUID(f"0198a4b1-98c0-7c28-ae3f-{0x100 + number:012x}"),
+            event_type=event_type,
+            stream_id=f"stream-kq-{number}",
+            occurred_at=day + timedelta(minutes=number),
+            observed_at=day + timedelta(minutes=number, seconds=30),
+            producer=ProducerV1(producer_id="kq-e2e", name="kq-e2e", version="1.0.0"),
+            context=EventContextV1(
+                workspace_id="ws_1", project_id="prj_1", repository_id="repo_1", session_id="sess_1"
+            ),
+            payload=payload,
+            redaction=EventRedactionSummaryV1(
+                policy_version="test-policy-v1", disposition=ContentDisposition.SANITIZED
+            ),
+            idempotency_key=f"kq-{number}",
+        )
+
+    def valid(offset: int) -> str:
+        return (day + timedelta(days=offset)).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    def decision(number: int, decision_id: str, supersedes: str | None) -> EventDraftV1:
+        return draft(
+            number,
+            "knowledge.decision.recorded",
+            {
+                "decision_id": decision_id,
+                "status": "accepted",
+                "supersedes_id": supersedes,
+                "subjects": ["pkg"],
+                "content_id": f"content_{decision_id}",
+                "valid_from": valid(number),
+                "recorded_at": valid(number),
+            },
+        )
+
+    return [
+        decision(1, "dec_1", None),
+        decision(2, "dec_2", "dec_1"),
+        draft(
+            3,
+            "knowledge.constraint.recorded",
+            {
+                "constraint_id": "con_1",
+                "subjects": ["pkg"],
+                "content_id": "content_con_1",
+                "valid_from": valid(3),
+                "recorded_at": valid(3),
+            },
+        ),
+        draft(
+            4,
+            "knowledge.summary.recorded",
+            {
+                "summary_id": "sum_1",
+                "source_event_ids": [str(uuid.UUID("0198a4b1-98c0-7c28-ae3f-000000000001"))],
+                "subjects": ["pkg"],
+                "content_id": "content_sum_1",
+                "valid_from": valid(4),
+                "recorded_at": valid(4),
+            },
+        ),
+        draft(
+            5,
+            "quality.test_run.completed",
+            {
+                "test_run_id": "tr_1",
+                "framework": "pytest",
+                "status": "failed",
+                "total_count": 2,
+                "passed_count": 1,
+                "failed_count": 1,
+                "skipped_count": 0,
+                "error_count": 0,
+                "duration_ms": 90,
+                "commit_id": commit,
+            },
+        ),
+        draft(
+            6,
+            "quality.ci_run.completed",
+            {
+                "ci_run_id": "ci_1",
+                "provider": "github",
+                "workflow": "ci",
+                "job": "test",
+                "external_id": "9001",
+                "status": "failure",
+                "duration_ms": 4000,
+                "error_class": "TestFailure",
+                "commit_id": commit,
+            },
+        ),
+        draft(
+            7,
+            "quality.finding.observed",
+            {
+                "finding_id": "find_1",
+                "scanner": "bandit",
+                "rule_id": "B101",
+                "severity": "low",
+                "status": "open",
+                "fingerprint_sha256": sha,
+                "path": "pkg/calc.py",
+                "commit_id": commit,
+            },
+        ),
+        draft(
+            8,
+            "knowledge.failure.observed",
+            {
+                "failure_id": "fail_1",
+                "component": "pytest",
+                "operation": "run",
+                "error_class": "AssertionError",
+                "fingerprint_version": "1",
+                "fingerprint_sha256": sha,
+                "session_id": "sess_1",
+                "test_run_id": "tr_1",
+                "ci_run_id": "ci_1",
+            },
+        ),
+    ]
+
+
 async def build_ledger(dsn: str, root: Path) -> int:
     api = create_async_engine(
         dsn, poolclass=NullPool, connect_args={"options": "-c role=agent_context_api"}
@@ -449,6 +598,12 @@ async def build_ledger(dsn: str, root: Path) -> int:
         )
         assert outcome.http_status == 200
         total += len(fixtures)
+        knowledge_quality = knowledge_quality_drafts()
+        outcome = await ingestion.ingest(
+            IngestBatchRequestV1(batch_id=new_uuid7(), events=tuple(knowledge_quality))
+        )
+        assert outcome.http_status == 200
+        total += len(knowledge_quality)
 
         lineage: dict[str, uuid.UUID] = {}
         steps = 0
