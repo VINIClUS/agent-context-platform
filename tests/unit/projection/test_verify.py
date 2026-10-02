@@ -124,8 +124,15 @@ class FakeTx:
             return Rows([Rec(deleted=len(doomed))])
         if query.startswith("MATCH (n) WHERE NOT any"):
             keyed = set(parameters["keyed"])
+            keys = parameters["keys"]
             after = parameters["after"]
-            ids = sorted(i for i, (labels, _) in graph.nodes.items() if not keyed & set(labels))
+            ids = sorted(
+                i
+                for i, (labels, props) in graph.nodes.items()
+                if not any(
+                    label in keyed and props.get(keys[label]) is not None for label in labels
+                )
+            )
             ids = [i for i in ids if after is None or f"e{i:06d}" > after][: parameters["limit"]]
             return Rows(
                 [
@@ -144,7 +151,9 @@ class FakeTx:
             found = sorted(
                 (props[key], labels, props)
                 for labels, props in graph.nodes.values()
-                if label in labels and key in props and (after is None or props[key] > after)
+                if label in labels
+                and props.get(key) is not None
+                and (after is None or props[key] > after)
             )[: parameters["limit"]]
             return Rows([Rec(cursor=c, labels=labels, props=props) for c, labels, props in found])
         rel_match = re.match(r"MATCH \(a:`(\w+)`\)", query)
@@ -1817,3 +1826,56 @@ async def test_a_rebuild_reports_the_dead_lettered_events_it_skipped(
         "count": 2,
         "event_ids": [str(item) for item in poison],
     }
+
+
+async def test_a_keyed_node_without_its_identity_is_counted_and_reported() -> None:
+    graph = sample_graph()
+    for _ in range(7):
+        graph.node("Commit", note="no commit_id", source_event_id="<bad>")
+    graph.node("Commit", commit_id=None)
+    make = factory(lambda *_: [])
+
+    scanned, collector = await verify._scan_with_orphans(FakeStore(graph), make, 2)  # type: ignore[arg-type]
+
+    assert scanned.missing_identity == 8
+    assert scanned.node_count == 5 + 8 and scanned.nodes["Commit"] == 1 + 8
+    assert "<bad>" in collector.orphans
+    assert scanned.to_dict()["missing_identity"] == 8
+    clean = await compute_graph_digest(FakeStore(sample_graph()), batch_size=2)
+    assert clean.missing_identity == 0 and clean.digest != scanned.digest
+
+
+def test_a_missing_identity_makes_the_verification_mismatch() -> None:
+    report = VerificationReport(
+        projectors=(),
+        streams=StreamHeadCheck(1, 0, (), 0),
+        graph=replace(digest(), missing_identity=2),
+        orphan_count=0,
+        orphan_sample=(),
+        source_ids_checked=0,
+        ledger_head_outbox_id=None,
+    )
+
+    assert "graph: missing_identity" in report.problems() and not report.ok()
+
+
+def test_a_rebuilding_checkpoint_is_an_issue_even_on_an_empty_ledger() -> None:
+    result = classify_projector(
+        FakeProjector("p", "t.a"),
+        checkpoint(
+            outbox_id=None,
+            event_id=None,
+            processed_count=0,
+            pointer_event_id=None,
+            state="rebuilding",
+        ),
+        [],
+    )
+
+    assert result.issues == ("checkpoint_rebuilding",)
+    active = classify_projector(
+        FakeProjector("p", "t.a"),
+        checkpoint(outbox_id=None, event_id=None, processed_count=0, pointer_event_id=None),
+        [],
+    )
+    assert active.issues == ()

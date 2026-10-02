@@ -136,6 +136,7 @@ class GraphDigest:
     relationship_count: int
     nodes: Mapping[str, int]
     relationships: Mapping[str, int]
+    missing_identity: int = 0  # keyed-label nodes that lack their identity property
 
     def to_dict(self) -> dict[str, Any]:
         return {
@@ -144,6 +145,7 @@ class GraphDigest:
             "relationship_count": self.relationship_count,
             "nodes": dict(sorted(self.nodes.items())),
             "relationships": dict(sorted(self.relationships.items())),
+            "missing_identity": self.missing_identity,
         }
 
 
@@ -210,7 +212,11 @@ _REL_RETURN: Final[LiteralString] = (
 
 @dataclass(frozen=True, slots=True)
 class _Pass:
-    """One scan pass: the nodes of one keyed label, or every node without a keyed label."""
+    """One scan pass: the nodes of one keyed label that have their key, or every other node.
+
+    The fallback pass takes every node that has no keyed label with a non-null identity property,
+    including a keyed-label node whose identity property is missing (reported as corrupt).
+    """
 
     label: str | None
 
@@ -218,7 +224,8 @@ class _Pass:
         """(page query, relationship query), each taking `$cursors`/`$after`/`$limit`."""
         if self.label is None:
             return (
-                "MATCH (n) WHERE NOT any(l IN labels(n) WHERE l IN $keyed) "
+                "MATCH (n) WHERE NOT any(l IN labels(n) WHERE l IN $keyed "
+                "AND n[$keys[l]] IS NOT NULL) "
                 "AND ($after IS NULL OR elementId(n) > $after) "
                 "WITH n ORDER BY elementId(n) LIMIT $limit "
                 "RETURN elementId(n) AS cursor, labels(n) AS labels, properties(n) AS props",
@@ -227,7 +234,8 @@ class _Pass:
         label, key = _identifier(self.label), _identifier(NODE_KEYS[self.label])
         return (
             _literal(
-                f"MATCH (n:`{label}`) WHERE $after IS NULL OR n.`{key}` > $after "
+                f"MATCH (n:`{label}`) WHERE n.`{key}` IS NOT NULL "
+                f"AND ($after IS NULL OR n.`{key}` > $after) "
                 f"WITH n ORDER BY n.`{key}` LIMIT $limit "
                 f"RETURN n.`{key}` AS cursor, labels(n) AS labels, properties(n) AS props"
             ),
@@ -247,7 +255,12 @@ class _Pass:
             nodes = (
                 await tx.run(
                     node_query,
-                    parameters={"after": after, "limit": limit, "keyed": sorted(NODE_KEYS)},
+                    parameters={
+                        "after": after,
+                        "limit": limit,
+                        "keyed": sorted(NODE_KEYS),
+                        "keys": dict(NODE_KEYS),
+                    },
                 )
             ).records
             cursors = [record["cursor"] for record in nodes]
@@ -280,6 +293,7 @@ async def compute_graph_digest(
     node_counts: Counter[str] = Counter()
     relationship_counts: Counter[str] = Counter()
     pending: set[str] = set()
+    missing_identity = 0
 
     async def flush() -> None:
         if pending and on_source_ids is not None:
@@ -305,6 +319,8 @@ async def compute_graph_digest(
                     b"n" + _item_hash("node", identity, sorted(labels), _stable_props(props))
                 )
                 node_counts[":".join(sorted(labels))] += 1
+                if scan.label is None and any(label in NODE_KEYS for label in labels):
+                    missing_identity += 1
                 pending.update(source_ids(props))
             for record in rels:
                 a_labels, a_props = record["a_labels"], record["a_props"]
@@ -336,6 +352,7 @@ async def compute_graph_digest(
         relationship_count=sum(relationship_counts.values()),
         nodes=dict(node_counts),
         relationships=dict(relationship_counts),
+        missing_identity=missing_identity,
     )
 
 
@@ -465,7 +482,7 @@ def classify_projector(
 ) -> ProjectorVerification:
     """Judge one projector's checkpoint against the ledger aggregates (pure).
 
-    Failures: a checkpoint behind an event the outbox already delivered (regression), a
+    Failures: a checkpoint still marked `rebuilding`, a checkpoint behind an event the outbox already delivered (regression), a
     checkpoint whose pointer disagrees with the outbox, a dead letter below the checkpoint (gap),
     a processed count that is not the number of delivered handled events up to the checkpoint, and
     an event that was never queued. Lag and in-flight rows are reported and only fail under
@@ -490,6 +507,8 @@ def classify_projector(
         and checkpoint.pointer_event_id != checkpoint.event_id
     ):
         issues.append("checkpoint_pointer_mismatch")
+    if checkpoint is not None and checkpoint.state == ProjectionState.REBUILDING:
+        issues.append("checkpoint_rebuilding")
     if beyond:
         issues.append("checkpoint_regressed")
     if dead:
@@ -916,6 +935,8 @@ class VerificationReport:
             found.append("streams: behind")
         if self.orphan_count:
             found.append("graph: orphan_source_ids")
+        if self.graph.missing_identity:
+            found.append("graph: missing_identity")
         if self.replay_matches is False:
             found.append("graph: replay_digest_mismatch")
         return found

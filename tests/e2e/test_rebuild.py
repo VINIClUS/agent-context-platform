@@ -691,6 +691,35 @@ def test_verify_matches_is_idempotent_and_fails_on_tampering(world: World) -> No
     )
     assert invoke(["projection", "verify", "--no-record"], world.env()).exit_code == 0
 
+    # A keyed node without its identity property, and a checkpoint left in `rebuilding`.
+    asyncio.run(run_graph("CREATE (:Commit {note: 'no commit_id'})"))
+    keyless = invoke(["projection", "verify", "--no-record", "--json"], world.env())
+    assert keyless.exit_code == 1
+    assert "graph: missing_identity" in report(keyless)["problems"]
+    assert report(keyless)["graph"]["missing_identity"] == 1
+    asyncio.run(run_graph("MATCH (n:Commit) WHERE n.commit_id IS NULL DETACH DELETE n"))
+    assert invoke(["projection", "verify", "--no-record"], world.env()).exit_code == 0
+    asyncio.run(
+        sql(
+            world.owner,
+            "UPDATE projection.projection_checkpoints SET state = 'rebuilding' "
+            "WHERE projector_name = 'git'",
+        )
+    )
+    try:
+        stuck = invoke(["projection", "verify", "--no-record", "--json"], world.env())
+        assert stuck.exit_code == 1
+        assert any("checkpoint_rebuilding" in p for p in report(stuck)["problems"])
+    finally:
+        asyncio.run(
+            sql(
+                world.owner,
+                "UPDATE projection.projection_checkpoints SET state = 'active' "
+                "WHERE projector_name = 'git'",
+            )
+        )
+    assert invoke(["projection", "verify", "--no-record"], world.env()).exit_code == 0
+
     # A regressed checkpoint: the pointer and count move back, the outbox says delivered.
     saved = asyncio.run(
         sql(
