@@ -105,6 +105,17 @@ agent-context projection rebuild --target-uri bolt://standby:7687 --target-datab
 agent-context projection rebuild --in-place --confirm neo4j   # stop the projection runner first
 ```
 
+* **Database roles.** The CLI uses two connections, each falling back to
+  `AGENT_CONTEXT_POSTGRESQL__DSN` when unset. `AGENT_CONTEXT_POSTGRESQL__PROJECTOR_DSN` reads
+  checkpoints, dead letters, stream heads and the ledger, and rewrites checkpoints for
+  `--in-place`. `AGENT_CONTEXT_POSTGRESQL__API_DSN` is used only to record `projection.rebuilt`
+  through the ingestion service, and is not needed with `--no-record`. Production needs two login
+  roles, members of the `NOLOGIN` roles `agent_context_projector` and `agent_context_api`
+  (provisioned by INFRA, I040); the owner or a shared DSN is not required. Both connections'
+  grants are checked before any target is wiped or checkpoint reset, and a missing grant exits `1`
+  naming the privilege. If the verification or rebuild succeeds but the report cannot be recorded,
+  the result (verified target and digest) is still printed, the JSON carries
+  `"record_error": "record_failed"`, and the exit code is `1`.
 * `verify` is read-only. Per projector it checks checkpoint continuity (no regression, no dead
   letter below the checkpoint, processed count equals delivered events) and event coverage (lag is
   reported, and fails only with `--require-caught-up`); across the graph it checks that every

@@ -46,7 +46,7 @@ from agent_context_sdk.events.system import (
     ProjectionOutcome,
     ProjectionRebuiltV1,
 )
-from sqlalchemy import String, and_, func, literal, select
+from sqlalchemy import String, and_, func, literal, select, text
 from sqlalchemy import cast as sql_cast
 from sqlalchemy.dialects.postgresql import insert
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
@@ -697,6 +697,8 @@ async def ledger_head(session: AsyncSession) -> int | None:
 # Reporting `projection.rebuilt`
 # --------------------------------------------------------------------------------------------
 
+# The public error class of a report the ledger could not take; it never carries the cause.
+RECORD_FAILED: Final = "record_failed"
 PLATFORM_PRODUCER_ID: Final = "agent-context-platform"
 SYSTEM_STREAM_ID: Final = "platform:projection"
 SYSTEM_EVENT_TYPE: Final = "projection.rebuilt"
@@ -879,6 +881,7 @@ class VerificationReport:
     ledger_head_outbox_id: int | None
     replay_digest: str | None = None
     recorded: RecordResult | None = None
+    record_error: str | None = None
 
     @property
     def replay_matches(self) -> bool | None:
@@ -916,6 +919,7 @@ class VerificationReport:
             "replay_digest": self.replay_digest,
             "replay_matches": self.replay_matches,
             "recorded": None if self.recorded is None else self.recorded.to_dict(),
+            "record_error": self.record_error,
         }
 
 
@@ -1065,16 +1069,20 @@ async def verify_projections(
         if report.ok(require_caught_up=require_caught_up)
         else ProjectionOutcome.MISMATCHED
     )
-    recorded = await recorder.record(
-        _runs(
-            verifications,
-            mode=ProjectionMode.VERIFY,
-            outcome=outcome,
-            started_at=started,
-            completed_at=max(clock(), started),
-            digest=graph.digest,
+    try:
+        recorded = await recorder.record(
+            _runs(
+                verifications,
+                mode=ProjectionMode.VERIFY,
+                outcome=outcome,
+                started_at=started,
+                completed_at=max(clock(), started),
+                digest=graph.digest,
+            )
         )
-    )
+    except Exception:
+        # Recording never masks the verification result.
+        return replace(report, record_error=RECORD_FAILED)
     return replace(report, recorded=recorded)
 
 
@@ -1269,6 +1277,7 @@ class RebuildReport:
     wiped_nodes: int
     outcome: ProjectionOutcome
     recorded: RecordResult | None
+    record_error: str | None = None
 
     @property
     def ok(self) -> bool:
@@ -1286,6 +1295,7 @@ class RebuildReport:
             "wiped_nodes": self.wiped_nodes,
             "verification": self.verification.to_dict(),
             "recorded": None if self.recorded is None else self.recorded.to_dict(),
+            "record_error": self.record_error,
         }
 
 
@@ -1401,18 +1411,23 @@ async def rebuild_projections(
     ok = verification.ok()
     outcome = ProjectionOutcome.COMPLETED if ok else ProjectionOutcome.FAILED
     recorded = None
+    record_error = None
     if recorder is not None:
-        recorded = await recorder.record(
-            _runs(
-                verification.projectors,
-                mode=ProjectionMode.REBUILD,
-                outcome=outcome,
-                started_at=started,
-                completed_at=max(clock(), started),
-                digest=verification.graph.digest,
-                error_class=None if ok else "VerificationFailed",
+        try:
+            recorded = await recorder.record(
+                _runs(
+                    verification.projectors,
+                    mode=ProjectionMode.REBUILD,
+                    outcome=outcome,
+                    started_at=started,
+                    completed_at=max(clock(), started),
+                    digest=verification.graph.digest,
+                    error_class=None if ok else "VerificationFailed",
+                )
             )
-        )
+        except Exception:
+            # The rebuild and its verification stand; only the ledger report is missing.
+            record_error = RECORD_FAILED
     return RebuildReport(
         mode="in_place" if in_place else "standby",
         target=target_description,
@@ -1421,7 +1436,116 @@ async def rebuild_projections(
         wiped_nodes=wiped,
         outcome=outcome,
         recorded=recorded,
+        record_error=record_error,
     )
+
+
+# --------------------------------------------------------------------------------------------
+# Grant preflight
+# --------------------------------------------------------------------------------------------
+
+
+@dataclass(frozen=True, slots=True)
+class GrantRequirement:
+    """One privilege a connection must hold, checked with `has_*_privilege` (inherited roles count)."""
+
+    kind: str  # "table", "column" or "sequence"
+    obj: str
+    privilege: str
+    column: str | None = None
+
+    @property
+    def label(self) -> str:
+        where = self.obj if self.column is None else f"{self.obj}.{self.column}"
+        return f"{self.privilege} on {where}"
+
+
+_READ_TABLES: Final = (
+    "ledger.events",
+    "ledger.event_streams",
+    "ledger.event_content_refs",
+    "projection.outbox",
+    "projection.projection_checkpoints",
+    "projection.dead_letters",
+)
+_CHECKPOINT_COLUMNS: Final = (
+    "last_outbox_id",
+    "last_event_id",
+    "processed_count",
+    "state",
+    "updated_at",
+)
+# Checkpoints, dead letters, stream heads and in-place resets: the projector role.
+PROJECTOR_READ_GRANTS: Final = tuple(GrantRequirement("table", t, "SELECT") for t in _READ_TABLES)
+PROJECTOR_CHECKPOINT_GRANTS: Final = (
+    GrantRequirement("table", "projection.projection_checkpoints", "INSERT"),
+    *(
+        GrantRequirement("column", "projection.projection_checkpoints", "UPDATE", column)
+        for column in _CHECKPOINT_COLUMNS
+    ),
+)
+# Recording `projection.rebuilt` through `IngestionService`: the API role.
+RECORDER_GRANTS: Final = (
+    GrantRequirement("table", "ledger.events", "SELECT"),
+    GrantRequirement("table", "ledger.events", "INSERT"),
+    GrantRequirement("table", "ledger.event_streams", "SELECT"),
+    GrantRequirement("table", "ledger.event_streams", "INSERT"),
+    GrantRequirement("column", "ledger.event_streams", "UPDATE", "last_sequence"),
+    GrantRequirement("table", "ledger.event_content_refs", "SELECT"),
+    GrantRequirement("table", "projection.outbox", "INSERT"),
+    GrantRequirement("sequence", "projection.outbox_outbox_id_seq", "USAGE"),
+)
+
+
+class MissingGrantError(ProjectionOperationError):
+    """A connection lacks privileges the operation needs; raised before anything is mutated."""
+
+    def __init__(self, role: str, missing: Sequence[str]) -> None:
+        super().__init__(f"the {role} connection lacks: {'; '.join(missing)}")
+        self.role = role
+        self.missing = tuple(missing)
+
+
+async def check_grants(
+    session_factory: async_sessionmaker[AsyncSession],
+    requirements: Sequence[GrantRequirement],
+    *,
+    role: str,
+) -> None:
+    """Fail with `MissingGrantError` unless the connection holds every required privilege."""
+    missing: list[str] = []
+    async with session_factory() as session:
+        for item in requirements:
+            if item.kind == "table":
+                query = text("SELECT has_table_privilege(:obj, :priv)")
+                params: dict[str, Any] = {"obj": item.obj, "priv": item.privilege}
+            elif item.kind == "column":
+                query = text("SELECT has_column_privilege(:obj, :col, :priv)")
+                params = {"obj": item.obj, "col": item.column, "priv": item.privilege}
+            else:
+                query = text("SELECT has_sequence_privilege(:obj, :priv)")
+                params = {"obj": item.obj, "priv": item.privilege}
+            if not await session.scalar(query, params):
+                missing.append(item.label)
+    if missing:
+        raise MissingGrantError(role, missing)
+
+
+async def preflight(
+    projector_sessions: async_sessionmaker[AsyncSession],
+    recorder_sessions: async_sessionmaker[AsyncSession] | None,
+    *,
+    write_checkpoints: bool,
+) -> None:
+    """Check both connections' grants; call before any target or checkpoint is mutated.
+
+    `recorder_sessions` is None when the report is not recorded. `write_checkpoints` is the
+    in-place rebuild, which rewrites the live checkpoints.
+    """
+    needed = PROJECTOR_READ_GRANTS + (PROJECTOR_CHECKPOINT_GRANTS if write_checkpoints else ())
+    await check_grants(projector_sessions, needed, role="projector")
+    if recorder_sessions is not None:
+        await check_grants(recorder_sessions, RECORDER_GRANTS, role="api")
 
 
 # --------------------------------------------------------------------------------------------
@@ -1495,12 +1619,15 @@ __all__ = [
     "DEFAULT_BATCH_SIZE",
     "NODE_KEYS",
     "PLATFORM_PRODUCER_ID",
+    "RECORD_FAILED",
     "SOURCE_ID_PROPERTIES",
     "VOLATILE_PROPERTIES",
     "CheckpointView",
     "EventTypeStats",
+    "GrantRequirement",
     "GraphDigest",
     "GraphScanError",
+    "MissingGrantError",
     "NoContentBlobStore",
     "OrphanCollector",
     "ProjectionEventRecorder",
@@ -1517,11 +1644,13 @@ __all__ = [
     "StreamHeadCheck",
     "TargetNotEmptyError",
     "VerificationReport",
+    "check_grants",
     "classify_projector",
     "classify_replay",
     "compute_graph_digest",
     "count_nodes",
     "node_identity",
+    "preflight",
     "primary_label",
     "projection_status",
     "rebuild_projections",

@@ -19,19 +19,26 @@ from dataclasses import dataclass
 from typing import Annotated, Any
 
 import typer
-from pydantic import ValidationError
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from pydantic import PostgresDsn, Secret, ValidationError
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 
-from agent_context_platform.db import create_engine, session_factory
+from agent_context_platform.db import session_factory
 from agent_context_platform.projection.neo4j import Neo4jStore
 from agent_context_platform.projection.registry import registered_projectors
 from agent_context_platform.projection.verify import (
     DEFAULT_BATCH_SIZE,
+    MissingGrantError,
     ProjectionEventRecorder,
     RebuildReport,
     RunnerActiveError,
     TargetNotEmptyError,
     VerificationReport,
+    preflight,
     projection_status,
     public_error_class,
     rebuild_projections,
@@ -97,9 +104,15 @@ class CliUsageError(Exception):
 
 @dataclass(frozen=True, slots=True)
 class Runtime:
-    """The opened resources one command runs with."""
+    """The opened resources one command runs with.
+
+    `sessions` is the projector-role connection (checkpoints, dead letters, stream heads, in-place
+    resets); `recording_sessions` is the API-role connection, used only to record
+    `projection.rebuilt` through `IngestionService`, and is None when nothing is recorded.
+    """
 
     sessions: async_sessionmaker[AsyncSession]
+    recording_sessions: async_sessionmaker[AsyncSession] | None
     store: Neo4jStore
 
 
@@ -110,18 +123,33 @@ def _load_settings() -> Settings:
         raise CliUsageError("invalid AGENT_CONTEXT_* configuration") from None
 
 
+def _engine(dsn: Secret[PostgresDsn] | None, name: str) -> AsyncEngine:
+    if dsn is None:
+        raise CliUsageError(f"AGENT_CONTEXT_POSTGRESQL__{name} (or __DSN) is required")
+    return create_async_engine(dsn.get_secret_value().unicode_string(), pool_pre_ping=True)
+
+
 @asynccontextmanager
-async def _runtime(settings: Settings) -> AsyncIterator[Runtime]:
-    try:
-        engine = create_engine(settings)
-    except ValueError:
-        raise CliUsageError("AGENT_CONTEXT_POSTGRESQL__DSN is required") from None
+async def _runtime(settings: Settings, *, record: bool = False) -> AsyncIterator[Runtime]:
+    postgresql = settings.postgresql
+    engines = [_engine(postgresql.effective_projector_dsn, "PROJECTOR_DSN")]
+    if record:
+        try:
+            engines.append(_engine(postgresql.effective_api_dsn, "API_DSN"))
+        except CliUsageError:
+            await engines[0].dispose()
+            raise
     store = Neo4jStore(settings.neo4j)
     try:
-        yield Runtime(session_factory(engine), store)
+        yield Runtime(
+            session_factory(engines[0]),
+            session_factory(engines[1]) if record else None,
+            store,
+        )
     finally:
         await store.close()
-        await engine.dispose()
+        for engine in engines:
+            await engine.dispose()
 
 
 def _server_key(settings: Neo4jSettings) -> tuple[str, int, str]:
@@ -213,6 +241,9 @@ def _run(main: Callable[[], Coroutine[Any, Any, int]]) -> None:
             "error: the target holds graph data; use --wipe-target --confirm <database>", err=True
         )
         code = EXIT_USAGE
+    except MissingGrantError as error:
+        typer.echo(f"error: {error}", err=True)
+        code = EXIT_FAILED
     except RunnerActiveError:
         typer.echo("error: the projection runner holds outbox leases; stop it first", err=True)
         code = EXIT_FAILED
@@ -220,6 +251,12 @@ def _run(main: Callable[[], Coroutine[Any, Any, int]]) -> None:
         typer.echo(f"error: {public_error_class(error)}", err=True)
         code = EXIT_FAILED
     raise typer.Exit(code)
+
+
+def _recorder(runtime: Runtime) -> ProjectionEventRecorder | None:
+    if runtime.recording_sessions is None:
+        return None
+    return ProjectionEventRecorder.in_process(runtime.recording_sessions)
 
 
 def _verification_lines(report: VerificationReport, *, require_caught_up: bool) -> list[str]:
@@ -240,6 +277,8 @@ def _verification_lines(report: VerificationReport, *, require_caught_up: bool) 
     lines.append(f"orphan source ids: {report.orphan_count} of {report.source_ids_checked} checked")
     if report.replay_digest is not None:
         lines.append(f"replay digest {report.replay_digest} (matches: {report.replay_matches})")
+    if report.record_error is not None:
+        lines.append(f"recording failed: {report.record_error}")
     if report.recorded is not None:
         lines.append(
             f"recorded {report.recorded.appended} new projection.rebuilt events "
@@ -286,7 +325,10 @@ def verify_command(
         else:
             _forbid_target_options(target_uri, target_database, wipe_target, confirm)
         try:
-            async with _runtime(settings) as runtime:
+            async with _runtime(settings, record=record) as runtime:
+                await preflight(
+                    runtime.sessions, runtime.recording_sessions, write_checkpoints=False
+                )
                 report = await verify_projections(
                     runtime.sessions,
                     runtime.store,
@@ -294,9 +336,7 @@ def verify_command(
                     require_caught_up=require_caught_up,
                     replay_target=scratch,
                     wipe_replay_target=wipe_target,
-                    recorder=ProjectionEventRecorder.in_process(runtime.sessions)
-                    if record
-                    else None,
+                    recorder=_recorder(runtime),
                     batch_size=batch_size,
                 )
         finally:
@@ -307,6 +347,9 @@ def verify_command(
             as_json=json_output,
             lines=_verification_lines(report, require_caught_up=require_caught_up),
         )
+        if report.record_error:
+            typer.echo(f"error: {report.record_error}", err=True)
+            return EXIT_FAILED
         return EXIT_OK if report.ok(require_caught_up=require_caught_up) else EXIT_FAILED
 
     _run(main)
@@ -318,6 +361,8 @@ def _rebuild_lines(report: RebuildReport) -> list[str]:
         f"projected {report.projected_events} events, wiped {report.wiped_nodes} nodes",
     ]
     lines.extend(_verification_lines(report.verification, require_caught_up=False))
+    if report.record_error is not None:
+        lines.append(f"recording failed: {report.record_error}")
     if report.ok:
         lines.append(f"verified target {report.target} digest {report.verification.graph.digest}")
         lines.append("cutover is an operator step: point the API and projector at this target")
@@ -356,7 +401,11 @@ def rebuild_command(
             _require_distinct_target(settings.neo4j, target_settings)
             if wipe_target:
                 _confirmed(confirm, target_settings.database, "--wipe-target")
-        async with _runtime(settings) as runtime:
+        async with _runtime(settings, record=record) as runtime:
+            # Before anything is mutated: a missing grant must not surface after a target is wiped.
+            await preflight(
+                runtime.sessions, runtime.recording_sessions, write_checkpoints=in_place
+            )
             target = runtime.store if in_place else Neo4jStore(target_settings)
             try:
                 report = await rebuild_projections(
@@ -366,15 +415,17 @@ def rebuild_command(
                     target_description=_describe(target_settings),
                     in_place=in_place,
                     wipe_target=wipe_target,
-                    recorder=ProjectionEventRecorder.in_process(runtime.sessions)
-                    if record
-                    else None,
+                    recorder=_recorder(runtime),
                     batch_size=batch_size,
                 )
             finally:
                 if not in_place:
                     await target.close()
         _emit(report.to_dict(), as_json=json_output, lines=_rebuild_lines(report))
+        if report.record_error:
+            # The rebuild and its verified target stand and are printed above; the report is lost.
+            typer.echo(f"error: {report.record_error}", err=True)
+            return EXIT_FAILED
         return EXIT_OK if report.ok else EXIT_FAILED
 
     _run(main)

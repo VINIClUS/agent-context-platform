@@ -311,7 +311,7 @@ class FakeSession:
         self.statements.append(sql_of(statement))
         return self._answer("execute", self.statements[-1])
 
-    async def scalar(self, statement: Any) -> Any:
+    async def scalar(self, statement: Any, _params: Any = None) -> Any:
         self.statements.append(sql_of(statement))
         return self._answer("scalar", self.statements[-1])
 
@@ -1387,3 +1387,70 @@ def test_rebuild_report_serialization_marks_the_adopted_target() -> None:
     )
 
     assert report.ok and report.to_dict()["recorded"] is None
+
+
+async def test_a_recording_failure_leaves_the_verification_result_intact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    projectors = patch_state(monkeypatch)
+
+    report = await verify.verify_projections(
+        factory(lambda *_: None),  # type: ignore[arg-type]
+        FakeStore(),  # type: ignore[arg-type]
+        projectors,
+        recorder=FakeRecorder(fail=True),  # type: ignore[arg-type]
+        clock=clock,
+    )
+
+    assert report.ok() and report.recorded is None
+    assert report.record_error == "record_failed" == verify.RECORD_FAILED
+    assert report.to_dict()["record_error"] == "record_failed"
+
+
+async def test_a_recording_failure_leaves_the_rebuild_and_its_verified_target_intact(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    steps = Steps(monkeypatch)
+
+    result = await rebuild(steps, in_place=False, recorder=FakeRecorder(fail=True))
+
+    assert result.ok and result.recorded is None and result.record_error == "record_failed"
+    payload = result.to_dict()
+    assert payload["verified_target"] == "host:7687/neo4j" and payload["graph_digest"] == "d" * 64
+    assert payload["record_error"] == "record_failed"
+
+
+def grant_answer(missing: set[str]) -> Callable[[str, str], Any]:
+    def answer(kind: str, text: str) -> Any:
+        return not any(name in text for name in missing)
+
+    return answer
+
+
+async def test_preflight_passes_when_every_grant_is_held() -> None:
+    make = factory(grant_answer(set()))
+
+    await verify.preflight(make, make, write_checkpoints=True)  # type: ignore[arg-type]
+    await verify.preflight(make, None, write_checkpoints=False)  # type: ignore[arg-type]
+
+    texts = [text for session in make.sessions for text in session.statements]  # type: ignore[attr-defined]
+    assert any("has_table_privilege" in t for t in texts)
+    assert any("has_column_privilege" in t for t in texts)
+    assert any("has_sequence_privilege" in t for t in texts)
+
+
+async def test_preflight_names_every_missing_grant_per_role() -> None:
+    projector = factory(grant_answer({"has_column_privilege"}))
+    recorder = factory(grant_answer({"has_sequence_privilege", "has_table_privilege"}))
+
+    with pytest.raises(verify.MissingGrantError) as no_write:
+        await verify.preflight(projector, None, write_checkpoints=True)  # type: ignore[arg-type]
+    assert no_write.value.role == "projector"
+    assert "UPDATE on projection.projection_checkpoints.state" in no_write.value.missing
+    await verify.preflight(projector, None, write_checkpoints=False)  # type: ignore[arg-type]
+
+    with pytest.raises(verify.MissingGrantError) as no_insert:
+        await verify.preflight(factory(grant_answer(set())), recorder, write_checkpoints=False)  # type: ignore[arg-type]
+    assert no_insert.value.role == "api"
+    assert "INSERT on ledger.events" in str(no_insert.value)
+    assert "USAGE on projection.outbox_outbox_id_seq" in no_insert.value.missing

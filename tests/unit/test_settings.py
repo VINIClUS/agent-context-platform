@@ -348,3 +348,29 @@ def test_indexer_confinement_settings_default_closed_and_load_from_environment(
     monkeypatch.setenv("AGENT_CONTEXT_INDEXER_ALLOW_UNCONFINED_ADAPTERS", "maybe")
     with pytest.raises(ValidationError):
         Settings()
+
+
+def test_role_dsns_fall_back_to_the_shared_dsn_and_never_print() -> None:
+    shared = "postgresql+psycopg://platform:shared-secret@postgres/agent_context"
+    projector = "postgresql+psycopg://projector:projector-secret@postgres/agent_context"
+
+    only_shared = Settings(postgresql={"dsn": shared})
+    split = Settings(postgresql={"dsn": shared, "projector_dsn": projector})
+
+    assert only_shared.postgresql.effective_projector_dsn is only_shared.postgresql.dsn
+    assert only_shared.postgresql.effective_api_dsn is only_shared.postgresql.dsn
+    assert split.postgresql.effective_projector_dsn is not None
+    assert split.postgresql.effective_projector_dsn.get_secret_value().unicode_string() == projector
+    assert split.postgresql.effective_api_dsn is split.postgresql.dsn
+    assert Settings().postgresql.effective_api_dsn is None
+    assert "projector-secret" not in repr(split) and "shared-secret" not in repr(split)
+
+
+@pytest.mark.parametrize("field", ["projector_dsn", "api_dsn"])
+@pytest.mark.parametrize(
+    "dsn",
+    ["postgresql://u:p@postgres/agent", "postgresql+psycopg://u:p@postgres", "mysql://u:p@h/d"],
+)
+def test_role_dsns_share_the_scheme_and_database_rules(field: str, dsn: str) -> None:
+    with pytest.raises(ValidationError):
+        Settings(postgresql={field: dsn})

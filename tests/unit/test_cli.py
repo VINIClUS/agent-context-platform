@@ -15,6 +15,7 @@ from typer.testing import CliRunner
 from agent_context_platform import cli
 from agent_context_platform.projection.verify import (
     GraphDigest,
+    MissingGrantError,
     ProjectorStatus,
     ProjectorVerification,
     RebuildReport,
@@ -52,6 +53,9 @@ class Calls:
         self.rebuild: list[dict[str, Any]] = []
         self.runtime_store: Any = None
         self.closed: list[Any] = []
+        self.recording: list[bool] = []
+        self.preflight: list[tuple[bool, bool]] = []
+        self.preflight_error: Exception | None = None
 
 
 @pytest.fixture
@@ -59,11 +63,22 @@ def calls(monkeypatch: pytest.MonkeyPatch) -> Calls:
     seen = Calls()
 
     @asynccontextmanager
-    async def runtime(_settings: Any) -> AsyncIterator[cli.Runtime]:
+    async def runtime(_settings: Any, *, record: bool = False) -> AsyncIterator[cli.Runtime]:
         seen.runtime_store = object()
-        yield cli.Runtime(sessions=object(), store=seen.runtime_store)  # type: ignore[arg-type]
+        seen.recording.append(record)
+        yield cli.Runtime(
+            sessions=object(),  # type: ignore[arg-type]
+            recording_sessions=object() if record else None,  # type: ignore[arg-type]
+            store=seen.runtime_store,
+        )
+
+    async def fake_preflight(_projector: Any, recorder: Any, *, write_checkpoints: bool) -> None:
+        seen.preflight.append((recorder is not None, write_checkpoints))
+        if seen.preflight_error is not None:
+            raise seen.preflight_error
 
     monkeypatch.setattr(cli, "_runtime", runtime)
+    monkeypatch.setattr(cli, "preflight", fake_preflight)
     return seen
 
 
@@ -85,7 +100,9 @@ def projector(*issues: str) -> ProjectorVerification:
     )
 
 
-def verification(*issues: str, replay: str | None = None) -> VerificationReport:
+def verification(
+    *issues: str, replay: str | None = None, record_error: str | None = None
+) -> VerificationReport:
     return VerificationReport(
         projectors=(projector(*issues),),
         streams=StreamHeadCheck(2, 0, (), 0),
@@ -96,6 +113,7 @@ def verification(*issues: str, replay: str | None = None) -> VerificationReport:
         ledger_head_outbox_id=4,
         replay_digest=replay,
         recorded=RecordResult(1, 0),
+        record_error=record_error,
     )
 
 
@@ -112,7 +130,10 @@ def patch_verify(
 
 
 def patch_rebuild(
-    monkeypatch: pytest.MonkeyPatch, calls: Calls, outcome: Exception | ProjectionOutcome
+    monkeypatch: pytest.MonkeyPatch,
+    calls: Calls,
+    outcome: Exception | ProjectionOutcome,
+    record_error: str | None = None,
 ) -> None:
     async def fake(*args: Any, **kwargs: Any) -> RebuildReport:
         calls.rebuild.append({"args": args, **kwargs})
@@ -126,6 +147,7 @@ def patch_rebuild(
             wiped_nodes=1,
             outcome=outcome,
             recorded=RecordResult(1, 0),
+            record_error=record_error,
         )
 
     monkeypatch.setattr(cli, "rebuild_projections", fake)
@@ -396,11 +418,105 @@ def test_a_missing_or_invalid_configuration_is_a_usage_error(
 ) -> None:
     monkeypatch.delenv("AGENT_CONTEXT_POSTGRESQL__DSN")
     missing = run("projection", "status")
-    assert missing.exit_code == 2 and "POSTGRESQL__DSN" in missing.stderr
+    assert missing.exit_code == 2 and "PROJECTOR_DSN" in missing.stderr
 
     monkeypatch.setenv("AGENT_CONTEXT_NEO4J__URI", "ftp://wrong")
     invalid = run("projection", "status")
     assert invalid.exit_code == 2 and "invalid" in invalid.stderr
+
+
+def test_preflight_runs_before_any_work_and_a_missing_grant_exits_one(
+    monkeypatch: pytest.MonkeyPatch, calls: Calls
+) -> None:
+    patch_verify(monkeypatch, calls, verification())
+    patch_rebuild(monkeypatch, calls, ProjectionOutcome.COMPLETED)
+
+    run("projection", "verify")
+    run("projection", "verify", "--no-record")
+    run("projection", "rebuild", "--in-place", "--confirm", "neo4j")
+    run("projection", "rebuild", *TARGET, *USER, "--no-record")
+    assert calls.preflight == [(True, False), (False, False), (True, True), (False, False)]
+    assert calls.recording == [True, False, True, False]
+
+    calls.preflight_error = MissingGrantError("api", ["INSERT on ledger.events"])
+    calls.rebuild.clear()
+    calls.verify.clear()
+    for args in (
+        ("rebuild", *TARGET, *USER, "--wipe-target", "--confirm", "neo4j"),
+        ("rebuild", "--in-place", "--confirm", "neo4j"),
+        ("verify",),
+    ):
+        result = run("projection", *args)
+        assert result.exit_code == 1 and "INSERT on ledger.events" in result.stderr
+    assert calls.rebuild == [] and calls.verify == []
+
+
+def test_a_recording_failure_never_masks_the_verification_result(
+    monkeypatch: pytest.MonkeyPatch, calls: Calls
+) -> None:
+    patch_verify(monkeypatch, calls, verification(record_error="record_failed"))
+
+    machine = run("projection", "verify", "--json")
+    human = run("projection", "verify")
+
+    assert machine.exit_code == 1 and human.exit_code == 1
+    assert json.loads(machine.stdout)["record_error"] == "record_failed"
+    assert json.loads(machine.stdout)["ok"] is True
+    assert "recording failed: record_failed" in human.output and "verified" in human.output
+    assert "error: record_failed" in human.stderr
+
+
+def test_a_recording_failure_still_reports_the_verified_rebuild_target(
+    monkeypatch: pytest.MonkeyPatch, calls: Calls
+) -> None:
+    patch_rebuild(monkeypatch, calls, ProjectionOutcome.COMPLETED, record_error="record_failed")
+
+    machine = run("projection", "rebuild", *TARGET, *USER, "--json")
+    human = run("projection", "rebuild", *TARGET, *USER)
+
+    assert machine.exit_code == 1 and human.exit_code == 1
+    payload = json.loads(machine.stdout)
+    assert payload["verified_target"] == "standby.example.test:7687/neo4j"
+    assert payload["graph_digest"] == "d" * 64 and payload["record_error"] == "record_failed"
+    assert "verified target standby.example.test:7687/neo4j" in human.output
+    assert "error: record_failed" in human.stderr
+
+
+async def _open_real(settings: Any, *, record: bool) -> tuple[Any, Any]:
+    async with cli._runtime(settings, record=record) as runtime:
+        return runtime.sessions, runtime.recording_sessions
+
+
+def test_the_real_runtime_builds_one_engine_per_role_and_only_records_with_the_api_one(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    monkeypatch.setenv(
+        "AGENT_CONTEXT_POSTGRESQL__PROJECTOR_DSN", "postgresql+psycopg://projector:pw@db/agent"
+    )
+    settings = cli._load_settings()
+
+    projector_only = asyncio.run(_open_real(settings, record=False))
+    both = asyncio.run(_open_real(settings, record=True))
+
+    assert projector_only[1] is None and both[0] is not None and both[1] is not None
+
+
+def test_a_missing_dsn_for_a_needed_role_is_a_usage_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    monkeypatch.delenv("AGENT_CONTEXT_POSTGRESQL__DSN")
+    monkeypatch.setenv(
+        "AGENT_CONTEXT_POSTGRESQL__PROJECTOR_DSN", "postgresql+psycopg://projector:pw@db/agent"
+    )
+    settings = cli._load_settings()
+
+    assert asyncio.run(_open_real(settings, record=False))[1] is None
+    with pytest.raises(cli.CliUsageError, match="API_DSN"):
+        asyncio.run(_open_real(settings, record=True))
 
 
 def test_the_real_runtime_opens_lazily_and_closes(monkeypatch: pytest.MonkeyPatch) -> None:

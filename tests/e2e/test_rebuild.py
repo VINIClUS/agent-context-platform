@@ -38,10 +38,12 @@ from agent_context_sdk import (
 from integration.projection.conftest import neo4j_integration_settings, role_scoped_engine
 from integration.projection.projectors.fixtures import session_events
 from sqlalchemy import text
+from sqlalchemy.engine import make_url
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
 from sqlalchemy.pool import NullPool
 from typer.testing import CliRunner
 
+from agent_context_platform import cli
 from agent_context_platform.cli import TARGET_PASSWORD_ENV, app
 from agent_context_platform.content.service import ContentService
 from agent_context_platform.db import session_factory
@@ -291,11 +293,26 @@ class World:
     owner: AsyncEngine
     facts: GraphFacts
     event_count: int
+    roles: dict[str, str]
 
-    def env(self, *, live_uri: str | None = None) -> dict[str, str]:
+    def env(
+        self,
+        *,
+        live_uri: str | None = None,
+        projector: str = "projector",
+        api: str | None = "api",
+    ) -> dict[str, str]:
+        """The CLI environment: login roles that are members of the two migration roles.
+
+        There is deliberately no shared `AGENT_CONTEXT_POSTGRESQL__DSN` (the owner): the CLI must
+        work with the least-privilege roles alone.
+        """
         settings = neo4j_integration_settings()
+        postgres = {"AGENT_CONTEXT_POSTGRESQL__PROJECTOR_DSN": self.roles[projector]}
+        if api is not None:
+            postgres["AGENT_CONTEXT_POSTGRESQL__API_DSN"] = self.roles[api]
         return {
-            "AGENT_CONTEXT_POSTGRESQL__DSN": self.dsn,
+            **postgres,
             "AGENT_CONTEXT_NEO4J__URI": live_uri or str(settings.uri),
             "AGENT_CONTEXT_NEO4J__USERNAME": settings.username or "",
             "AGENT_CONTEXT_NEO4J__PASSWORD": settings.password.get_secret_value()
@@ -304,11 +321,11 @@ class World:
             "AGENT_CONTEXT_NEO4J__DATABASE": settings.database,
         }
 
-    def target_env(self, *, live_uri: str | None) -> dict[str, str]:
+    def target_env(self, *, live_uri: str | None, **roles: Any) -> dict[str, str]:
         settings = neo4j_integration_settings()
         assert settings.password is not None
         return {
-            **self.env(live_uri=live_uri),
+            **self.env(live_uri=live_uri, **roles),
             TARGET_PASSWORD_ENV: settings.password.get_secret_value(),
         }
 
@@ -411,7 +428,63 @@ async def build_ledger(dsn: str, root: Path) -> int:
 
 
 @pytest.fixture(scope="module")
-def world(postgres_dsn: str, ledger_engine: AsyncEngine, tmp_path_factory: Any) -> Iterator[World]:
+def login_roles(postgres_dsn: str, ledger_engine: AsyncEngine) -> Iterator[dict[str, str]]:
+    """LOGIN roles that are members of the real migration roles; dropped before the downgrade.
+
+    `projector` and `api` are the roles the CLI needs. `readonly` (projector membership only) has
+    no INSERT on the ledger and `apionly` (API membership only) cannot read checkpoints: each is
+    the connection that is missing a grant in the preflight tests.
+    """
+    suffix = uuid.uuid4().hex[:8]
+    members = {
+        "projector": "agent_context_projector",
+        "api": "agent_context_api",
+        "readonly": "agent_context_projector",
+        "apionly": "agent_context_api",
+    }
+    password = uuid.uuid4().hex
+    base = make_url(postgres_dsn)
+    names = {key: f"e2e_{key}_{suffix}" for key in members}
+
+    async def create() -> None:
+        engine = create_async_engine(postgres_dsn, poolclass=NullPool, isolation_level="AUTOCOMMIT")
+        try:
+            async with engine.connect() as connection:
+                for key, parent in members.items():
+                    await connection.execute(
+                        text(
+                            f"CREATE ROLE {names[key]} LOGIN PASSWORD '{password}' IN ROLE {parent}"
+                        )
+                    )
+        finally:
+            await engine.dispose()
+
+    async def drop() -> None:
+        engine = create_async_engine(postgres_dsn, poolclass=NullPool, isolation_level="AUTOCOMMIT")
+        try:
+            async with engine.connect() as connection:
+                for name in names.values():
+                    await connection.execute(text(f"DROP ROLE IF EXISTS {name}"))
+        finally:
+            await engine.dispose()
+
+    asyncio.run(create())
+    try:
+        yield {
+            key: base.set(username=name, password=password).render_as_string(hide_password=False)
+            for key, name in names.items()
+        }
+    finally:
+        asyncio.run(drop())
+
+
+@pytest.fixture(scope="module")
+def world(
+    postgres_dsn: str,
+    ledger_engine: AsyncEngine,
+    login_roles: dict[str, str],
+    tmp_path_factory: Any,
+) -> Iterator[World]:
     """Step 1: project the realistic ledger with the real runner and record the graph facts."""
     root = tmp_path_factory.mktemp("g3-repo")
     count = asyncio.run(build_ledger(postgres_dsn, root))
@@ -429,7 +502,7 @@ def world(postgres_dsn: str, ledger_engine: AsyncEngine, tmp_path_factory: Any) 
         sql(owner, "SELECT count(*) FROM projection.outbox WHERE status <> 'delivered'")
     )
     assert pending[0][0] == 0
-    yield World(postgres_dsn, owner, facts, count)
+    yield World(postgres_dsn, owner, facts, count, login_roles)
     asyncio.run(owner.dispose())
 
 
@@ -629,6 +702,91 @@ def test_the_installed_entry_point_runs_the_cli(world: World) -> None:
     payload = json.loads(completed.stdout)
     assert payload["ok"] and payload["graph"]["digest"] == world.facts.digest
     assert urlsplit(str(neo4j_integration_settings().uri)).netloc not in completed.stderr
+
+
+def test_projector_only_connection_is_enough_when_nothing_is_recorded(world: World) -> None:
+    """Record off needs no API connection at all (and no shared DSN)."""
+    env = world.env(api=None)
+
+    verified = invoke(["projection", "verify", "--no-record", "--json"], env)
+    assert verified.exit_code == 0, verified.output
+    standby = invoke(
+        [
+            "projection",
+            "rebuild",
+            *world.target_args(),
+            "--wipe-target",
+            "--confirm",
+            "neo4j",
+            "--no-record",
+            "--json",
+        ],
+        world.target_env(live_uri="bolt://live.invalid:7687", api=None),
+    )
+    assert standby.exit_code == 0, standby.output
+    assert report(standby)["recorded"] is None and not report(standby)["record_error"]
+    in_place = invoke(
+        ["projection", "rebuild", "--in-place", "--confirm", "neo4j", "--no-record", "--json"], env
+    )
+    assert in_place.exit_code == 0, in_place.output
+    assert report(in_place)["graph_digest"] == world.facts.digest
+    # Recording is required by default, and its connection is a different one.
+    assert invoke(["projection", "verify"], env).exit_code == 2
+
+
+def test_a_missing_grant_fails_before_any_target_is_wiped_or_checkpoint_reset(world: World) -> None:
+    live = "bolt://live.invalid:7687"
+    checkpoints = asyncio.run(sql(world.owner, "SELECT * FROM projection.projection_checkpoints"))
+    wipe = ["projection", "rebuild", *world.target_args(), "--wipe-target", "--confirm", "neo4j"]
+
+    # The API connection cannot insert into the ledger: recording would fail after the wipe.
+    standby = invoke(wipe, world.target_env(live_uri=live, api="readonly"))
+    assert standby.exit_code == 1 and "api connection lacks" in standby.stderr
+    assert "INSERT on ledger.events" in standby.stderr
+    in_place = invoke(
+        ["projection", "rebuild", "--in-place", "--confirm", "neo4j"], world.env(api="readonly")
+    )
+    assert in_place.exit_code == 1 and "api connection lacks" in in_place.stderr
+    # The projector connection cannot read checkpoints.
+    blind = invoke(["projection", "verify"], world.env(projector="apionly"))
+    assert blind.exit_code == 1 and "projector connection lacks" in blind.stderr
+    assert "SELECT on projection.projection_checkpoints" in blind.stderr
+
+    assert asyncio.run(graph_facts()) == world.facts  # nothing was wiped
+    assert (
+        asyncio.run(sql(world.owner, "SELECT * FROM projection.projection_checkpoints"))
+        == checkpoints
+    )
+    for secret in world.roles.values():
+        assert secret.split(":")[2].split("@")[0] not in standby.stderr + blind.stderr
+
+
+def test_a_recording_failure_does_not_mask_a_verified_rebuild(
+    world: World, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    class Broken:
+        async def record(self, _runs: Any) -> Any:
+            raise RuntimeError("the ledger refused it")
+
+    monkeypatch.setattr(cli, "_recorder", lambda _runtime: Broken())
+    args = [
+        "projection",
+        "rebuild",
+        *world.target_args(),
+        "--wipe-target",
+        "--confirm",
+        "neo4j",
+        "--json",
+    ]
+
+    result = invoke(args, world.target_env(live_uri="bolt://live.invalid:7687"))
+
+    assert result.exit_code == 1
+    payload = json.loads(result.stdout)
+    assert payload["record_error"] == "record_failed" and payload["ok"]
+    assert payload["verified_target"] and payload["graph_digest"] == world.facts.digest
+    assert "error: record_failed" in result.stderr and "refused" not in result.output
+    assert asyncio.run(graph_facts()) == world.facts
 
 
 def test_the_digest_scales_and_ignores_batch_size(world: World) -> None:

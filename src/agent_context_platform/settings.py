@@ -50,8 +50,20 @@ class PostgreSQLSettings(BaseModel):
     model_config = _SECTION_CONFIG
 
     dsn: Secret[PostgresDsn] | None = Field(default=None, repr=False)
+    # Least-privilege login roles for the operator CLI (members of `agent_context_projector` and
+    # `agent_context_api`); each falls back to `dsn` when unset.
+    projector_dsn: Secret[PostgresDsn] | None = Field(default=None, repr=False)
+    api_dsn: Secret[PostgresDsn] | None = Field(default=None, repr=False)
 
-    @field_validator("dsn")
+    @property
+    def effective_projector_dsn(self) -> Secret[PostgresDsn] | None:
+        return self.projector_dsn or self.dsn
+
+    @property
+    def effective_api_dsn(self) -> Secret[PostgresDsn] | None:
+        return self.api_dsn or self.dsn
+
+    @field_validator("dsn", "projector_dsn", "api_dsn")
     @classmethod
     def require_async_psycopg_database(
         cls, dsn: Secret[PostgresDsn] | None
