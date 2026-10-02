@@ -56,10 +56,11 @@ def drive(
 ) -> cli.WorkerTotals:
     calls = 0
 
-    async def probe() -> bool:
+    @asynccontextmanager
+    async def probe() -> AsyncIterator[bool]:
         nonlocal calls
         calls += 1
-        return held(calls)
+        yield held(calls)
 
     async def main() -> cli.WorkerTotals:
         return await cli._drive_worker(
@@ -163,14 +164,82 @@ def test_progress_lines_are_content_free_counts() -> None:
     assert progress and all(" lag=" in line and "dead_lettered=" in line for line in progress)
 
 
+def test_the_rebuild_lock_is_held_for_the_whole_batch_and_released_after() -> None:
+    events: list[str] = []
+
+    @asynccontextmanager
+    async def guard() -> AsyncIterator[bool]:
+        events.append("lock")
+        try:
+            yield False
+        finally:
+            events.append("unlock")
+
+    class Runner(FakeRunner):
+        async def run_once(self, limit: int) -> ProjectionRunReport:
+            events.append("batch")
+            return ProjectionRunReport(claimed=int(events.count("batch") == 1), delivered=1)
+
+    async def main() -> None:
+        await cli._drive_worker(
+            Runner([]),
+            guard,
+            asyncio.Event(),
+            once=True,
+            batch_size=1,
+            poll_seconds=0.01,
+            max_seconds=None,
+            log_seconds=3600.0,
+            touch=lambda: None,
+            log=lambda _message: None,
+        )
+
+    asyncio.run(main())
+    assert events[:3] == ["lock", "batch", "unlock"]
+
+
+def test_the_lock_is_released_when_the_batch_raises() -> None:
+    events: list[str] = []
+
+    @asynccontextmanager
+    async def guard() -> AsyncIterator[bool]:
+        try:
+            yield False
+        finally:
+            events.append("unlock")
+
+    class Boom(FakeRunner):
+        async def run_once(self, limit: int) -> ProjectionRunReport:
+            raise RuntimeError("batch failed")
+
+    async def main() -> None:
+        await cli._drive_worker(
+            Boom([]),
+            guard,
+            asyncio.Event(),
+            once=True,
+            batch_size=1,
+            poll_seconds=0.01,
+            max_seconds=None,
+            log_seconds=3600.0,
+            touch=lambda: None,
+            log=lambda _message: None,
+        )
+
+    with pytest.raises(RuntimeError):
+        asyncio.run(main())
+    assert events == ["unlock"]
+
+
 def test_a_stop_during_a_slow_probe_claims_nothing_more() -> None:
     stop = asyncio.Event()
     runner = FakeRunner([ProjectionRunReport(claimed=1, delivered=1)])
 
-    async def slow_probe() -> bool:
+    @asynccontextmanager
+    async def slow_probe() -> AsyncIterator[bool]:
         await asyncio.sleep(0.01)  # the signal lands while the probe is in flight
         stop.set()
-        return False
+        yield False
 
     async def main() -> cli.WorkerTotals:
         return await cli._drive_worker(
@@ -194,9 +263,10 @@ def test_a_deadline_reached_during_a_slow_probe_claims_nothing_more() -> None:
     clock = [0.0]
     runner = FakeRunner([ProjectionRunReport(claimed=1, delivered=1)])
 
-    async def slow_probe() -> bool:
+    @asynccontextmanager
+    async def slow_probe() -> AsyncIterator[bool]:
         clock[0] = 10.0  # the deadline passes while the probe is in flight
-        return False
+        yield False
 
     async def main() -> cli.WorkerTotals:
         return await cli._drive_worker(

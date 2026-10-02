@@ -25,8 +25,8 @@ import signal
 import stat
 import sys
 import time
-from collections.abc import AsyncIterator, Awaitable, Callable, Coroutine, Sequence
-from contextlib import asynccontextmanager
+from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
+from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import asdict, dataclass
 from datetime import UTC, datetime
 from pathlib import Path
@@ -638,28 +638,43 @@ def _idle_delay(poll_seconds: float, idle_polls: int) -> float:
     )
 
 
-async def _rebuild_in_progress(sessions: async_sessionmaker[AsyncSession]) -> bool:
-    """Whether a rebuild holds the P039 rebuild lock, without waiting for it (FU-62).
+@asynccontextmanager
+async def _shared_rebuild_lock(
+    sessions: async_sessionmaker[AsyncSession],
+) -> AsyncIterator[bool]:
+    """Hold the rebuild lock SHARED for the body; yield whether a rebuild blocks us (FU-62).
 
-    A rebuild takes the exclusive session-level lock; a shared try-lock fails exactly while that
-    is held. A free lock is released again at once, on the same connection, so the probe never
-    blocks a rebuild for longer than the round trip.
+    A rebuild takes the exclusive session-level lock, so a shared try-lock fails exactly while one
+    is held (yield True, nothing held). Otherwise the shared lock stays held on this dedicated
+    connection for the whole body (a claim and its batch), and is released afterwards, also on a
+    stop or an error: a rebuild's exclusive try-lock is refused meanwhile, which is retryable.
+    Workers share the lock with each other.
     """
     async with sessions() as session:
-        free = await session.scalar(
-            text("SELECT pg_try_advisory_lock_shared(:key)"), {"key": REBUILD_LOCK_KEY}
-        )
-        if free:
+        free = bool(
             await session.scalar(
-                text("SELECT pg_advisory_unlock_shared(:key)"), {"key": REBUILD_LOCK_KEY}
+                text("SELECT pg_try_advisory_lock_shared(:key)"), {"key": REBUILD_LOCK_KEY}
             )
-        await session.rollback()
-        return not free
+        )
+        try:
+            yield not free
+        finally:
+            if free:
+                try:
+                    await session.rollback()  # session-level: the lock survives the rollback
+                    await session.scalar(
+                        text("SELECT pg_advisory_unlock_shared(:key)"), {"key": REBUILD_LOCK_KEY}
+                    )
+                except BaseException:
+                    # Never hand a connection that may still hold the lock back to the pool.
+                    await session.invalidate()
+                    raise
+            await session.rollback()
 
 
 async def _drive_worker(
     runner: _WorkerRunner,
-    rebuild_held: Callable[[], Awaitable[bool]],
+    rebuild_guard: Callable[[], AbstractAsyncContextManager[bool]],
     stop: asyncio.Event,
     *,
     once: bool,
@@ -673,7 +688,8 @@ async def _drive_worker(
 ) -> WorkerTotals:
     """Poll the outbox until drained (`once`), timed out or told to stop.
 
-    Each iteration: pause while a rebuild holds its lock, else claim and project one batch. A
+    Each iteration: pause while a rebuild holds its lock, else claim and project one batch with
+    the lock held shared throughout. A
     batch is always finished (never abandoned mid-way), so a stop request leaves no lease behind.
     """
     totals = WorkerTotals()
@@ -692,7 +708,20 @@ async def _drive_worker(
             totals.outcome = "timeout"
             return totals
         totals.iterations += 1
-        if await rebuild_held():
+        # The shared rebuild lock is held from before the claim until the batch is finalized.
+        async with rebuild_guard() as blocked:
+            if not blocked:
+                if paused:
+                    log("resumed_after_rebuild")
+                    paused = False
+                # Entering the guard is a round trip: a stop or the deadline may have arrived.
+                if stop.is_set():
+                    break
+                if max_seconds is not None and now() - started >= max_seconds:
+                    totals.outcome = "timeout"
+                    return totals
+                report = await runner.run_once(batch_size)
+        if blocked:
             if not paused:
                 log("paused_for_rebuild")
                 paused = True
@@ -700,16 +729,6 @@ async def _drive_worker(
             touch()
             await nap(poll_seconds)
             continue
-        if paused:
-            log("resumed_after_rebuild")
-            paused = False
-        # The probe is a round trip: a stop or the deadline may have arrived during it.
-        if stop.is_set():
-            break
-        if max_seconds is not None and now() - started >= max_seconds:
-            totals.outcome = "timeout"
-            return totals
-        report = await runner.run_once(batch_size)
         totals.add(report)
         touch()
         if report.claimed:
@@ -823,7 +842,7 @@ def run_command(
                 try:
                     totals = await _drive_worker(
                         runner,
-                        lambda: _rebuild_in_progress(runtime.sessions),
+                        lambda: _shared_rebuild_lock(runtime.sessions),
                         stop,
                         once=once,
                         batch_size=batch_size,

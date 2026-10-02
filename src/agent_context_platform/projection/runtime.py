@@ -106,14 +106,13 @@ class ProjectionRunReport:
 
 @dataclass(frozen=True, slots=True)
 class OutboxBacklog:
-    """Outbox row counts by status: what a long-running worker reports as lag.
+    """Counts of the outbox rows that are not delivered: what a long-running worker reports as lag.
 
     `pending` includes rows still waiting out a retry backoff, which are not claimable yet.
     """
 
     pending: int = 0
     leased: int = 0
-    delivered: int = 0
     dead_lettered: int = 0
 
     @property
@@ -248,16 +247,26 @@ class ProjectionRunner:
         )
 
     async def backlog(self) -> OutboxBacklog:
-        """Count the outbox rows by status (a single read; content-free)."""
+        """Count the pending, leased and dead-lettered rows (content-free).
+
+        Delivered rows, the bulk of the table, are never counted: the status filter is served by
+        `ix_outbox_status` (status, available_at, outbox_id), so the cost follows the backlog and
+        not the total number of events.
+        """
         async with self._session_factory() as session:
             rows = await session.execute(
-                select(OutboxRow.status, func.count()).group_by(OutboxRow.status)
+                select(OutboxRow.status, func.count())
+                .where(
+                    OutboxRow.status.in_(
+                        (OutboxStatus.PENDING, OutboxStatus.LEASED, OutboxStatus.DEAD_LETTERED)
+                    )
+                )
+                .group_by(OutboxRow.status)
             )
             counts = {OutboxStatus(status): int(count) for status, count in rows.all()}
         return OutboxBacklog(
             pending=counts.get(OutboxStatus.PENDING, 0),
             leased=counts.get(OutboxStatus.LEASED, 0),
-            delivered=counts.get(OutboxStatus.DELIVERED, 0),
             dead_lettered=counts.get(OutboxStatus.DEAD_LETTERED, 0),
         )
 

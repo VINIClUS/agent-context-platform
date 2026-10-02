@@ -118,9 +118,12 @@ agent-context projection rebuild --in-place --confirm neo4j   # stop the project
   delivered, retried, dead-lettered, per-projector checkpoints; `--json` for JSON on stdout) and
   exits `0`; it exits `1` if any event was dead-lettered during the run, or when `--max-seconds`
   (approximate: checked once per loop iteration) expires (`outcome: timeout`), or when SIGTERM/SIGINT interrupts it before it has drained (`outcome: interrupted`), and `2` on a usage error. E2E scenarios use `run --once` to project
-  deterministically. Before every claim the worker probes the rebuild advisory lock
-  (`pg_try_advisory_lock_shared`, same key as `rebuild`); while a rebuild holds it, nothing is
-  claimed and `paused_for_rebuild` is logged, and claiming resumes when it is released.
+  deterministically. The worker takes the rebuild advisory lock
+  SHARED (`pg_try_advisory_lock_shared`, same key as `rebuild`) before each claim and holds it
+  until that batch is finalized, so a claim never overlaps a rebuild. While a rebuild holds the
+  lock, nothing is claimed and `paused_for_rebuild` is logged; claiming resumes when it is
+  released. Conversely a rebuild started while a batch is in flight is refused ("another rebuild
+  holds the lock", exit `1`) and can simply be retried.
   `--health-file <path>` is touched after every loop iteration (a paused one too) and removed on
   shutdown. For a container healthcheck, use the file age; a Compose service with the default
   `--poll-seconds` can use
