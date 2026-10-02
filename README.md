@@ -117,7 +117,7 @@ agent-context projection rebuild --in-place --confirm neo4j   # stop the project
   retry delays so a poison event reaches the dead-letter queue, then prints a summary (claimed,
   delivered, retried, dead-lettered, per-projector checkpoints; `--json` for JSON on stdout) and
   exits `0`; it exits `1` if any event was dead-lettered during the run, or when `--max-seconds`
-  expires (`outcome: timeout`), and `2` on a usage error. E2E scenarios use `run --once` to project
+  (approximate: checked once per loop iteration) expires (`outcome: timeout`), or when SIGTERM/SIGINT interrupts it before it has drained (`outcome: interrupted`), and `2` on a usage error. E2E scenarios use `run --once` to project
   deterministically. Before every claim the worker probes the rebuild advisory lock
   (`pg_try_advisory_lock_shared`, same key as `rebuild`); while a rebuild holds it, nothing is
   claimed and `paused_for_rebuild` is logged, and claiming resumes when it is released.

@@ -595,7 +595,7 @@ class WorkerTotals:
     lost_leases: int = 0
     iterations: int = 0
     paused_for_rebuild: int = 0
-    outcome: str = "stopped"  # drained | timeout | stopped
+    outcome: str = "stopped"  # drained | timeout | stopped | interrupted
 
     def add(self, report: ProjectionRunReport) -> None:
         self.claimed += report.claimed
@@ -618,12 +618,12 @@ def build_projectors(settings: Settings) -> tuple[Projector, ...]:
 
 
 def _worker_exit_code(totals: WorkerTotals, *, once: bool) -> int:
-    """1 when `--max-seconds` ran out, or (`--once` only) an event was dead-lettered; else 0.
+    """1 on timeout, an interrupted `--once`, or (`--once` only) a dead-lettered event; else 0.
 
     A long-running worker that is told to stop exits 0 whatever it dead-lettered meanwhile: a
     routine deploy stop must not look like a failure.
     """
-    if totals.outcome == "timeout" or (once and totals.dead_lettered):
+    if totals.outcome in {"timeout", "interrupted"} or (once and totals.dead_lettered):
         return EXIT_FAILED
     return EXIT_OK
 
@@ -729,6 +729,8 @@ async def _drive_worker(
                 f"dead_lettered={totals.dead_lettered} lag={backlog.outstanding} "
                 f"leased={backlog.leased} dead_letters_total={backlog.dead_lettered}"
             )
+    # Only a stop request leaves the loop here: a `--once` drain cut short is not a drain.
+    totals.outcome = "interrupted" if once else "stopped"
     return totals
 
 
@@ -784,7 +786,7 @@ def run_command(
     Without `--once` it runs until SIGTERM or SIGINT: it stops claiming, finishes the batch in
     hand (no lease outlives the process), closes its connections and exits 0. With `--once` it
     drains the outbox and exits 0, or 1 when an event was dead-lettered during the run, or on
-    `--max-seconds` expiring (`timeout`). Pauses (`paused_for_rebuild`) while a rebuild holds the
+    `--max-seconds` expiring (`timeout`), or when SIGTERM/SIGINT cuts it short (`interrupted`). Pauses (`paused_for_rebuild`) while a rebuild holds the
     rebuild lock. Uses the projector role. Progress and the summary are counts only; never a DSN
     or event content.
     """

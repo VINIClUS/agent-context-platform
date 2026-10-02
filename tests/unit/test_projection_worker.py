@@ -320,3 +320,19 @@ def test_the_worker_builds_its_projectors_through_one_factory(
     monkeypatch.setattr(cli, "build_projectors", lambda settings: built.append(settings) or ())
     assert CliRunner().invoke(cli.app, ["projection", "run", "--once"]).exit_code == 0
     assert len(built) == 1
+
+
+def test_an_interrupted_once_exits_1_and_is_not_a_drain() -> None:
+    stop = asyncio.Event()
+
+    class StoppingRunner(FakeRunner):
+        async def run_once(self, limit: int) -> ProjectionRunReport:
+            stop.set()
+            return ProjectionRunReport(claimed=1, delivered=1)
+
+        async def backlog(self) -> OutboxBacklog:
+            return OutboxBacklog(pending=5)
+
+    totals = drive(StoppingRunner([]), stop=stop, once=True)
+    assert totals.outcome == "interrupted"
+    assert cli._worker_exit_code(totals, once=True) == cli.EXIT_FAILED
