@@ -31,7 +31,8 @@ Contract
   `(kind, node_id)` order.
 - Evidence: every node and edge has an `EvidenceRef` (see below). Only resolved, current edges are
   returned unless `include_alternatives=True`, which adds the assertions that lost to the winning
-  evidence (`lower_evidence`) or are no longer current (`not_current`) between the returned nodes.
+  evidence (`lower_evidence`) or are no longer current (`not_current`) between the returned nodes. Losers
+  are read from P038's stored flags, never inferred from the capped output.
 
 Mapping to the SDK `EvidenceRefV1` (PLATFORM-043)
 -------------------------------------------------
@@ -161,7 +162,7 @@ class GraphAlternative:
     predicate: str
     subject_id: str
     object_id: str
-    status: str  # lower_evidence | not_current | unresolved
+    status: str  # lower_evidence | not_current
     current: bool
     evidence: EvidenceRef
 
@@ -229,7 +230,8 @@ _RESOLVE: Final[LiteralString] = (
     "MATCH (n:Repository {repository_id: $id}) WHERE n.repository_id = $repository_id "
     "RETURN 'repository' AS kind "
     "UNION MATCH (n:Module {module_id: $id}) WHERE n.repository_id = $repository_id "
-    "AND EXISTS { (n)<-[:IN_MODULE]-(:File {current: true}) } RETURN 'module' AS kind "
+    "AND EXISTS { (n)<-[:IN_MODULE]-(:File {current: true, repository_id: $repository_id}) } "
+    "RETURN 'module' AS kind "
     "UNION MATCH (n:File {file_id: $id}) "
     "WHERE n.repository_id = $repository_id AND n.current = true RETURN 'file' AS kind "
     "UNION MATCH (n:Symbol {symbol_id: $id}) "
@@ -276,7 +278,8 @@ _STEP: Final[dict[tuple[_Mode, NodeKind], LiteralString]] = {
     (_Mode.NEIGHBORHOOD, NodeKind.REPOSITORY): (
         "MATCH (a)<-[:IN_REPOSITORY]-(n) WHERE n.repository_id = $repository_id "
         "AND ((n:File AND n.current = true) "
-        "OR (n:Module AND EXISTS { (n)<-[:IN_MODULE]-(:File) })) "
+        "OR (n:Module AND EXISTS { "
+        "(n)<-[:IN_MODULE]-(:File {current: true, repository_id: $repository_id}) })) "
     ),
     (_Mode.CALLERS, NodeKind.SYMBOL): "MATCH (a)<-[:CALLS]-(n) " + _CURRENT_CODE,
     (_Mode.CALLERS, NodeKind.FILE): "MATCH (a)<-[:CALLS]-(n) " + _CURRENT_CODE,
@@ -299,8 +302,8 @@ def _edge_query(label: LiteralString, key: LiteralString, types: LiteralString) 
         f"MATCH (a:{label}) WHERE a.{key} IN $ids AND a.repository_id = $repository_id "
         f"MATCH (a)-[r:{types}]->(b) "
         f"WHERE b.repository_id = $repository_id AND {_END_ID} IN $ids "
-        "OPTIONAL MATCH (x:Assertion {assertion_id: r.resolved_assertion_id})"
-        "-[:OBSERVED_IN]->(fr:FileRevision) "
+        "OPTIONAL MATCH (x:Assertion {assertion_id: r.resolved_assertion_id, "
+        "repository_id: $repository_id})-[:OBSERVED_IN]->(fr:FileRevision) "
         f"WITH a, b, r, collect(fr.file_revision_id) AS revisions "
         f"RETURN type(r) AS type, a.{key} AS source_id, {_END_ID} AS target_id, "
         "properties(r) AS props, revisions ORDER BY type, source_id, target_id LIMIT $limit"
@@ -332,7 +335,8 @@ _NODE_EVIDENCE: Final[dict[NodeKind, LiteralString]] = {
         "rev.symbol_revision_id AS revision_id, rev.extractor_name AS extractor_name, "
         "rev.extractor_version AS extractor_version, h.valid_from AS valid_from, "
         "h.valid_to AS valid_to, "
-        "[(n)-[i:IN_REPOSITORY]->() | i.source_event_ids] "
+        "[(n)-[i:IN_REPOSITORY]->(:Repository {repository_id: $repository_id}) "
+        "| i.source_event_ids] "
         "+ [(rev)-[d:DEFINED_IN]->() | d.source_event_ids] AS events"
     ),
     NodeKind.FILE: (
@@ -343,28 +347,43 @@ _NODE_EVIDENCE: Final[dict[NodeKind, LiteralString]] = {
         "rev.file_revision_id AS revision_id, rev.extractor_name AS extractor_name, "
         "rev.extractor_version AS extractor_version, h.valid_from AS valid_from, "
         "h.valid_to AS valid_to, "
-        "[(n)-[i:IN_REPOSITORY]->() | i.source_event_ids] "
-        "+ [(rev)-[m:MEMBER_OF]->() | m.source_event_ids] AS events"
+        "[(n)-[i:IN_REPOSITORY]->(:Repository {repository_id: $repository_id}) "
+        "| i.source_event_ids] "
+        "+ [(rev)-[m:MEMBER_OF]->(:Commit|WorkspaceSnapshot {repository_id: $repository_id}) "
+        "| m.source_event_ids] AS events"
     ),
     NodeKind.MODULE: (
         "MATCH (n:Module) WHERE n.module_id IN $ids AND n.repository_id = $repository_id "
         "RETURN n.module_id AS node_id, null AS name, null AS revision_id, "
         "null AS extractor_name, null AS extractor_version, null AS valid_from, "
-        "null AS valid_to, [(n)-[i:IN_REPOSITORY]->() | i.source_event_ids] AS events"
+        "null AS valid_to, "
+        "[(n)-[i:IN_REPOSITORY]->(:Repository {repository_id: $repository_id}) "
+        "| i.source_event_ids] AS events"
     ),
     NodeKind.REPOSITORY: (
         "MATCH (n:Repository) WHERE n.repository_id IN $ids "
         "AND n.repository_id = $repository_id "
         "RETURN n.repository_id AS node_id, null AS name, null AS revision_id, "
         "null AS extractor_name, null AS extractor_version, null AS valid_from, "
-        "null AS valid_to, [(n)-[i:INDEXED]->() | i.source_event_ids] AS events"
+        "null AS valid_to, "
+        "[(n)-[i:INDEXED]->(:Commit|WorkspaceSnapshot {repository_id: $repository_id}) "
+        "| i.source_event_ids] AS events"
     ),
 }
 
+# A loser is read from what P038 stored, never inferred from the (capped) output: a non-current
+# assertion, or a current one listed in `lower_evidence_assertion_ids` of the resolved edge of its
+# own triple. The resolved winner is on neither list, so it can never be reported as an alternative.
 _ALTERNATIVES: Final[LiteralString] = (
     "MATCH (a:Assertion {repository_id: $repository_id, family: 'relation'}) "
     "WHERE a.subject_id IN $ids AND a.object_id IN $ids AND a.predicate IN $predicates "
-    "AND NOT a.assertion_id IN $winners "
+    "AND (a.current IS NULL OR a.current = false "
+    "OR EXISTS { (s:Symbol {symbol_id: a.subject_id, repository_id: $repository_id})"
+    "-[r]->(o:Symbol {symbol_id: a.object_id, repository_id: $repository_id}) "
+    "WHERE type(r) = a.predicate AND a.assertion_id IN r.lower_evidence_assertion_ids } "
+    "OR EXISTS { (s:File {file_id: a.subject_id, repository_id: $repository_id})"
+    "-[r]->(o:Symbol {symbol_id: a.object_id, repository_id: $repository_id}) "
+    "WHERE type(r) = a.predicate AND a.assertion_id IN r.lower_evidence_assertion_ids }) "
     "RETURN a.assertion_id AS assertion_id, a.predicate AS predicate, "
     "a.subject_id AS subject_id, a.object_id AS object_id, a.current AS current, "
     "properties(a) AS props, "
@@ -397,8 +416,9 @@ def _path_query(
         "WITH p, ns, [x IN ns | coalesce(x.symbol_id, x.file_id)] AS ids "
         "RETURN ids, [x IN ns | labels(x)[0]] AS labels, "
         "[r IN relationships(p) | {type: type(r), props: properties(r), "
-        "revisions: [(x:Assertion {assertion_id: r.resolved_assertion_id})"
-        "-[:OBSERVED_IN]->(fr:FileRevision) | fr.file_revision_id]}] AS rels "
+        "revisions: [(x:Assertion {assertion_id: r.resolved_assertion_id, "
+        "repository_id: $repository_id})-[:OBSERVED_IN]->(fr:FileRevision) "
+        "| fr.file_revision_id]}] AS rels "
         "ORDER BY length(p), ids LIMIT $limit"
     )
 
@@ -413,39 +433,51 @@ _PATHS: Final[dict[tuple[NodeKind, NodeKind, int], LiteralString]] = {
 
 _IMPORT_TAIL: Final[LiteralString] = (
     "UNWIND subjects AS s MATCH (s)-[r:IMPORTS]->(t:Symbol) "
-    "WHERE t.repository_id = $repository_id AND t.current = true "
-    "OPTIONAL MATCH (x:Assertion {assertion_id: r.resolved_assertion_id})"
-    "-[:OBSERVED_IN]->(fr:FileRevision) "
+    "WHERE s.repository_id = $repository_id AND t.repository_id = $repository_id "
+    "AND t.current = true "
+    "OPTIONAL MATCH (x:Assertion {assertion_id: r.resolved_assertion_id, "
+    "repository_id: $repository_id})-[:OBSERVED_IN]->(fr:FileRevision) "
     "WITH s, r, t, collect(fr.file_revision_id) AS revisions "
     "RETURN coalesce(s.symbol_id, s.file_id) AS source_id, t.symbol_id AS target_id, "
     "properties(r) AS props, revisions ORDER BY target_id, source_id LIMIT $limit"
 )
+# The subjects of an import query (the anchor's files and the symbols they define) are cut inside
+# the database, so memory is bounded by the cap and not by the anchor's size. Each cut is paired
+# with `_MEMBERS_CUT`, the same walk with one row more: when it sees more than the cap, the
+# result is `truncated` even if the cut subjects have no imports left to show.
+_FILE_SUBJECTS: Final[LiteralString] = (
+    "MATCH (f:File {file_id: $id}) WHERE f.repository_id = $repository_id "
+    "AND f.current = true "
+    "OPTIONAL MATCH (f)-[:DEFINES]->(d:Symbol) "
+    "WHERE d.repository_id = $repository_id AND d.current = true "
+)
+_MODULE_SUBJECTS: Final[LiteralString] = (
+    "MATCH (m:Module {module_id: $id}) WHERE m.repository_id = $repository_id "
+    "MATCH (m)<-[:IN_MODULE]-(f:File) "
+    "WHERE f.repository_id = $repository_id AND f.current = true "
+    "WITH f ORDER BY f.file_id LIMIT {FILES} "
+    "OPTIONAL MATCH (f)-[:DEFINES]->(d:Symbol) "
+    "WHERE d.repository_id = $repository_id AND d.current = true "
+)
 _IMPORTS: Final[dict[NodeKind, LiteralString]] = {
     NodeKind.FILE: (
-        "MATCH (f:File {file_id: $id}) WHERE f.repository_id = $repository_id "
-        "AND f.current = true OPTIONAL MATCH (f)-[:DEFINES]->(d:Symbol) WHERE d.current = true "
+        _FILE_SUBJECTS + "WITH f, d ORDER BY d.symbol_id LIMIT 500 "
         "WITH f, collect(d) + [f] AS subjects " + _IMPORT_TAIL
     ),
     NodeKind.MODULE: (
-        "MATCH (m:Module {module_id: $id}) WHERE m.repository_id = $repository_id "
-        # Members are cut inside the database (500 files, then 500 file/symbol rows), so memory
-        # is bounded by the cap and not by the module size.
-        "MATCH (m)<-[:IN_MODULE]-(f:File) WHERE f.current = true "
-        "WITH f ORDER BY f.file_id LIMIT 500 "
-        "OPTIONAL MATCH (f)-[:DEFINES]->(d:Symbol) WHERE d.current = true "
-        "WITH f, d ORDER BY f.file_id, d.symbol_id LIMIT 500 "
-        "WITH collect(DISTINCT f) + collect(DISTINCT d) AS subjects " + _IMPORT_TAIL
+        _MODULE_SUBJECTS.replace("{FILES}", "500") + "WITH f, d ORDER BY f.file_id, d.symbol_id "
+        "LIMIT 500 WITH collect(DISTINCT f) + collect(DISTINCT d) AS subjects " + _IMPORT_TAIL
     ),
 }
-# Same cut as `_IMPORTS[MODULE]` but one row further, so the cap being exceeded is observable.
-_MODULE_MEMBERS_CUT: Final[LiteralString] = (
-    "MATCH (m:Module {module_id: $id}) WHERE m.repository_id = $repository_id "
-    "MATCH (m)<-[:IN_MODULE]-(f:File) WHERE f.current = true "
-    "WITH f ORDER BY f.file_id LIMIT 501 "
-    "OPTIONAL MATCH (f)-[:DEFINES]->(d:Symbol) WHERE d.current = true "
-    "WITH f, d ORDER BY f.file_id, d.symbol_id LIMIT 501 "
-    "RETURN count(*) AS members"
-)
+_MEMBERS_CUT: Final[dict[NodeKind, LiteralString]] = {
+    NodeKind.FILE: (
+        _FILE_SUBJECTS + "WITH f, d ORDER BY d.symbol_id LIMIT 501 RETURN count(*) AS members"
+    ),
+    NodeKind.MODULE: (
+        _MODULE_SUBJECTS.replace("{FILES}", "501")
+        + "WITH f, d ORDER BY f.file_id, d.symbol_id LIMIT 501 RETURN count(*) AS members"
+    ),
+}
 _EXTERNAL_TAIL: Final[LiteralString] = (
     "MATCH (fr)<-[:OBSERVED_IN]-(a:Assertion {family: 'dependency'}) "
     "WHERE a.repository_id = $repository_id AND a.current = true "
@@ -461,7 +493,8 @@ _EXTERNAL: Final[dict[NodeKind, LiteralString]] = {
     NodeKind.MODULE: (
         "MATCH (m:Module {module_id: $id})<-[:IN_MODULE]-(f:File)"
         "-[:CURRENT_REVISION]->(fr:FileRevision) "
-        "WHERE m.repository_id = $repository_id AND f.current = true " + _EXTERNAL_TAIL
+        "WHERE m.repository_id = $repository_id AND f.repository_id = $repository_id "
+        "AND f.current = true " + _EXTERNAL_TAIL
     ),
 }
 
@@ -749,11 +782,11 @@ async def _walk(
         if truncated:
             break
     nodes = await _materialize(tx, scope, placed)
-    edges, edge_rows, edges_cut = await _edges(tx, scope, mode, nodes)
+    edges, edges_cut = await _edges(tx, scope, mode, nodes)
     alternatives: tuple[GraphAlternative, ...] = ()
     alternatives_cut = False
     if include_alternatives:
-        alternatives, alternatives_cut = await _alternatives(tx, scope, mode, nodes, edge_rows)
+        alternatives, alternatives_cut = await _alternatives(tx, scope, mode, nodes)
     return GraphNeighborhood(
         repository_id=scope.repository_id,
         anchor=nodes[0],
@@ -830,11 +863,10 @@ async def _materialize(
 
 async def _edges(
     tx: Neo4jTransaction, scope: GraphScope, mode: _Mode, nodes: Sequence[GraphNode]
-) -> tuple[list[GraphEdge], list[Mapping[str, Any]], bool]:
+) -> tuple[list[GraphEdge], bool]:
     ids = sorted(node.node_id for node in nodes)
     by_id = {node.node_id: node for node in nodes}
     edges: list[GraphEdge] = []
-    resolved: list[Mapping[str, Any]] = []
     cut = False
     for kind, _label, _key in _EDGE_SOURCES:
         room = MAX_EDGES - len(edges)
@@ -855,12 +887,11 @@ async def _edges(
                 evidence = by_id[str(row["source_id"])].evidence
             else:
                 evidence = _evidence(props, row["revisions"])
-                resolved.append(props)
             edges.append(
                 GraphEdge(edge_kind, str(row["source_id"]), str(row["target_id"]), evidence)
             )
     edges.sort(key=lambda e: (e.kind.value, e.source_id, e.target_id))
-    return edges, resolved, cut
+    return edges, cut
 
 
 async def _alternatives(
@@ -868,12 +899,7 @@ async def _alternatives(
     scope: GraphScope,
     mode: _Mode,
     nodes: Sequence[GraphNode],
-    resolved: Sequence[Mapping[str, Any]],
 ) -> tuple[tuple[GraphAlternative, ...], bool]:
-    winners = sorted(
-        {str(p["resolved_assertion_id"]) for p in resolved if "resolved_assertion_id" in p}
-    )
-    lower = {str(a) for p in resolved for a in p.get("lower_evidence_assertion_ids") or ()}
     rows = (
         await tx.run(
             _ALTERNATIVES,
@@ -881,7 +907,6 @@ async def _alternatives(
                 "ids": sorted(node.node_id for node in nodes),
                 "repository_id": scope.repository_id,
                 "predicates": _PREDICATES[mode],
-                "winners": winners,
                 "limit": MAX_EDGES + 1,
             },
         )
@@ -892,13 +917,7 @@ async def _alternatives(
     for row in rows:
         assertion_id = str(row["assertion_id"])
         current = bool(row["current"])
-        status = (
-            "not_current"
-            if not current
-            else "lower_evidence"
-            if assertion_id in lower
-            else "unresolved"
-        )
+        status = "lower_evidence" if current else "not_current"  # the query returns no others
         found.append(
             GraphAlternative(
                 predicate=str(row["predicate"]),
@@ -969,9 +988,8 @@ async def _outgoing(tx: Neo4jTransaction, scope: GraphScope, anchor: str) -> Out
     # Edges are capped one below the node cap, so anchor plus targets never exceeds MAX_NODES.
     rows = (await tx.run(_IMPORTS[kind], parameters=params | {"limit": MAX_NODES})).records
     truncated = len(rows) >= MAX_NODES
-    if kind is NodeKind.MODULE:  # members beyond the in-database cut are never silent
-        members = (await tx.run(_MODULE_MEMBERS_CUT, parameters=params)).records[0]["members"]
-        truncated = truncated or int(members) > MAX_NODES
+    members = (await tx.run(_MEMBERS_CUT[kind], parameters=params)).records[0]["members"]
+    truncated = truncated or int(members) > MAX_NODES  # a cut of the subjects is never silent
     rows = rows[: MAX_NODES - 1]
     targets = sorted({str(row["target_id"]) for row in rows})
     placed = [_Placed(kind, anchor, 0), *(_Placed(NodeKind.SYMBOL, t, 1) for t in targets)]

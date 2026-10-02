@@ -228,12 +228,13 @@ def test_cypher_is_static_and_uses_closed_tables() -> None:
         *graph._NODE_EVIDENCE.values(),
         *graph._PATHS.values(),
         *graph._IMPORTS.values(),
+        *graph._MEMBERS_CUT.values(),
         *graph._EXTERNAL.values(),
         graph._ALTERNATIVES,
     ]
     allowed = {
         "id", "ids", "repository_id", "visited", "limit",
-        "source_id", "target_id", "predicates", "winners",
+        "source_id", "target_id", "predicates",
     }  # fmt: skip
     for query in queries:
         assert set(re.findall(r"\$(\w+)", query)) <= allowed, query
@@ -275,3 +276,44 @@ def test_revision_and_as_of_scopes_are_rejected_before_any_transaction(field: st
     asyncio.run(run())
     assert driver.timeouts == []
     assert issubclass(GraphTemporalScopeUnsupported, GraphRequestError)
+
+
+_REPO_LABELS = {"Repository", "Module", "File", "Symbol", "Assertion", "Dependency"}
+_NODE_PATTERN = re.compile(r"(?<![\w])\(\s*(\w+)\s*(?::\s*([\w|]+))?\s*(\{[^}]*\})?\s*\)")
+
+
+def _all_queries() -> list[str]:
+    return [
+        graph._RESOLVE,
+        *graph._LEVEL.values(),
+        *graph._EDGES.values(),
+        *graph._NODE_EVIDENCE.values(),
+        *graph._PATHS.values(),
+        *graph._IMPORTS.values(),
+        *graph._MEMBERS_CUT.values(),
+        *graph._EXTERNAL.values(),
+        graph._ALTERNATIVES,
+    ]
+
+
+def test_every_bound_node_variable_is_scoped_to_the_repository() -> None:
+    """Isolation by construction: no matched node is trusted just because a neighbour is scoped."""
+    checked = 0
+    for query in _all_queries():
+        labels: dict[str, set[str]] = {}
+        scoped: set[str] = set()
+        for name, label, props in _NODE_PATTERN.findall(query):
+            labels.setdefault(name, set()).update(label.split("|") if label else ())
+            if "repository_id: $repository_id" in props:
+                scoped.add(name)
+        for name in set(re.findall(r"(\w+)\.repository_id = \$repository_id", query)):
+            scoped.add(name)
+        variables = set(labels) | set(re.findall(r"UNWIND \w+ AS (\w+)", query))
+        variables |= set(re.findall(r"(\w+) IN (?:ns|subjects)\b", query))
+        for name in variables:
+            known = labels.get(name, set())
+            if known and not known & _REPO_LABELS:
+                continue  # revisions and run targets have no repository_id: reached through scoped nodes
+            assert name in scoped, (name, query)
+            checked += 1
+    assert checked > 40

@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import tempfile
 from pathlib import Path
+from typing import Any
 
 import pytest
 
@@ -536,5 +537,190 @@ def test_a_module_larger_than_the_member_cut_is_flagged_truncated() -> None:
         await seed.files("repo-2", MAX_NODES + 1, "mod-big")
         big = await service.dependencies(GraphScope("repo-2"), "mod-big")
         assert big.truncated
+
+    with_graph(body)
+
+
+async def stray(
+    store: Neo4jStore, kind: str, a: tuple[str, str, str], b: tuple[str, str, str], **props: Any
+) -> None:
+    """One relationship `kind` from node `a` to node `b`, each `(label, key, id)`."""
+
+    async def run(tx: Neo4jTransaction) -> None:
+        await tx.run(
+            f"MATCH (a:{a[0]} {{{a[1]}: $a}}) MATCH (b:{b[0]} {{{b[1]}: $b}}) "
+            f"CREATE (a)-[r:{kind}]->(b) SET r += $props",
+            parameters={"a": a[2], "b": b[2], "props": props},
+        )
+
+    await store.execute_write(run)
+
+
+def test_stray_edges_of_every_traversed_type_to_foreign_nodes_leak_nothing() -> None:
+    async def body(store: Neo4jStore, service: GraphTraversalService, seed: GraphSeed) -> None:
+        mine, foreign = ["a1", "a2"], ["foreign-s1", "foreign-s2"]
+        await seed.symbols("repo-1", mine)
+        await seed.symbols("repo-2", foreign)
+        await seed.file("repo-1", "file-1", "x.py", "mod-1")
+        await seed.file("repo-1", "file-lone", "z.py", "mod-lone")
+        await seed.file("repo-2", "foreign-file", "y.py", "foreign-mod")
+        await seed.defines("file-1", ["a1"])
+        await seed.calls([("a1", "a2")])
+        ev = {"source_event_ids": ["ev-foreign"], "evidence_kind": "scip", "confidence": 1.0}
+        sym1, sym2 = ("Symbol", "symbol_id", "a1"), ("Symbol", "symbol_id", "a2")
+        fsym = ("Symbol", "symbol_id", "foreign-s1")
+        ffile = ("File", "file_id", "foreign-file")
+        file1 = ("File", "file_id", "file-1")
+        for kind in ("CALLS", "IMPORTS", "REFERENCES", "DEFINES"):
+            for src in (sym1, sym2, file1):
+                await stray(store, kind, src, fsym, **ev)
+            await stray(store, kind, fsym, sym1, **ev)
+            await stray(store, kind, fsym, sym2, **ev)
+            await stray(store, kind, ffile, sym1, **ev)
+        await stray(store, "IN_MODULE", file1, ("Module", "module_id", "foreign-mod"))
+        await stray(store, "IN_MODULE", ffile, ("Module", "module_id", "mod-1"))
+        await stray(store, "IN_MODULE", ffile, ("Module", "module_id", "mod-lone"))
+        for src in (sym1, file1, ("Module", "module_id", "mod-1")):
+            await stray(
+                store, "IN_REPOSITORY", src, ("Repository", "repository_id", "repo-2"),
+                source_event_ids=["ev-foreign"],
+            )  # fmt: skip
+        await stray(store, "IN_REPOSITORY", ffile, ("Repository", "repository_id", "repo-1"),
+                    source_event_ids=["ev-foreign"])  # fmt: skip
+
+        async def deps(tx: Neo4jTransaction) -> None:
+            await tx.run(
+                "MATCH (f:File {file_id: 'file-1'}) "
+                "CREATE (f)-[:CURRENT_REVISION]->(fr:FileRevision {file_revision_id: 'fr-1'}) "
+                "CREATE (own:Assertion {assertion_id: 'dep-own', repository_id: 'repo-1', "
+                "family: 'dependency', current: true, source_event_ids: ['ev-own']}) "
+                "CREATE (alien:Assertion {assertion_id: 'dep-foreign', repository_id: 'repo-2', "
+                "family: 'dependency', current: true, source_event_ids: ['ev-foreign']}) "
+                "CREATE (own)-[:OBSERVED_IN]->(fr) CREATE (alien)-[:OBSERVED_IN]->(fr) "
+                "CREATE (own)-[:DEPENDS_ON]->(:Dependency "
+                "{dependency_id: 'json', repository_id: 'repo-1'}) "
+                "CREATE (own)-[:DEPENDS_ON]->(:Dependency "
+                "{dependency_id: 'foreign-dep', repository_id: 'repo-2'}) "
+                "CREATE (alien)-[:DEPENDS_ON]->(:Dependency "
+                "{dependency_id: 'foreign-dep-2', repository_id: 'repo-2'})",
+                parameters={},
+            )
+
+        await store.execute_write(deps)
+
+        async def indexed(tx: Neo4jTransaction) -> None:
+            await tx.run(
+                "MATCH (r:Repository {repository_id: 'repo-1'}) "
+                "CREATE (r)-[:INDEXED {source_event_ids: ['ev-run']}]->"
+                "(:Commit {commit_id: 'c1', repository_id: 'repo-1'})",
+                parameters={},
+            )
+
+        await store.execute_write(indexed)
+        for assertion, subject, obj in (("as-foreign-1", "a1", "foreign-s1"),):
+            await seed.assertion(
+                "repo-2", assertion, subject, obj, current=False,
+                evidence_kind="scip", confidence=1.0,
+            )  # fmt: skip
+
+        results: list[Any] = []
+        for anchor in ("repo-1", "mod-1", "file-1", "a1", "a2"):
+            for depth in (1, 2, 3, 4):
+                results.append(
+                    await service.neighborhood(R1, anchor, depth, include_alternatives=True)
+                )
+        for symbol in ("a1", "a2"):
+            for depth in (1, 4):
+                results.append(await service.callers(R1, symbol, depth, include_alternatives=True))
+                results.append(await service.callees(R1, symbol, depth, include_alternatives=True))
+        results.append(await service.dependency_paths(R1, "a1", "a2"))
+        results.append(await service.dependency_paths(R1, "file-1", "a2"))
+        results.append(await service.dependencies(R1, "file-1"))
+        results.append(await service.dependencies(R1, "mod-1"))
+        for result in results:
+            assert "foreign" not in repr(result), result
+            assert_evidenced(result)
+        assert [d.dependency_id for d in results[-2].external] == ["json"]
+        # A module whose only current member file belongs to another repository is not current.
+        for call in (
+            service.neighborhood(R1, "foreign-mod", 1),
+            service.dependencies(R1, "foreign-mod"),
+        ):
+            with pytest.raises(GraphAnchorNotFound):
+                await call
+        lone = await service.neighborhood(R1, "mod-lone", 1)
+        assert "foreign" not in repr(lone)
+        assert {n.node_id for n in lone.nodes} == {"mod-lone", "file-lone"}
+
+        async def drop_member(tx: Neo4jTransaction) -> None:
+            await tx.run("MATCH (:File {file_id: 'file-lone'})-[r:IN_MODULE]->() DELETE r",
+                         parameters={})  # fmt: skip
+
+        await store.execute_write(drop_member)  # only the foreign stray member is left
+        with pytest.raises(GraphAnchorNotFound):
+            await service.neighborhood(R1, "mod-lone", 1)
+        repo = await service.neighborhood(R1, "repo-1", 1)
+        assert "mod-lone" not in {n.node_id for n in repo.nodes}
+
+    with_graph(body)
+
+
+def test_cut_subjects_with_no_imports_left_still_flag_truncation() -> None:
+    async def body(store: Neo4jStore, service: GraphTraversalService, seed: GraphSeed) -> None:
+        # Module: the only import is made by a file beyond the 500-file cut.
+        await seed.files("repo-1", MAX_NODES, "mod-1")
+        await seed.file("repo-1", "repo-1-file-9999", "last.py", "mod-1")
+        await seed.symbols("repo-1", ["last-owner", "target"])
+        await seed.defines("repo-1-file-9999", ["last-owner"])
+        await seed.imports([("last-owner", "target")])
+        module = await service.dependencies(R1, "mod-1")
+        assert module.edges == () and module.truncated
+        # File: the only import is made by the 501st defined symbol.
+        await seed.file("repo-1", "big-file", "big.py", "mod-2")
+        owners = [f"o{n:04d}" for n in range(MAX_NODES + 1)]
+        await seed.symbols("repo-1", owners)
+        await seed.defines("big-file", owners)
+        await seed.imports([(owners[-1], "target")])
+        big = await service.dependencies(R1, "big-file")
+        assert big.edges == () and big.truncated
+        await seed.imports([(owners[0], "target")])
+        assert [e.source_id for e in (await service.dependencies(R1, "big-file")).edges] == [
+            owners[0]
+        ]
+
+    with_graph(body)
+
+
+def test_alternatives_never_label_a_winner_when_the_edge_output_is_capped() -> None:
+    async def body(store: Neo4jStore, service: GraphTraversalService, seed: GraphSeed) -> None:
+        ids = [sym(n) for n in range(MAX_NODES)]
+        await seed.symbols("repo-1", ids)
+        pairs = [(ids[0], ids[n]) for n in range(1, MAX_NODES)]  # the hub reaches every node
+        pairs += [
+            (ids[n], ids[(n + k) % MAX_NODES])
+            for n in range(1, MAX_NODES)
+            for k in range(1, 6)
+            if (ids[n], ids[(n + k) % MAX_NODES]) not in pairs and (n + k) % MAX_NODES != 0
+        ]
+        await seed.calls(pairs, lower=["as-loser"])  # ~2,900 resolved edges, over MAX_EDGES
+        for a, b in pairs:
+            await seed.assertion(
+                "repo-1", f"as-{a}>{b}", a, b, current=True, evidence_kind="tree_sitter",
+                confidence=0.5,
+            )  # fmt: skip
+        await seed.assertion(
+            "repo-1", "as-loser", ids[0], ids[1], current=True, evidence_kind="tree_sitter",
+            confidence=0.4,
+        )  # fmt: skip
+        await seed.assertion(
+            "repo-1", "as-old", ids[2], ids[3], current=False, evidence_kind="tree_sitter",
+            confidence=0.4,
+        )  # fmt: skip
+        result = await service.neighborhood(R1, ids[0], 4, include_alternatives=True)
+        assert result.truncated and len(result.edges) == 2000 and len(result.nodes) == MAX_NODES
+        assert {(a.evidence.assertion_id, a.status) for a in result.alternatives} == {
+            ("as-loser", "lower_evidence"),
+            ("as-old", "not_current"),
+        }
 
     with_graph(body)
