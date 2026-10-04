@@ -37,6 +37,7 @@ from agent_context_platform.mcp.auth import (
     require_scope,
 )
 from agent_context_platform.mcp.server import MCP_PATH, build_mcp_mount, create_mcp_server
+from agent_context_platform.operations import faults
 from agent_context_platform.settings import Settings
 
 
@@ -120,6 +121,7 @@ def create_app(
     answers 401 without a token and 503 with one: it fails closed.
     """
     resolved_settings = Settings() if settings is None else settings
+    faults.configure(resolved_settings.fault_injection)
     mcp_holder = McpAuthHolder(mcp_auth)
     # One server per application: the SDK app can only be started once.
     mcp_mount = build_mcp_mount(
