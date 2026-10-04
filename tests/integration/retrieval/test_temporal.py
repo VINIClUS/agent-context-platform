@@ -785,3 +785,163 @@ def test_a_tiny_deadline_against_the_database_raises_and_the_service_recovers() 
             await cold.close()
 
     with_service(body)
+
+
+# --- review round: failure observations, scoped history, stale graphs ---
+
+
+def test_failures_are_read_from_the_observations_visible_at_each_cut() -> None:
+    events = [
+        ci_run(1, "ci_1", "failure"),
+        failure(2, "fail_1", ci_run_id="ci_1", observed=5),
+        # the same failure seen again much later, in another run reported even later
+        ci_run(3, "ci_2", "failure", observed=22),
+        failure(4, "fail_1", ci_run_id="ci_2", observed=20),
+    ]
+
+    async def body(store: Neo4jStore, service: TemporalService) -> None:
+        for order in (events, list(reversed(events))):
+            await deliver(store, order)
+            early = (await service.failures(P1, day(FAR), day(10))).failures
+            (one,) = early
+            assert one.source_event_ids == (str(event_uuid(2)),)
+            assert one.recorded_at == day(5) and one.valid_from == T0 + timedelta(seconds=2)
+            assert [r.run_id for r in one.observed_in] == ["ci_1"]
+            # observed by valid time 3 s only the first observation exists; the second is later
+            by_valid = (await service.failures(P1, T0 + timedelta(seconds=3), day(FAR))).failures
+            assert [f.source_event_ids for f in by_valid] == [(str(event_uuid(2)),)]
+            # at day 21 the second observation is recorded, but its run is not yet
+            mid = (await service.failures(P1, day(FAR), day(21))).failures[0]
+            assert mid.source_event_ids == (str(event_uuid(2)), str(event_uuid(4)))
+            assert [r.run_id for r in mid.observed_in] == ["ci_1"]
+            late = (await service.failures(P1, day(FAR), day(30))).failures[0]
+            assert [r.run_id for r in late.observed_in] == ["ci_1", "ci_2"]
+            assert late.recorded_at == day(5)  # the earliest visible observation
+
+    with_service(body)
+
+
+def test_a_run_not_yet_recorded_is_invisible_whether_it_failed_or_passed() -> None:
+    async def body(store: Neo4jStore, service: TemporalService) -> None:
+        await deliver(
+            store,
+            [
+                failure(2, "fail_1", ci_run_id="ci_1", observed=2),
+                ci_run(1, "ci_1", "failure", observed=10),  # recorded after the failure
+            ],
+        )
+        before = (await service.failures(P1, day(FAR), day(5))).failures[0]
+        assert before.observed_in == () and before.resolution.status is FixStatus.UNKNOWN
+        assert before.source_event_ids == (str(event_uuid(2)),)  # still evidence
+        after = (await service.failures(P1, day(FAR), day(10))).failures[0]
+        assert [r.run_id for r in after.observed_in] == ["ci_1"]
+        assert after.resolution.status is FixStatus.UNRESOLVED
+
+    with_service(body)
+
+
+def test_a_failure_with_no_run_still_names_the_events_that_observed_it() -> None:
+    async def body(store: Neo4jStore, service: TemporalService) -> None:
+        await deliver(store, [failure(1, "fail_1", ci_run_id="ci_missing")])
+        (found,) = (await service.failures(P1, day(FAR), day(FAR))).failures
+        assert found.observed_in == () and found.source_event_ids == (str(event_uuid(1)),)
+
+    with_service(body)
+
+
+def test_an_undated_superseded_decision_waits_for_its_valid_from() -> None:
+    async def body(store: Neo4jStore, service: TemporalService) -> None:
+        await deliver(store, [decision(1, "dec_u", status="superseded", valid_from=10)])
+        before = await service.decisions(P1, day(5), day(FAR), include_history=True)
+        assert before.decisions == ()
+        after = await service.decisions(P1, day(15), day(FAR), include_history=True)
+        assert [d.reason for d in after.decisions] == [HistoricalReason.SUPERSEDED_UNDATED]
+
+    with_service(body)
+
+
+def test_a_decision_recorded_in_two_scopes_has_one_history_per_scope() -> None:
+    events = [
+        decision(1, "dec_x", valid_from=0, context=CTX1),
+        decision(2, "dec_x", valid_from=3, context=CTX2),
+        decision(3, "dec_y", supersedes="dec_x", valid_from=8, context=CTX1),
+        decision(4, "dec_x", valid_from=1, status="proposed", context=CTX1),
+    ]
+
+    async def body(store: Neo4jStore, service: TemporalService) -> None:
+        for order in (events, list(reversed(events))):
+            await deliver(store, order)
+            one = await service.decision_history("dec_x", P1)
+            assert [e.decision_id for e in one.entries] == ["dec_x", "dec_y"]
+            assert [v.event_id for v in one.entries[0].versions] == [
+                str(event_uuid(1)),
+                str(event_uuid(4)),
+            ]
+            two = await service.decision_history("dec_x", P2)
+            assert [e.decision_id for e in two.entries] == ["dec_x"]
+            assert [v.event_id for v in two.entries[0].versions] == [str(event_uuid(2))]
+            assert two.entries[0].valid_from == day(3)
+            # the repository view of the second scope agrees
+            assert (await service.decision_history("dec_x", R1)).entries[0].versions == (
+                one.entries[0].versions
+            )
+            assert await active(service, P2, 5) == ["dec_x"]
+            with pytest.raises(TemporalDecisionNotFound):
+                await service.decision_history("dec_y", P2)
+
+    with_service(body)
+
+
+def test_a_history_lists_only_the_newest_recordings_and_says_so(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def body(store: Neo4jStore, service: TemporalService) -> None:
+        await deliver(store, [decision(n, "dec_r", valid_from=n) for n in (1, 2, 3)])
+        monkeypatch.setattr(temporal, "MAX_ENTRY_VERSIONS", 2)
+        history = await service.decision_history("dec_r", P1)
+        assert history.truncated
+        assert [v.event_id for v in history.entries[0].versions] == [
+            str(event_uuid(2)),
+            str(event_uuid(3)),
+        ]
+
+    with_service(body)
+
+
+def test_a_graph_projected_before_the_history_nodes_is_refused() -> None:
+    legacy: dict[str, LiteralString] = {
+        "decisions": "CREATE (:Decision {decision_id: 'old', state_order: 'x', project_id: 'prj_1'})",
+        "failures": "CREATE (:Failure {failure_id: 'old', project_id: 'prj_1'})",
+        "ci": "CREATE (:CIRun {ci_run_id: 'old', workflow: 'ci', project_id: 'prj_1'})",
+    }
+
+    async def body(store: Neo4jStore, service: TemporalService) -> None:
+        async def create(statement: LiteralString) -> None:
+            async def run(tx: Neo4jTransaction) -> None:
+                await tx.run(statement, parameters={})
+
+            await store.execute_write(run)
+
+        await deliver(store, [decision(1, "dec_a"), failure(2, "fail_1", ci_run_id="ci_1")])
+        assert await active(service, P1, 5) == ["dec_a"]  # a current graph is served
+        await create(legacy["decisions"])
+        fresh = TemporalService.from_settings(neo4j_integration_settings())
+        try:
+            with pytest.raises(temporal.TemporalProjectionOutdated):
+                await fresh.decisions(P1)
+            with pytest.raises(temporal.TemporalProjectionOutdated):
+                await fresh.decision_history("dec_a", P1)
+            assert (await fresh.failures(P1)).failures  # failures are checked on their own
+        finally:
+            await fresh.close()
+        for kind in ("failures", "ci"):
+            await wipe(store)
+            await create(legacy[kind])
+            fresh = TemporalService.from_settings(neo4j_integration_settings())
+            try:
+                with pytest.raises(temporal.TemporalProjectionOutdated):
+                    await fresh.failures(P1)
+            finally:
+                await fresh.close()
+
+    with_service(body)

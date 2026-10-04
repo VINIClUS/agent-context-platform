@@ -34,7 +34,14 @@ the payload's status, subjects, `valid_from`, `valid_to`, `supersedes_id` and `p
 the envelope `recorded_at` (`observed_at`), the `state_order` of the event and its
 `source_event_ids`. It is written once and never changed, so it commutes in any delivery order.
 
-Scope. Decision, DecisionVersion and Failure nodes (and the TestRun and CIRun nodes in
+Failure history. A failure is an immutable fingerprint, so the `Failure` node minimises its times
+independently and cannot answer "as known at T". Each failure event is therefore also kept as one
+immutable `(:Failure)-[:HAS_OBSERVATION]->(:FailureObservation)` node keyed by `event_id`, with the
+occurrence time (`valid_from`), the envelope `recorded_at`, the fingerprint facts, the
+session, test run and CI run the event names, its scope and `source_event_ids`. The node and its
+`OBSERVED_IN` edges keep the current semantics.
+
+Scope. Decision, DecisionVersion, FailureObservation and Failure nodes (and the TestRun and CIRun nodes in
 `quality.py`) carry the envelope `context.project_id` and `context.repository_id` as
 `project_id`/`repository_id`, when the context has them. They are written with the smallest
 non-null value winning, so a later event that disagrees cannot move them and any delivery order
@@ -46,7 +53,7 @@ valid time, as known at a recorded time.
 
 from __future__ import annotations
 
-from collections.abc import Awaitable, Callable, Iterable
+from collections.abc import Awaitable, Callable, Iterable, Mapping
 from dataclasses import dataclass
 from datetime import datetime
 from typing import Final, LiteralString
@@ -107,6 +114,26 @@ _DECISION_VERSION: Final = node_statement("DecisionVersion", "event_id") + fill_
     "source_event_ids",
     "project_id",
     "repository_id",
+)
+# One immutable node per failure event: when it was observed, when it was recorded, where.
+_FAILURE_OBSERVATION: Final = node_statement("FailureObservation", "event_id") + fill_once(
+    "failure_id",
+    "component",
+    "operation",
+    "error_class",
+    "fingerprint_version",
+    "fingerprint_sha256",
+    "valid_from",
+    "recorded_at",
+    "source_event_ids",
+    "session_id",
+    "test_run_id",
+    "ci_run_id",
+    "project_id",
+    "repository_id",
+)
+_HAS_OBSERVATION: Final = relationship_statement(
+    "Failure", "failure_id", "HAS_OBSERVATION", "FailureObservation", "event_id"
 )
 _VERSION_FIELDS: Final = (
     "status",
@@ -289,6 +316,27 @@ async def _failure_observed(tx: Neo4jTransaction, event: StoredEventV1) -> None:
         },
     )
     failure = payload.failure_id
+    observation = str(event.event_id)
+    await tx.run(
+        _FAILURE_OBSERVATION,
+        parameters={
+            "node_id": observation,
+            "failure_id": failure,
+            "component": payload.component,
+            "operation": payload.operation,
+            "error_class": payload.error_class,
+            "fingerprint_version": payload.fingerprint_version,
+            "fingerprint_sha256": payload.fingerprint_sha256,
+            "valid_from": timestamp(event.occurred_at),
+            "recorded_at": timestamp(event.observed_at),
+            "source_event_ids": [observation],
+            "session_id": payload.session_id,
+            "test_run_id": payload.test_run_id,
+            "ci_run_id": payload.ci_run_id,
+            **scope_parameters(event),
+        },
+    )
+    await assert_link(tx, _HAS_OBSERVATION, event, failure, observation)
     if payload.session_id is not None:
         await assert_link(
             tx, _OBSERVED_IN_SESSION, event, failure, session_node_id(payload.session_id)
@@ -329,7 +377,10 @@ def lock_keys(event: StoredEventV1) -> list[tuple[str, str]]:
         return [("Summary", summary.summary_id)]
     if kind == "knowledge.failure.observed":
         failure = FailureObservedV1.model_validate(dict(event.payload))
-        keys = [("Failure", failure.failure_id)]
+        keys = [
+            ("Failure", failure.failure_id),
+            ("FailureObservation", str(event.event_id)),
+        ]
         if failure.session_id is not None:
             keys.append(("Session", session_node_id(failure.session_id)))
         if failure.test_run_id is not None:
@@ -344,7 +395,10 @@ class KnowledgeProjector:
     """Projects decision, constraint, failure and summary events."""
 
     name = "knowledge"
-    version = "1"
+    # "2" added DecisionVersion/FailureObservation history and scope properties. Graphs projected
+    # by "1" lack them: `projection status`/`verify` report no "2" checkpoint, and a rebuild
+    # (README, "projection rebuild") is required. `TemporalService` refuses to read such a graph.
+    version = "2"
 
     def handles(self, event_type: str) -> bool:
         return event_type in _HANDLERS
@@ -404,6 +458,20 @@ class DecisionState:
         return status in _SUPERSEDING and not (status == "superseded" and self.end is None)
 
 
+def _edges(current: Mapping[str, DecisionVersion]) -> list[tuple[str, str]]:
+    """`(superseder, superseded)` for each current version that asserts a supersession."""
+    return sorted(
+        (decision_id, version.supersedes_id)
+        for decision_id, version in current.items()
+        if version.supersedes_id is not None and version.status in _SUPERSEDING
+    )
+
+
+def supersession_edges(states: Mapping[str, DecisionState]) -> list[tuple[str, str]]:
+    """The `(superseder, superseded)` pairs of `decision_states`: the graph's SUPERSEDES edges."""
+    return _edges({decision_id: state.version for decision_id, state in states.items()})
+
+
 def decision_states(
     versions: Iterable[DecisionVersion], *, recorded_at: datetime
 ) -> dict[str, DecisionState]:
@@ -422,12 +490,11 @@ def decision_states(
         if best is None or (version.order, version.recorded_at) > (best.order, best.recorded_at):
             current[version.decision_id] = version
     closing: dict[str, tuple[datetime, str]] = {}
-    for version in current.values():
-        if version.supersedes_id is not None and version.status in _SUPERSEDING:
-            candidate = (version.valid_from, version.decision_id)
-            earlier = closing.get(version.supersedes_id)
-            if earlier is None or candidate < earlier:
-                closing[version.supersedes_id] = candidate
+    for superseder, target in _edges(current):
+        candidate = (current[superseder].valid_from, superseder)
+        earlier = closing.get(target)
+        if earlier is None or candidate < earlier:
+            closing[target] = candidate
     states: dict[str, DecisionState] = {}
     for decision_id, version in current.items():
         closed_at, superseded_by = closing.get(decision_id, (None, None))

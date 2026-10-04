@@ -133,6 +133,7 @@ def test_a_failure_locks_every_node_it_links_to() -> None:
     assert event_lock_keys(event) == [
         ("CIRun", "ci_1"),
         ("Failure", "fail_1"),
+        ("FailureObservation", str(event.event_id)),
         ("Session", "sess_1"),
         ("TestRun", "tr_1"),
     ]

@@ -9,52 +9,66 @@ default to "now". They are not interchangeable: a decision recorded late is invi
 Decisions. The graph keeps one immutable `(:DecisionVersion)` per recording, reached with
 `(:Decision)-[:HAS_VERSION]->`. This module loads the versions of a scope with bounded Cypher and
 hands them to the PURE helpers of `projection.projectors.knowledge` (`decision_states`,
-`active_decisions`), so supersession, reopening by a rejected superseder and `valid_to` expiry agree
-with the projector by construction. Nothing here re-derives them in Cypher. `active_decisions`
-filters on a subject token; scoping is done in Cypher on `project_id`/`repository_id`, so every
-version is presented to it with one fixed subject.
+`supersession_edges`, `active_decisions`), so supersession, reopening by a rejected superseder and
+`valid_to` expiry agree with the projector by construction. Nothing here re-derives them in
+Cypher. `active_decisions` filters on a subject token; scoping is done in Cypher on the version's
+`project_id`/`repository_id`, so every version is presented to it with one fixed subject. A
+recording whose event carried no context has no scope and is invisible to every scoped read.
+A decision recorded in two scopes is two sets of versions: each scope sees only its own.
 
 `decisions(..., include_history=True)` also returns the decisions that held and have ended at
 `valid_at`, each marked `historical` with its reason: `superseded` (by a named decision),
-`expired` (its own `valid_to`) or `superseded_undated` (recorded as `superseded` but no known
-superseder says when it stopped). Decisions that were only `proposed` or `rejected`, and ones that
-have not begun at `valid_at`, are neither active nor history and are not returned.
-`decision_history` follows the SUPERSEDES chain both ways in the CURRENT graph, with every
-recording of each link.
+`expired` (its own `valid_to`) or `superseded_undated` (recorded as `superseded`, already in
+force at `valid_at`, but no known superseder says when it stopped). Decisions that were only
+`proposed` or `rejected`, and ones that have not begun at `valid_at`, are neither active nor
+history and are not returned. `decision_history` follows the SUPERSEDES chain both ways, as known
+now, from the same scoped versions, with every recording of each link.
 
-Failures. `failures` returns the `Failure` nodes of a scope that were observed (`valid_from`, the
-event `occurred_at`) by `valid_at` and recorded by `recorded_at`, with the runs they were observed
-in. The design has no FIXED_BY edge, so a fix is derived from projected data only, for CI runs:
-a failure observed in a CI run is `resolved` when a LATER CI run of the same provider, workflow
-and job, in the same project and repository, has status `success` and a `commit_id` or
+Failures. The graph keeps one immutable `(:FailureObservation)` per failure event, reached with
+`(:Failure)-[:HAS_OBSERVATION]->`: the occurrence time (`valid_from`), the envelope `recorded_at`,
+the fingerprint facts, scope, `source_event_ids` and the session, test run and CI run it names.
+`failures` selects observations with `valid_from <= valid_at AND recorded_at <= recorded_at`, one
+by one, and describes each failure from those observations only: its times, its events and where
+it was seen. The design has no FIXED_BY edge, so a fix is derived from projected data only, for CI
+runs: a failure observed in a CI run is `resolved` when a LATER CI run of the same provider,
+workflow and job, in the same project and repository, has status `success` and a `commit_id` or
 `snapshot_id` (the commit or snapshot it validated). "Later" is `(completed_at, ci_run_id)`
 order; the graph holds no commit order, so `commit_changed` says whether the passing run's commit
-differs from the failing one (`None` when either is unknown). The earliest such run wins. The path
-is Failure -> failing CI run -> passing CI run -> validated commit or snapshot.
+differs from the failing one (`None` when either is unknown). A rerun that passes on the SAME
+commit is `resolved` with `commit_changed=False`; the composer must read the flag. The earliest
+such run wins. The path is Failure -> failing CI run -> passing CI run -> validated commit or
+snapshot. A run, failing or passing, counts only in scope and once its own `recorded_at` (the
+earliest envelope `observed_at` that reported it) is at or before the cut; an identity-only stub
+has none and is never visible at a past cut.
 Gaps, reported rather than guessed:
 - `TestRunCompletedV1` carries no suite or target identifier (SDK gap FU-77), so the same test
   cannot be identified and a failure observed only in test runs is `unsupported`. `framework`
   is never used as a target.
 - A failure observed in no CI or test run in scope is `unknown`.
-- Run nodes keep the NEWEST observation of a run. A CI run also keeps `recorded_at`, the first time
-  it was reported, so a run first reported after `recorded_at` is not used; a re-observation that
-  changed its status is not versioned.
+- Run nodes keep the NEWEST observation of a run; a re-observation that changed its status is not
+  versioned.
+
+Rebuild required. The history nodes exist only in a graph projected by knowledge and quality
+projector version "2". Reading an older graph would silently return nothing, so the first read of
+each kind checks for a decision, failure, CI run or test run without its history and raises
+`TemporalProjectionOutdated`; rebuild the graph (README, `agent-context projection rebuild`).
 
 Scope. Every call takes a `TemporalScope` with a `project_id` or a `repository_id` (both given:
 both must match). Every node a query touches is matched on those properties, so a node without
 scope, or of another scope, is never returned.
 
-Bounds. Every query carries a `LIMIT`: 5,000 decision versions and 500 failures per request, 100
-chain links per direction (path depth at most 50). `truncated=True` says a cap was hit. For
-`decisions` the cap is on versions, so a cut can drop recordings of a decision and the answer is
-then only as complete as the versions read. The result is further limited to 500 decisions. One read
-transaction per request carries the driver timeout, and the same deadline bounds the client with
-`asyncio.timeout`; expiry raises `RetrievalDeadlineExceeded`. All Cypher is static text and all
-input goes in as parameters.
+Bounds. Every query carries a `LIMIT`: 5,000 decision versions and 5,000 failure observations per
+request (so no unbounded collection exists, history included). `truncated=True` says a cap was
+hit. For `decisions` the cap is on versions, so a cut can drop recordings of a decision and the
+answer is then only as complete as the versions read. Results are limited to 500 decisions and
+500 failures; a history lists at most 100 links per direction (depth at most 50) and the newest
+100 recordings of each. One read transaction per request carries the driver timeout, and the same
+deadline bounds the client with `asyncio.timeout`; expiry raises `RetrievalDeadlineExceeded`. All
+Cypher is static text and all input goes in as parameters.
 
 Evidence for PLATFORM-043. Every item carries `source_event_ids` and its intervals as UTC
-datetimes. A decision's are the recording events of its known versions; a failure's are the events
-that observed it (`OBSERVED_IN` provenance); a run's is the event of its newest observation, read
+datetimes. A decision's are the recording events of its known versions; a failure's are the events of
+its visible observations (which also covers a failure seen in no run); a run's is the event of its newest observation, read
 from its `result_order`. The composer must resolve these through the ledger
 (`event_content_refs`) to a content reference, or choose a metadata-only form, as for the graph
 reads. A decision's `content_id` is on the `Decision` node and not on its versions, so it is not
@@ -79,6 +93,7 @@ from agent_context_platform.projection.projectors.knowledge import (
     DecisionVersion,
     active_decisions,
     decision_states,
+    supersession_edges,
 )
 from agent_context_platform.retrieval.graph import (
     DEFAULT_DEADLINE_SECONDS,
@@ -90,7 +105,10 @@ from agent_context_platform.settings import Neo4jSettings
 MAX_VERSIONS: Final = 5000
 MAX_DECISIONS: Final = 500
 MAX_FAILURES: Final = 500
-MAX_CHAIN: Final = 100
+MAX_CHAIN: Final = 100  # links per direction
+MAX_DEPTH: Final = 50
+MAX_ENTRY_VERSIONS: Final = 100  # recordings listed per history entry (the newest)
+MAX_OBSERVATIONS: Final = 5000
 
 # `active_decisions` matches a subject token; scope is enforced in Cypher, so every version is
 # presented to it with this one subject.
@@ -105,6 +123,10 @@ class TemporalRequestError(RetrievalError, ValueError):
 
 class TemporalDecisionNotFound(RetrievalError, LookupError):
     """The decision does not exist in the scope."""
+
+
+class TemporalProjectionOutdated(RetrievalError):
+    """The graph was projected before the history nodes existed; rebuild it (README)."""
 
 
 class DecisionStanding(StrEnum):
@@ -300,57 +322,52 @@ _VERSIONS: Final[LiteralString] = (
     "ORDER BY v.decision_id, v.state_order, v.event_id LIMIT $limit"
 )
 
-_CHAIN_FIELDS: Final[LiteralString] = (
-    "x.decision_id AS decision_id, x.status AS status, x.valid_from AS valid_from, "
-    "x.valid_to AS valid_to, x.effective_valid_to AS effective_valid_to, "
-    "x.superseded_at AS superseded_at, x.supersedes_id AS supersedes_id, "
-    "x.recorded_at AS recorded_at, distance, versions"
+# Two sentinel reads, run once per service instance, that tell a graph projected before the
+# history nodes existed (it has none) from a current one.
+_UNPROJECTED_DECISIONS: Final[LiteralString] = (
+    "MATCH (d:Decision) WHERE d.state_order IS NOT NULL AND NOT (d)-[:HAS_VERSION]->() "
+    "RETURN d.decision_id AS id LIMIT 1"
 )
-_CHAIN_VERSIONS: Final[LiteralString] = (
-    "OPTIONAL MATCH (x)-[:HAS_VERSION]->(v:DecisionVersion) WHERE " + _in_scope("v") + " "
-    "WITH x, distance, v ORDER BY v.state_order, v.event_id "
-    "WITH x, distance, collect(CASE WHEN v IS NULL THEN NULL ELSE {event_id: v.event_id, "
-    "status: v.status, valid_from: v.valid_from, valid_to: v.valid_to, "
-    "supersedes_id: v.supersedes_id, recorded_at: v.recorded_at} END) AS versions "
-    "ORDER BY distance, x.decision_id LIMIT $limit "
-    "RETURN " + _CHAIN_FIELDS
+_UNPROJECTED_FAILURES: Final[LiteralString] = (
+    "MATCH (f:Failure) WHERE NOT (f)-[:HAS_OBSERVATION]->() RETURN f.failure_id AS id LIMIT 1 "
+    "UNION ALL MATCH (r:CIRun) WHERE r.workflow IS NOT NULL AND r.recorded_at IS NULL "
+    "RETURN r.ci_run_id AS id LIMIT 1 "
+    "UNION ALL MATCH (r:TestRun) WHERE r.framework IS NOT NULL AND r.recorded_at IS NULL "
+    "RETURN r.test_run_id AS id LIMIT 1"
 )
-# Earlier links (the decisions this one supersedes) and the decision itself: distance 0.
-_EARLIER: Final[LiteralString] = (
-    "MATCH (a:Decision {decision_id: $decision_id}) WHERE " + _in_scope("a") + " "
-    "MATCH p = (a)-[:SUPERSEDES*0..50]->(x:Decision) "
-    "WHERE all(n IN nodes(p) WHERE " + _in_scope("n") + ") "
-    "WITH x, min(length(p)) AS distance "
-) + _CHAIN_VERSIONS
-_LATER: Final[LiteralString] = (
-    "MATCH (a:Decision {decision_id: $decision_id}) WHERE " + _in_scope("a") + " "
-    "MATCH p = (x:Decision)-[:SUPERSEDES*1..50]->(a) "
-    "WHERE all(n IN nodes(p) WHERE " + _in_scope("n") + ") "
-    "WITH x, min(length(p)) AS distance "
-) + _CHAIN_VERSIONS
 
-_FAILURES: Final[LiteralString] = (
-    "MATCH (f:Failure) WHERE " + _in_scope("f") + " "
-    "AND f.valid_from <= $valid_at AND f.recorded_at <= $recorded_at "
-    "WITH f ORDER BY f.valid_from, f.failure_id LIMIT $limit "
-    "OPTIONAL MATCH (f)-[o:OBSERVED_IN]->(r) "
-    "WHERE r:Session OR ((r:TestRun OR r:CIRun) AND " + _in_scope("r") + ") "
-    "RETURN f.failure_id AS failure_id, f.component AS component, f.operation AS operation, "
-    "f.error_class AS error_class, f.fingerprint_sha256 AS fingerprint_sha256, "
-    "f.valid_from AS valid_from, f.recorded_at AS recorded_at, "
-    "head([l IN labels(r) WHERE l IN ['Session', 'TestRun', 'CIRun']]) AS kind, "
-    "coalesce(r.session_id, r.test_run_id, r.ci_run_id) AS run_id, r.status AS status, "
-    "r.workflow AS workflow, r.job AS job, r.completed_at AS completed_at, "
-    "r.commit_id AS commit_id, r.snapshot_id AS snapshot_id, r.result_order AS result_order, "
-    "o.source_event_ids AS edge_events "
-    "ORDER BY f.valid_from, f.failure_id, kind, run_id"
+_OBSERVATIONS: Final[LiteralString] = (
+    "MATCH (o:FailureObservation) WHERE " + _in_scope("o") + " "
+    "AND o.valid_from <= $valid_at AND o.recorded_at <= $recorded_at "
+    "RETURN o.event_id AS event_id, o.failure_id AS failure_id, o.component AS component, "
+    "o.operation AS operation, o.error_class AS error_class, "
+    "o.fingerprint_sha256 AS fingerprint_sha256, o.valid_from AS valid_from, "
+    "o.recorded_at AS recorded_at, o.session_id AS session_id, o.test_run_id AS test_run_id, "
+    "o.ci_run_id AS ci_run_id "
+    "ORDER BY o.valid_from, o.failure_id, o.event_id LIMIT $limit"
+)
+# A run is visible only in scope and once the platform had recorded it; a stub has no
+# `recorded_at` and never is.
+_CI_RUNS: Final[LiteralString] = (
+    "UNWIND $run_ids AS run_id MATCH (r:CIRun {ci_run_id: run_id}) WHERE " + _in_scope("r") + " "
+    "AND r.recorded_at <= $recorded_at "
+    "RETURN r.ci_run_id AS run_id, r.status AS status, r.workflow AS workflow, r.job AS job, "
+    "r.completed_at AS completed_at, r.commit_id AS commit_id, r.snapshot_id AS snapshot_id, "
+    "r.result_order AS result_order"
+)
+_TEST_RUNS: Final[LiteralString] = (
+    "UNWIND $run_ids AS run_id MATCH (r:TestRun {test_run_id: run_id}) WHERE "
+    + _in_scope("r")
+    + " AND r.recorded_at <= $recorded_at "
+    "RETURN r.test_run_id AS run_id, r.status AS status, r.completed_at AS completed_at, "
+    "r.commit_id AS commit_id, r.snapshot_id AS snapshot_id, r.result_order AS result_order"
 )
 
 # For each failing CI run, the earliest later passing run of the same target.
 _NEXT_PASS: Final[LiteralString] = (
     "UNWIND $run_ids AS run_id "
     "MATCH (r:CIRun {ci_run_id: run_id}) WHERE " + _in_scope("r") + " "
-    "AND r.completed_at IS NOT NULL AND r.workflow IS NOT NULL AND r.job IS NOT NULL "
+    "AND r.recorded_at <= $recorded_at AND r.completed_at IS NOT NULL AND r.workflow IS NOT NULL AND r.job IS NOT NULL "
     "OPTIONAL MATCH (p:CIRun) WHERE " + _in_scope("p") + " "
     "AND p.status = 'success' AND p.provider = r.provider AND p.workflow = r.workflow "
     "AND p.job = r.job "
@@ -394,6 +411,7 @@ class TemporalService:
         self._default_deadline = default_deadline_seconds
         self._owns_driver = owns_driver
         self._clock = clock
+        self._projected: set[str] = set()
 
     @classmethod
     def from_settings(
@@ -454,8 +472,8 @@ class TemporalService:
         now = self._clock()
         valid = _aware(valid_at or now, "valid_at")
         recorded = _aware(recorded_at or now, "recorded_at")
-        rows, truncated = await self._run(
-            deadline_seconds, lambda tx: _load_versions(tx, scope, recorded)
+        rows, truncated = await self._read(
+            deadline_seconds, "decisions", lambda tx: _load_versions(tx, scope, recorded)
         )
         result, cut = _classify(rows, valid, recorded, include_history)
         return DecisionsResult(scope, valid, recorded, result, truncated or cut)
@@ -467,13 +485,20 @@ class TemporalService:
         *,
         deadline_seconds: float | None = None,
     ) -> DecisionHistory:
-        """The SUPERSEDES chain around a decision, both ways, with intervals and recordings."""
+        """The SUPERSEDES chain around a decision, both ways, with intervals and recordings.
+
+        Built from the scope's recorded versions with the same pure helpers as `decisions`, as
+        known now, so a decision recorded in two scopes shows only the recordings of the scope
+        asked about.
+        """
         if not decision_id.strip():
             raise TemporalRequestError("decision_id is required")
-        entries, truncated = await self._run(
-            deadline_seconds, lambda tx: _chain(tx, scope, decision_id)
+        now = self._clock()
+        rows, cut = await self._read(
+            deadline_seconds, "decisions", lambda tx: _load_versions(tx, scope, _aware(now, "now"))
         )
-        return DecisionHistory(scope, decision_id, entries, truncated)
+        entries, truncated = _history(rows, decision_id, _aware(now, "now"))
+        return DecisionHistory(scope, decision_id, entries, truncated or cut)
 
     async def failures(
         self,
@@ -492,14 +517,35 @@ class TemporalService:
         now = self._clock()
         valid = _aware(valid_at or now, "valid_at")
         recorded = _aware(recorded_at or now, "recorded_at")
-        records, truncated = await self._run(
-            deadline_seconds, lambda tx: _failures(tx, scope, valid, recorded)
+        records, truncated = await self._read(
+            deadline_seconds, "failures", lambda tx: _failures(tx, scope, valid, recorded)
         )
         if not include_resolved:
             records = tuple(r for r in records if r.resolution.status is not FixStatus.RESOLVED)
         return FailuresResult(scope, valid, recorded, records, truncated)
 
     # --- transaction boundary ---
+
+    async def _read(
+        self,
+        deadline_seconds: float | None,
+        kind: str,
+        work: Callable[[Neo4jTransaction], Awaitable[ResultT]],
+    ) -> ResultT:
+        """Run `work` after checking, once per instance, that the graph has its history nodes."""
+
+        async def guarded(tx: Neo4jTransaction) -> ResultT:
+            if kind not in self._projected:
+                statement = _UNPROJECTED_DECISIONS if kind == "decisions" else _UNPROJECTED_FAILURES
+                if (await tx.run(statement, parameters={})).records:
+                    raise TemporalProjectionOutdated(
+                        "the graph predates the decision and failure history nodes; run "
+                        "`agent-context projection rebuild` (see the README) before reading it"
+                    )
+                self._projected.add(kind)
+            return await work(tx)
+
+        return await self._run(deadline_seconds, guarded)
 
     async def _run(
         self,
@@ -614,7 +660,9 @@ def _classify(
             standing = DecisionStanding.ACTIVE
         elif not include_history:
             continue
-        elif version.status == "superseded" and state.end is None:
+        elif (
+            version.status == "superseded" and state.end is None and version.valid_from <= valid_at
+        ):
             standing, reason = DecisionStanding.HISTORICAL, HistoricalReason.SUPERSEDED_UNDATED
         elif state.asserted and state.end is not None and state.end <= valid_at:
             standing = DecisionStanding.HISTORICAL
@@ -644,51 +692,85 @@ def _classify(
     return tuple(records[:MAX_DECISIONS]), len(records) > MAX_DECISIONS
 
 
-def _entry(record: Record, relation: ChainRelation) -> HistoryEntry:
-    versions = tuple(
-        RecordedVersion(
-            event_id=str(item["event_id"]),
-            status=str(item["status"]),
-            valid_from=_parse(item["valid_from"]),
-            valid_to=_parse_optional(item["valid_to"]),
-            supersedes_id=None if item["supersedes_id"] is None else str(item["supersedes_id"]),
-            recorded_at=_parse(item["recorded_at"]),
-        )
-        for item in record["versions"]
-        if item is not None
-    )
-    return HistoryEntry(
-        decision_id=str(record["decision_id"]),
-        relation=relation,
-        distance=int(record["distance"]),
-        status=str(record["status"]),
-        valid_from=_parse(record["valid_from"]),
-        valid_to=_parse_optional(record["valid_to"]),
-        effective_valid_to=_parse_optional(record["effective_valid_to"]),
-        superseded_at=_parse_optional(record["superseded_at"]),
-        supersedes_id=None if record["supersedes_id"] is None else str(record["supersedes_id"]),
-        recorded_at=_parse(record["recorded_at"]),
-        versions=versions,
-        source_event_ids=tuple(sorted(item.event_id for item in versions)),
+def _recorded(row: _VersionRow) -> RecordedVersion:
+    version = row.version
+    return RecordedVersion(
+        event_id=row.event_id,
+        status=version.status,
+        valid_from=version.valid_from,
+        valid_to=version.valid_to,
+        supersedes_id=version.supersedes_id,
+        recorded_at=version.recorded_at,
     )
 
 
-async def _chain(
-    tx: Neo4jTransaction, scope: TemporalScope, decision_id: str
+def _reach(links: dict[str, list[str]], start: str) -> tuple[dict[str, int], bool]:
+    """Distance of every decision reachable from `start` along `links`, and whether depth cut it."""
+    seen = {start: 0}
+    frontier = [start]
+    while frontier:
+        reached: list[str] = []
+        for node in frontier:
+            for target in links.get(node, ()):
+                if target not in seen:
+                    seen[target] = seen[node] + 1
+                    reached.append(target)
+        if reached and seen[reached[0]] > MAX_DEPTH:
+            return {k: v for k, v in seen.items() if v <= MAX_DEPTH and k != start}, True
+        frontier = reached
+    return {k: v for k, v in seen.items() if k != start}, False
+
+
+def _history(
+    rows: Sequence[_VersionRow], decision_id: str, recorded_at: datetime
 ) -> tuple[tuple[HistoryEntry, ...], bool]:
-    parameters = {**scope.parameters(), "decision_id": decision_id, "limit": MAX_CHAIN + 1}
-    earlier = (await tx.run(_EARLIER, parameters=parameters)).records
-    if not earlier:
+    states = decision_states([row.version for row in rows], recorded_at=recorded_at)
+    if decision_id not in states:
         raise TemporalDecisionNotFound(decision_id)
-    later = (await tx.run(_LATER, parameters=parameters)).records
-    truncated = len(earlier) > MAX_CHAIN or len(later) > MAX_CHAIN
-    truncated = truncated or any(int(r["distance"]) >= 50 for r in (*earlier, *later))
-    entries = [
-        *reversed([_entry(r, ChainRelation.EARLIER) for r in earlier[:MAX_CHAIN] if r["distance"]]),
-        *[_entry(r, ChainRelation.SELF) for r in earlier if not r["distance"]],
-        *[_entry(r, ChainRelation.LATER) for r in later[:MAX_CHAIN]],
-    ]
-    return tuple(entries), truncated
+    older: dict[str, list[str]] = {}
+    newer: dict[str, list[str]] = {}
+    for superseder, target in supersession_edges(states):
+        if target not in states:  # a decision no recording of this scope has reached yet
+            continue
+        older.setdefault(superseder, []).append(target)
+        newer.setdefault(target, []).append(superseder)
+    recordings: dict[str, list[_VersionRow]] = {}
+    for row in rows:
+        recordings.setdefault(row.version.decision_id, []).append(row)
+    truncated = False
+
+    def entry(item: str, relation: ChainRelation, distance: int) -> HistoryEntry:
+        nonlocal truncated
+        state = states[item]
+        mine = sorted(recordings[item], key=lambda r: (r.version.order, r.event_id))
+        if len(mine) > MAX_ENTRY_VERSIONS:
+            mine, truncated = mine[-MAX_ENTRY_VERSIONS:], True
+        listed = tuple(_recorded(row) for row in mine)
+        return HistoryEntry(
+            decision_id=item,
+            relation=relation,
+            distance=distance,
+            status=state.version.status,
+            valid_from=state.version.valid_from,
+            valid_to=state.version.valid_to,
+            effective_valid_to=state.end,
+            superseded_at=state.closed_at,
+            supersedes_id=state.version.supersedes_id,
+            recorded_at=state.version.recorded_at,
+            versions=listed,
+            source_event_ids=tuple(sorted(version.event_id for version in listed)),
+        )
+
+    sides: list[tuple[ChainRelation, dict[str, int]]] = []
+    for relation, links in ((ChainRelation.EARLIER, older), (ChainRelation.LATER, newer)):
+        reached, cut = _reach(links, decision_id)
+        ordered = sorted(reached.items(), key=lambda pair: (pair[1], pair[0]))
+        if cut or len(ordered) > MAX_CHAIN:
+            truncated = True
+        sides.append((relation, dict(ordered[:MAX_CHAIN])))
+    before = [entry(i, ChainRelation.EARLIER, d) for i, d in reversed(list(sides[0][1].items()))]
+    after = [entry(i, ChainRelation.LATER, d) for i, d in sides[1][1].items()]
+    return (*before, entry(decision_id, ChainRelation.SELF, 0), *after), truncated
 
 
 # --------------------------------------------------------------------------------------------
@@ -697,10 +779,14 @@ async def _chain(
 
 
 @dataclass(slots=True)
-class _Failure:
-    row: Record
-    runs: list[ObservedRun]
-    events: set[str]
+class _Seen:
+    """One failure as the observations visible at the cut describe it."""
+
+    rows: list[Record]
+
+
+def _text(value: object) -> str | None:
+    return None if value is None else str(value)
 
 
 def _fix_path(failure_id: str, record: Record) -> FixPath:
@@ -714,8 +800,8 @@ def _fix_path(failure_id: str, record: Record) -> FixPath:
         job=str(record["job"]),
         failing_completed_at=_parse(record["failing_completed_at"]),
         passing_completed_at=_parse(record["passing_completed_at"]),
-        validated_commit_id=None if passing_commit is None else str(passing_commit),
-        validated_snapshot_id=None if record["snapshot_id"] is None else str(record["snapshot_id"]),
+        validated_commit_id=_text(passing_commit),
+        validated_snapshot_id=_text(record["snapshot_id"]),
         commit_changed=(
             None
             if failing_commit is None or passing_commit is None
@@ -727,6 +813,22 @@ def _fix_path(failure_id: str, record: Record) -> FixPath:
     )
 
 
+def _run(kind: RunKind, run_id: str, record: Record | None) -> ObservedRun:
+    if record is None:  # a session: only the observation names it
+        return ObservedRun(kind, run_id, None, None, None, None, None, None, ())
+    return ObservedRun(
+        kind=kind,
+        run_id=run_id,
+        status=_text(record["status"]),
+        workflow=_text(record.get("workflow")),
+        job=_text(record.get("job")),
+        completed_at=_parse_optional(record["completed_at"]),
+        commit_id=_text(record["commit_id"]),
+        snapshot_id=_text(record["snapshot_id"]),
+        source_event_ids=_event_of(record["result_order"]),
+    )
+
+
 async def _failures(
     tx: Neo4jTransaction, scope: TemporalScope, valid_at: datetime, recorded_at: datetime
 ) -> tuple[tuple[FailureRecord, ...], bool]:
@@ -735,43 +837,64 @@ async def _failures(
         "valid_at": timestamp(valid_at),
         "recorded_at": timestamp(recorded_at),
     }
-    rows = (await tx.run(_FAILURES, parameters={**parameters, "limit": MAX_FAILURES + 1})).records
-    found: dict[str, _Failure] = {}
-    for row in rows:
-        entry = found.setdefault(str(row["failure_id"]), _Failure(row, [], set()))
-        if row["kind"] is None:
-            continue
-        entry.events.update(str(item) for item in row["edge_events"] or ())
-        kind = RunKind(
-            {"Session": "session", "TestRun": "test_run", "CIRun": "ci_run"}[str(row["kind"])]
-        )
-        entry.runs.append(
-            ObservedRun(
-                kind=kind,
-                run_id=str(row["run_id"]),
-                status=None if row["status"] is None else str(row["status"]),
-                workflow=None if row["workflow"] is None else str(row["workflow"]),
-                job=None if row["job"] is None else str(row["job"]),
-                completed_at=_parse_optional(row["completed_at"]),
-                commit_id=None if row["commit_id"] is None else str(row["commit_id"]),
-                snapshot_id=None if row["snapshot_id"] is None else str(row["snapshot_id"]),
-                source_event_ids=_event_of(row["result_order"]),
-            )
-        )
-    truncated = len(found) > MAX_FAILURES
+    rows = (
+        await tx.run(_OBSERVATIONS, parameters={**parameters, "limit": MAX_OBSERVATIONS + 1})
+    ).records
+    truncated = len(rows) > MAX_OBSERVATIONS
+    found: dict[str, _Seen] = {}
+    for row in rows[:MAX_OBSERVATIONS]:
+        found.setdefault(str(row["failure_id"]), _Seen([])).rows.append(row)
+    truncated = truncated or len(found) > MAX_FAILURES
     kept = list(found.items())[:MAX_FAILURES]
-    ci_ids = sorted({run.run_id for _, f in kept for run in f.runs if run.kind is RunKind.CI_RUN})
+    wanted = {
+        key: sorted({str(row[key]) for _, seen in kept for row in seen.rows if row[key]})
+        for key in ("ci_run_id", "test_run_id")
+    }
+    ci: dict[str, Record] = {}
+    tests: dict[str, Record] = {}
+    if wanted["ci_run_id"]:
+        ci_rows = (
+            await tx.run(_CI_RUNS, parameters={**parameters, "run_ids": wanted["ci_run_id"]})
+        ).records
+        ci = {str(record["run_id"]): record for record in ci_rows}
+    if wanted["test_run_id"]:
+        test_rows = (
+            await tx.run(_TEST_RUNS, parameters={**parameters, "run_ids": wanted["test_run_id"]})
+        ).records
+        tests = {str(record["run_id"]): record for record in test_rows}
     passes: dict[str, Record] = {}
-    if ci_ids:
-        records = (await tx.run(_NEXT_PASS, parameters={**parameters, "run_ids": ci_ids})).records
+    if ci:
+        records = (
+            await tx.run(_NEXT_PASS, parameters={**parameters, "run_ids": sorted(ci)})
+        ).records
         passes = {str(record["failing_id"]): record for record in records}
-    result = [_failure_record(failure_id, item, passes) for failure_id, item in kept]
+    result = [
+        _failure_record(failure_id, seen.rows, ci, tests, passes) for failure_id, seen in kept
+    ]
     return tuple(result), truncated
 
 
-def _failure_record(failure_id: str, item: _Failure, passes: dict[str, Record]) -> FailureRecord:
-    ci_runs = [run for run in item.runs if run.kind is RunKind.CI_RUN]
-    test_runs = [run for run in item.runs if run.kind is RunKind.TEST_RUN]
+def _failure_record(
+    failure_id: str,
+    observations: list[Record],
+    ci: dict[str, Record],
+    tests: dict[str, Record],
+    passes: dict[str, Record],
+) -> FailureRecord:
+    runs: dict[tuple[RunKind, str], ObservedRun] = {}
+    for row in observations:
+        if row["session_id"]:
+            session = str(row["session_id"])
+            runs.setdefault((RunKind.SESSION, session), _run(RunKind.SESSION, session, None))
+        if row["test_run_id"] and str(row["test_run_id"]) in tests:
+            test = str(row["test_run_id"])
+            runs.setdefault((RunKind.TEST_RUN, test), _run(RunKind.TEST_RUN, test, tests[test]))
+        if row["ci_run_id"] and str(row["ci_run_id"]) in ci:
+            run_id = str(row["ci_run_id"])
+            runs.setdefault((RunKind.CI_RUN, run_id), _run(RunKind.CI_RUN, run_id, ci[run_id]))
+    ordered = [runs[key] for key in sorted(runs, key=lambda k: (k[0].value, k[1]))]
+    ci_runs = [run for run in ordered if run.kind is RunKind.CI_RUN]
+    test_runs = [run for run in ordered if run.kind is RunKind.TEST_RUN]
     paths = [
         _fix_path(failure_id, passes[run.run_id])
         for run in ci_runs
@@ -791,18 +914,16 @@ def _failure_record(failure_id: str, item: _Failure, passes: dict[str, Record]) 
         )
     else:
         resolution = FixResolution(FixStatus.UNKNOWN, "observed in no CI or test run in scope")
-    row = item.row
+    first = observations[0]
     return FailureRecord(
         failure_id=failure_id,
-        component=None if row["component"] is None else str(row["component"]),
-        operation=None if row["operation"] is None else str(row["operation"]),
-        error_class=None if row["error_class"] is None else str(row["error_class"]),
-        fingerprint_sha256=(
-            None if row["fingerprint_sha256"] is None else str(row["fingerprint_sha256"])
-        ),
-        valid_from=_parse(row["valid_from"]),
-        recorded_at=_parse(row["recorded_at"]),
-        observed_in=tuple(item.runs),
+        component=_text(first["component"]),
+        operation=_text(first["operation"]),
+        error_class=_text(first["error_class"]),
+        fingerprint_sha256=_text(first["fingerprint_sha256"]),
+        valid_from=min(_parse(row["valid_from"]) for row in observations),
+        recorded_at=min(_parse(row["recorded_at"]) for row in observations),
+        observed_in=tuple(ordered),
         resolution=resolution,
-        source_event_ids=tuple(sorted(item.events)),
+        source_event_ids=tuple(sorted(str(row["event_id"]) for row in observations)),
     )

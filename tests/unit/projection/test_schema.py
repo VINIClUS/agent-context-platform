@@ -46,6 +46,7 @@ EXPECTED_CONSTRAINTS = {
     "uq_decision_version_event_id": ("DecisionVersion", "event_id"),
     "uq_constraint_constraint_id": ("Constraint", "constraint_id"),
     "uq_failure_failure_id": ("Failure", "failure_id"),
+    "uq_failure_observation_event_id": ("FailureObservation", "event_id"),
     "uq_summary_summary_id": ("Summary", "summary_id"),
     "uq_assertion_assertion_id": ("Assertion", "assertion_id"),
     "uq_content_embedding_content_id": ("ContentEmbedding", "content_id"),

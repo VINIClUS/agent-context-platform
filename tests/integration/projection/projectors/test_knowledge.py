@@ -48,6 +48,7 @@ NODE_KEYS.update(
         "DecisionVersion": "event_id",
         "Constraint": "constraint_id",
         "Failure": "failure_id",
+        "FailureObservation": "event_id",
         "Summary": "summary_id",
         "TestRun": "test_run_id",
         "CIRun": "ci_run_id",
@@ -598,5 +599,70 @@ def test_scope_comes_from_the_envelope_and_the_smallest_value_wins_in_any_order(
         assert "repository_id" not in node(state, "Decision:dec_s")
         assert versions_of(state)[str(scoped.event_id)]["project_id"] == "prj_a"
         assert "project_id" not in versions_of(state)[str(unscoped.event_id)]
+
+    with_graph(body)
+
+
+def failure_event(number: int, **kwargs: Any) -> StoredEventV1:
+    payload: dict[str, object] = {
+        "failure_id": "fail_o",
+        "component": "api",
+        "operation": "ingest",
+        "error_class": "Timeout",
+        "fingerprint_version": "1",
+        "fingerprint_sha256": SHA,
+    }
+    return make(
+        number,
+        "knowledge.failure.observed",
+        payload | kwargs.pop("payload"),
+        **kwargs,
+    )
+
+
+def test_every_failure_event_is_kept_as_an_immutable_observation() -> None:
+    first = failure_event(
+        1, payload={"ci_run_id": "ci_1"}, observed=5, context={"project_id": "prj_a"}
+    )
+    second = failure_event(
+        2,
+        payload={"session_id": "sess_1", "test_run_id": "tr_1"},
+        observed=9,
+        context={"project_id": "prj_a", "repository_id": "repo_a"},
+    )
+
+    async def body(store: Neo4jStore) -> None:
+        expected = digest(await deliver(store, [first, second]))
+        state = await deliver(store, [second, first])
+        assert digest(state) == expected
+        assert digest(await deliver(store, [first, second, first])) == expected  # replay
+        observations = {
+            item["id"].split(":", 1)[1]: item["props"]
+            for item in state["nodes"]
+            if item["id"].startswith("FailureObservation:")
+        }
+        assert observations[str(first.event_id)] == {
+            "event_id": str(first.event_id),
+            "failure_id": "fail_o",
+            "component": "api",
+            "operation": "ingest",
+            "error_class": "Timeout",
+            "fingerprint_version": "1",
+            "fingerprint_sha256": SHA,
+            "valid_from": "2026-08-13T13:00:01.000000Z",
+            "recorded_at": ts(5),
+            "source_event_ids": [str(first.event_id)],
+            "ci_run_id": "ci_1",
+            "project_id": "prj_a",
+        }
+        later = observations[str(second.event_id)]
+        assert (later["session_id"], later["test_run_id"]) == ("sess_1", "tr_1")
+        assert (later["recorded_at"], later["repository_id"]) == (ts(9), "repo_a")
+        assert "ci_run_id" not in later
+        assert sorted(b for _, b, _ in rels(state, "HAS_OBSERVATION")) == sorted(
+            f"FailureObservation:{event.event_id}" for event in (first, second)
+        )
+        # The Failure node still holds the current, independently minimised view.
+        assert node(state, "Failure:fail_o")["recorded_at"] == ts(5)
 
     with_graph(body)

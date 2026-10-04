@@ -13,9 +13,11 @@ A payload names its target as a bare commit OID or snapshot ID; a commit node is
 `context.repository_id` the commit relation is skipped rather than guessed. CI runs and findings
 keep their target as `commit_id`/`snapshot_id` properties, because §9.2 has no relation for them.
 The commit and snapshot nodes are identity-only stubs until the git projector fills them, the way
-that projector stubs a parent commit. Test and CI run nodes carry the envelope `project_id`/`repository_id` (smallest non-null wins, so
-any delivery order converges), and a CI run also keeps `recorded_at`, the earliest envelope
-`observed_at` that reported it, so a record-time read can tell when the platform first knew it.
+that projector stubs a parent commit.
+Test and CI run nodes carry the envelope `project_id`/`repository_id` and `recorded_at`, the
+earliest envelope `observed_at` that reported the run (smallest non-null wins, so any delivery
+order converges). A record-time read can tell when the platform first knew a run; an identity-only
+stub has no `recorded_at` and so is not visible at a past record time.
 Only content IDs enter the graph, never output text.
 """
 
@@ -63,7 +65,7 @@ _TEST_RUN: Final = (
         "snapshot_id",
         "completed_at",
     )
-    + (" WITH n " + min_non_null("project_id", "repository_id"))
+    + (" WITH n " + min_non_null("project_id", "repository_id", "recorded_at"))
 )
 _CI_RUN: Final = (
     node_statement("CIRun", "ci_run_id")
@@ -204,6 +206,7 @@ async def _test_run_completed(tx: Neo4jTransaction, event: StoredEventV1) -> Non
             "commit_id": payload.commit_id,
             "snapshot_id": payload.snapshot_id,
             "completed_at": timestamp(event.occurred_at),
+            "recorded_at": timestamp(event.observed_at),
             **scope_parameters(event),
         },
     )
@@ -307,7 +310,8 @@ class QualityProjector:
     """Projects test run, CI run and finding events."""
 
     name = "quality"
-    version = "1"
+    # "2" added the scope and `recorded_at` properties of test and CI runs (see KnowledgeProjector).
+    version = "2"
 
     def handles(self, event_type: str) -> bool:
         return event_type in _HANDLERS

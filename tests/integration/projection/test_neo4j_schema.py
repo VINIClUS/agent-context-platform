@@ -65,6 +65,13 @@ EXPECTED_CONSTRAINTS: set[SchemaObject] = {
     ("uq_decision_version_event_id", "UNIQUENESS", "NODE", ("DecisionVersion",), ("event_id",)),
     ("uq_constraint_constraint_id", "UNIQUENESS", "NODE", ("Constraint",), ("constraint_id",)),
     ("uq_failure_failure_id", "UNIQUENESS", "NODE", ("Failure",), ("failure_id",)),
+    (
+        "uq_failure_observation_event_id",
+        "UNIQUENESS",
+        "NODE",
+        ("FailureObservation",),
+        ("event_id",),
+    ),
     ("uq_summary_summary_id", "UNIQUENESS", "NODE", ("Summary",), ("summary_id",)),
     ("uq_assertion_assertion_id", "UNIQUENESS", "NODE", ("Assertion",), ("assertion_id",)),
     (
@@ -128,6 +135,7 @@ EXPECTED_INDEXES: set[SchemaObject] = {
     ("uq_decision_version_event_id", "RANGE", "NODE", ("DecisionVersion",), ("event_id",)),
     ("uq_constraint_constraint_id", "RANGE", "NODE", ("Constraint",), ("constraint_id",)),
     ("uq_failure_failure_id", "RANGE", "NODE", ("Failure",), ("failure_id",)),
+    ("uq_failure_observation_event_id", "RANGE", "NODE", ("FailureObservation",), ("event_id",)),
     ("uq_summary_summary_id", "RANGE", "NODE", ("Summary",), ("summary_id",)),
     ("uq_assertion_assertion_id", "RANGE", "NODE", ("Assertion",), ("assertion_id",)),
     ("uq_content_embedding_content_id", "RANGE", "NODE", ("ContentEmbedding",), ("content_id",)),

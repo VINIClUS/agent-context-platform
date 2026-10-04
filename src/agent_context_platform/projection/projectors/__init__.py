@@ -38,6 +38,9 @@ _LOCK_STATEMENTS: dict[str, LiteralString] = {
         "MERGE (n:DecisionVersion {event_id: $node_id}) SET n._lock = true REMOVE n._lock"
     ),
     "Failure": "MERGE (n:Failure {failure_id: $node_id}) SET n._lock = true REMOVE n._lock",
+    "FailureObservation": (
+        "MERGE (n:FailureObservation {event_id: $node_id}) SET n._lock = true REMOVE n._lock"
+    ),
     "Finding": "MERGE (n:Finding {finding_id: $node_id}) SET n._lock = true REMOVE n._lock",
     "Project": "MERGE (n:Project {project_id: $node_id}) SET n._lock = true REMOVE n._lock",
     "Repository": "MERGE (n:Repository {repository_id: $node_id}) SET n._lock = true REMOVE n._lock",

@@ -190,6 +190,12 @@ CONSTRAINT_STATEMENTS: tuple[SchemaStatement, ...] = (
         "failure_id",
     ),
     SchemaStatement(
+        "uq_failure_observation_event_id",
+        "CREATE CONSTRAINT uq_failure_observation_event_id IF NOT EXISTS FOR (n:FailureObservation) REQUIRE n.event_id IS UNIQUE",
+        "FailureObservation",
+        "event_id",
+    ),
+    SchemaStatement(
         "uq_summary_summary_id",
         "CREATE CONSTRAINT uq_summary_summary_id IF NOT EXISTS FOR (n:Summary) REQUIRE n.summary_id IS UNIQUE",
         "Summary",
