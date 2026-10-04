@@ -4,10 +4,13 @@ from __future__ import annotations
 
 import asyncio
 import re
+from collections.abc import Awaitable, Callable
 from datetime import UTC, datetime, timedelta
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
+from neo4j.exceptions import ClientError, ConfigurationError, Neo4jError
 
 from agent_context_platform.projection.projectors.knowledge import (
     DecisionVersion,
@@ -22,6 +25,7 @@ from agent_context_platform.retrieval.temporal import (
     TemporalScope,
     TemporalService,
 )
+from agent_context_platform.settings import Neo4jSettings
 
 pytestmark = pytest.mark.unit
 
@@ -182,3 +186,298 @@ def test_decision_states_pick_the_earliest_current_superseder() -> None:
     assert (early.superseded_by, early.end) == ("z", at(9))  # only z is known by then
     states = decision_states([r.version for r in rows[:3]], recorded_at=at(50))
     assert states["a"].superseded_by == "b"  # a tie on valid_from breaks on the decision ID
+
+
+# --- the read path, against a scripted transaction (no database) ---
+
+
+class _ServerError(ClientError):
+    """A server failure with a chosen Neo4j status code."""
+
+    def __init__(self, status: str) -> None:
+        super().__init__("server said no")
+        self._status = status
+
+    @property
+    def code(self) -> str:
+        return self._status
+
+
+class _Tx:
+    def __init__(self, script: Callable[[str, dict[str, Any]], list[dict[str, Any]]]) -> None:
+        self.script = script
+        self.calls: list[dict[str, Any]] = []
+
+    async def run(self, query: str, parameters: dict[str, Any]) -> Any:
+        self.calls.append(parameters)
+        records = self.script(query, parameters)
+
+        class Result:
+            async def to_eager_result(self) -> Any:
+                return SimpleNamespace(records=records)
+
+        return Result()
+
+
+class _Driver:
+    def __init__(self, tx: _Tx) -> None:
+        self.tx = tx
+
+    def session(self, **_kwargs: Any) -> _Driver:
+        return self
+
+    async def __aenter__(self) -> _Driver:
+        return self
+
+    async def __aexit__(self, *_args: object) -> None:
+        return None
+
+    async def execute_read(self, work: Callable[[Any], Awaitable[Any]]) -> Any:
+        return await work(self.tx)
+
+
+def _service(script: Callable[[str, dict[str, Any]], list[dict[str, Any]]]) -> TemporalService:
+    return TemporalService(_Driver(_Tx(script)), database="neo4j", clock=lambda: at(30))  # type: ignore[arg-type]
+
+
+def stamp(days: float) -> str:
+    return f"{at(days):%Y-%m-%dT%H:%M:%S.%fZ}"
+
+
+def version_row(
+    decision_id: str, event: int, *, status: str = "accepted", valid_from: float = 0, **more: Any
+) -> dict[str, Any]:
+    return {
+        "event_id": f"ev{event}",
+        "decision_id": decision_id,
+        "status": status,
+        "subjects": ["mod_a"],
+        "valid_from": stamp(valid_from),
+        "valid_to": None,
+        "supersedes_id": more.get("supersedes"),
+        "recorded_at": stamp(event),
+        "state_order": f"{event:04d}",
+    }
+
+
+def test_decisions_reads_versions_for_the_scope_and_defaults_to_now() -> None:
+    rows = [
+        version_row("a", 1),
+        version_row("b", 2, valid_from=10, supersedes="a"),
+        version_row("a", 3, status="accepted"),
+    ]
+    service = _service(lambda _q, _p: rows)
+    result = asyncio.run(service.decisions(TemporalScope("p"), include_history=True))
+    assert result.valid_at == result.recorded_at == at(30)
+    assert [(d.decision_id, d.standing.value) for d in result.decisions] == [
+        ("b", "active"),
+        ("a", "historical"),
+    ]
+    assert result.decisions[1].source_event_ids == ("ev1", "ev3")
+    tx = service._driver.tx  # type: ignore[attr-defined]
+    assert tx.calls[0]["project_id"] == "p" and tx.calls[0]["repository_id"] is None
+    assert (
+        tx.calls[0]["recorded_at"] == stamp(30)
+        and tx.calls[0]["limit"] == temporal.MAX_VERSIONS + 1
+    )
+
+
+def test_decisions_flag_a_version_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(temporal, "MAX_VERSIONS", 1)
+    service = _service(lambda _q, _p: [version_row("a", 1), version_row("b", 2)])
+    assert asyncio.run(service.decisions(TemporalScope("p"))).truncated
+
+
+def chain_row(decision_id: str, distance: int, versions: list[Any] | None = None) -> dict[str, Any]:
+    return {
+        "decision_id": decision_id,
+        "status": "accepted",
+        "valid_from": stamp(distance),
+        "valid_to": None,
+        "effective_valid_to": stamp(9),
+        "superseded_at": stamp(9),
+        "supersedes_id": None,
+        "recorded_at": stamp(1),
+        "distance": distance,
+        "versions": [
+            None,
+            {
+                "event_id": "ev1",
+                "status": "accepted",
+                "valid_from": stamp(0),
+                "valid_to": stamp(5),
+                "supersedes_id": "x",
+                "recorded_at": stamp(1),
+            },
+        ]
+        if versions is None
+        else versions,
+    }
+
+
+def test_decision_history_orders_older_links_self_then_newer_links() -> None:
+    def script(query: str, _p: dict[str, Any]) -> list[dict[str, Any]]:
+        if query is temporal._EARLIER:
+            return [chain_row("b", 0), chain_row("a", 1), chain_row("z", 2)]
+        return [chain_row("c", 1)]
+
+    history = asyncio.run(_service(script).decision_history("b", TemporalScope("p")))
+    assert [(e.decision_id, e.relation.value, e.distance) for e in history.entries] == [
+        ("z", "earlier", 2),
+        ("a", "earlier", 1),
+        ("b", "self", 0),
+        ("c", "later", 1),
+    ]
+    first = history.entries[0]
+    assert first.versions[0].valid_to == at(5) and first.versions[0].supersedes_id == "x"
+    assert first.source_event_ids == ("ev1",) and not history.truncated
+
+
+def test_decision_history_flags_caps_and_missing_decisions(monkeypatch: pytest.MonkeyPatch) -> None:
+    with pytest.raises(temporal.TemporalDecisionNotFound):
+        asyncio.run(_service(lambda _q, _p: []).decision_history("b", TemporalScope("p")))
+    deep = _service(
+        lambda q, _p: [chain_row("b", 0), chain_row("a", 50)] if q is temporal._EARLIER else []
+    )
+    assert asyncio.run(deep.decision_history("b", TemporalScope("p"))).truncated
+    monkeypatch.setattr(temporal, "MAX_CHAIN", 1)
+    wide = _service(
+        lambda q, _p: (
+            [chain_row("b", 0)]
+            if q is temporal._EARLIER
+            else [chain_row("c", 1), chain_row("d", 1)]
+        )
+    )
+    assert asyncio.run(wide.decision_history("b", TemporalScope("p"))).truncated
+
+
+def failure_row(
+    failure_id: str, kind: str | None, run_id: str | None, **more: Any
+) -> dict[str, Any]:
+    return {
+        "failure_id": failure_id,
+        "component": "api",
+        "operation": "ingest",
+        "error_class": "Timeout",
+        "fingerprint_sha256": "e" * 64,
+        "valid_from": stamp(1),
+        "recorded_at": stamp(2),
+        "kind": kind,
+        "run_id": run_id,
+        "status": more.get("status"),
+        "workflow": more.get("workflow"),
+        "job": more.get("job"),
+        "completed_at": more.get("completed_at"),
+        "commit_id": more.get("commit_id"),
+        "snapshot_id": more.get("snapshot_id"),
+        "result_order": more.get("result_order"),
+        "edge_events": ["evf"] if kind else None,
+    }
+
+
+def pass_row(failing: str, passing: str | None, **more: Any) -> dict[str, Any]:
+    return {
+        "failing_id": failing,
+        "workflow": "ci",
+        "job": "test",
+        "failing_completed_at": stamp(1),
+        "failing_commit_id": more.get("failing_commit"),
+        "failing_order": "t|evr1",
+        "passing_id": passing,
+        "passing_completed_at": None if passing is None else stamp(5),
+        "commit_id": more.get("commit"),
+        "snapshot_id": more.get("snapshot"),
+        "passing_order": "t|evp1",
+    }
+
+
+def test_failures_classify_each_resolution_and_hide_resolved_by_default() -> None:
+    ci = {"workflow": "ci", "job": "test", "completed_at": stamp(1), "status": "failure"}
+    failures = [
+        failure_row("f_fixed", "CIRun", "ci_1", result_order="t|evr1", **ci),
+        failure_row("f_open", "CIRun", "ci_2", **ci),
+        failure_row("f_test", "TestRun", "tr_1"),
+        failure_row("f_session", "Session", "sess_1"),
+        failure_row("f_none", None, None),
+        failure_row("f_snap", "CIRun", "ci_3", **ci),
+    ]
+    passes = [
+        pass_row("ci_1", "ci_9", commit="b" * 40, failing_commit="a" * 40),
+        pass_row("ci_2", None),
+        pass_row("ci_3", "ci_8", snapshot="snap_1"),
+    ]
+
+    def script(query: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        if query is temporal._FAILURES:
+            return failures
+        assert params["run_ids"] == ["ci_1", "ci_2", "ci_3"]
+        return passes
+
+    service = _service(script)
+    scope = TemporalScope(repository_id="r")
+    shown = asyncio.run(service.failures(scope, include_resolved=True)).failures
+    status = {f.failure_id: f.resolution.status.value for f in shown}
+    assert status == {
+        "f_fixed": "resolved",
+        "f_open": "unresolved",
+        "f_test": "unsupported",
+        "f_session": "unknown",
+        "f_none": "unknown",
+        "f_snap": "resolved",
+    }
+    path = shown[0].resolution.path
+    assert path is not None
+    assert (path.failing_run_id, path.passing_run_id, path.commit_changed) == ("ci_1", "ci_9", True)
+    assert path.source_event_ids == ("evp1", "evr1") and path.validated_snapshot_id is None
+    snap = shown[5].resolution.path
+    assert (
+        snap is not None and snap.commit_changed is None and snap.validated_snapshot_id == "snap_1"
+    )
+    assert shown[0].observed_in[0].source_event_ids == ("evr1",)
+    assert shown[0].source_event_ids == ("evf",)
+    default = asyncio.run(service.failures(scope)).failures
+    assert [f.failure_id for f in default] == ["f_open", "f_test", "f_session", "f_none"]
+
+
+def test_failures_flag_the_failure_cap(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(temporal, "MAX_FAILURES", 1)
+    rows = [failure_row("f1", None, None), failure_row("f2", None, None)]
+    result = asyncio.run(_service(lambda _q, _p: rows).failures(TemporalScope("p")))
+    assert result.truncated and [f.failure_id for f in result.failures] == ["f1"]
+
+
+def test_from_settings_needs_complete_connection_settings() -> None:
+    async def run() -> None:
+        with pytest.raises(ConfigurationError):
+            TemporalService.from_settings(Neo4jSettings())
+        complete = Neo4jSettings.model_validate(
+            {"uri": "bolt://127.0.0.1:1", "username": "u", "password": "p"}
+        )
+        async with TemporalService.from_settings(complete):  # opens no connection
+            pass
+
+    asyncio.run(run())
+
+
+def test_a_database_side_timeout_is_a_deadline_error() -> None:
+    class Slow(_Driver):
+        async def execute_read(self, work: Callable[[Any], Awaitable[Any]]) -> Any:
+            raise _ServerError("Neo.ClientError.Transaction.TransactionTimedOutClientConfiguration")
+
+    service = TemporalService(Slow(_Tx(lambda _q, _p: [])), database="neo4j")  # type: ignore[arg-type]
+    with pytest.raises(temporal.RetrievalDeadlineExceeded):
+        asyncio.run(service.decisions(TemporalScope("p")))
+
+    class Broken(_Driver):
+        async def execute_read(self, work: Callable[[Any], Awaitable[Any]]) -> Any:
+            raise _ServerError("Neo.ClientError.Statement.SyntaxError")
+
+    service = TemporalService(Broken(_Tx(lambda _q, _p: [])), database="neo4j")  # type: ignore[arg-type]
+    with pytest.raises(Neo4jError):
+        asyncio.run(service.decisions(TemporalScope("p")))
+
+
+def test_a_non_positive_per_call_deadline_is_rejected() -> None:
+    service = _service(lambda _q, _p: [])
+    with pytest.raises(TemporalRequestError, match="deadline"):
+        asyncio.run(service.decisions(TemporalScope("p"), deadline_seconds=0))
