@@ -20,6 +20,7 @@ from agent_context_platform.projection.projectors.knowledge import (
 from agent_context_platform.retrieval import temporal
 from agent_context_platform.retrieval.temporal import (
     DecisionStanding,
+    FixStatus,
     HistoricalReason,
     TemporalRequestError,
     TemporalScope,
@@ -546,3 +547,40 @@ def test_a_decision_closed_before_it_began_is_neither_active_nor_historical() ->
         recorded_at=at(50),
     )["d"]
     assert not live.empty and live.ended_by(at(6)) and not live.ended_by(at(4))
+
+
+def test_a_recurrence_after_a_fix_is_unresolved_until_a_pass_follows_the_latest_run() -> None:
+    observations = [observation("f_rec", 1, ci="ci_1"), observation("f_rec", 2, ci="ci_3")]
+    runs = [
+        {**ci_row("ci_1"), "completed_at": stamp(1)},
+        {**ci_row("ci_3"), "completed_at": stamp(3)},
+    ]
+    fixed_first = pass_row("ci_1", "ci_2", commit="b" * 40)
+
+    def service_with(passes: list[dict[str, Any]]) -> TemporalService:
+        def script(query: str, _p: dict[str, Any]) -> list[dict[str, Any]]:
+            if query is temporal._OBSERVATIONS:
+                return observations
+            return runs if query is temporal._CI_RUNS else passes
+
+        return _service(script)
+
+    scope = TemporalScope("p")
+    recurred = asyncio.run(
+        service_with([fixed_first, pass_row("ci_3", None)]).failures(scope, include_resolved=True)
+    ).failures[0]
+    assert recurred.resolution.status is FixStatus.UNRESOLVED
+    assert recurred.resolution.path is None and "ci_3" in (recurred.resolution.reason or "")
+    assert [
+        f.failure_id for f in asyncio.run(service_with([fixed_first]).failures(scope)).failures
+    ] == ["f_rec"]
+    fixed_again = pass_row("ci_3", "ci_4", commit="c" * 40)
+    final = asyncio.run(
+        service_with([fixed_first, fixed_again]).failures(scope, include_resolved=True)
+    ).failures[0]
+    assert final.resolution.status is FixStatus.RESOLVED
+    assert final.resolution.path is not None
+    assert (final.resolution.path.failing_run_id, final.resolution.path.passing_run_id) == (
+        "ci_3",
+        "ci_4",
+    )

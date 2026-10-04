@@ -1001,3 +1001,41 @@ def test_a_run_not_yet_completed_at_the_valid_time_is_omitted() -> None:
         assert after["fail_t"].resolution.status is FixStatus.UNSUPPORTED
 
     with_service(body)
+
+
+def test_a_recurrence_after_a_fix_reopens_the_failure_until_it_is_fixed_again() -> None:
+    first = [
+        ci_run(1, "ci_1", "failure", commit=OID_A),
+        ci_run(2, "ci_2", "success", commit=OID_B),
+        failure(10, "fail_1", ci_run_id="ci_1"),
+    ]
+    recurrence = [
+        ci_run(3, "ci_3", "failure", commit=OID_B),
+        failure(11, "fail_1", ci_run_id="ci_3"),
+    ]
+    fixed_again = ci_run(4, "ci_4", "success", commit=OID_A)
+
+    async def body(store: Neo4jStore, service: TemporalService) -> None:
+        for order in (first + recurrence, list(reversed(first + recurrence))):
+            await deliver(store, order)
+            assert (await service.failures(P1, day(FAR), day(FAR))).failures[0].failure_id == (
+                "fail_1"
+            )  # the default listing no longer hides it
+            (found,) = (await service.failures(P1, day(FAR), day(FAR))).failures
+            assert found.resolution.status is FixStatus.UNRESOLVED
+            assert found.resolution.path is None
+            assert [r.run_id for r in found.observed_in] == ["ci_1", "ci_3"]
+            # before the recurrence is visible, the first fix still stands
+            earlier = await service.failures(P1, T0 + timedelta(seconds=10), day(FAR), True)
+            assert earlier.failures[0].resolution.status is FixStatus.RESOLVED
+            await project_event(store, fixed_again, ALL)
+            (healed,) = (
+                await service.failures(P1, day(FAR), day(FAR), include_resolved=True)
+            ).failures
+            assert healed.resolution.status is FixStatus.RESOLVED
+            path = healed.resolution.path
+            assert path is not None
+            assert (path.failing_run_id, path.passing_run_id) == ("ci_3", "ci_4")
+            assert (await service.failures(P1, day(FAR), day(FAR))).failures == ()
+
+    with_service(body)

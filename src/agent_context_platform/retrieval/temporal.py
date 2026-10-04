@@ -34,7 +34,9 @@ runs: a failure observed in a CI run is `resolved` when a LATER CI run of the sa
 workflow and job, in the same project and repository, has status `success` and a `commit_id` or
 `snapshot_id` (the commit or snapshot it validated). "Later" is `(completed_at, ci_run_id)`
 order; the graph holds no commit order, so `commit_changed` says whether the passing run's commit
-differs from the failing one (`None` when either is unknown). A rerun that passes on the SAME
+differs from the failing one (`None` when either is unknown). Resolution follows the LATEST
+visible failing run of each target: a failure that recurs after an earlier fix is `unresolved`
+until a pass follows that latest run, and the path reported is for the latest occurrence. A rerun that passes on the SAME
 commit is `resolved` with `commit_changed=False`; the composer must read the flag. The earliest
 such run wins. The path is Failure -> failing CI run -> passing CI run -> validated commit or
 snapshot. A run, failing or passing, counts only in scope, once its own `recorded_at` (the
@@ -355,6 +357,7 @@ _CI_RUNS: Final[LiteralString] = (
     "UNWIND $run_ids AS run_id MATCH (r:CIRun {ci_run_id: run_id}) WHERE " + _in_scope("r") + " "
     "AND r.recorded_at <= $recorded_at AND r.completed_at <= $valid_at "
     "RETURN r.ci_run_id AS run_id, r.status AS status, r.workflow AS workflow, r.job AS job, "
+    "r.provider AS provider, r.project_id AS project_id, r.repository_id AS repository_id, "
     "r.completed_at AS completed_at, r.commit_id AS commit_id, r.snapshot_id AS snapshot_id, "
     "r.result_order AS result_order"
 )
@@ -816,6 +819,10 @@ def _fix_path(failure_id: str, record: Record) -> FixPath:
     )
 
 
+def _occurred(run: ObservedRun) -> tuple[datetime, str]:
+    return (run.completed_at or datetime.min.replace(tzinfo=UTC), run.run_id)
+
+
 def _run(kind: RunKind, run_id: str, record: Record | None) -> ObservedRun:
     if record is None:  # a session: only the observation names it
         return ObservedRun(kind, run_id, None, None, None, None, None, None, ())
@@ -898,17 +905,33 @@ def _failure_record(
     ordered = [runs[key] for key in sorted(runs, key=lambda k: (k[0].value, k[1]))]
     ci_runs = [run for run in ordered if run.kind is RunKind.CI_RUN]
     test_runs = [run for run in ordered if run.kind is RunKind.TEST_RUN]
-    paths = [
-        _fix_path(failure_id, passes[run.run_id])
-        for run in ci_runs
+    # Resolution follows the LATEST visible failing run of each target (provider, workflow, job,
+    # project, repository): a recurrence after an earlier fix leaves the failure unresolved.
+    latest: dict[tuple[object, ...], ObservedRun] = {}
+    for run in ci_runs:
+        record = ci[run.run_id]
+        key = tuple(
+            record.get(name)
+            for name in ("provider", "workflow", "job", "project_id", "repository_id")
+        )
+        best = latest.get(key)
+        if best is None or _occurred(run) > _occurred(best):
+            latest[key] = run
+    fixed = [
+        (run, passes[run.run_id])
+        for run in latest.values()
         if run.run_id in passes and passes[run.run_id]["passing_id"] is not None
     ]
-    if paths:
-        best = min(paths, key=lambda p: (p.passing_completed_at, p.passing_run_id))
-        resolution = FixResolution(FixStatus.RESOLVED, path=best)
+    if latest and len(fixed) == len(latest):
+        _, record = max(fixed, key=lambda item: _occurred(item[0]))
+        resolution = FixResolution(FixStatus.RESOLVED, path=_fix_path(failure_id, record))
     elif ci_runs:
+        open_runs = sorted(
+            run.run_id for run in latest.values() if run not in [item[0] for item in fixed]
+        )
         resolution = FixResolution(
-            FixStatus.UNRESOLVED, "no later passing run of the same CI workflow and job"
+            FixStatus.UNRESOLVED,
+            f"no later passing run of the same CI workflow and job after {', '.join(open_runs)}",
         )
     elif test_runs:
         resolution = FixResolution(
