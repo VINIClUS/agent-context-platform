@@ -524,3 +524,25 @@ def test_an_undated_superseded_decision_is_history_only_once_it_was_in_force() -
     assert [(r.decision_id, r.reason) for r in later] == [
         ("f", HistoricalReason.SUPERSEDED_UNDATED)
     ]
+
+
+def test_a_decision_closed_before_it_began_is_neither_active_nor_historical() -> None:
+    rows = [version("d", 1, valid_from=10), version("s", 2, supersedes="d", valid_from=5)]
+    versions = [row.version for row in rows]
+    for valid in (4, 6, 12, 30):
+        assert active_decisions(
+            versions, scope="scope", valid_at=at(valid), recorded_at=at(50)
+        ) == (["s"] if valid >= 5 else [])
+        records, _ = temporal._classify(rows, at(valid), at(50), True)
+        assert [r.decision_id for r in records] == (["s"] if valid >= 5 else []), valid
+    state = decision_states(versions, recorded_at=at(50))["d"]
+    assert state.empty and not state.ended_by(at(30))
+    # a non-empty interval still ends: begun at 2, closed at 5
+    live = decision_states(
+        [
+            version("d", 1, valid_from=2).version,
+            version("s", 2, supersedes="d", valid_from=5).version,
+        ],
+        recorded_at=at(50),
+    )["d"]
+    assert not live.empty and live.ended_by(at(6)) and not live.ended_by(at(4))

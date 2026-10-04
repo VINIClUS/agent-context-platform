@@ -37,8 +37,10 @@ order; the graph holds no commit order, so `commit_changed` says whether the pas
 differs from the failing one (`None` when either is unknown). A rerun that passes on the SAME
 commit is `resolved` with `commit_changed=False`; the composer must read the flag. The earliest
 such run wins. The path is Failure -> failing CI run -> passing CI run -> validated commit or
-snapshot. A run, failing or passing, counts only in scope and once its own `recorded_at` (the
-earliest envelope `observed_at` that reported it) is at or before the cut; an identity-only stub
+snapshot. A run, failing or passing, counts only in scope, once its own `recorded_at` (the
+earliest envelope `observed_at` that reported it) is at or before the cut, and once its
+`completed_at` is at or before `valid_at`; a run still to complete is omitted from `observed_in`
+(and so is no candidate for a fix path), never shown with an unknown status; an identity-only stub
 has none and is never visible at a past cut.
 Gaps, reported rather than guessed:
 - `TestRunCompletedV1` carries no suite or target identifier (SDK gap FU-77), so the same test
@@ -346,11 +348,12 @@ _OBSERVATIONS: Final[LiteralString] = (
     "o.ci_run_id AS ci_run_id "
     "ORDER BY o.valid_from, o.failure_id, o.event_id LIMIT $limit"
 )
-# A run is visible only in scope and once the platform had recorded it; a stub has no
-# `recorded_at` and never is.
+# A run is visible only in scope, once the platform had recorded it (a stub has no `recorded_at`
+# and never is) and once it had completed: a run still to complete at `valid_at` is omitted from
+# `observed_in` and is no candidate for a fix path.
 _CI_RUNS: Final[LiteralString] = (
     "UNWIND $run_ids AS run_id MATCH (r:CIRun {ci_run_id: run_id}) WHERE " + _in_scope("r") + " "
-    "AND r.recorded_at <= $recorded_at "
+    "AND r.recorded_at <= $recorded_at AND r.completed_at <= $valid_at "
     "RETURN r.ci_run_id AS run_id, r.status AS status, r.workflow AS workflow, r.job AS job, "
     "r.completed_at AS completed_at, r.commit_id AS commit_id, r.snapshot_id AS snapshot_id, "
     "r.result_order AS result_order"
@@ -358,7 +361,7 @@ _CI_RUNS: Final[LiteralString] = (
 _TEST_RUNS: Final[LiteralString] = (
     "UNWIND $run_ids AS run_id MATCH (r:TestRun {test_run_id: run_id}) WHERE "
     + _in_scope("r")
-    + " AND r.recorded_at <= $recorded_at "
+    + " AND r.recorded_at <= $recorded_at AND r.completed_at <= $valid_at "
     "RETURN r.test_run_id AS run_id, r.status AS status, r.completed_at AS completed_at, "
     "r.commit_id AS commit_id, r.snapshot_id AS snapshot_id, r.result_order AS result_order"
 )
@@ -367,7 +370,7 @@ _TEST_RUNS: Final[LiteralString] = (
 _NEXT_PASS: Final[LiteralString] = (
     "UNWIND $run_ids AS run_id "
     "MATCH (r:CIRun {ci_run_id: run_id}) WHERE " + _in_scope("r") + " "
-    "AND r.recorded_at <= $recorded_at AND r.completed_at IS NOT NULL AND r.workflow IS NOT NULL AND r.job IS NOT NULL "
+    "AND r.recorded_at <= $recorded_at AND r.completed_at <= $valid_at AND r.workflow IS NOT NULL AND r.job IS NOT NULL "
     "OPTIONAL MATCH (p:CIRun) WHERE " + _in_scope("p") + " "
     "AND p.status = 'success' AND p.provider = r.provider AND p.workflow = r.workflow "
     "AND p.job = r.job "
@@ -664,7 +667,7 @@ def _classify(
             version.status == "superseded" and state.end is None and version.valid_from <= valid_at
         ):
             standing, reason = DecisionStanding.HISTORICAL, HistoricalReason.SUPERSEDED_UNDATED
-        elif state.asserted and state.end is not None and state.end <= valid_at:
+        elif state.ended_by(valid_at):
             standing = DecisionStanding.HISTORICAL
             by_successor = state.closed_at is not None and state.closed_at == state.end
             reason = HistoricalReason.SUPERSEDED if by_successor else HistoricalReason.EXPIRED

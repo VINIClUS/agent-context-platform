@@ -945,3 +945,59 @@ def test_a_graph_projected_before_the_history_nodes_is_refused() -> None:
                 await fresh.close()
 
     with_service(body)
+
+
+def test_a_decision_closed_before_it_began_is_never_returned() -> None:
+    events = [
+        decision(1, "dec_d", valid_from=10),
+        decision(2, "dec_s", supersedes="dec_d", valid_from=5),
+    ]
+
+    async def body(store: Neo4jStore, service: TemporalService) -> None:
+        for order in (events, list(reversed(events))):
+            await deliver(store, order)
+            for valid in (6, 12, 30):
+                shown = await service.decisions(P1, day(valid), day(FAR), include_history=True)
+                assert [(d.decision_id, d.standing) for d in shown.decisions] == [
+                    ("dec_s", DecisionStanding.ACTIVE)
+                ], valid
+            versions = [decision_version(event) for event in events]
+            assert active_decisions(
+                versions, scope="mod_a", valid_at=day(6), recorded_at=day(FAR)
+            ) == ["dec_s"]
+
+    with_service(body)
+
+
+def test_a_run_not_yet_completed_at_the_valid_time_is_omitted() -> None:
+    # The failure is seen at 2 s; its CI run completes at 10 s and the passing one at 20 s.
+    events = [
+        failure(2, "fail_1", ci_run_id="ci_1"),
+        ci_run(10, "ci_1", "failure", observed=1),
+        ci_run(20, "ci_2", "success", commit=OID_B, observed=1),
+        failure(3, "fail_t", test_run_id="tr_1"),
+        run_of_tests(15, "tr_1"),
+    ]
+
+    async def body(store: Neo4jStore, service: TemporalService) -> None:
+        await deliver(store, events)
+
+        async def seen(seconds: float) -> dict[str, Any]:
+            moment = T0 + timedelta(seconds=seconds)
+            shown = await service.failures(P1, moment, day(FAR), include_resolved=True)
+            return {f.failure_id: f for f in shown.failures}
+
+        early = await seen(5)  # neither run has completed
+        assert early["fail_1"].observed_in == () and early["fail_t"].observed_in == ()
+        assert early["fail_1"].resolution.status is FixStatus.UNKNOWN
+        assert early["fail_1"].source_event_ids == (str(event_uuid(2)),)
+        between = await seen(12)  # the failing run completed, the passing one has not
+        assert [r.run_id for r in between["fail_1"].observed_in] == ["ci_1"]
+        assert between["fail_1"].resolution.status is FixStatus.UNRESOLVED
+        assert between["fail_t"].observed_in == ()
+        after = await seen(20)
+        assert after["fail_1"].resolution.status is FixStatus.RESOLVED
+        assert [r.run_id for r in after["fail_t"].observed_in] == ["tr_1"]
+        assert after["fail_t"].resolution.status is FixStatus.UNSUPPORTED
+
+    with_service(body)

@@ -457,6 +457,21 @@ class DecisionState:
         status = self.version.status
         return status in _SUPERSEDING and not (status == "superseded" and self.end is None)
 
+    @property
+    def empty(self) -> bool:
+        """Whether it was closed at or before it began: never in force, so never history either."""
+        return self.end is not None and self.end <= self.version.valid_from
+
+    def ended_by(self, valid_at: datetime) -> bool:
+        """Whether it had begun and then ended at or before `valid_at` (a non-empty interval)."""
+        return (
+            self.asserted
+            and not self.empty
+            and self.end is not None
+            and self.version.valid_from <= valid_at
+            and self.end <= valid_at
+        )
+
 
 def _edges(current: Mapping[str, DecisionVersion]) -> list[tuple[str, str]]:
     """`(superseder, superseded)` for each current version that asserts a supersession."""
