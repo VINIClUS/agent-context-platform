@@ -172,6 +172,12 @@ CONSTRAINT_STATEMENTS: tuple[SchemaStatement, ...] = (
         "decision_id",
     ),
     SchemaStatement(
+        "uq_decision_version_event_id",
+        "CREATE CONSTRAINT uq_decision_version_event_id IF NOT EXISTS FOR (n:DecisionVersion) REQUIRE n.event_id IS UNIQUE",
+        "DecisionVersion",
+        "event_id",
+    ),
+    SchemaStatement(
         "uq_constraint_constraint_id",
         "CREATE CONSTRAINT uq_constraint_constraint_id IF NOT EXISTS FOR (n:Constraint) REQUIRE n.constraint_id IS UNIQUE",
         "Constraint",
@@ -182,6 +188,12 @@ CONSTRAINT_STATEMENTS: tuple[SchemaStatement, ...] = (
         "CREATE CONSTRAINT uq_failure_failure_id IF NOT EXISTS FOR (n:Failure) REQUIRE n.failure_id IS UNIQUE",
         "Failure",
         "failure_id",
+    ),
+    SchemaStatement(
+        "uq_failure_observation_event_id",
+        "CREATE CONSTRAINT uq_failure_observation_event_id IF NOT EXISTS FOR (n:FailureObservation) REQUIRE n.event_id IS UNIQUE",
+        "FailureObservation",
+        "event_id",
     ),
     SchemaStatement(
         "uq_summary_summary_id",

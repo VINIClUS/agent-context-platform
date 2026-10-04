@@ -45,8 +45,10 @@ pytestmark = pytest.mark.integration
 NODE_KEYS.update(
     {
         "Decision": "decision_id",
+        "DecisionVersion": "event_id",
         "Constraint": "constraint_id",
         "Failure": "failure_id",
+        "FailureObservation": "event_id",
         "Summary": "summary_id",
         "TestRun": "test_run_id",
         "CIRun": "ci_run_id",
@@ -431,7 +433,10 @@ def test_a_dropped_supersession_leaves_no_stub_of_a_decision_that_never_arrived(
         both = digest(await deliver(store, [accepted, rejected]))
         assert digest(await deliver(store, [rejected, accepted])) == both
         state = await deliver(store, [accepted, rejected])
-        assert [item["id"] for item in state["nodes"]] == ["Decision:dec_b"]
+        # The never-delivered decision leaves no stub; the two recordings of dec_b stay as history.
+        assert [item["id"] for item in state["nodes"] if item["id"].startswith("Decision:")] == [
+            "Decision:dec_b"
+        ]
         # While the edge stands, the stub is there and carries the closure.
         assert node(await deliver(store, [accepted]), "Decision:dec_a")["superseded_at"] == ts(10)
 
@@ -503,5 +508,161 @@ def test_active_decisions_agrees_with_the_graph_closure_at_several_as_of_points(
                     recorded_at=T0 + timedelta(days=365),
                 )
                 assert graph_active(state, "mod_a", valid_day) == expected, valid_day
+
+    with_graph(body)
+
+
+def versions_of(state: dict[str, list[dict]]) -> dict[str, dict[str, Any]]:
+    return {
+        item["id"].split(":", 1)[1]: item["props"]
+        for item in state["nodes"]
+        if item["id"].startswith("DecisionVersion:")
+    }
+
+
+def test_every_decision_recording_is_kept_as_an_immutable_version() -> None:
+    async def body(store: Neo4jStore) -> None:
+        a, accepted, rejected = reopening_events()
+        expected = digest(await deliver(store, [a, accepted, rejected]))
+        for order in itertools.permutations([a, accepted, rejected]):
+            state = await deliver(store, list(order))
+            assert digest(state) == expected, [str(e.event_id)[-1] for e in order]
+        assert sorted(versions_of(state)) == sorted(
+            str(e.event_id) for e in (a, accepted, rejected)
+        )
+        assert versions_of(state)[str(accepted.event_id)] == {
+            "event_id": str(accepted.event_id),
+            "decision_id": "dec_b",
+            "status": "accepted",
+            "subjects": ["mod_a", "mod_b"],
+            "supersedes_id": "dec_a",
+            "valid_from": ts(10),
+            "recorded_at": ts(2),
+            "payload_recorded_at": ts(2),
+            "state_order": f"2026-08-13T13:00:02.000000|{accepted.event_id}",
+            "source_event_ids": [str(accepted.event_id)],
+        }
+        assert versions_of(state)[str(rejected.event_id)]["status"] == "rejected"
+        links = rels(state, "HAS_VERSION")
+        assert sorted((a_, b_) for a_, b_, _ in links) == sorted(
+            [
+                ("Decision:dec_a", f"DecisionVersion:{a.event_id}"),
+                ("Decision:dec_b", f"DecisionVersion:{accepted.event_id}"),
+                ("Decision:dec_b", f"DecisionVersion:{rejected.event_id}"),
+            ]
+        )
+        # Replaying an event adds nothing.
+        await project_event(store, accepted, ALL)
+        assert digest(await graph_state(store)) == expected
+
+    with_graph(body)
+
+
+def test_scope_comes_from_the_envelope_and_the_smallest_value_wins_in_any_order() -> None:
+    first = make(
+        1,
+        "knowledge.failure.observed",
+        {
+            "failure_id": "fail_s",
+            "component": "api",
+            "operation": "ingest",
+            "error_class": "Timeout",
+            "fingerprint_version": "1",
+            "fingerprint_sha256": SHA,
+            "ci_run_id": "ci_s",
+        },
+        context={"project_id": "prj_b", "repository_id": "repo_b"},
+    )
+    second = make(
+        2,
+        "knowledge.failure.observed",
+        {**first.payload, "failure_id": "fail_s"},
+        context={"project_id": "prj_a", "repository_id": "repo_a"},
+    )
+    unscoped = decision(3, "dec_u")
+    scoped = make(
+        4,
+        "knowledge.decision.recorded",
+        {**unscoped.payload, "decision_id": "dec_s"},
+        context={"project_id": "prj_a"},
+    )
+
+    async def body(store: Neo4jStore) -> None:
+        expected = digest(await deliver(store, [first, second, unscoped, scoped]))
+        for order in itertools.permutations([first, second, unscoped, scoped]):
+            state = await deliver(store, list(order))
+            assert digest(state) == expected
+        failure = node(state, "Failure:fail_s")
+        assert (failure["project_id"], failure["repository_id"]) == ("prj_a", "repo_a")
+        assert "project_id" not in node(state, "Decision:dec_u")
+        assert node(state, "Decision:dec_s")["project_id"] == "prj_a"
+        assert "repository_id" not in node(state, "Decision:dec_s")
+        assert versions_of(state)[str(scoped.event_id)]["project_id"] == "prj_a"
+        assert "project_id" not in versions_of(state)[str(unscoped.event_id)]
+
+    with_graph(body)
+
+
+def failure_event(number: int, **kwargs: Any) -> StoredEventV1:
+    payload: dict[str, object] = {
+        "failure_id": "fail_o",
+        "component": "api",
+        "operation": "ingest",
+        "error_class": "Timeout",
+        "fingerprint_version": "1",
+        "fingerprint_sha256": SHA,
+    }
+    return make(
+        number,
+        "knowledge.failure.observed",
+        payload | kwargs.pop("payload"),
+        **kwargs,
+    )
+
+
+def test_every_failure_event_is_kept_as_an_immutable_observation() -> None:
+    first = failure_event(
+        1, payload={"ci_run_id": "ci_1"}, observed=5, context={"project_id": "prj_a"}
+    )
+    second = failure_event(
+        2,
+        payload={"session_id": "sess_1", "test_run_id": "tr_1"},
+        observed=9,
+        context={"project_id": "prj_a", "repository_id": "repo_a"},
+    )
+
+    async def body(store: Neo4jStore) -> None:
+        expected = digest(await deliver(store, [first, second]))
+        state = await deliver(store, [second, first])
+        assert digest(state) == expected
+        assert digest(await deliver(store, [first, second, first])) == expected  # replay
+        observations = {
+            item["id"].split(":", 1)[1]: item["props"]
+            for item in state["nodes"]
+            if item["id"].startswith("FailureObservation:")
+        }
+        assert observations[str(first.event_id)] == {
+            "event_id": str(first.event_id),
+            "failure_id": "fail_o",
+            "component": "api",
+            "operation": "ingest",
+            "error_class": "Timeout",
+            "fingerprint_version": "1",
+            "fingerprint_sha256": SHA,
+            "valid_from": "2026-08-13T13:00:01.000000Z",
+            "recorded_at": ts(5),
+            "source_event_ids": [str(first.event_id)],
+            "ci_run_id": "ci_1",
+            "project_id": "prj_a",
+        }
+        later = observations[str(second.event_id)]
+        assert (later["session_id"], later["test_run_id"]) == ("sess_1", "tr_1")
+        assert (later["recorded_at"], later["repository_id"]) == (ts(9), "repo_a")
+        assert "ci_run_id" not in later
+        assert sorted(b for _, b, _ in rels(state, "HAS_OBSERVATION")) == sorted(
+            f"FailureObservation:{event.event_id}" for event in (first, second)
+        )
+        # The Failure node still holds the current, independently minimised view.
+        assert node(state, "Failure:fail_o")["recorded_at"] == ts(5)
 
     with_graph(body)
