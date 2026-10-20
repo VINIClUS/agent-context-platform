@@ -59,6 +59,11 @@ from agent_context_platform.projection.runtime import (
     ProjectionRunReport,
     Projector,
 )
+from agent_context_platform.projection.schema import (
+    HistoryState,
+    history_state,
+    projection_history,
+)
 from agent_context_platform.projection.verify import (
     CLI_APPLICATION_NAME,
     DEFAULT_BATCH_SIZE,
@@ -76,6 +81,7 @@ from agent_context_platform.projection.verify import (
     projection_status,
     public_error_class,
     rebuild_projections,
+    record_history_if_fresh,
     verify_projections,
 )
 from agent_context_platform.settings import Neo4jSettings, Settings
@@ -434,13 +440,15 @@ def verify_command(
                     recorder=_recorder(runtime),
                     batch_size=batch_size,
                 )
+                history = await _history(runtime.store, registered_projectors())
         finally:
             if scratch is not None:
                 await scratch.close()
+        lines = _verification_lines(report, require_caught_up=require_caught_up)
         _emit(
-            report.to_dict(require_caught_up=require_caught_up),
+            {**report.to_dict(require_caught_up=require_caught_up), "history": history},
             as_json=json_output,
-            lines=_verification_lines(report, require_caught_up=require_caught_up),
+            lines=[*lines[:-1], _history_line(history), lines[-1]],
         )
         if report.record_error:
             typer.echo(f"error: {report.record_error}", err=True)
@@ -448,6 +456,23 @@ def verify_command(
         return EXIT_OK if report.ok(require_caught_up=require_caught_up) else EXIT_FAILED
 
     _run(main)
+
+
+async def _history(store: Neo4jStore, projectors: Sequence[Projector]) -> dict[str, Any]:
+    """Whether these projector versions projected the live graph from the ledger's start."""
+    state, missing = history_state(
+        await projection_history(store), ((item.name, item.version) for item in projectors)
+    )
+    return {"state": state.value, "missing": list(missing)}
+
+
+def _history_line(history: dict[str, Any]) -> str:
+    if history["state"] == HistoryState.COMPLETE:
+        return "history: complete (projected from the start of the ledger)"
+    return (
+        f"history: {history['state']}, rebuild required before temporal reads "
+        f"(not replayed from the start: {', '.join(history['missing']) or 'none'})"
+    )
 
 
 def _rebuild_lines(report: RebuildReport) -> list[str]:
@@ -555,6 +580,7 @@ def status_command(json_output: _JSON = False) -> None:
         settings = _load_settings()
         async with _runtime(settings) as runtime:
             statuses = await projection_status(runtime.sessions, registered_projectors())
+            history = await _history(runtime.store, registered_projectors())
         lines = [
             f"{item.name} {item.version}: state {item.state or 'none'}, "
             f"checkpoint {item.checkpoint_outbox_id}/{item.ledger_head_outbox_id}, "
@@ -563,7 +589,9 @@ def status_command(json_output: _JSON = False) -> None:
             for item in statuses
         ]
         _emit(
-            {"projectors": [item.to_dict() for item in statuses]}, as_json=json_output, lines=lines
+            {"projectors": [item.to_dict() for item in statuses], "history": history},
+            as_json=json_output,
+            lines=[*lines, _history_line(history)],
         )
         return EXIT_OK
 
@@ -837,6 +865,13 @@ def run_command(
                 runner = ProjectionRunner(
                     runtime.sessions, runtime.store, projectors, worker_id=worker_id
                 )
+                # A worker starting on an empty graph with nothing delivered projects the whole
+                # ledger: record that (the history marker); never while a rebuild holds the lock.
+                async with _shared_rebuild_lock(runtime.sessions) as blocked:
+                    if not blocked and await record_history_if_fresh(
+                        runtime.sessions, runtime.store, projectors
+                    ):
+                        log("history_marker_recorded")
                 touch()
                 log("started")
                 try:

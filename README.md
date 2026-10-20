@@ -107,15 +107,26 @@ agent-context projection rebuild --target-uri bolt://standby:7687 --target-datab
 agent-context projection rebuild --in-place --confirm neo4j   # stop the projection runner first
 ```
 
-* **Rebuild required on upgrade.** Checkpoints are per `(projector, version)`. The `knowledge` and
-  `quality` projectors are version `2`: they add the `DecisionVersion` and `FailureObservation`
-  history nodes and the `project_id`/`repository_id`/`recorded_at` run properties the temporal
-  reads (`retrieval/temporal.py`) need. Events already delivered by version `1` are not replayed
-  into version `2`, so after upgrading run `projection rebuild` (in place or into a standby),
-  which replays the whole ledger. Until then `TemporalService` refuses to read
-  (`TemporalProjectionOutdated`) instead of returning empty answers. That guard only detects
-  entities with no history at all; an entity with some but not all of its history (partly
-  projected before the upgrade) is not detected, so a rebuild is mandatory on upgrade.
+* **Rebuild required on upgrade.** Checkpoints are per `(projector, version)` and a delivered
+  outbox row is never claimed again, so a projector version deployed over a populated graph only
+  sees the events delivered after it. The `knowledge` and `quality` projectors are version `2`:
+  they add the `DecisionVersion` and `FailureObservation` history nodes and the
+  `project_id`/`repository_id`/`recorded_at` run properties the temporal reads
+  (`retrieval/temporal.py`) need, and after an upgrade every older entity lacks some or all of
+  that history. The graph therefore carries a projection history marker
+  (`(:ProjectionHistory {marker_id: "ledger"})`, `projection/schema.py`) naming the projector
+  versions that projected it from the START of the ledger. Only two things record it: a rebuild
+  (in place or into a standby) once its full replay has verified, and `projection run` when it
+  starts on an empty graph before any outbox row was delivered. A wipe (the first step of an
+  in-place rebuild) removes it, and the graph digest leaves it out. `TemporalService` checks it in
+  every read transaction and raises `TemporalProjectionOutdated` unless it names the current
+  `knowledge` and `quality` versions; it never serves partial history. `projection status` and
+  `projection verify` print `history: complete|outdated|missing` (JSON `history.state`, with the
+  projector versions not replayed from the start in `history.missing`); it is reported, not a
+  verification failure (an upgrade without a rebuild already fails `verify` with
+  `processed_count_mismatch`). **Operator procedure on upgrade:** stop the projection runner,
+  deploy, run `projection rebuild --in-place --confirm <database>` (or a standby rebuild and
+  cutover), check that `projection status` prints `history: complete`, then start the runner.
 * **Running the projector.** `agent-context projection run` is the worker process: it drives the
   existing `ProjectionRunner` over the registered projectors with the projector-role connection
   (`AGENT_CONTEXT_POSTGRESQL__PROJECTOR_DSN`, falling back to `__DSN`) and the live Neo4j settings.

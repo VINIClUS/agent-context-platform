@@ -79,9 +79,16 @@ def test_run_once_projects_the_fixture_ledger_to_the_golden_digest(ledger: World
     assert asyncio.run(graph_facts()).digest == GOLDEN_DIGEST
     assert count_status(ledger, "delivered") == ledger.event_count
 
+    # It started on an empty graph with nothing delivered: the whole ledger went through the
+    # current projectors, which is what the history marker records.
+    assert "projection_worker history_marker_recorded" in result.stderr
+    status = json.loads(invoke(["projection", "status", "--json"], ledger.env(api=None)).stdout)
+    assert status["history"] == {"state": "complete", "missing": []}
+
     # Nothing left: a second drain claims nothing and still exits 0.
-    again = report(invoke(["projection", "run", "--once", "--json"], ledger.env(api=None)))
-    assert again["claimed"] == 0
+    second = invoke(["projection", "run", "--once", "--json"], ledger.env(api=None))
+    assert report(second)["claimed"] == 0
+    assert "history_marker_recorded" not in second.stderr
 
 
 def test_a_poison_event_is_dead_lettered_and_exits_1(ledger: World) -> None:

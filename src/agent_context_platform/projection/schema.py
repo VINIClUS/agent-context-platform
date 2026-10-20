@@ -1,10 +1,11 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Mapping
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
+from enum import StrEnum
 from time import monotonic
-from typing import LiteralString
+from typing import Final, LiteralString
 
 from neo4j import Record
 
@@ -374,3 +375,103 @@ def _validate_vector_config(record: Record, statement: SchemaStatement) -> None:
         raise Neo4jSchemaMismatchError(
             f"Neo4j schema object {statement.name} does not match the projection manifest"
         )
+
+
+# --------------------------------------------------------------------------------------------
+# Projection history marker
+# --------------------------------------------------------------------------------------------
+#
+# Checkpoints are per (projector, version) and a delivered outbox row is never claimed again, so a
+# projector version deployed over an already-populated graph sees only the events delivered after
+# it: history it adds (the knowledge projector's DecisionVersion and FailureObservation nodes) is
+# then missing for everything older, and nothing in the graph says so. The marker says it: one
+# `(:ProjectionHistory {marker_id: "ledger"})` node whose `projectors` list names, as
+# `<name>:<version>`, the projector versions that have projected this graph from the start of the
+# ledger. Only two writers record it, both after the fact is established: a rebuild (in place or
+# into a standby) once its replay of the whole ledger has been verified, and the projection worker
+# when it starts on an empty graph before any outbox row was delivered (every event is then still
+# to come, through the current projectors). Wiping the graph removes it. It is metadata about the
+# projection, not a projection of an event, so the graph digest leaves it out (`verify.py`).
+# Readers that depend on complete history (`retrieval/temporal.py`) refuse to serve without it.
+
+HISTORY_LABEL: Final = "ProjectionHistory"
+HISTORY_MARKER_ID: Final = "ledger"
+_MAX_MARKERS: Final = 16
+
+_RECORD_HISTORY: Final[LiteralString] = (
+    "MERGE (m:ProjectionHistory {marker_id: $marker_id}) SET m.projectors = $projectors"
+)
+_READ_HISTORY: Final[LiteralString] = (
+    "MATCH (m:ProjectionHistory) RETURN m.marker_id AS marker_id, m.projectors AS projectors "
+    "LIMIT $limit"
+)
+
+
+class HistoryState(StrEnum):
+    COMPLETE = "complete"  # every projector asked about projected the graph from the start
+    OUTDATED = "outdated"  # a marker exists, but not for every one of those projector versions
+    MISSING = "missing"  # no marker: never rebuilt, or wiped by an unfinished rebuild
+
+
+def projector_key(name: str, version: str) -> str:
+    return f"{name}:{version}"
+
+
+@dataclass(frozen=True, slots=True)
+class ProjectionHistory:
+    """The projector versions (`<name>:<version>`) that projected this graph from the start."""
+
+    projectors: frozenset[str]
+
+
+def history_state(
+    history: ProjectionHistory | None, required: Iterable[tuple[str, str]]
+) -> tuple[HistoryState, tuple[str, ...]]:
+    """Whether `history` covers every `(name, version)` in `required`, and which ones it lacks."""
+    wanted = tuple(sorted({projector_key(*item) for item in required}))
+    if history is None:
+        return HistoryState.MISSING, wanted
+    missing = tuple(item for item in wanted if item not in history.projectors)
+    return (HistoryState.OUTDATED if missing else HistoryState.COMPLETE), missing
+
+
+async def read_projection_history(tx: Neo4jTransaction) -> ProjectionHistory | None:
+    """The marker, read inside the caller's transaction (so it matches the data read with it).
+
+    Fail-closed: a marker of another ID, a `projectors` value that is not a list of strings, or
+    several markers (the worker's start-up write has no uniqueness constraint) only ever narrow
+    the result, to the projectors every valid marker names.
+    """
+    records = (await tx.run(_READ_HISTORY, parameters={"limit": _MAX_MARKERS})).records
+    covered: frozenset[str] | None = None
+    for record in records:
+        value = record["projectors"]
+        names: frozenset[str] = frozenset()
+        if record["marker_id"] == HISTORY_MARKER_ID and isinstance(value, list):
+            names = frozenset(item for item in value if isinstance(item, str))
+            if len(names) != len(value):
+                names = frozenset()
+        covered = names if covered is None else covered & names
+    return None if covered is None else ProjectionHistory(covered)
+
+
+async def projection_history(store: Neo4jStore) -> ProjectionHistory | None:
+    """`read_projection_history` in its own read transaction."""
+    return await store.execute_read(read_projection_history)
+
+
+async def record_projection_history(
+    store: Neo4jStore, projectors: Iterable[tuple[str, str]]
+) -> None:
+    """Record that `projectors` (`(name, version)`) projected this graph from the ledger's start.
+
+    Call it only once that is established (see the section comment); it replaces any earlier list.
+    """
+    names = sorted({projector_key(*item) for item in projectors})
+
+    async def write(tx: Neo4jTransaction) -> None:
+        await tx.run(
+            _RECORD_HISTORY, parameters={"marker_id": HISTORY_MARKER_ID, "projectors": names}
+        )
+
+    await store.execute_write(write)

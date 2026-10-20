@@ -4,7 +4,9 @@ Everything the `agent-context projection` CLI does lives here, so it can be test
 
 * `compute_graph_digest` is the production digest: a canonical SHA-256 over every node (labels and
   non-volatile properties) and relationship (type, endpoint identities, properties) of ONE Neo4j
-  database. It streams in keyset-ordered batches and holds only 32 bytes per graph item.
+  database. It streams in keyset-ordered batches and holds only 32 bytes per graph item. The
+  projection history marker (`schema.HISTORY_LABEL`) is metadata about the graph, not projected
+  data, and is left out, so a replay without it still matches the live graph.
 * `verify_projections` checks, read-only, checkpoint continuity, event coverage, orphan source IDs
   and stream heads against the ledger, and can compare the live graph with a scratch replay.
 * `replay_ledger` projects the ledger, in ledger (outbox) order, through the registered projectors
@@ -77,7 +79,12 @@ from agent_context_platform.projection.runtime import (
     OrphanedOutboxRowError,
     Projector,
 )
-from agent_context_platform.projection.schema import CONSTRAINT_STATEMENTS, ensure_schema
+from agent_context_platform.projection.schema import (
+    CONSTRAINT_STATEMENTS,
+    HISTORY_LABEL,
+    ensure_schema,
+    record_projection_history,
+)
 
 Clock = Callable[[], datetime]
 
@@ -224,8 +231,8 @@ class _Pass:
         """(page query, relationship query), each taking `$cursors`/`$after`/`$limit`."""
         if self.label is None:
             return (
-                "MATCH (n) WHERE NOT any(l IN labels(n) WHERE l IN $keyed "
-                "AND n[$keys[l]] IS NOT NULL) "
+                "MATCH (n) WHERE NOT n:" + HISTORY_LABEL + " AND NOT any(l IN labels(n) "
+                "WHERE l IN $keyed AND n[$keys[l]] IS NOT NULL) "
                 "AND ($after IS NULL OR elementId(n) > $after) "
                 "WITH n ORDER BY elementId(n) LIMIT $limit "
                 "RETURN elementId(n) AS cursor, labels(n) AS labels, properties(n) AS props",
@@ -1519,6 +1526,7 @@ class RebuildReport:
     recorded: RecordResult | None
     record_error: str | None = None
     skipped_dead_lettered: tuple[UUID, ...] = ()
+    history_recorded: bool = False
 
     @property
     def ok(self) -> bool:
@@ -1537,6 +1545,7 @@ class RebuildReport:
             "verification": self.verification.to_dict(),
             "recorded": None if self.recorded is None else self.recorded.to_dict(),
             "record_error": self.record_error,
+            "history_recorded": self.history_recorded,
             "skipped_dead_lettered": {
                 "count": len(self.skipped_dead_lettered),
                 "event_ids": [str(item) for item in self.skipped_dead_lettered[:_SKIPPED_LISTED]],
@@ -1649,6 +1658,10 @@ async def _rebuild_projections(
     row lock: catch up on events delivered meanwhile, never move a checkpoint backwards, recompute
     the processed counts), and verify the live projection like `verify_projections`. Pending
     events stay pending for the runner.
+
+    Only once that verification passes is the projection history marker recorded on the target
+    (`schema.record_projection_history`, `history_recorded`): every registered projector has then
+    seen the ledger from its start. A failed or interrupted rebuild leaves the target without one.
     """
     started = clock()
     wiped = 0
@@ -1686,6 +1699,8 @@ async def _rebuild_projections(
             verification = await _verify_replayed_target(
                 session_factory, target, projectors, replay, batch_size
             )
+        if verification.ok():
+            await record_projection_history(target, ((p.name, p.version) for p in projectors))
     except Exception as error:
         if recorder is not None:
             with contextlib.suppress(Exception):  # the original failure is the one to surface
@@ -1732,7 +1747,33 @@ async def _rebuild_projections(
         recorded=recorded,
         record_error=record_error,
         skipped_dead_lettered=skipped,
+        history_recorded=ok,
     )
+
+
+async def record_history_if_fresh(
+    session_factory: async_sessionmaker[AsyncSession],
+    store: Neo4jStore,
+    projectors: Sequence[Projector],
+) -> bool:
+    """Record the projection history marker when `store` starts empty with nothing delivered.
+
+    The projection worker calls this at start-up, holding the rebuild lock shared. An empty graph
+    while no outbox row has ever been delivered means every ledger event is still to be projected,
+    by these projectors, from the start: the marker is then true. Anything else (a graph with data,
+    or a delivered row, whatever version delivered it) records nothing; only a verified rebuild
+    can establish complete history there. Returns whether the marker was recorded.
+    """
+    if await count_nodes(store):
+        return False
+    async with session_factory() as session:
+        delivered = await session.scalar(
+            select(OutboxRow.outbox_id).where(OutboxRow.status == OutboxStatus.DELIVERED).limit(1)
+        )
+    if delivered is not None:
+        return False
+    await record_projection_history(store, ((p.name, p.version) for p in projectors))
+    return True
 
 
 # --------------------------------------------------------------------------------------------
@@ -1969,6 +2010,7 @@ __all__ = [
     "projection_status",
     "rebuild_lock",
     "rebuild_projections",
+    "record_history_if_fresh",
     "replay_ledger",
     "source_ids",
     "system_event_key",

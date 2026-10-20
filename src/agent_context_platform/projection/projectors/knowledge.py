@@ -396,8 +396,9 @@ class KnowledgeProjector:
 
     name = "knowledge"
     # "2" added DecisionVersion/FailureObservation history and scope properties. Graphs projected
-    # by "1" lack them: `projection status`/`verify` report no "2" checkpoint, and a rebuild
-    # (README, "projection rebuild") is required. `TemporalService` refuses to read such a graph.
+    # by "1" lack them for every event delivered before the upgrade, so a rebuild (README,
+    # "Rebuild required on upgrade") is required. `TemporalService` refuses to read a graph whose
+    # projection history marker (`projection/schema.py`) does not name this version.
     version = "2"
 
     def handles(self, event_type: str) -> bool:
