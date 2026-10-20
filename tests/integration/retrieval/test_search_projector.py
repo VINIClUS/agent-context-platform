@@ -82,9 +82,12 @@ def test_a_projected_event_leaves_one_row_and_one_node_without_the_text(
         (row,) = await _rows(
             world,
             "SELECT content_id, event_id, source_event_ids, event_type, project_id, "
-            "repository_id, session_id, redaction, tsv::text FROM retrieval.search_documents",
+            "repository_id, session_id, redaction, content_sha256, media_type, tsv::text "
+            "FROM retrieval.search_documents",
         )
         assert (row.content_id, str(row.event_id)) == ("c-1", str(event_id))
+        assert row.content_sha256 == hashlib.sha256(secret_free.encode()).hexdigest()
+        assert row.media_type == "text/plain"
         assert [str(item) for item in row.source_event_ids] == [str(event_id)]
         assert (row.project_id, row.repository_id, row.session_id) == (
             "project-1",
@@ -100,6 +103,7 @@ def test_a_projected_event_leaves_one_row_and_one_node_without_the_text(
             "model_id",
             "model_revision",
             "content_sha256",
+            "media_type",
             "truncated",
             "project_id",
             "repository_id",
@@ -499,8 +503,9 @@ def test_an_in_place_rebuild_resets_the_search_tables_and_rebuilds_them_from_the
                 text(
                     "INSERT INTO retrieval.search_documents (content_id, event_id, "
                     "source_event_ids, event_type, project_id, repository_id, occurred_at, "
-                    "redaction, tsv) SELECT 'c-orphan', event_id, ARRAY[event_id], 'x', 'p', 'r', "
-                    "now(), 'sanitized', to_tsvector('simple', 'orphan') FROM ledger.events LIMIT 1"
+                    "redaction, content_sha256, media_type, tsv) SELECT 'c-orphan', event_id, "
+                    "ARRAY[event_id], 'x', 'p', 'r', now(), 'sanitized', repeat('0', 64), "
+                    "'text/plain', to_tsvector('simple', 'orphan') FROM ledger.events LIMIT 1"
                 )
             )
             await connection.execute(
@@ -603,3 +608,173 @@ def test_an_in_place_rebuild_survives_content_whose_bytes_were_really_purged(
 
 def _service(world: SearchWorld) -> SearchService:
     return SearchService(world.api, world.store.read_only(), world.embeddings)
+
+
+class _FailOnPurge:
+    """Fails the Neo4j transaction of every purge after the search projector's PostgreSQL commit."""
+
+    name = "fail-on-purge"
+    version = "1"
+
+    def handles(self, event_type: str) -> bool:
+        return event_type == "content.purged"
+
+    async def project(self, _tx: object, _event: object) -> None:
+        raise RuntimeError("graph write failed")
+
+
+def test_an_in_place_rebuild_keeps_the_tombstone_of_a_dead_lettered_purge(
+    postgres_dsn: str, projection_engine: AsyncEngine
+) -> None:
+    from agent_context_platform import cli
+    from agent_context_platform.projection.verify import rebuild_projections
+
+    async def body(world: SearchWorld) -> None:
+        await world.ingest("kept text", "c-kept")
+        await world.ingest("purged text", "c-gone", session="session-2", turn="turn-2")
+        assert (await world.project()).dead_lettered == 0
+        await world.purge("c-gone")
+        # The purge's PostgreSQL delete and tombstone commit, then its graph write fails for good.
+        assert (await world.project(extra_projectors=[_FailOnPurge()])).dead_lettered == 1
+        projectors = projectors_with_search(world.backend())
+
+        report = await rebuild_projections(
+            world.projector_sessions,
+            world.store,
+            projectors,
+            target_description="live",
+            in_place=True,
+            runner_quiet_seconds=0,
+            before_replay=lambda: cli._prepare_search_replay(projectors, world.projector_sessions),
+        )
+
+        assert report.ok and report.skipped_dead_lettered  # the replay skipped the purge
+        tombstones = await _rows(world, "SELECT content_id FROM retrieval.content_tombstones")
+        assert [r.content_id for r in tombstones] == ["c-gone"]  # persisted by the reset
+        assert await world.documents() == ["c-kept"]
+        assert await world.embedding_ids() == ["c-kept"]
+        # Once the rebuild is over, a new event naming the purged content cannot bring it back.
+        await world.ingest("purged text", "c-gone", session="session-3", turn="turn-3")
+        assert (await world.project()).dead_lettered == 0
+        assert await world.documents() == ["c-kept"]
+        assert await world.embedding_ids() == ["c-kept"]
+
+    with_world(body, dsn=postgres_dsn, owner=projection_engine)
+
+
+def test_a_seeded_standby_replay_never_reads_bytes_a_pending_purge_removed(
+    postgres_dsn: str, projection_engine: AsyncEngine
+) -> None:
+    async def body(world: SearchWorld) -> None:
+        await world.ingest("kept text", "c-kept")
+        await world.ingest("bytes will vanish", "c-gone")
+        await world.purge("c-gone")  # nothing is projected live: the purge is still pending
+        async with world.owner.begin() as connection:  # what a real purge does to the bytes
+            await connection.execute(text("SET LOCAL session_replication_role = replica"))
+            await connection.execute(
+                text("DELETE FROM catalog.inline_contents WHERE content_sha256 = :d"),
+                {"d": hashlib.sha256(b"bytes will vanish").hexdigest()},
+            )
+        projectors = projectors_with_search(world.backend(write_documents=False))
+        (search_projector,) = [p for p in projectors if isinstance(p, SearchProjector)]
+
+        assert await search_projector.seed_purges(world.projector_sessions) == 1
+        await replay_ledger(world.projector_sessions, world.store, projectors, delivered_only=False)
+
+        assert await world.embedding_ids() == ["c-kept"]
+        assert await _rows(world, "SELECT 1 FROM retrieval.content_tombstones") == []
+
+    with_world(body, dsn=postgres_dsn, owner=projection_engine)
+
+
+def test_a_reused_content_id_for_other_bytes_in_the_same_scope_is_refused_not_merged(
+    postgres_dsn: str, projection_engine: AsyncEngine
+) -> None:
+    async def body(world: SearchWorld) -> None:
+        first = await world.ingest("the original body", "c-dup")
+        assert (await world.project()).dead_lettered == 0
+        await world.ingest("a different body", "c-dup", session="session-2", turn="turn-2")
+
+        report = await world.project()
+
+        assert report.dead_lettered == 1
+        (dead,) = await _rows(world, "SELECT error_class FROM projection.dead_letters")
+        assert dead.error_class == "SearchContentConflictError"
+        (row,) = await _rows(
+            world,
+            "SELECT content_sha256, media_type, source_event_ids, tsv::text AS tsv "
+            "FROM retrieval.search_documents",
+        )
+        assert row.content_sha256 == hashlib.sha256(b"the original body").hexdigest()
+        assert row.media_type == "text/plain"
+        assert [str(item) for item in row.source_event_ids] == [str(first)]
+        assert "original" in row.tsv and "different" not in row.tsv
+        (node,) = await _cypher(
+            world,
+            "MATCH (n:ContentEmbedding) RETURN n.content_sha256 AS sha, n.source_event_ids AS s",
+        )
+        assert node == {"sha": row.content_sha256, "s": [str(first)]}
+        assert _ids(await _service(world).lexical("different", SCOPE, 5)) == []
+
+    with_world(body, dsn=postgres_dsn, owner=projection_engine)
+
+
+@pytest.mark.parametrize(
+    ("second", "error"),
+    [
+        ({"body": "a different body"}, "SearchContentConflictError"),
+        ({"body": "the original body", "repository": "repo-2"}, "SearchScopeConflictError"),
+    ],
+)
+def test_a_graph_only_replay_refuses_a_reused_content_id_instead_of_following_replay_order(
+    postgres_dsn: str, projection_engine: AsyncEngine, second: dict[str, str], error: str
+) -> None:
+    async def body(world: SearchWorld) -> None:
+        await world.ingest("the original body", "c-dup")
+        await world.ingest(
+            second["body"], "c-dup", repository=second.get("repository", "repo-1"), turn="turn-2"
+        )
+        projectors = projectors_with_search(world.backend(write_documents=False))
+
+        with pytest.raises(Exception) as raised:
+            await replay_ledger(
+                world.projector_sessions, world.store, projectors, delivered_only=False
+            )
+
+        assert type(raised.value).__name__ == error
+        (node,) = await _cypher(world, "MATCH (n:ContentEmbedding) RETURN n.content_sha256 AS s")
+        assert node["s"] == hashlib.sha256(b"the original body").hexdigest()
+
+    with_world(body, dsn=postgres_dsn, owner=projection_engine)
+
+
+def _ids(hits: Sequence[Any]) -> list[str]:
+    return [hit.content_id for hit in hits]
+
+
+def test_a_searchless_replay_check_is_refused_because_its_digest_would_always_mismatch(
+    postgres_dsn: str, projection_engine: AsyncEngine
+) -> None:
+    from agent_context_platform import cli
+
+    async def body(world: SearchWorld) -> None:
+        await world.ingest("embedded text", "c-embedded")
+        assert (await world.project()).dead_lettered == 0
+        searchless = tuple(item for item in registered_projectors() if item.name != "search")
+
+        with pytest.raises(cli.CliUsageError, match="ContentEmbedding"):
+            await cli._require_no_embeddings(world.store, what="a replay check with")
+        # What the refusal prevents: a scratch replay without the search projector lacks the
+        # embeddings, so the comparison would report drift that is not there.
+        verification = await verify_projections(
+            world.projector_sessions,
+            world.store,
+            searchless,
+            replay_target=world.store,
+            wipe_replay_target=True,
+        )
+        assert verification.replay_digest != verification.graph.digest
+        assert await world.embedding_ids() == []
+        await cli._require_no_embeddings(world.store, what="a replay check with")  # now allowed
+
+    with_world(body, dsn=postgres_dsn, owner=projection_engine)

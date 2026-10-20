@@ -89,6 +89,16 @@ class SearchScopeConflictError(RuntimeError):
     """A content ID is already indexed under a different project or repository."""
 
 
+class SearchContentConflictError(RuntimeError):
+    """A content ID is already indexed, in the same scope, for different sanitized bytes.
+
+    Content IDs are chosen by producers. Merging would make the indexed text and vector depend on
+    delivery order (live workers) versus ledger order (a replay), so the later event is refused
+    (retried, then dead-lettered) exactly like a cross-scope collision. The message never carries
+    content, digests or IDs.
+    """
+
+
 class EmbeddingDimensionError(RuntimeError):
     """The embedding provider's vectors do not match the vector index."""
 
@@ -133,17 +143,30 @@ _LEDGER_PURGES: Final[str] = (
     "jsonb_array_elements(e.payload -> 'purged_contents') AS item "
     "WHERE e.event_type = 'content.purged'"
 )
+# Every purge the ledger records, whatever its outbox status (pending, delivered or dead-lettered),
+# as tombstones: the first purge of a content ID in ledger order names it. Used by an in-place
+# rebuild right after it empties the tables, in the same transaction.
+_PERSIST_LEDGER_PURGES: Final[str] = (
+    "INSERT INTO retrieval.content_tombstones (content_id, purged_event_id, purged_at) "
+    "SELECT DISTINCT ON (item ->> 'content_id') item ->> 'content_id', e.event_id, "
+    "CAST(e.payload ->> 'purged_at' AS timestamptz) "
+    "FROM ledger.events e, jsonb_array_elements(e.payload -> 'purged_contents') AS item "
+    "WHERE e.event_type = 'content.purged' "
+    "ORDER BY item ->> 'content_id', e.recorded_at, e.event_id "
+    "ON CONFLICT (content_id) DO NOTHING"
+)
+_RESET_TABLES: Final[str] = "TRUNCATE retrieval.search_documents, retrieval.content_tombstones"
 _TOMBSTONED: Final[str] = (
     "SELECT 1 FROM retrieval.content_tombstones WHERE content_id = :content_id"
 )
 _UPSERT_DOCUMENT: Final[str] = f"""
 INSERT INTO retrieval.search_documents AS d
     (content_id, event_id, source_event_ids, event_type, project_id, repository_id,
-     session_id, occurred_at, redaction, tsv)
+     session_id, occurred_at, redaction, content_sha256, media_type, tsv)
 VALUES
     (:content_id, CAST(:event_id AS uuid), ARRAY[CAST(:event_id AS uuid)], :event_type,
-     :project_id, :repository_id, :session_id, :occurred_at, :redaction,
-     to_tsvector('{TEXT_SEARCH_CONFIG}', CAST(:body AS text)))
+     :project_id, :repository_id, :session_id, :occurred_at, :redaction, :content_sha256,
+     :media_type, to_tsvector('{TEXT_SEARCH_CONFIG}', CAST(:body AS text)))
 ON CONFLICT (content_id) DO UPDATE SET
     event_id = CASE WHEN (excluded.occurred_at, excluded.event_id) < (d.occurred_at, d.event_id)
         THEN excluded.event_id ELSE d.event_id END,
@@ -161,8 +184,12 @@ ON CONFLICT (content_id) DO UPDATE SET
     tsv = excluded.tsv,
     indexed_at = now()
 WHERE d.project_id = excluded.project_id AND d.repository_id = excluded.repository_id
+  AND d.content_sha256 = excluded.content_sha256 AND d.media_type = excluded.media_type
 RETURNING content_id
 """
+_EXISTING_SCOPE: Final[str] = (
+    "SELECT project_id, repository_id FROM retrieval.search_documents WHERE content_id = :content_id"
+)
 _INSERT_TOMBSTONE: Final[str] = (
     "INSERT INTO retrieval.content_tombstones (content_id, purged_event_id, purged_at) "
     "VALUES (:content_id, CAST(:event_id AS uuid), :purged_at) ON CONFLICT (content_id) DO NOTHING"
@@ -175,7 +202,7 @@ _DELETE_DOCUMENTS: Final[str] = (
 _UPSERT_EMBEDDING: Final[LiteralString] = (
     "MERGE (n:ContentEmbedding {content_id: $content_id}) "
     "SET n.model_id = $model_id, n.model_revision = $model_revision, "
-    "n.content_sha256 = $content_sha256, n.truncated = $truncated, "
+    "n.content_sha256 = $content_sha256, n.media_type = $media_type, n.truncated = $truncated, "
     "n.project_id = coalesce(n.project_id, $project_id), "
     "n.repository_id = coalesce(n.repository_id, $repository_id) "
     "WITH n "
@@ -184,6 +211,13 @@ _UPSERT_EMBEDDING: Final[LiteralString] = (
     "WITH n, collect(source_event_id) AS source_event_ids "
     "SET n.source_event_ids = source_event_ids "
     "WITH n CALL db.create.setNodeVectorProperty(n, 'embedding', $vector)"
+)
+# The graph twin of the PostgreSQL identity check. A replay into a scratch or standby graph never
+# writes PostgreSQL, so without it the vector of a reused content ID would follow replay order.
+_EMBEDDING_IDENTITY: Final[LiteralString] = (
+    "MATCH (n:ContentEmbedding {content_id: $content_id}) "
+    "RETURN n.project_id = $project_id AND n.repository_id = $repository_id AS same_scope, "
+    "n.content_sha256 = $content_sha256 AND n.media_type = $media_type AS same_content"
 )
 _DELETE_EMBEDDINGS: Final[LiteralString] = (
     "MATCH (n:ContentEmbedding) WHERE n.content_id IN $content_ids DETACH DELETE n"
@@ -272,9 +306,9 @@ class SearchProjector:
     async def seed_purges(self, sessions: async_sessionmaker[AsyncSession]) -> int:
         """Remember every `content.purged` ID in the ledger, before a replay.
 
-        An in-place rebuild empties the tombstone table, and the purged bytes are already gone, so
-        an original event replayed before its later purge would fail to read them. The ledger is
-        authoritative: content it records as purged is never read or embedded by this instance.
+        The purged bytes are already gone, so an original event replayed before its later purge
+        would fail to read them. The ledger is authoritative: content it records as purged is never
+        read or embedded by this instance, whatever the purge event's outbox status.
         """
         async with sessions() as session:
             rows = await session.execute(text(_LEDGER_PURGES))
@@ -297,6 +331,7 @@ class SearchProjector:
         await lock_event_nodes(tx, event)
         owner = _owner(event)
         for document, vector, truncated in indexed:
+            await _check_embedding_identity(tx, document.ref, project_id, repository_id)
             await tx.run(
                 _UPSERT_EMBEDDING,
                 parameters={
@@ -304,6 +339,7 @@ class SearchProjector:
                     "model_id": backend.embeddings.model_id,
                     "model_revision": backend.embeddings.model_revision,
                     "content_sha256": document.ref.content_sha256,
+                    "media_type": document.ref.media_type,
                     "truncated": truncated,
                     "project_id": project_id,
                     "repository_id": repository_id,
@@ -379,12 +415,14 @@ class SearchProjector:
                         "session_id": event.context.session_id,
                         "occurred_at": event.occurred_at,
                         "redaction": document.ref.disposition.value,
+                        "content_sha256": document.ref.content_sha256,
+                        "media_type": document.ref.media_type,
                         "body": document.text,
                     },
                 )
                 if row.first() is None:
-                    raise SearchScopeConflictError(
-                        "content is already indexed under another project or repository"
+                    await _raise_conflict(
+                        session, document.ref.content_id, project_id, repository_id
                     )
                 written.append((document, item.vector, item.truncated))
         return written
@@ -410,6 +448,56 @@ class SearchProjector:
                 await session.execute(text(_DELETE_DOCUMENTS), {"content_ids": content_ids})
         await lock_event_nodes(tx, event)
         await tx.run(_DELETE_EMBEDDINGS, parameters={"content_ids": content_ids})
+
+
+async def reset_search_tables(session: AsyncSession) -> int:
+    """Empty the search tables, then tombstone every purge the ledger records; in one transaction.
+
+    For an in-place rebuild: the tables are projections of the ledger, but a delivered-only replay
+    skips a dead-lettered `content.purged` whose PostgreSQL delete may already have committed, so
+    its tombstone is persisted here instead of being forgotten (a later event could otherwise
+    re-index purged content once the rebuild is over). The caller owns the transaction.
+    """
+    await session.execute(text(_RESET_TABLES))
+    persisted = await session.execute(text(_PERSIST_LEDGER_PURGES))
+    return int(getattr(persisted, "rowcount", 0) or 0)
+
+
+async def _raise_conflict(
+    session: AsyncSession, content_id: str, project_id: str, repository_id: str
+) -> None:
+    """Name the collision the identity-checked upsert refused; content-free messages only."""
+    existing = (await session.execute(text(_EXISTING_SCOPE), {"content_id": content_id})).first()
+    if existing is None or (existing.project_id, existing.repository_id) != (
+        project_id,
+        repository_id,
+    ):
+        raise SearchScopeConflictError(
+            "content is already indexed under another project or repository"
+        )
+    raise SearchContentConflictError("content ID is already indexed for different content")
+
+
+async def _check_embedding_identity(
+    tx: Neo4jTransaction, ref: ContentRefV1, project_id: str, repository_id: str
+) -> None:
+    result = await tx.run(
+        _EMBEDDING_IDENTITY,
+        parameters={
+            "content_id": ref.content_id,
+            "project_id": project_id,
+            "repository_id": repository_id,
+            "content_sha256": ref.content_sha256,
+            "media_type": ref.media_type,
+        },
+    )
+    for record in result.records:
+        if not record["same_scope"]:
+            raise SearchScopeConflictError(
+                "content is already embedded under another project or repository"
+            )
+        if not record["same_content"]:
+            raise SearchContentConflictError("content ID is already embedded for different content")
 
 
 def _content_id(ref: ContentRefV1) -> str:

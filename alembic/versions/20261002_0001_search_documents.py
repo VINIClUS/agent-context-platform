@@ -1,7 +1,9 @@
 """Add the retrieval schema: lexical search documents and purge tombstones.
 
 ``retrieval.search_documents`` holds, per sanitized content object, its scope, provenance and a
-``simple``-configuration ``tsvector`` with a GIN index. It never stores the text. The projector
+``simple``-configuration ``tsvector`` with a GIN index, plus the sanitized content's digest and media
+type, so a producer-chosen ``content_id`` reused for different bytes is refused instead of
+overwritten. It never stores the text. The projector
 role writes it (and deletes rows on purge); the API role only reads it. ``retrieval.content_tombstones``
 records purged content IDs (insert-only for the projector) so a redelivered original event cannot
 re-index purged content.
@@ -41,6 +43,8 @@ def upgrade() -> None:
         sa.Column("session_id", sa.Text(), nullable=True),
         sa.Column("occurred_at", timestamp, nullable=False),
         sa.Column("redaction", sa.String(25), nullable=False),
+        sa.Column("content_sha256", sa.String(64), nullable=False),
+        sa.Column("media_type", sa.String(255), nullable=False),
         sa.Column("tsv", postgresql.TSVECTOR(), nullable=False),
         sa.Column("indexed_at", timestamp, server_default=sa.func.now(), nullable=False),
         sa.CheckConstraint(
@@ -49,6 +53,9 @@ def upgrade() -> None:
         ),
         sa.CheckConstraint(
             "event_id = ANY(source_event_ids)", name="ck_search_documents_event_id_in_sources"
+        ),
+        sa.CheckConstraint(
+            "content_sha256 ~ '^[0-9a-f]{64}$'", name="ck_search_documents_content_sha256_hex"
         ),
         sa.PrimaryKeyConstraint("content_id", name="pk_search_documents"),
         schema="retrieval",

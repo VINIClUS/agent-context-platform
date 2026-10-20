@@ -57,6 +57,7 @@ from agent_context_platform.projection.projectors.search import (
     PurgeAccess,
     SearchBackend,
     SearchProjector,
+    reset_search_tables,
 )
 from agent_context_platform.projection.registry import (
     projectors_with_purge,
@@ -1511,22 +1512,23 @@ async def _require_no_embeddings(store: Neo4jStore, *, what: str) -> None:
 async def _prepare_search_replay(
     projectors: Sequence[Projector], sessions: async_sessionmaker[AsyncSession]
 ) -> None:
-    """Before an in-place replay: empty the search tables, then seed purges from the ledger."""
-    await _reset_search_tables(sessions)
+    """Before an in-place replay: reset the search tables, then seed purges from the ledger.
+
+    The reset empties both tables and, in the same transaction, persists a tombstone for every
+    purge the ledger records (`reset_search_tables`), so purge knowledge survives the rebuild even
+    for a dead-lettered `content.purged` the delivered-only replay skips.
+    """
+    async with sessions() as session, session.begin():
+        await reset_search_tables(session)
+    await _seed_search_purges(projectors, sessions)
+
+
+async def _seed_search_purges(
+    projectors: Sequence[Projector], sessions: async_sessionmaker[AsyncSession]
+) -> None:
     for projector in projectors:
         if isinstance(projector, SearchProjector):
             await projector.seed_purges(sessions)
-
-
-async def _reset_search_tables(sessions: async_sessionmaker[AsyncSession]) -> None:
-    """Empty the search tables of an in-place rebuild: they are projections of the ledger.
-
-    The replay re-creates the rows, and the tombstones from the replayed `content.purged` events.
-    """
-    async with sessions() as session, session.begin():
-        await session.execute(
-            text("TRUNCATE retrieval.search_documents, retrieval.content_tombstones")
-        )
 
 
 async def _search_projectors(
@@ -1551,9 +1553,14 @@ async def _search_projectors(
         threads=settings.search.embedding_threads,
     )
     content = ContentService(S3BlobStore.from_settings(settings.s3), RedactionPolicyV1())
-    return projectors_with_search(
+    projectors = projectors_with_search(
         SearchBackend(runtime.sessions, content, provider, write_documents)
     )
+    if not write_documents:
+        # A scratch or standby replay never writes tombstones, and its originals precede their
+        # purges: remember every purge the ledger records so purged bytes are never read.
+        await _seed_search_purges(projectors, runtime.sessions)
+    return projectors
 
 
 # --- end PLATFORM-042 ---------------------------------------------------------------------------

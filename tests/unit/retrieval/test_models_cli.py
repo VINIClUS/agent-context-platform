@@ -87,6 +87,10 @@ def test_without_a_model_directory_search_can_still_purge_but_not_index() -> Non
     assert search._purge_access.sessions is sessions  # type: ignore[attr-defined]
 
 
+async def _no_seed(*_args: Any) -> None:
+    return None
+
+
 def test_with_a_model_directory_the_search_projector_gets_a_verified_provider_and_content(
     monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
@@ -99,6 +103,7 @@ def test_with_a_model_directory_the_search_projector_gets_a_verified_provider_an
 
     monkeypatch.setattr(cli.LocalMiniLMProvider, "load", staticmethod(fake_load))
     monkeypatch.setattr(cli.S3BlobStore, "from_settings", staticmethod(lambda _settings: object()))
+    monkeypatch.setattr(cli, "_seed_search_purges", _no_seed)
     settings = Settings(search={"model_dir": tmp_path, "embedding_batch_size": 4})
     sessions = object()
     runtime = cli.Runtime(sessions=sessions, recording_sessions=None, store=object())  # type: ignore[arg-type]
@@ -339,3 +344,31 @@ def test_a_standby_rebuild_without_search_is_allowed_even_with_embeddings(
     _invoke("projection", "rebuild", *_TARGET, "--target-username", "op", "--without-search")
 
     assert seen["calls"] == ["runtime", "preflight", "rebuild"]
+
+
+@pytest.mark.parametrize("write_documents", [False, True])
+def test_only_a_replay_that_never_writes_tombstones_seeds_purges_from_the_ledger(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, write_documents: bool
+) -> None:
+    from agent_context_platform.projection.projectors.search import SearchProjector
+
+    seeded: list[object] = []
+
+    async def seed(_self: Any, sessions: Any) -> int:
+        seeded.append(sessions)
+        return 0
+
+    monkeypatch.setattr(cli.LocalMiniLMProvider, "load", staticmethod(lambda *_a, **_k: object()))
+    monkeypatch.setattr(cli.S3BlobStore, "from_settings", staticmethod(lambda _s: object()))
+    monkeypatch.setattr(SearchProjector, "seed_purges", seed)
+    sessions = object()
+    runtime = cli.Runtime(sessions=sessions, recording_sessions=None, store=object())  # type: ignore[arg-type]
+
+    projectors = asyncio.run(
+        cli._search_projectors(
+            Settings(search={"model_dir": tmp_path}), runtime, write_documents=write_documents
+        )
+    )
+
+    assert projectors[-1].name == "search"
+    assert seeded == ([] if write_documents else [sessions])
