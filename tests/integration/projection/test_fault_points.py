@@ -5,6 +5,9 @@
 that restarts without the label reclaims the abandoned lease and converges: the outbox row
 is delivered once, the checkpoint advances once and the graph holds exactly one node for
 the event, with no duplicate.
+
+A ``projection.rebuilt`` row, which no projector handles, is queued ahead of the event: the
+worker must deliver it without firing or counting the label.
 """
 
 from __future__ import annotations
@@ -16,14 +19,23 @@ from typing import LiteralString
 from uuid import uuid4
 
 import pytest
+from agent_context_sdk import StoredEventV1, seal_event
+from agent_context_sdk.events.system import ProjectionMode, ProjectionOutcome
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncEngine
 
 from agent_context_platform.db import session_factory
 from agent_context_platform.projection.neo4j import Neo4jStore, Neo4jTransaction
+from agent_context_platform.projection.verify import RunRecord, build_system_draft
 
 from ..fault_harness import CRASH_EXIT_CODE, process_env, run_cli
-from .conftest import neo4j_integration_settings, reset_projection_state, seed_pending_event
+from .conftest import (
+    insert_ledger_event,
+    insert_outbox_row,
+    neo4j_integration_settings,
+    reset_projection_state,
+    seed_pending_event,
+)
 
 pytestmark = pytest.mark.integration
 
@@ -51,6 +63,23 @@ async def _session_nodes(store: Neo4jStore, session_id: str) -> int:
         return int(result.records[0]["n"])
 
     return await store.execute_read(count)
+
+
+def _rebuilt_event(now: datetime) -> StoredEventV1:
+    """The platform's own verify report, built like `ProjectionEventRecorder` builds it."""
+    run = RunRecord(
+        projector_name="agent",
+        projector_version="1",
+        mode=ProjectionMode.VERIFY,
+        outcome=ProjectionOutcome.MATCHED,
+        started_at=now,
+        completed_at=now,
+        from_event_id=None,
+        through_event_id=None,
+        event_count=0,
+        graph_digest="0" * 64,
+    )
+    return seal_event(build_system_draft(run, observed_at=now), [], 1, None)
 
 
 async def _expire_lease(engine: AsyncEngine, outbox_id: int) -> None:
@@ -85,17 +114,22 @@ def test_crash_at_label_then_restart_converges(
     settings = neo4j_integration_settings()
     args = ["projection", "run", "--once", "--max-seconds", "90"]
 
-    async def seed() -> int:
+    async def seed() -> tuple[int, int]:
         await reset_projection_state(projection_engine)
+        now = datetime.now(UTC)
         async with session_factory(projection_engine)() as session:
+            # Claimed and processed first (lower outbox_id): handled by no projector.
+            rebuilt = _rebuilt_event(now)
+            await insert_ledger_event(session, rebuilt, now=now)
+            rebuilt_outbox_id = await insert_outbox_row(session, event_id=rebuilt.event_id, now=now)
             _sealed, outbox_id = await seed_pending_event(
                 session,
-                now=datetime.now(UTC),
+                now=now,
                 event_type="agent.session.started",
                 payload={"source": "codex", "session_id": session_id},
             )
             await session.commit()
-        return outbox_id
+        return rebuilt_outbox_id, outbox_id
 
     async def inspect(outbox_id: int) -> tuple[tuple[str, int], int]:
         async with Neo4jStore(settings) as store:
@@ -111,12 +145,14 @@ def test_crash_at_label_then_restart_converges(
 
             await store.execute_write(delete)
 
-    outbox_id = asyncio.run(seed())
+    rebuilt_outbox_id, outbox_id = asyncio.run(seed())
     try:
         code, stderr = run_cli(args, process_env(postgres_dsn, crash_at=case.label))
         assert code == CRASH_EXIT_CODE, stderr
         assert f"fault_injected label={case.label}" in stderr
 
+        rebuilt_status, _ = asyncio.run(_outbox(projection_engine, rebuilt_outbox_id))
+        assert rebuilt_status == "delivered", "the unhandled event must not fire the label"
         (status, checkpointed), nodes = asyncio.run(inspect(outbox_id))
         assert status == "leased", "the lease is abandoned, never delivered"
         assert checkpointed == 0, "no checkpoint may advance past an unfinalized event"
@@ -130,6 +166,7 @@ def test_crash_at_label_then_restart_converges(
         assert status == "delivered"
         assert checkpointed >= 1
         assert nodes == 1
+        assert asyncio.run(_outbox(projection_engine, rebuilt_outbox_id))[0] == "delivered"
 
         # Idempotent: another drain neither redelivers nor duplicates.
         code, stderr = run_cli(args, process_env(postgres_dsn))

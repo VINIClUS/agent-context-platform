@@ -38,8 +38,12 @@ Hits are counted per process and per label.
 | `ledger.after_event_before_outbox` | API | `LedgerRepository` append, after the event and its content-ref rows are flushed, before the redaction-report and outbox rows. | Transaction never commits: nothing persisted. |
 | `ledger.before_commit` | API | `IngestionService`, after `attach` and `append` succeeded, before the transaction commits. | Transaction never commits: nothing persisted. |
 | `ledger.after_commit_before_response` | API | `IngestionService`, after the commit, before the HTTP response is built. | Events, refs and outbox rows committed; the producer never sees the 200. A retry reports `existing`. |
-| `projection.during_mutation` | projector | `ProjectionRunner`, inside the Neo4j write transaction after every projector ran, before it commits. | Graph unchanged; the outbox row stays leased until the lease expires. |
-| `projection.before_checkpoint` | projector | `ProjectionRunner._finalize_success`, after the Neo4j commit and the fenced outbox update, before the checkpoints advance. | Graph written; outbox still leased and no checkpoint advanced; the replay re-merges idempotently. |
+| `projection.during_mutation` | projector | `ProjectionRunner`, inside the Neo4j write transaction after every matching projector ran, before it commits. | Graph unchanged; the outbox row stays leased until the lease expires. |
+| `projection.before_checkpoint` | projector | `ProjectionRunner._finalize_success` of an event a projector handled, after the Neo4j commit and the fenced outbox update, before the checkpoints advance. | Graph written; outbox still leased and no checkpoint advanced; the replay re-merges idempotently. |
+
+The projection labels count only events that at least one projector handles. An event no
+projector handles, such as the platform's own `projection.rebuilt` reports, is delivered with
+no Neo4j write and no checkpoint: it neither fires a projection label nor counts towards `AFTER`.
 
 "After response before spool ack" is adapter-side: the scenario kills the uploader instead.
 

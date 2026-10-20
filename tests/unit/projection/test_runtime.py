@@ -1,9 +1,9 @@
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Sequence
+from collections.abc import Iterator, Sequence
 from datetime import UTC, datetime, timedelta, timezone
-from uuid import uuid4
+from uuid import UUID, uuid4
 
 import pytest
 
@@ -13,6 +13,8 @@ from agent_context_platform.ledger.models import (
     EventContentRefRow,
     EventRow,
 )
+from agent_context_platform.operations import faults
+from agent_context_platform.operations.faults import FaultLabel
 from agent_context_platform.projection import runtime
 from agent_context_platform.projection.checkpoints import CheckpointRepository
 from agent_context_platform.projection.models import OutboxRow, OutboxStatus
@@ -23,6 +25,7 @@ from agent_context_platform.projection.runtime import (
     ProjectionRunReport,
     Projector,
 )
+from agent_context_platform.settings import FaultInjectionSettings
 
 from ._doubles import (
     FakeExecuteResult,
@@ -969,3 +972,102 @@ def test_load_event_blocks_an_event_that_fails_integrity_verification() -> None:
 
     with pytest.raises(runtime.EventIntegrityError):
         asyncio.run(runtime._load_event(session, sealed.event_id))  # type: ignore[arg-type]
+
+
+# --- crash-test fault points (docs/operations/fault-injection.md) -------------------
+
+_HANDLED_TYPE = "graph.node.created"
+# The platform's own verify/rebuild report: no registered projector handles it.
+_UNHANDLED_TYPE = "projection.rebuilt"
+
+
+class _Crash(BaseException):
+    """Raised by the patched `os._exit`: stops the run where the real exit kills the process."""
+
+
+@pytest.fixture
+def crash_exits(monkeypatch: pytest.MonkeyPatch) -> Iterator[list[int]]:
+    codes: list[int] = []
+
+    def fake_exit(code: int) -> None:
+        codes.append(code)
+        raise _Crash
+
+    monkeypatch.setattr(faults.os, "_exit", fake_exit)
+    yield codes
+    faults.configure(FaultInjectionSettings())
+
+
+@pytest.mark.parametrize("label", ["projection.during_mutation", "projection.before_checkpoint"])
+@pytest.mark.parametrize(("after", "crashed_outbox_id"), [(1, 2), (2, 4)])
+def test_projection_fault_points_skip_events_that_no_projector_handles(
+    monkeypatch: pytest.MonkeyPatch,
+    crash_exits: list[int],
+    label: FaultLabel,
+    after: int,
+    crashed_outbox_id: int,
+) -> None:
+    """An unhandled event neither fires a projection label nor counts towards `AFTER`.
+
+    Nothing is written to Neo4j and no checkpoint advances for it, so the n-th hit is the
+    n-th event a projector actually handles, even when `projection.rebuilt` rows come first.
+    """
+    events = {
+        1: build_stored_event(event_type=_UNHANDLED_TYPE),
+        2: build_stored_event(event_type=_HANDLED_TYPE),
+        3: build_stored_event(event_type=_UNHANDLED_TYPE),
+        4: build_stored_event(event_type=_HANDLED_TYPE),
+    }
+    by_event_id = {event.event_id: event for event in events.values()}
+
+    async def fake_load_event(_session: object, event_id: UUID) -> object:
+        return by_event_id[event_id]
+
+    advanced: list[object] = []
+
+    async def fake_advance(_session: object, **kwargs: object) -> None:
+        advanced.append(kwargs["outbox_id"])
+
+    monkeypatch.setattr(runtime, "_load_event", fake_load_event)
+    monkeypatch.setattr(CheckpointRepository, "advance", fake_advance)
+    # Per row: one session loads the event, one finalizes it (its fenced update matches).
+    finalize_sessions = {
+        outbox_id: FakeSession(execute_results=[FakeExecuteResult(scalar=outbox_id)])
+        for outbox_id in events
+    }
+    projector = RecordingProjector("graph.test", "1", handled_types=[_HANDLED_TYPE])
+    runner = ProjectionRunner(
+        FakeSessionFactory(
+            [
+                session
+                for outbox_id in events
+                for session in (FakeSession(), finalize_sessions[outbox_id])
+            ]
+        ),
+        FakeNeo4jStore(),
+        [projector],
+        worker_id="worker-a",
+        clock=lambda: NOW,
+    )
+
+    async def fake_claim_batch(_limit: int) -> list[ClaimedOutboxRow]:
+        return [
+            _claimed_row(outbox_id=outbox_id, event_id=event.event_id)
+            for outbox_id, event in events.items()
+        ]
+
+    runner._claim_batch = fake_claim_batch  # type: ignore[method-assign]
+    faults.configure(FaultInjectionSettings(enabled=True, crash_at=label, after=after))
+
+    with pytest.raises(_Crash):
+        asyncio.run(runner.run_once(10))
+
+    assert crash_exits == [137]
+    earlier = range(1, crashed_outbox_id)
+    # Every earlier row, the unhandled ones included, was finalized and committed first.
+    assert [n for n, session in finalize_sessions.items() if session.commit_calls] == list(earlier)
+    # The crash happened while projecting the expected handled event, not an unhandled one.
+    assert projector.project_calls == [
+        events[n] for n in range(1, crashed_outbox_id + 1) if events[n].event_type == _HANDLED_TYPE
+    ]
+    assert advanced == [n for n in earlier if events[n].event_type == _HANDLED_TYPE]

@@ -469,7 +469,10 @@ class ProjectionRunner:
                 await session.rollback()
                 return False
 
-            fault_point("projection.before_checkpoint")
+            if matching:
+                # Only an event a projector handled reached Neo4j and has checkpoints to
+                # advance; an unhandled one (e.g. `projection.rebuilt`) neither fires nor counts.
+                fault_point("projection.before_checkpoint")
             for projector in matching:
                 await CheckpointRepository.advance(
                     session,
