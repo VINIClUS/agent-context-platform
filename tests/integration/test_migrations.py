@@ -21,7 +21,7 @@ from alembic import command
 pytestmark = pytest.mark.integration
 
 PROJECT_ROOT = Path(__file__).parents[2]
-MANAGED_SCHEMAS = {"catalog", "ledger", "projection", "operations"}
+MANAGED_SCHEMAS = {"catalog", "ledger", "projection", "operations", "retrieval"}
 MANAGED_ROLES = {"agent_context_api", "agent_context_projector"}
 EXPECTED_TABLES = {
     "catalog": {
@@ -52,6 +52,7 @@ EXPECTED_TABLES = {
         "schema_versions",
         "retention_policies",
     },
+    "retrieval": {"search_documents", "content_tombstones"},
 }
 EXPECTED_COLUMNS = {
     "catalog.workspaces": {"name", "id", "created_at", "observed_at"},
@@ -218,6 +219,20 @@ EXPECTED_COLUMNS = {
         "updated_at",
         "last_used_at",
     },
+    "retrieval.search_documents": {
+        "content_id",
+        "event_id",
+        "source_event_ids",
+        "event_type",
+        "project_id",
+        "repository_id",
+        "session_id",
+        "occurred_at",
+        "redaction",
+        "tsv",
+        "indexed_at",
+    },
+    "retrieval.content_tombstones": {"content_id", "purged_event_id", "purged_at"},
     "operations.mcp_tokens": {
         "token_id",
         "token_prefix",
@@ -305,6 +320,7 @@ async def _exercise_migration(dsn: str) -> None:
 _PRE_CONTENT_REVISION = "20260823_0001"
 _CONTENT_REVISION = "20260928_0001"
 _MCP_TOKENS_REVISION = "20260929_0001"
+_SEARCH_REVISION = "20261002_0001"
 _LEGACY_DIGEST = hashlib.sha256(b"legacy-content-that-was-never-stored").hexdigest()
 
 
@@ -337,6 +353,68 @@ async def _exercise_mcp_tokens_step(dsn: str) -> None:
                 assert await connection.scalar(
                     text("SELECT to_regclass('catalog.inline_contents')")
                 )
+            finally:
+                await connection.rollback()
+                await _run_alembic(connection, command.downgrade, "base")
+                await connection.commit()
+    finally:
+        await engine.dispose()
+
+
+def test_search_revision_steps_down_and_up_cleanly(postgres_dsn: str) -> None:
+    """The search revision adds and removes only the ``retrieval`` schema, with its grants."""
+    asyncio.run(_exercise_search_step(postgres_dsn))
+
+
+async def _exercise_search_step(dsn: str) -> None:
+    engine = create_async_engine(dsn, poolclass=NullPool)
+    try:
+        async with engine.connect() as connection:
+            try:
+                for _ in range(2):
+                    await _run_alembic(connection, command.upgrade, _SEARCH_REVISION)
+                    await connection.commit()
+                    assert await connection.scalar(
+                        text("SELECT to_regclass('retrieval.search_documents')")
+                    )
+                    # Full-text, scope and the role split: the API reads, the projector writes.
+                    indexes = await _names(
+                        connection,
+                        "SELECT indexdef FROM pg_indexes WHERE schemaname = 'retrieval' "
+                        "AND tablename = 'search_documents'",
+                    )
+                    assert any("USING gin (tsv)" in definition for definition in indexes)
+                    for role, privilege, allowed in (
+                        ("agent_context_api", "SELECT", True),
+                        ("agent_context_api", "INSERT", False),
+                        ("agent_context_api", "DELETE", False),
+                        ("agent_context_projector", "DELETE", True),
+                        ("agent_context_projector", "TRUNCATE", True),
+                    ):
+                        assert (
+                            await connection.scalar(
+                                text(
+                                    "SELECT has_table_privilege(:role, "
+                                    "'retrieval.search_documents', :privilege)"
+                                ),
+                                {"role": role, "privilege": privilege},
+                            )
+                            is allowed
+                        )
+                    assert not await connection.scalar(
+                        text(
+                            "SELECT has_table_privilege('agent_context_projector', "
+                            "'retrieval.content_tombstones', 'DELETE')"
+                        )
+                    )
+                    await _run_alembic(connection, command.downgrade, _MCP_TOKENS_REVISION)
+                    await connection.commit()
+                    assert (
+                        await connection.scalar(text("SELECT to_regnamespace('retrieval')")) is None
+                    )
+                    assert await connection.scalar(
+                        text("SELECT to_regclass('operations.mcp_tokens')")
+                    )
             finally:
                 await connection.rollback()
                 await _run_alembic(connection, command.downgrade, "base")
@@ -679,7 +757,7 @@ async def _assert_role_contract(connection: AsyncConnection) -> None:
             text("SELECT has_schema_privilege('agent_context_api', :schema, 'CREATE')"),
             {"schema": schema},
         )
-    for schema in {"ledger", "projection", "catalog"}:
+    for schema in {"ledger", "projection", "catalog", "retrieval"}:
         assert await connection.scalar(
             text("SELECT has_schema_privilege('agent_context_projector', :schema, 'USAGE')"),
             {"schema": schema},
@@ -875,6 +953,10 @@ EXPECTED_CONSTRAINT_NAMES = {
     "ck_registered_producers_expiry_after_creation",
     "ck_registered_producers_revocation_after_creation",
     "ck_registered_producers_timestamp_order",
+    "pk_search_documents",
+    "ck_search_documents_source_event_ids_not_empty",
+    "ck_search_documents_event_id_in_sources",
+    "pk_content_tombstones",
     "pk_mcp_tokens",
     "uq_mcp_tokens_token_prefix",
     "ck_mcp_tokens_mcp_prefix",
@@ -927,6 +1009,16 @@ def _table_grants(role: str, tables: set[str], privileges: set[str]) -> set[tupl
 CATALOG_TABLES = {f"catalog.{table}" for table in EXPECTED_TABLES["catalog"]}
 LEDGER_TABLES = {f"ledger.{table}" for table in EXPECTED_TABLES["ledger"]}
 OPERATIONS_TABLES = {f"operations.{table}" for table in EXPECTED_TABLES["operations"]}
+SEARCH_UPDATE_COLUMNS = {
+    "event_id",
+    "source_event_ids",
+    "event_type",
+    "session_id",
+    "occurred_at",
+    "redaction",
+    "tsv",
+    "indexed_at",
+}
 EXPECTED_TABLE_GRANTS = (
     _table_grants("agent_context_api", CATALOG_TABLES, {"SELECT", "INSERT"})
     | _table_grants("agent_context_api", LEDGER_TABLES, {"SELECT", "INSERT"})
@@ -938,6 +1030,17 @@ EXPECTED_TABLE_GRANTS = (
     )
     | _table_grants("agent_context_projector", LEDGER_TABLES, {"SELECT"})
     | _table_grants("agent_context_projector", {"catalog.inline_contents"}, {"SELECT"})
+    | _table_grants("agent_context_api", {"retrieval.search_documents"}, {"SELECT"})
+    | _table_grants(
+        "agent_context_projector",
+        {"retrieval.search_documents"},
+        {"SELECT", "INSERT", "DELETE", "TRUNCATE"},
+    )
+    | _table_grants(
+        "agent_context_projector",
+        {"retrieval.content_tombstones"},
+        {"SELECT", "INSERT", "TRUNCATE"},
+    )
     | _table_grants("agent_context_projector", {"projection.outbox"}, {"SELECT"})
     | _table_grants(
         "agent_context_projector",
@@ -946,6 +1049,10 @@ EXPECTED_TABLE_GRANTS = (
     )
 )
 EXPECTED_UPDATE_GRANTS = {
+    *{
+        ("agent_context_projector", "retrieval.search_documents", column)
+        for column in SEARCH_UPDATE_COLUMNS
+    },
     ("agent_context_api", "catalog.repositories", "observed_at"),
     ("agent_context_api", "catalog.checkouts", "observed_at"),
     *{

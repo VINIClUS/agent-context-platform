@@ -4,8 +4,8 @@
 the live projection, a rebuild and a verification can never disagree about which projectors exist
 or in which order they run.
 
-Order: portfolio, agent, git, code, knowledge, quality. Delivery is at-least-once and unordered, so
-no projector may depend on another having run first (every write commutes, see
+Order: portfolio, agent, git, code, knowledge, quality, search. Delivery is at-least-once and
+unordered, so no projector may depend on another having run first (every write commutes, see
 `projectors/__init__.py`); the order therefore only fixes the sequence the matching projectors run
 in inside one Neo4j transaction. It follows the data's dependency direction, so a transaction
 touches roots before leaves and a replay reads like the system grew: the portfolio owns the
@@ -15,10 +15,11 @@ and snapshots the agent and code projections point at; the code projector comes 
 file, symbol and assertion revisions hang on the repository, commit and snapshot nodes. Knowledge
 and quality come right after code, because a decision, failure, test run or finding points at the
 session, commit, snapshot and test or CI run nodes the earlier projectors own (as identity-only
-stubs when they have not arrived). Every projector takes the same global node-lock order first
-(`event_lock_keys`). Only the knowledge and quality projectors then lock a few more nodes they read
-from the graph (the old targets of an edge they replace); a deadlock there is a transient error the
-driver retries.
+stubs when they have not arrived). The search projector is last because its embedding nodes hang on
+the session, turn and tool-call nodes the agent projector writes. Every projector takes the same
+global node-lock order first (`event_lock_keys`). Only the knowledge and quality projectors then
+lock a few more nodes they read from the graph (the old targets of an edge they replace); a
+deadlock there is a transient error the driver retries.
 
 Registration rejects a duplicate projector name (checkpoints and dead letters are attributed by
 name) and a duplicate (name, version) pair, each with its own typed error.
@@ -34,6 +35,11 @@ from agent_context_platform.projection.projectors.git import GitProjector
 from agent_context_platform.projection.projectors.knowledge import KnowledgeProjector
 from agent_context_platform.projection.projectors.portfolio import PortfolioProjector
 from agent_context_platform.projection.projectors.quality import QualityProjector
+from agent_context_platform.projection.projectors.search import (
+    PurgeAccess,
+    SearchBackend,
+    SearchProjector,
+)
 from agent_context_platform.projection.runtime import Projector
 
 
@@ -83,6 +89,7 @@ PROJECTORS: tuple[Projector, ...] = register_projectors(
         CodeProjector(),
         KnowledgeProjector(),
         QualityProjector(),
+        SearchProjector(),
     )
 )
 
@@ -90,3 +97,29 @@ PROJECTORS: tuple[Projector, ...] = register_projectors(
 def registered_projectors() -> tuple[Projector, ...]:
     """The platform's projectors in their deterministic run order."""
     return PROJECTORS
+
+
+def projectors_with_search(backend: SearchBackend) -> tuple[Projector, ...]:
+    """The registered projectors with the search projector bound to a configured `backend`.
+
+    `PROJECTORS` holds an unconfigured `SearchProjector`: it handles its events but fails closed
+    (typed error, so the runner retries then dead-letters) when asked to index. A process that
+    can embed (a worker, `agent-context projection rebuild` with a model directory) uses this.
+    """
+    return register_projectors(
+        projector.with_backend(backend) if isinstance(projector, SearchProjector) else projector
+        for projector in PROJECTORS
+    )
+
+
+def projectors_with_purge(access: PurgeAccess) -> tuple[Projector, ...]:
+    """The registered projectors with a search projector that can purge but not index.
+
+    For a deployment with no embedding model: `content.purged` still removes search rows and
+    embeddings (it needs no model or content reader); events that must be indexed still fail
+    closed.
+    """
+    return register_projectors(
+        projector.with_purge(access) if isinstance(projector, SearchProjector) else projector
+        for projector in PROJECTORS
+    )

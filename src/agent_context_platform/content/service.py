@@ -89,7 +89,7 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_context_platform.catalog.models import ContentObjectRow
-from agent_context_platform.content.blob_store import BlobStore, StoredBlob
+from agent_context_platform.content.blob_store import BlobStore, BlobStoreError, StoredBlob
 from agent_context_platform.content.models import INLINE_MAX_BYTES, InlineContentRow
 
 #: Fixed namespace for every advisory lock this module (and the orphan
@@ -154,6 +154,12 @@ class ContentResolutionError(ContentServiceError):
     """``PreparedContent.resolve()`` claims do not match the prepared batch."""
 
     error_code: ClassVar[str] = "content_resolution_mismatch"
+
+
+class ContentUnavailableError(ContentServiceError):
+    """Stored content a ref points at could not be read back (missing, purged or corrupt)."""
+
+    error_code: ClassVar[str] = "content_unavailable"
 
 
 def content_digest_lock_key(content_sha256: str) -> tuple[int, int]:
@@ -573,6 +579,37 @@ class ContentService:
                 .on_conflict_do_nothing(index_elements=["inline_id"])
             )
             await session.execute(insert_inline)
+
+    async def read(self, session: AsyncSession, ref: ContentRefV1) -> bytes:
+        """Return the sanitized bytes `ref` addresses, verified against the ref's digest.
+
+        This is the read path for consumers of stored content (the search projector). Inline
+        content is read from ``catalog.inline_contents`` through the caller's session (the
+        projector role holds ``SELECT``); object content is fetched and verified through the
+        :class:`BlobStore`. Raises :class:`ContentUnavailableError`, content-free, when the bytes
+        are gone (purged) or no longer match the ref.
+
+        INTERNAL projector read path: it performs NO scope or authorization check and must never
+        be exposed to callers as is. Any caller-facing read (PLATFORM-043) must gate it first.
+        """
+        if ref.storage is ContentStorage.INLINE:
+            row = await session.get(InlineContentRow, ref.inline_id)
+            if row is None:
+                raise ContentUnavailableError("inline content is not stored")
+            data = row.data
+        else:
+            if ref.object_key is None:
+                raise ContentUnavailableError("content ref has no object key")
+            try:
+                data = await self._blob_store.get_verified(ref.object_key, ref.content_sha256)
+            except BlobStoreError:
+                raise ContentUnavailableError("object content could not be read") from None
+        if (
+            len(data) != ref.uncompressed_bytes
+            or hashlib.sha256(data).hexdigest() != ref.content_sha256
+        ):
+            raise ContentUnavailableError("stored content does not match its ref")
+        return data
 
     @staticmethod
     async def _lock_digest(session: AsyncSession, content_sha256: str) -> None:
