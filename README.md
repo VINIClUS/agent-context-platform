@@ -50,6 +50,13 @@ uv run --frozen uvicorn agent_context_platform.app:create_app \
 The process-only liveness endpoint is `GET http://127.0.0.1:8000/health/live`. It does not
 represent readiness of PostgreSQL, object storage, Neo4j, or any other external service.
 
+## Telemetry
+
+The platform exports its own OpenTelemetry traces and metrics over OTLP/HTTP when
+`AGENT_CONTEXT_OBSERVABILITY__OTLP_ENDPOINT` (or a standard `OTEL_EXPORTER_OTLP_*ENDPOINT`) is set,
+and nothing otherwise. The instruments, attributes and privacy rules are the contract in
+[docs/operations/telemetry.md](docs/operations/telemetry.md).
+
 ## Quality gates
 
 Run the same gates as CI:
