@@ -379,6 +379,26 @@ def test_purged_or_foreign_content_is_never_read(
         )
         assert later == {}
         assert await ledger.events(["not-a-uuid", str(UUID(int=7))], scope) == {}
+        decision = seeded.keys["decision:dec_parser"]
+        async with world.owner.begin() as connection:
+            await connection.execute(
+                text(
+                    "UPDATE projection.outbox SET status = 'dead_lettered', delivered_at = NULL, "
+                    "dead_lettered_at = now() WHERE event_id = :id"
+                ),
+                {"id": decision},
+            )
+        try:
+            assert await ledger.events([decision], scope) == {}  # never cite an undelivered event
+        finally:
+            async with world.owner.begin() as connection:
+                await connection.execute(
+                    text(
+                        "UPDATE projection.outbox SET status = 'delivered', delivered_at = now(), "
+                        "dead_lettered_at = NULL WHERE event_id = :id"
+                    ),
+                    {"id": decision},
+                )
 
         composer = world.composer(content=spy)
         page = await composer.context_for_task(

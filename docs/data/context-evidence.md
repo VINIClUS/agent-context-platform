@@ -11,6 +11,9 @@ A reference is built only from a stored event that:
 
 - exists in `ledger.events` and is reconstructed through `LedgerRepository.get_event` (the
   ledger's single reconstruction path);
+- has been delivered by the projection runner (its `projection.outbox` row is `delivered`), so a
+  pending or dead-lettered event, which never reached the graph or the search material, is never
+  cited, even when a search row still names it;
 - passes the SDK integrity check (`verify_event`) and has a UUIDv7 `event_id`
   (`EvidenceRefV1.source_event_id` is typed `UUID7`);
 - belongs to the request scope by its envelope `context` (the repository, or the project for a

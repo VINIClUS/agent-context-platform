@@ -2,8 +2,9 @@
 
 Every `EvidenceRefV1` a context package cites is built here from a REAL stored event, loaded through
 `LedgerRepository.get_event` (the ledger's single reconstruction path) and integrity-checked with
-the SDK's `verify_event`; an event that is missing, fails verification, has a non-UUIDv7 ID or lies
-outside the request scope is never cited.
+the SDK's `verify_event`; an event that is missing, not yet delivered by the projection runner
+(pending or dead-lettered), fails verification, has a non-UUIDv7 ID or lies outside the request
+scope is never cited.
 
 Content reference. `EvidenceRefV1.content_ref` is required by the SDK. When the cited event carries
 content (an `event_content_refs` row that is `sanitized` and not purged: the one the item is about,
@@ -76,6 +77,12 @@ _PURGED: Final[str] = (
     "SELECT DISTINCT item ->> 'content_id' AS content_id FROM ledger.events e, "
     "jsonb_array_elements(e.payload -> 'purged_contents') AS item "
     "WHERE e.event_type = 'content.purged' AND item ->> 'content_id' = ANY(:content_ids)"
+)
+# Only events every projector has taken (delivered) are cited: a dead-lettered or pending event
+# never reached the graph or the search material, so nothing the package says rests on it.
+_DELIVERED: Final[str] = (
+    "SELECT event_id FROM projection.outbox WHERE event_id = ANY(CAST(:ids AS uuid[])) "
+    "AND status = 'delivered'"
 )
 _RANK: Final[str] = f"""
 WITH q AS (SELECT websearch_to_tsquery('{TEXT_SEARCH_CONFIG}', :query) AS tsq)
@@ -237,7 +244,13 @@ class EvidenceLedger:
         loaded: dict[str, LedgerEvent] = {}
         async with self._sessions() as session:
             events: list[StoredEventV1] = []
+            delivered = set()
+            if wanted:
+                rows = await session.execute(text(_DELIVERED), {"ids": [str(e) for e in wanted]})
+                delivered = {UUID(str(row.event_id)) for row in rows}
             for event_id in wanted:
+                if event_id not in delivered:
+                    continue
                 event = await LedgerRepository.get_event(session, event_id)
                 if event is None or event.event_id.version != 7 or not verify_event(event):
                     continue

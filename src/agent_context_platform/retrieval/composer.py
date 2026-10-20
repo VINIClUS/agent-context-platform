@@ -498,7 +498,16 @@ class ContextComposer:
         content = candidate.body
         if quote and candidate.excerpt is not None:
             event_id, content_id = candidate.excerpt
-            owner = events.get(event_id)
+            owner = events.get(event_id) or next(
+                (
+                    events[c.event_id]
+                    for c in candidate.citations
+                    if c.content_id is not None
+                    and c.content_id == content_id
+                    and c.event_id in events
+                ),
+                None,
+            )
             excerpt = None if owner is None else await self._ledger.snippet(owner, content_id)
             if excerpt is not None:
                 content += f"\n{EXCERPT_LABEL}: " + json.dumps(excerpt, ensure_ascii=False)
@@ -1367,14 +1376,17 @@ def _content_candidate(hit: SearchHit, score: float) -> _Candidate:
         kind=kind,
         title=f"{kind.replace('_', ' ')} in {where}",
         body=body,
-        citations=(
+        # Every event that referenced the content; the ledger keeps only the delivered ones (a
+        # row's metadata can come from a later event that was dead-lettered).
+        citations=tuple(
             Citation(
-                event_id=hit.event_id,
+                event_id=event_id,
                 evidence_kind="test" if executed else "agent",
                 confidence=1.0,
                 valid_from=hit.occurred_at,
                 content_id=hit.content_id,
-            ),
+            )
+            for event_id in sorted({hit.event_id, *hit.source_event_ids})
         ),
         tier=5 if executed else 1,
         exact_scope=False,
