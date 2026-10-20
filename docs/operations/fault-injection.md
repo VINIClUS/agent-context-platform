@@ -45,6 +45,15 @@ The projection labels count only events that at least one projector handles. An 
 projector handles, such as the platform's own `projection.rebuilt` reports, is delivered with
 no Neo4j write and no checkpoint: it neither fires a projection label nor counts towards `AFTER`.
 
+The content labels fire only for items kept in object storage (larger than `INLINE_MAX_BYTES`,
+64 KiB), once per distinct digest in a batch. `content.after_s3_put` also needs an actual upload:
+in the default `content_addressed` write mode an object already stored under the same digest is
+verified and reused without a PUT, so a scenario arming it must send content not stored yet.
+
+The ledger labels sit in `IngestionService`, which also runs in process in `agent-context index`
+and `agent-context projection verify|rebuild --record` (events only, no content): arm a label
+only in the process under test.
+
 "After response before spool ack" is adapter-side: the scenario kills the uploader instead.
 
 ## Recovery expectations
