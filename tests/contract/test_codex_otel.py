@@ -271,6 +271,21 @@ def test_platform_origin_telemetry_is_rejected_to_prevent_loops(service: str) ->
     assert _reason(gap_record, LOG_CONFIG) is RejectionReason.PLATFORM_ORIGIN
 
 
+@pytest.mark.parametrize("origin", ["platform", "PLATFORM", "anything", "", 0, None])
+def test_any_platform_origin_marker_is_rejected_even_from_an_allowed_service(
+    origin: object,
+) -> None:
+    # PLATFORM-050: every platform signal carries `agent_context.origin=platform`; a record that
+    # carries the marker key at all is platform telemetry, whatever its service name claims.
+    record = _record(resource={"service.name": "codex_cli_rs", "agent_context.origin": origin})
+    assert _reason(record) is RejectionReason.PLATFORM_ORIGIN
+    gap = _load("api_request.log.json")
+    gap_record = CodexOtelRecord(
+        gap.signal, {"service.name": "codex_exec", "agent_context.origin": origin}, gap.attributes
+    )
+    assert _reason(gap_record, LOG_CONFIG) is RejectionReason.PLATFORM_ORIGIN
+
+
 @pytest.mark.parametrize("service", ["otelcol", "codex-cli", "codex_cli_rs2", "", "x" * 500])
 def test_unknown_service_names_are_rejected(service: str) -> None:
     reason = _reason(_record(resource={"service.name": service}))
