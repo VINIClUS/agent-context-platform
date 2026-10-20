@@ -24,8 +24,15 @@ cannot resurrect purged content; a `content.purged` that is projected before the
 PostgreSQL row, so a node a concurrent index-and-purge race leaves behind is never returned and the
 next rebuild removes it.
 
+Identity: content IDs are chosen by producers, so a content ID is bound to the scope, digest and
+media type of the bytes first indexed under it. A later event naming it with another scope or other
+bytes is refused (`SearchScopeConflictError`, `SearchContentConflictError`: retried, then
+dead-lettered), in PostgreSQL for live delivery and on the `ContentEmbedding` node for a replay
+that never writes PostgreSQL, so the result never depends on delivery order.
+
 Only events scoped to both a project and a repository are indexed: retrieval is always scoped,
-so an unscoped document could never be returned.
+so an unscoped document could never be returned. A worker with no model may run the projector
+purge-only (`skip_index`): purges still apply, events that would be indexed are counted no-ops.
 
 `embedding` is excluded from the P039 graph digest (`VOLATILE_PROPERTIES`); the model identity and
 revision stay in it.
