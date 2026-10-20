@@ -283,7 +283,8 @@ def test_without_search_skips_the_projector_and_the_search_table_reset(
     projectors = asyncio.run(
         cli._search_projectors(Settings(), object(), write_documents=True, without_search=True)  # type: ignore[arg-type]
     )
-    assert "search" not in [item.name for item in projectors] and len(projectors) == 4
+    assert "search" not in [item.name for item in projectors]
+    assert len(projectors) == len(registered_projectors()) - 1
 
 
 def test_an_in_place_rebuild_with_search_resets_the_search_tables_a_standby_one_does_not(

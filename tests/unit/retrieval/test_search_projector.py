@@ -255,7 +255,14 @@ def test_a_non_agent_event_writes_the_embedding_without_an_owner_link() -> None:
     event = _event(
         [_ref("c-s", data)],
         event_type="knowledge.summary.recorded",
-        payload={"content_id": "c-s"},
+        payload={
+            "summary_id": "sum-1",
+            "subjects": ["topic"],
+            "content_id": "c-s",
+            "valid_from": MOMENT.isoformat(),
+            "recorded_at": MOMENT.isoformat(),
+            "source_event_ids": ["0190f5e0-0000-7000-8000-000000000001"],
+        },
         context=EventContextV1(project_id="proj", repository_id="repo"),
     )
 
