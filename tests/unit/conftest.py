@@ -14,6 +14,7 @@ PRODUCTION_ENV = {
     "AGENT_CONTEXT_S3__ACCESS_KEY_ID": "garage-access-key",
     "AGENT_CONTEXT_S3__SECRET_ACCESS_KEY": "garage-secret-key",
     "AGENT_CONTEXT_MCP__TOKEN_HMAC_KEY": "mcp-secret-hmac-key-0123456789abcdef",
+    "AGENT_CONTEXT_MCP__CURSOR_HMAC_KEY": "mcp-cursor-hmac-key-0123456789abcdef",
 }
 
 
