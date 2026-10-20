@@ -12,6 +12,7 @@ from typing import Any
 import pytest
 from neo4j.exceptions import ClientError, ConfigurationError, Neo4jError
 
+from agent_context_platform.projection import schema
 from agent_context_platform.projection.projectors.knowledge import (
     DecisionVersion,
     active_decisions,
@@ -106,15 +107,26 @@ def test_every_cypher_statement_is_static_and_scoped() -> None:
         temporal._CI_RUNS,
         temporal._TEST_RUNS,
         temporal._NEXT_PASS,
+        temporal._DECISION_VERSIONS,
+        temporal._SUPERSEDERS,
     ]
     for statement in statements:
         assert "$project_id IS NULL OR" in statement
         assert "$repository_id IS NULL OR" in statement
         assert not re.search(r"\{[a-z_]+\}", statement)
         assert "recorded_at <= $recorded_at" in statement
-    assert "LIMIT $limit" in temporal._VERSIONS and "LIMIT $limit" in temporal._OBSERVATIONS
-    for guard in (temporal._UNPROJECTED_DECISIONS, temporal._UNPROJECTED_FAILURES):
-        assert "LIMIT 1" in guard and "$" not in guard
+    # The run lookups are bounded by the run IDs they unwind; every other read by its LIMIT.
+    for bulk in (
+        temporal._VERSIONS,
+        temporal._OBSERVATIONS,
+        temporal._DECISION_VERSIONS,
+        temporal._SUPERSEDERS,
+    ):
+        assert "LIMIT $limit" in bulk
+    assert "LIMIT $per_decision" in temporal._DECISION_VERSIONS
+    for runs in (temporal._CI_RUNS, temporal._TEST_RUNS, temporal._NEXT_PASS):
+        assert "r.completed_at <= $valid_at" in runs  # a run still to complete is hidden
+    assert "p.completed_at <= $valid_at" in temporal._NEXT_PASS
 
 
 def test_classification_agrees_with_active_decisions_for_every_probe() -> None:
@@ -206,17 +218,22 @@ class _ServerError(ClientError):
         return self._status
 
 
+COMPLETE = [{"marker_id": "ledger", "projectors": ["knowledge:2", "quality:2"]}]
+
+
 class _Tx:
     def __init__(self, script: Callable[[str, dict[str, Any]], list[dict[str, Any]]]) -> None:
         self.script = script
-        self.stale: list[dict[str, Any]] = []
+        self.history: list[dict[str, Any]] = COMPLETE
         self.calls: list[dict[str, Any]] = []
+        self.queries: list[str] = []
 
     async def run(self, query: str, parameters: dict[str, Any]) -> Any:
-        self.calls.append(parameters)
-        if query in (temporal._UNPROJECTED_DECISIONS, temporal._UNPROJECTED_FAILURES):
-            records: list[dict[str, Any]] = self.stale
+        self.queries.append(query)
+        if query == schema._READ_HISTORY:
+            records: list[dict[str, Any]] = self.history
         else:
+            self.calls.append(parameters)
             records = self.script(query, parameters)
 
         class Result:
@@ -245,6 +262,32 @@ class _Driver:
 
 def _service(script: Callable[[str, dict[str, Any]], list[dict[str, Any]]]) -> TemporalService:
     return TemporalService(_Driver(_Tx(script)), database="neo4j", clock=lambda: at(30))  # type: ignore[arg-type]
+
+
+def graph(rows: list[dict[str, Any]]) -> Callable[[str, dict[str, Any]], list[dict[str, Any]]]:
+    """Answer the version queries over `rows` like the database: by ID, newest first, capped."""
+
+    def script(query: str, parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        if query == temporal._DECISION_VERSIONS:
+            found: list[dict[str, Any]] = []
+            for wanted in parameters["decision_ids"]:
+                mine = [row for row in rows if row["decision_id"] == wanted]
+                mine.sort(key=lambda row: (row["state_order"], row["event_id"]), reverse=True)
+                found.extend(mine[: parameters["per_decision"]])
+            return found[: parameters["limit"]]
+        if query == temporal._SUPERSEDERS:
+            ids = sorted(
+                {
+                    row["decision_id"]
+                    for row in rows
+                    if row["supersedes_id"] in parameters["decision_ids"]
+                    and row["status"] in ("accepted", "superseded")
+                }
+            )
+            return [{"decision_id": item} for item in ids[: parameters["limit"]]]
+        return rows
+
+    return script
 
 
 def stamp(days: float) -> str:
@@ -305,7 +348,7 @@ def test_decision_history_orders_older_links_self_then_newer_links() -> None:
         version_row("x", 6, supersedes="b", status="rejected", valid_from=9),
         version_row("q", 7),
     ]
-    history = asyncio.run(_service(lambda _q, _p: rows).decision_history("b", TemporalScope("p")))
+    history = asyncio.run(_service(graph(rows)).decision_history("b", TemporalScope("p")))
     assert [(e.decision_id, e.relation.value, e.distance) for e in history.entries] == [
         ("z", "earlier", 2),
         ("a", "earlier", 1),
@@ -321,12 +364,12 @@ def test_decision_history_orders_older_links_self_then_newer_links() -> None:
 
 def test_decision_history_flags_caps_and_missing_decisions(monkeypatch: pytest.MonkeyPatch) -> None:
     with pytest.raises(temporal.TemporalDecisionNotFound):
-        asyncio.run(_service(lambda _q, _p: []).decision_history("b", TemporalScope("p")))
+        asyncio.run(_service(graph([])).decision_history("b", TemporalScope("p")))
     chain = [
         version_row("d0", 1),
         *[version_row(f"d{n}", n + 1, supersedes=f"d{n - 1}", valid_from=n) for n in range(1, 4)],
     ]
-    script = _service(lambda _q, _p: chain)
+    script = _service(graph(chain))
     monkeypatch.setattr(temporal, "MAX_DEPTH", 2)
     deep = asyncio.run(script.decision_history("d0", TemporalScope("p")))
     assert deep.truncated and [e.decision_id for e in deep.entries] == ["d0", "d1", "d2"]
@@ -336,26 +379,67 @@ def test_decision_history_flags_caps_and_missing_decisions(monkeypatch: pytest.M
     assert wide.truncated and [e.decision_id for e in wide.entries] == ["d0", "d1"]
     monkeypatch.setattr(temporal, "MAX_CHAIN", 100)
     monkeypatch.setattr(temporal, "MAX_ENTRY_VERSIONS", 1)
-    many = _service(lambda _q, _p: [version_row("a", 1), version_row("a", 2)])
+    many = _service(graph([version_row("a", 1), version_row("a", 2)]))
     shown = asyncio.run(many.decision_history("a", TemporalScope("p")))
     assert shown.truncated and [v.event_id for v in shown.entries[0].versions] == ["ev2"]
 
 
-def test_a_graph_without_history_nodes_is_refused_until_rebuilt() -> None:
-    tx = _Tx(lambda _q, _p: [version_row("a", 1)])
-    tx.stale = [{"id": "old"}]
+def test_a_graph_without_complete_history_is_refused_until_rebuilt() -> None:
+    tx = _Tx(graph([version_row("a", 1)]))
     service = TemporalService(_Driver(tx), database="neo4j", clock=lambda: at(30))  # type: ignore[arg-type]
-    for call in (
+    calls = (
         lambda: service.decisions(TemporalScope("p")),
         lambda: service.decision_history("a", TemporalScope("p")),
         lambda: service.failures(TemporalScope("p")),
+    )
+    for history, state in (
+        ([], "missing"),  # never rebuilt, or wiped by a rebuild still running
+        ([{"marker_id": "ledger", "projectors": ["knowledge:1", "quality:2"]}], "outdated"),
+        ([{"marker_id": "ledger", "projectors": ["knowledge:2"]}], "outdated"),
     ):
-        with pytest.raises(temporal.TemporalProjectionOutdated, match="rebuild"):
-            asyncio.run(call())
-    tx.stale = []
+        tx.history = history
+        for call in calls:
+            tx.calls.clear()
+            with pytest.raises(temporal.TemporalProjectionOutdated, match=rf"\({state}\).*rebuild"):
+                asyncio.run(call())
+            assert tx.calls == []  # nothing else was read
+    tx.history = COMPLETE
     assert asyncio.run(service.decisions(TemporalScope("p"))).decisions
-    tx.stale = [{"id": "again"}]  # a healthy graph is checked once per instance
-    assert asyncio.run(service.decisions(TemporalScope("p"))).decisions
+    tx.history = []  # checked on every read, not once per instance
+    with pytest.raises(temporal.TemporalProjectionOutdated, match="knowledge:2, quality:2"):
+        asyncio.run(service.decisions(TemporalScope("p")))
+
+
+def test_history_finds_the_decision_whatever_precedes_it_in_the_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(temporal, "MAX_VERSIONS", 3)
+    rows = [version_row(f"a{n}", n) for n in range(1, 6)]
+    rows += [version_row("z", 10, supersedes="a1", valid_from=4)]
+    service = _service(graph(rows))
+    listed = asyncio.run(service.decisions(TemporalScope("p")))
+    assert listed.truncated and "z" not in {d.decision_id for d in listed.decisions}
+    history = asyncio.run(service.decision_history("z", TemporalScope("p")))
+    assert [e.decision_id for e in history.entries] == ["a1", "z"] and not history.truncated
+    assert history.entries[0].effective_valid_to == at(4)
+    asked = [p["decision_ids"] for p in service._driver.tx.calls if "decision_ids" in p]  # type: ignore[attr-defined]
+    assert asked[0] == ["z"]  # anchored on the decision asked about
+
+
+def test_history_reads_stay_within_the_version_budget(monkeypatch: pytest.MonkeyPatch) -> None:
+    rows = [version_row("d0", 1)]
+    rows += [version_row(f"d{n}", n + 1, supersedes=f"d{n - 1}", valid_from=n) for n in range(1, 6)]
+    monkeypatch.setattr(temporal, "MAX_VERSIONS", 3)
+    service = _service(graph(rows))
+    history = asyncio.run(service.decision_history("d0", TemporalScope("p")))
+    assert history.truncated and [e.decision_id for e in history.entries] == ["d0", "d1", "d2"]
+    limits = [p["limit"] for p in service._driver.tx.calls if "per_decision" in p]  # type: ignore[attr-defined]
+    assert limits and all(limit <= 4 for limit in limits)
+    monkeypatch.setattr(temporal, "MAX_VERSIONS", 5000)
+    monkeypatch.setattr(temporal, "MAX_CHAIN", 2)
+    wide = [version_row("x", 1), *[version_row(f"s{n}", n + 2, supersedes="x") for n in range(4)]]
+    shown = asyncio.run(_service(graph(wide)).decision_history("x", TemporalScope("p")))
+    assert shown.truncated and [e.decision_id for e in shown.entries] == ["x", "s0", "s1"]
 
 
 def observation(
