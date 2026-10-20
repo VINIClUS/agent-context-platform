@@ -107,6 +107,15 @@ agent-context projection rebuild --target-uri bolt://standby:7687 --target-datab
 agent-context projection rebuild --in-place --confirm neo4j   # stop the projection runner first
 ```
 
+* **Rebuild required on upgrade.** Checkpoints are per `(projector, version)`. The `knowledge` and
+  `quality` projectors are version `2`: they add the `DecisionVersion` and `FailureObservation`
+  history nodes and the `project_id`/`repository_id`/`recorded_at` run properties the temporal
+  reads (`retrieval/temporal.py`) need. Events already delivered by version `1` are not replayed
+  into version `2`, so after upgrading run `projection rebuild` (in place or into a standby),
+  which replays the whole ledger. Until then `TemporalService` refuses to read
+  (`TemporalProjectionOutdated`) instead of returning empty answers. That guard only detects
+  entities with no history at all; an entity with some but not all of its history (partly
+  projected before the upgrade) is not detected, so a rebuild is mandatory on upgrade.
 * **Running the projector.** `agent-context projection run` is the worker process: it drives the
   existing `ProjectionRunner` over the registered projectors with the projector-role connection
   (`AGENT_CONTEXT_POSTGRESQL__PROJECTOR_DSN`, falling back to `__DSN`) and the live Neo4j settings.

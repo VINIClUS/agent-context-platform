@@ -102,9 +102,15 @@ def test_projector_handles_exactly_the_knowledge_event_types() -> None:
 
 def test_a_superseding_decision_locks_the_superseded_decision() -> None:
     event = _decision("dec_b", supersedes="dec_a")
-    assert event_lock_keys(event) == [("Decision", "dec_a"), ("Decision", "dec_b")]
-    assert event_lock_keys(_decision("dec_b", status="proposed", supersedes="dec_a")) == [
-        ("Decision", "dec_b")
+    assert event_lock_keys(event) == [
+        ("Decision", "dec_a"),
+        ("Decision", "dec_b"),
+        ("DecisionVersion", str(event.event_id)),
+    ]
+    proposed = _decision("dec_b", status="proposed", supersedes="dec_a")
+    assert event_lock_keys(proposed) == [
+        ("Decision", "dec_b"),
+        ("DecisionVersion", str(proposed.event_id)),
     ]
 
 
@@ -127,6 +133,7 @@ def test_a_failure_locks_every_node_it_links_to() -> None:
     assert event_lock_keys(event) == [
         ("CIRun", "ci_1"),
         ("Failure", "fail_1"),
+        ("FailureObservation", str(event.event_id)),
         ("Session", "sess_1"),
         ("TestRun", "tr_1"),
     ]
@@ -260,3 +267,86 @@ def test_a_superseder_re_pointed_at_another_decision_stops_closing_the_old_one()
     ]
     got = active_decisions(versions, scope="mod_a", valid_at=_at(15), recorded_at=_at(20))
     assert got == ["dec_a", "dec_b"]
+
+
+class _Recorder:
+    def __init__(self) -> None:
+        self.statements: list[tuple[str, dict[str, Any]]] = []
+
+    async def run(self, query: str, *, parameters: dict[str, Any]) -> SimpleNamespace:
+        self.statements.append((query, parameters))
+        return SimpleNamespace(records=[])
+
+
+def _project(event: StoredEventV1) -> list[tuple[str, dict[str, Any]]]:
+    tx = _Recorder()
+    asyncio.run(KnowledgeProjector().project(tx, event))  # type: ignore[arg-type]
+    return tx.statements
+
+
+def test_a_decision_recording_is_kept_as_a_version_with_the_scope_and_its_event() -> None:
+    event = _decision("dec_a", supersedes="dec_z")
+    scoped = _event(
+        "knowledge.decision.recorded",
+        dict(event.payload),
+        number=2,
+    )
+    statements = _project(scoped)
+    version = next(p for _, p in statements if "source_event_ids" in p)
+    assert version["node_id"] == str(scoped.event_id)
+    assert version["source_event_ids"] == [str(scoped.event_id)]
+    assert version["decision_id"] == "dec_a" and version["supersedes_id"] == "dec_z"
+    assert version["status"] == "accepted" and version["state_order"].endswith(str(scoped.event_id))
+    assert "content_id" not in version  # text and content never enter the history node
+    assert any("HAS_VERSION" in q for q, _ in statements)
+    assert (version["project_id"], version["repository_id"]) == (None, None)
+
+
+def test_failures_constraints_and_summaries_project_with_recorded_parameters() -> None:
+    failure = _event(
+        "knowledge.failure.observed",
+        {
+            "failure_id": "fail_1",
+            "component": "api",
+            "operation": "ingest",
+            "error_class": "Timeout",
+            "fingerprint_version": "1",
+            "fingerprint_sha256": "e" * 64,
+            "session_id": "sess_1",
+            "test_run_id": "tr_1",
+            "ci_run_id": "ci_1",
+        },
+    )
+    statements = _project(failure)
+    written = next(p for _, p in statements if p.get("failure_id") is None and "component" in p)
+    assert written["node_id"] == "fail_1" and written["project_id"] is None
+    assert sum("OBSERVED_IN" in q for q, _ in statements) == 3
+    constraint = _event(
+        "knowledge.constraint.recorded",
+        {
+            "constraint_id": "con_1",
+            "subjects": ["mod_a"],
+            "content_id": "c",
+            "valid_from": _iso(T0),
+            "recorded_at": _iso(T0),
+        },
+    )
+    assert any(
+        p.get("node_id") == "con_1" and "supersedes_id" in p for _, p in _project(constraint)
+    )
+    summary = _event(
+        "knowledge.summary.recorded",
+        {
+            "summary_id": "sum_1",
+            "source_event_ids": [str(constraint.event_id)],
+            "subjects": ["mod_a"],
+            "content_id": "c",
+            "valid_from": _iso(T0),
+            "recorded_at": _iso(T0),
+        },
+    )
+    assert any(
+        p.get("grounded_event_ids") == [str(constraint.event_id)] for _, p in _project(summary)
+    )
+    assert event_lock_keys(constraint) == [("Constraint", "con_1")]
+    assert event_lock_keys(summary) == [("Summary", "sum_1")]
