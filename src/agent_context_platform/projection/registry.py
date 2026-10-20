@@ -112,14 +112,18 @@ def projectors_with_search(backend: SearchBackend) -> tuple[Projector, ...]:
     )
 
 
-def projectors_with_purge(access: PurgeAccess) -> tuple[Projector, ...]:
+def projectors_with_purge(
+    access: PurgeAccess, *, skip_index: bool = False
+) -> tuple[Projector, ...]:
     """The registered projectors with a search projector that can purge but not index.
 
     For a deployment with no embedding model: `content.purged` still removes search rows and
-    embeddings (it needs no model or content reader); events that must be indexed still fail
-    closed.
+    embeddings (it needs no model or content reader). Events that must be indexed fail closed,
+    unless `skip_index` (the worker's explicit purge-only mode) delivers them as counted no-ops.
     """
     return register_projectors(
-        projector.with_purge(access) if isinstance(projector, SearchProjector) else projector
+        projector.with_purge(access, skip_index=skip_index)
+        if isinstance(projector, SearchProjector)
+        else projector
         for projector in PROJECTORS
     )

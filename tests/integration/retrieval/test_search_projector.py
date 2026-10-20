@@ -778,3 +778,27 @@ def test_a_searchless_replay_check_is_refused_because_its_digest_would_always_mi
         await cli._require_no_embeddings(world.store, what="a replay check with")  # now allowed
 
     with_world(body, dsn=postgres_dsn, owner=projection_engine)
+
+
+def test_a_purge_only_worker_delivers_content_events_unindexed_and_applies_purges(
+    postgres_dsn: str, projection_engine: AsyncEngine
+) -> None:
+    from agent_context_platform.projection.projectors.search import PurgeAccess
+    from agent_context_platform.projection.registry import projectors_with_purge
+
+    async def body(world: SearchWorld) -> None:
+        await world.ingest("indexed while a model was configured", "c-old")
+        await world.project()
+        await world.ingest("arrives in purge-only mode", "c-new", turn="turn-2")
+        await world.purge("c-old")
+        projectors = projectors_with_purge(PurgeAccess(world.projector_sessions), skip_index=True)
+
+        report = await world.project(projectors=projectors)
+
+        assert (report.delivered, report.dead_lettered) == (2, 0)
+        assert projectors[-1].skipped_index_events == 1  # type: ignore[attr-defined]
+        assert await world.documents() == [] and await world.embedding_ids() == []
+        tombstones = await _rows(world, "SELECT content_id FROM retrieval.content_tombstones")
+        assert [r.content_id for r in tombstones] == ["c-old"]
+
+    with_world(body, dsn=postgres_dsn, owner=projection_engine)

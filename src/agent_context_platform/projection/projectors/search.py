@@ -34,6 +34,7 @@ revision stay in it.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any, Final, LiteralString
@@ -53,6 +54,8 @@ from agent_context_platform.projection.projectors import (
 )
 from agent_context_platform.retrieval.embeddings import EmbeddingProvider
 from agent_context_platform.retrieval.models import TEXT_SEARCH_CONFIG
+
+_LOG = logging.getLogger(__name__)
 
 CONTENT_PURGED_TYPE: Final = "content.purged"
 # Dimensions of the cosine vector index (`projection.schema`); a provider must match.
@@ -283,12 +286,21 @@ class SearchProjector:
     version = "1"
 
     def __init__(
-        self, backend: SearchBackend | None = None, purge: PurgeAccess | None = None
+        self,
+        backend: SearchBackend | None = None,
+        purge: PurgeAccess | None = None,
+        *,
+        skip_index: bool = False,
     ) -> None:
         self._backend = backend
         self._purge_access = (
             PurgeAccess(backend.sessions, backend.write_documents) if backend else purge
         )
+        # Purge-only (`projection run --without-search`): with no backend, an event that would be
+        # indexed is delivered as a no-op and counted instead of failing closed. Never for a
+        # replay: a rebuild or verification needs the model or skips the projector entirely.
+        self._skip_index = skip_index and backend is None
+        self.skipped_index_events = 0
         # Purges seen by THIS instance while it replays into a graph-only target
         # (`write_documents=False`): the live tombstone table is never written then, so a purge
         # that precedes its original event in the replay is remembered here instead.
@@ -297,8 +309,8 @@ class SearchProjector:
     def with_backend(self, backend: SearchBackend) -> SearchProjector:
         return SearchProjector(backend)
 
-    def with_purge(self, purge: PurgeAccess) -> SearchProjector:
-        return SearchProjector(purge=purge)
+    def with_purge(self, purge: PurgeAccess, *, skip_index: bool = False) -> SearchProjector:
+        return SearchProjector(purge=purge, skip_index=skip_index)
 
     def handles(self, event_type: str) -> bool:
         return event_type in _HANDLED
@@ -324,6 +336,11 @@ class SearchProjector:
         if scope is None or not refs:
             return
         project_id, repository_id = scope
+        if self._skip_index:
+            self.skipped_index_events += 1
+            if self.skipped_index_events == 1:
+                _LOG.warning("search indexing skipped: purge-only mode, no embedding model")
+            return
         backend = self._require_backend()
         indexed = await self._index_documents(backend, event, refs, project_id, repository_id)
         if not indexed:

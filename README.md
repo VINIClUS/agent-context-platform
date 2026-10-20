@@ -263,10 +263,40 @@ agent-context models fetch --dest /var/lib/agent-context/models/minilm   # about
 export AGENT_CONTEXT_SEARCH__MODEL_DIR=/var/lib/agent-context/models/minilm
 ```
 
-Loading re-checks every digest and fails closed on a mismatch. Without `MODEL_DIR` the search
-projector refuses to index (it dead-letters rather than silently skipping), and `projection
-rebuild|verify` need it to reproduce the `ContentEmbedding` nodes. `AGENT_CONTEXT_SEARCH__EMBEDDING_BATCH_SIZE`
-and `..._EMBEDDING_THREADS` bound the inference work. `tests/unit/retrieval/test_model_parity.py`
+Loading re-checks every digest and fails closed on a mismatch. `AGENT_CONTEXT_SEARCH__EMBEDDING_BATCH_SIZE`
+and `..._EMBEDDING_THREADS` bound the inference work.
+
+What needs the model:
+
+* `projection run` (the worker) refuses to start without `MODEL_DIR` (exit `2`, before any
+  connection) unless it runs **purge-only**: `--without-search` or
+  `AGENT_CONTEXT_PROJECTION_WITHOUT_SEARCH=1`. Purge-only applies every `content.purged` (it needs
+  only PostgreSQL) and delivers content events without indexing them, counted in the summary
+  (`search_index_skipped`) and the `projection_worker search_index_skipped N` log line; the flag
+  means purge-only even when a model is configured. Search stays incomplete until a rebuild with
+  the model backfills it.
+* `projection rebuild` and `projection verify --replay-check` refuse to run without `MODEL_DIR`
+  unless `--without-search` skips the search projector, and `--without-search` is itself refused
+  (in place, or for a replay check) while the live graph holds `ContentEmbedding` nodes: they would
+  be wiped, or reported as drift. Plain `projection verify`/`status` never load the model.
+* `projection rebuild --in-place` empties `retrieval.search_documents` and
+  `retrieval.content_tombstones` and, in the same transaction, tombstones every purge the ledger
+  records, so purged content stays purged across rebuilds even when its purge event was
+  dead-lettered; replayed originals of purged content never read their (deleted) bytes.
+
+Consistency: a search row is returned only once one of its source events is `delivered` (a row
+left behind by a dead-lettered or not-yet-delivered event stays hidden), indexing and purging of
+one content ID serialize on a PostgreSQL advisory lock, and a producer-chosen `content_id` reused
+for different sanitized bytes (or in another scope) is refused (`SearchContentConflictError`,
+`SearchScopeConflictError`: retried, then dead-lettered), never merged.
+
+Containers (service image): the worker container sets `AGENT_CONTEXT_SEARCH__MODEL_DIR` to a
+read-only volume the model was provisioned into once with `agent-context models fetch --dest`
+(about 470 MB; never at image build or start-up), or runs purge-only with
+`AGENT_CONTEXT_PROJECTION_WITHOUT_SEARCH=1` when no model is provisioned. The image needs the
+`onnxruntime`, `tokenizers` and `numpy` wheels (no torch). A process serving vector search
+(`SearchService.vector`, wired by PLATFORM-043) embeds the query, so it needs the same volume;
+lexical search needs only PostgreSQL. Rebuild and replay-check jobs need the volume too, or `--without-search` as above. `tests/unit/retrieval/test_model_parity.py`
 compares the ONNX output with sentence-transformers and runs only when
 `AGENT_CONTEXT_TEST_MODEL_PARITY=1`.
 

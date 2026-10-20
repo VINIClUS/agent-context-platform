@@ -299,6 +299,8 @@ def worker(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "AGENT_CONTEXT_NEO4J__URI": "bolt://live.example.test:7687",
         "AGENT_CONTEXT_NEO4J__USERNAME": "neo4j",
         "AGENT_CONTEXT_NEO4J__PASSWORD": PASSWORD,
+        # No model in these tests: the search projector runs purge-only, with no connection.
+        "AGENT_CONTEXT_PROJECTION_WITHOUT_SEARCH": "1",
     }.items():
         monkeypatch.setenv(name, value)
 
@@ -388,21 +390,79 @@ def test_the_worker_builds_its_projectors_through_one_factory(
     from agent_context_platform.projection.registry import registered_projectors
     from agent_context_platform.settings import Settings
 
-    # No model: the worker still starts, with a search projector that can purge but not index.
+    # Purge-only: a search projector that purges, never indexes, and counts what it skipped.
     sessions = object()
-    bound = asyncio.run(cli.build_projectors(Settings(), SimpleNamespace(sessions=sessions)))  # type: ignore[arg-type]
+    bound = asyncio.run(
+        cli.build_projectors(Settings(), SimpleNamespace(sessions=sessions), without_search=True)  # type: ignore[arg-type]
+    )
     assert [item.name for item in bound] == [item.name for item in registered_projectors()]
     assert bound[-1]._purge_access.sessions is sessions  # type: ignore[attr-defined]
-    assert bound[-1]._backend is None  # type: ignore[attr-defined]
-    built: list[object] = []
+    assert bound[-1]._backend is None and bound[-1]._skip_index  # type: ignore[attr-defined]
+    # Without a model and without the purge-only mode the factory refuses.
+    with pytest.raises(cli.CliUsageError, match="--without-search"):
+        asyncio.run(cli.build_projectors(Settings(), SimpleNamespace(sessions=sessions)))  # type: ignore[arg-type]
+    built: list[tuple[object, bool]] = []
 
-    async def fake_build(settings: object, runtime: object) -> tuple[()]:
-        built.append(settings)
+    async def fake_build(settings: object, runtime: object, *, without_search: bool) -> tuple[()]:
+        built.append((settings, without_search))
         return ()
 
     monkeypatch.setattr(cli, "build_projectors", fake_build)
     assert CliRunner().invoke(cli.app, ["projection", "run", "--once"]).exit_code == 0
-    assert len(built) == 1
+    assert len(built) == 1 and built[0][1] is True
+
+
+def test_without_a_model_the_worker_refuses_to_start_before_any_connection(
+    worker: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.delenv("AGENT_CONTEXT_PROJECTION_WITHOUT_SEARCH")
+
+    result = CliRunner().invoke(cli.app, ["projection", "run", "--once"])
+
+    assert result.exit_code == 2
+    assert (
+        "AGENT_CONTEXT_SEARCH__MODEL_DIR" in result.stderr and "--without-search" in result.stderr
+    )
+    assert "runtime_opened" not in worker
+
+
+def test_a_model_and_no_flag_binds_the_indexing_search_projector(
+    worker: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.delenv("AGENT_CONTEXT_PROJECTION_WITHOUT_SEARCH")
+    monkeypatch.setenv("AGENT_CONTEXT_SEARCH__MODEL_DIR", str(tmp_path))
+    bound: list[bool] = []
+
+    async def search_projectors(*_args: Any, write_documents: bool) -> tuple[()]:
+        bound.append(write_documents)
+        return ()
+
+    monkeypatch.setattr(cli, "_search_projectors", search_projectors)
+
+    assert CliRunner().invoke(cli.app, ["projection", "run", "--once"]).exit_code == 0
+    assert bound == [True]
+
+
+def test_purge_only_skips_are_counted_and_reported_without_content(
+    worker: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agent_context_platform.projection.projectors.search import SearchProjector
+
+    skipping = SearchProjector(skip_index=True)
+    skipping.skipped_index_events = 3
+
+    async def fake_build(*_args: Any, **_kwargs: Any) -> tuple[Any, ...]:
+        return (skipping,)
+
+    monkeypatch.setattr(cli, "build_projectors", fake_build)
+
+    result = CliRunner().invoke(cli.app, ["projection", "run", "--once", "--json"])
+
+    assert result.exit_code == 0, result.output
+    assert json.loads(result.stdout)["search_index_skipped"] == 3
+    assert "projection_worker search_index_skipped 3" in result.stderr
+    text_result = CliRunner().invoke(cli.app, ["projection", "run", "--once"])
+    assert "3 content events not indexed (purge-only)" in text_result.stdout
 
 
 def test_an_interrupted_once_exits_1_and_is_not_a_drain() -> None:

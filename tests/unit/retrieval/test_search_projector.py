@@ -567,3 +567,45 @@ def test_seeded_ledger_purges_are_neither_read_nor_embedded() -> None:
     assert seeded == 1
     assert rig.content.reads == [] and tx.queries == []
     assert rig.sessions.statements("INSERT INTO") == []
+
+
+def test_purge_only_mode_counts_index_events_and_still_purges(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    sessions = FakeSessions()
+    projector = SearchProjector(purge=PurgeAccess(sessions), skip_index=True)  # type: ignore[arg-type]
+    secret = b"secret body"
+    tx = FakeTx()
+
+    with caplog.at_level("WARNING"):
+        for _ in range(2):
+            asyncio.run(projector.project(tx, _event([_ref("c-1", secret)])))  # type: ignore[arg-type]
+
+    assert projector.skipped_index_events == 2
+    assert tx.queries == [] and sessions.log == []  # nothing read, embedded or written
+    assert len(caplog.records) == 1 and "secret" not in caplog.text and "c-1" not in caplog.text
+    purge = _event(
+        [],
+        event_type="content.purged",
+        payload={
+            "purge_request_id": "purge-1",
+            "purged_contents": [{"content_id": "c-1", "content_sha256": "a" * 64}],
+            "reason": "operator_request",
+            "purged_at": MOMENT.isoformat(),
+            "affected_event_count": 1,
+            "storage_kinds": ["inline"],
+        },
+        context=EventContextV1(),
+    )
+    asyncio.run(projector.project(tx, purge))  # type: ignore[arg-type]
+    assert sessions.statements("INSERT INTO retrieval.content_tombstones")
+    assert tx.with_fragment("DETACH DELETE") == [{"content_ids": ["c-1"]}]
+
+
+def test_purge_only_never_applies_to_a_projector_that_can_index() -> None:
+    rig = Rig({"c-1": b"x"})
+    projector = SearchProjector(rig.projector._backend, skip_index=True)  # type: ignore[attr-defined]
+
+    asyncio.run(projector.project(FakeTx(), _event([_ref("c-1", b"x")])))  # type: ignore[arg-type]
+
+    assert projector.skipped_index_events == 0 and rig.content.reads == ["c-1"]

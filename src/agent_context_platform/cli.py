@@ -655,6 +655,7 @@ class WorkerTotals:
     lost_leases: int = 0
     iterations: int = 0
     paused_for_rebuild: int = 0
+    search_index_skipped: int = 0  # purge-only mode: content events delivered without indexing
     outcome: str = "stopped"  # drained | timeout | stopped | interrupted
 
     def add(self, report: ProjectionRunReport) -> None:
@@ -665,16 +666,39 @@ class WorkerTotals:
         self.lost_leases += report.lost_leases
 
 
-async def build_projectors(settings: Settings, runtime: Runtime) -> tuple[Projector, ...]:
+async def build_projectors(
+    settings: Settings, runtime: Runtime, *, without_search: bool = False
+) -> tuple[Projector, ...]:
     """The projector set the worker runs: the ONE place a projector needing configuration binds.
 
     The search projector is bound exactly as `projection rebuild --in-place` binds it, in a writing
-    mode (`_search_projectors`, `write_documents=True`). With `AGENT_CONTEXT_SEARCH__MODEL_DIR` it
-    can index (loading verifies every model digest and fails closed). Without it the worker still
-    starts and the projector still processes `content.purged` (purges need only PostgreSQL), but an
-    event that must be indexed fails closed and is retried, then dead-lettered, never skipped.
+    mode (`_search_projectors`, `write_documents=True`); with `AGENT_CONTEXT_SEARCH__MODEL_DIR` it
+    indexes (loading verifies every model digest and fails closed). `without_search` is the
+    explicit purge-only mode, even with a model configured: `content.purged` is still applied
+    (purges need only PostgreSQL), and an event that would be indexed is delivered as a counted
+    no-op; a later rebuild with the model backfills search. Without a model and without that mode
+    the worker refuses to start: dead-lettering every content event would poison the outbox.
     """
+    if without_search:
+        return projectors_with_purge(PurgeAccess(runtime.sessions), skip_index=True)
+    _require_worker_search_model(settings)
     return await _search_projectors(settings, runtime, write_documents=True)
+
+
+def _require_worker_search_model(settings: Settings) -> None:
+    if settings.search.model_dir is None:
+        raise CliUsageError(
+            "the projection worker needs AGENT_CONTEXT_SEARCH__MODEL_DIR (see `models fetch`); "
+            "pass --without-search to run search purge-only"
+        )
+
+
+def _search_index_skipped(projectors: Sequence[Projector]) -> int:
+    return sum(
+        projector.skipped_index_events
+        for projector in projectors
+        if isinstance(projector, SearchProjector)
+    )
 
 
 def _worker_exit_code(totals: WorkerTotals, *, once: bool) -> int:
@@ -819,6 +843,10 @@ def _worker_lines(totals: WorkerTotals, statuses: Sequence[ProjectorStatus]) -> 
         f"retried {totals.retried}, dead-lettered {totals.dead_lettered}, "
         f"lost leases {totals.lost_leases}"
     ]
+    if totals.search_index_skipped:
+        lines.append(
+            f"search: {totals.search_index_skipped} content events not indexed (purge-only)"
+        )
     lines.extend(
         f"{item.name} {item.version}: checkpoint {item.checkpoint_outbox_id}/"
         f"{item.ledger_head_outbox_id}, lag {item.lag}"
@@ -859,6 +887,16 @@ def run_command(
         typer.Option("--log-seconds", min=0.1, help="At most one progress line per N seconds."),
     ] = 30.0,
     json_output: _JSON = False,
+    without_search: Annotated[
+        bool,
+        typer.Option(
+            "--without-search",
+            envvar="AGENT_CONTEXT_PROJECTION_WITHOUT_SEARCH",
+            help="Run the search projector purge-only: purges are applied, content events are "
+            "delivered without indexing (counted). Without this flag the worker needs "
+            "AGENT_CONTEXT_SEARCH__MODEL_DIR.",
+        ),
+    ] = False,
 ) -> None:
     """Run the projection worker: claim outbox rows and project them into the graph.
 
@@ -867,13 +905,16 @@ def run_command(
     drains the outbox and exits 0, or 1 when an event was dead-lettered during the run, or on
     `--max-seconds` expiring (`timeout`), or when SIGTERM/SIGINT cuts it short (`interrupted`). Pauses (`paused_for_rebuild`) while a rebuild holds the
     rebuild lock. Uses the projector role. Progress and the summary are counts only; never a DSN
-    or event content.
+    or event content. Needs AGENT_CONTEXT_SEARCH__MODEL_DIR unless `--without-search` runs the
+    search projector purge-only.
     """
 
     async def main() -> int:
         if health_file is not None and not health_file.parent.is_dir():
             raise CliUsageError("--health-file must be in an existing directory")
         settings = _load_settings()
+        if not without_search:
+            _require_worker_search_model(settings)  # before any connection
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         handled: list[signal.Signals] = []
@@ -893,7 +934,9 @@ def run_command(
         runner: ProjectionRunner | None = None
         try:
             async with _runtime(settings) as runtime:
-                projectors = await build_projectors(settings, runtime)
+                projectors = await build_projectors(
+                    settings, runtime, without_search=without_search
+                )
                 runner = ProjectionRunner(
                     runtime.sessions, runtime.store, projectors, worker_id=worker_id
                 )
@@ -916,6 +959,9 @@ def run_command(
                     # Never leave a lease behind, even when the loop died on an error.
                     with contextlib.suppress(Exception):
                         await asyncio.shield(runner.release_leases())
+                totals.search_index_skipped = _search_index_skipped(projectors)
+                if totals.search_index_skipped:
+                    log(f"search_index_skipped {totals.search_index_skipped}")
                 statuses = await projection_status(runtime.sessions, projectors)
         finally:
             for sig in handled:
