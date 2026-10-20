@@ -212,3 +212,30 @@ def test_stale_candidates_do_not_hide_a_valid_hit_further_down_the_same_round() 
     assert [hit.content_id for hit in hits] == ["c-5"]
     (parameters,) = tx.with_fragment("queryNodes")
     assert parameters["k"] == parameters["limit"] == 4  # every candidate of the round comes back
+
+
+def test_the_widened_round_returns_up_to_the_widened_candidate_count() -> None:
+    # A graph that honours both `$k` and `$limit`: four in-scope stale nodes rank above the only
+    # node with a searchable row, so `limit=1` finds it only if a later round returns more than 4.
+    ranked = ["c-1", "c-2", "c-3", "c-4", "c-5"]
+    documents = {"c-5": _document("c-5")}
+    sessions = FakeSessions(
+        lambda _sql, params: [documents[c] for c in params.get("content_ids", []) if c in documents]
+    )
+
+    def graph(_query: str, parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        returned = ranked[: min(parameters["k"], parameters["limit"])]
+        raw = min(parameters["k"], 20)  # the corpus holds 20 nodes, most out of scope
+        return [
+            {"raw_count": raw, "content_id": cid, "score": 0.9 - i / 10}
+            for i, cid in enumerate(returned)
+        ]
+
+    tx = FakeTx(graph)
+    service = SearchService(sessions, FakeGraph(tx), StubEmbedder())  # type: ignore[arg-type]
+
+    hits = asyncio.run(service.vector("hello", SCOPE, 1))
+
+    assert [hit.content_id for hit in hits] == ["c-5"]
+    rounds = tx.with_fragment("queryNodes")
+    assert [(p["k"], p["limit"]) for p in rounds] == [(4, 4), (16, 16)]
