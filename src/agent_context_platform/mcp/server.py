@@ -14,6 +14,7 @@ from starlette.applications import Starlette
 from starlette.types import ASGIApp
 
 from agent_context_platform.mcp.protocol_guard import AccessGate, ProtocolGuard
+from agent_context_platform.mcp.telemetry import McpSpanScope, McpTelemetry
 from agent_context_platform.settings import MCPSettings
 
 MCP_PATH: Final = "/mcp"
@@ -102,10 +103,11 @@ def build_mcp_mount(
         transport_security=TransportSecuritySettings(enable_dns_rebinding_protection=False),
     )
     guarded = ProtocolGuard(
-        sdk_app,
+        McpSpanScope(sdk_app),
         allowed_hosts=settings.allowed_hosts,
         allowed_origins=settings.allowed_origins,
         max_body_bytes=settings.max_request_body_bytes,
         access_gate=access_gate,
     )
-    return MCPMount(guarded, sdk_app)
+    # Telemetry outermost, so authentication and transport rejections are counted too.
+    return MCPMount(McpTelemetry(guarded), sdk_app)

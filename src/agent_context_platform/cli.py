@@ -50,6 +50,8 @@ from agent_context_platform.indexing.emitter import IndexingConfig, IndexingServ
 from agent_context_platform.indexing.identity import repository_namespace
 from agent_context_platform.indexing.pipeline import IndexReport, IndexRequest, index_checkout
 from agent_context_platform.ledger.service import IngestionService
+from agent_context_platform.observability import setup as telemetry_setup
+from agent_context_platform.observability.projection import ProjectionSampler
 from agent_context_platform.operations import provisioning
 from agent_context_platform.projection.neo4j import Neo4jStore
 from agent_context_platform.projection.registry import registered_projectors
@@ -831,12 +833,20 @@ def run_command(
 
         worker_id = f"projection-worker-{os.getpid()}-{uuid4().hex[:8]}"
         runner: ProjectionRunner | None = None
+        telemetry = telemetry_setup.start(settings)  # PLATFORM-050: no-op without an endpoint
+        sampler: asyncio.Task[None] | None = None
         try:
             async with _runtime(settings) as runtime:
                 projectors = build_projectors(settings)
                 runner = ProjectionRunner(
                     runtime.sessions, runtime.store, projectors, worker_id=worker_id
                 )
+                if telemetry is not None:
+                    sampler = asyncio.create_task(
+                        ProjectionSampler(
+                            runtime.sessions, [projector.name for projector in projectors]
+                        ).run(stop, settings.observability.projection_sample_seconds)
+                    )
                 touch()
                 log("started")
                 try:
@@ -856,8 +866,14 @@ def run_command(
                     # Never leave a lease behind, even when the loop died on an error.
                     with contextlib.suppress(Exception):
                         await asyncio.shield(runner.release_leases())
+                    if sampler is not None:
+                        sampler.cancel()
+                        await asyncio.gather(sampler, return_exceptions=True)
                 statuses = await projection_status(runtime.sessions, projectors)
         finally:
+            if sampler is not None and not sampler.done():
+                sampler.cancel()
+            await telemetry_setup.stop(telemetry, settings)
             for sig in handled:
                 loop.remove_signal_handler(sig)
             if health_file is not None:
@@ -922,6 +938,7 @@ def index_command(
             raise CliUsageError("--scip must be an existing file")
         settings = _load_settings()
         engine = _engine(settings.postgresql.effective_api_dsn, "API_DSN")
+        telemetry = telemetry_setup.start(settings)  # PLATFORM-050: no-op without an endpoint
         try:
             sessions = session_factory(engine)
             ingestion = IngestionService(
@@ -933,6 +950,7 @@ def index_command(
             )
         finally:
             await engine.dispose()
+            await telemetry_setup.stop(telemetry, settings)
         _emit(report.to_dict(), as_json=json_output, lines=_index_lines(report))
         return EXIT_OK if report.success else EXIT_FAILED
 

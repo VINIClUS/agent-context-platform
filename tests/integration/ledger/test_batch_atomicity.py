@@ -495,3 +495,57 @@ def test_append_with_outcome_reports_created_only_for_rows_it_inserted(stack: St
                 assert plain[0].event_id == second.event_id
 
     _run(exercise())
+
+
+def test_the_full_ingestion_path_is_traced_and_counted_without_content(
+    stack: Stack, caplog: pytest.LogCaptureFixture
+) -> None:
+    """PLATFORM-050: real auth, content, S3 and ledger; the batch content never reaches telemetry."""
+    from unit.observability._capture import capture_telemetry
+
+    from agent_context_platform.observability import contract
+
+    caplog.set_level(logging.DEBUG)
+    run = uuid4().hex
+    canary = f"CANARYtelemetry{time.time_ns()}"
+    inline_data, inline_claim, inline_item = _content(2_000)
+    object_data, object_claim, object_item = _content(INLINE_MAX_BYTES + 1_000)
+    events = (
+        _draft(f"t-{run}", stream_id=f"s-{run}", claims=(inline_claim, object_claim)),
+        _draft(f"u-{run}", stream_id=f"s-{run}", session_id=canary),
+    )
+    batch = _batch(events, (inline_item, object_item))
+
+    async def exercise() -> None:
+        with capture_telemetry() as telemetry:
+            assert (await stack.post(batch)).status_code == 200
+            assert (await stack.post(batch)).status_code == 200  # replay: all existing
+            assert (await stack.post(batch, token=f"{PREFIX}.{canary}")).status_code == 401
+
+            assert telemetry.points(contract.INGESTION_BATCHES) == {
+                (("outcome", "accepted"), ("reason", "none")): 2,
+                (("outcome", "rejected"), ("reason", "auth")): 1,
+            }
+            assert telemetry.value(contract.INGESTION_EVENTS, result="created") == 2
+            assert telemetry.value(contract.INGESTION_EVENTS, result="existing") == 2
+            assert telemetry.value(contract.CONTENT_OBJECTS, storage="inline", result="stored") == 2
+            assert telemetry.value(contract.CONTENT_OBJECTS, storage="object", result="stored") == 2
+
+            appends = telemetry.spans("agent_context.ledger.append")
+            assert [dict(span.attributes or {}) for span in appends] == [
+                {"agent_context.event_count": 2, "agent_context.events.created": 2},
+                {"agent_context.event_count": 2, "agent_context.events.created": 0},
+            ]
+            ingest = telemetry.spans("agent_context.ingest_batch")[0]
+            prepare = telemetry.spans("agent_context.content.prepare")[0]
+            assert prepare.parent is not None and prepare.parent.span_id == ingest.context.span_id
+            assert appends[0].parent is not None
+            assert appends[0].parent.span_id == ingest.context.span_id
+
+            dump = telemetry.dump()
+            records = "\n".join(str(record.__dict__) for record in caplog.records)
+            for forbidden in (canary, inline_data.decode(), object_data.decode()[:64], TOKEN):
+                assert forbidden not in dump
+                assert forbidden not in records
+
+    _run(exercise())

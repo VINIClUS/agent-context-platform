@@ -59,6 +59,7 @@ from agent_context_sdk import RevisionScopeV1
 from neo4j import AsyncDriver, AsyncGraphDatabase, AsyncManagedTransaction, Record, unit_of_work
 from neo4j.exceptions import ConfigurationError, Neo4jError
 
+from agent_context_platform.observability import traced_retrieval
 from agent_context_platform.projection.neo4j import Neo4jTransaction
 from agent_context_platform.settings import Neo4jSettings
 
@@ -89,6 +90,14 @@ class GraphTemporalScopeUnsupported(GraphRequestError):
 
 class GraphAnchorNotFound(RetrievalError, LookupError):
     """The ID is not a current repository, module, file or symbol of the scoped repository."""
+
+
+# Telemetry (PLATFORM-050): every public traversal is one `operation=graph` retrieval sample.
+_graph_retrieval = traced_retrieval(
+    "graph",
+    client_errors=(GraphRequestError, GraphAnchorNotFound),
+    deadline_errors=(RetrievalDeadlineExceeded,),
+)
 
 
 class NodeKind(StrEnum):
@@ -573,6 +582,7 @@ class GraphTraversalService:
 
     # --- operations ---
 
+    @_graph_retrieval
     async def neighborhood(
         self,
         scope: GraphScope,
@@ -593,6 +603,7 @@ class GraphTraversalService:
             lambda tx: _walk(tx, scope, anchor, depth, _Mode.NEIGHBORHOOD, include_alternatives),
         )
 
+    @_graph_retrieval
     async def callers(
         self,
         scope: GraphScope,
@@ -613,6 +624,7 @@ class GraphTraversalService:
             lambda tx: _walk(tx, scope, symbol, depth, _Mode.CALLERS, include_alternatives),
         )
 
+    @_graph_retrieval
     async def callees(
         self,
         scope: GraphScope,
@@ -633,6 +645,7 @@ class GraphTraversalService:
             lambda tx: _walk(tx, scope, symbol, depth, _Mode.CALLEES, include_alternatives),
         )
 
+    @_graph_retrieval
     async def dependency_paths(
         self,
         scope: GraphScope,
@@ -656,6 +669,7 @@ class GraphTraversalService:
             lambda tx: _paths(tx, scope, source, target, max_depth, max_paths),
         )
 
+    @_graph_retrieval
     async def dependencies(
         self,
         scope: GraphScope,

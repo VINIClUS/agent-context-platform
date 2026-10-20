@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import re
+import time
 from collections.abc import Callable, Sequence
 from dataclasses import dataclass
 from datetime import UTC, datetime, timedelta
@@ -17,6 +18,14 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 # Module import (not `from ... import`): ledger.repository imports projection.models,
 # so binding the attribute at call time keeps either import order cycle-free.
 import agent_context_platform.ledger.repository as ledger_repository
+from agent_context_platform.observability import (
+    SPAN_PROJECTION_BATCH,
+    SPAN_PROJECTION_EVENT,
+    record_integrity_failure,
+    record_projection_duration,
+    record_projection_event,
+    traced,
+)
 from agent_context_platform.projection.checkpoints import CheckpointRepository
 from agent_context_platform.projection.models import (
     DeadLetterRow,
@@ -157,6 +166,7 @@ async def _load_event(session: AsyncSession, event_id: UUID) -> StoredEventV1:
     if event is None:
         raise OrphanedOutboxRowError(f"ledger event missing for outbox claim: {event_id}")
     if not verify_event(event):
+        record_integrity_failure("digest_mismatch")  # telemetry (PLATFORM-050)
         raise EventIntegrityError(f"stored event failed integrity verification: {event_id}")
     return event
 
@@ -232,11 +242,29 @@ class ProjectionRunner:
         if limit < 1:
             raise ValueError("limit must be at least 1")
 
-        claimed_rows = await self._claim_batch(limit)
-        outcomes = {"delivered": 0, "retried": 0, "dead_lettered": 0, "lost_lease": 0}
-        for row in claimed_rows:
-            outcome = await self._process_claimed_row(row)
-            outcomes[outcome] += 1
+        # Telemetry (PLATFORM-050): one span per batch and one per claimed row, ids and counts only.
+        with traced(SPAN_PROJECTION_BATCH) as batch_span:
+            claimed_rows = await self._claim_batch(limit)
+            outcomes = {"delivered": 0, "retried": 0, "dead_lettered": 0, "lost_lease": 0}
+            for row in claimed_rows:
+                with traced(
+                    SPAN_PROJECTION_EVENT,
+                    {
+                        "agent_context.event_id": str(row.event_id),
+                        "agent_context.outbox_id": row.outbox_id,
+                    },
+                ) as event_span:
+                    outcome = await self._process_claimed_row(row)
+                    event_span.set_attribute("agent_context.result", outcome)
+                outcomes[outcome] += 1
+            batch_span.set_attributes(
+                {
+                    "agent_context.claimed": len(claimed_rows),
+                    "agent_context.delivered": outcomes["delivered"],
+                    "agent_context.retried": outcomes["retried"],
+                    "agent_context.dead_lettered": outcomes["dead_lettered"],
+                }
+            )
 
         return ProjectionRunReport(
             claimed=len(claimed_rows),
@@ -404,7 +432,9 @@ class ProjectionRunner:
             nonlocal failing_projector
             for projector in matching:
                 failing_projector = projector
+                started = time.perf_counter()
                 await projector.project(tx, event)
+                record_projection_duration(projector.name, time.perf_counter() - started)
             failing_projector = None
 
         try:
@@ -477,7 +507,10 @@ class ProjectionRunner:
                     now=now,
                 )
             await session.commit()
-            return True
+        # Telemetry (PLATFORM-050): once per matching projector, `none` when nothing matched.
+        for name in [projector.name for projector in matching] or ["none"]:
+            record_projection_event(name, "delivered")
+        return True
 
     async def _finalize_failure(
         self,
@@ -548,6 +581,9 @@ class ProjectionRunner:
                 )
                 await session.execute(dlq_statement)
                 await session.commit()
+                record_projection_event(  # telemetry (PLATFORM-050)
+                    None if failing_projector is None else failing_projector.name, "dead_lettered"
+                )
                 return "dead_lettered"
 
             applied = await self._fenced_update(
@@ -571,6 +607,9 @@ class ProjectionRunner:
                 await session.rollback()
                 return "lost_lease"
             await session.commit()
+            record_projection_event(  # telemetry (PLATFORM-050)
+                None if failing_projector is None else failing_projector.name, "retried"
+            )
             return "retried"
 
     @staticmethod

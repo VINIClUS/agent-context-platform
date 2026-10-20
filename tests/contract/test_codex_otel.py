@@ -286,6 +286,18 @@ def test_any_platform_origin_marker_is_rejected_even_from_an_allowed_service(
     assert _reason(gap_record, LOG_CONFIG) is RejectionReason.PLATFORM_ORIGIN
 
 
+def test_the_platform_telemetry_resource_is_rejected_as_platform_origin() -> None:
+    from agent_context_platform.observability.setup import build_resource
+    from agent_context_platform.settings import Settings
+
+    resource = dict(build_resource(Settings()).attributes)
+    assert _reason(_record(resource=resource)) is RejectionReason.PLATFORM_ORIGIN
+    # The marker alone suffices, even under a renamed or Codex service name.
+    for service in ("codex_cli_rs", "codex_exec", "renamed"):
+        renamed = {**resource, "service.name": service}
+        assert _reason(_record(resource=renamed)) is RejectionReason.PLATFORM_ORIGIN
+
+
 @pytest.mark.parametrize("service", ["otelcol", "codex-cli", "codex_cli_rs2", "", "x" * 500])
 def test_unknown_service_names_are_rejected(service: str) -> None:
     reason = _reason(_record(resource={"service.name": service}))

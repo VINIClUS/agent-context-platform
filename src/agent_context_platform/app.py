@@ -37,6 +37,8 @@ from agent_context_platform.mcp.auth import (
     require_scope,
 )
 from agent_context_platform.mcp.server import MCP_PATH, build_mcp_mount, create_mcp_server
+from agent_context_platform.observability import setup as telemetry_setup
+from agent_context_platform.observability.http import HttpTelemetryMiddleware
 from agent_context_platform.settings import Settings
 
 
@@ -130,6 +132,16 @@ def create_app(
 
     @asynccontextmanager
     async def lifespan(_application: FastAPI) -> AsyncIterator[None]:
+        # Telemetry (PLATFORM-050): exported only when an endpoint is configured.
+        telemetry = telemetry_setup.start(resolved_settings)
+        try:
+            async with _datastores():
+                yield
+        finally:
+            await telemetry_setup.stop(telemetry, resolved_settings)
+
+    @asynccontextmanager
+    async def _datastores() -> AsyncIterator[None]:
         dsn = resolved_settings.postgresql.dsn
         engine = None if dsn is None else create_engine(resolved_settings)
         sessions = None if engine is None else session_factory(engine)
@@ -163,6 +175,8 @@ def create_app(
     application.openapi = openapi  # type: ignore[method-assign]
     application.state.ingestion = ingestion
     application.include_router(router)
+    # Inside the request-context middleware: the server span is a child of the caller's trace.
+    application.add_middleware(HttpTelemetryMiddleware)
     application.add_middleware(RequestContextMiddleware)
     # Exact path, no Mount: a mount would redirect POST /mcp to /mcp/.
     application.router.routes.append(Route(MCP_PATH, mcp_mount.asgi_app))
