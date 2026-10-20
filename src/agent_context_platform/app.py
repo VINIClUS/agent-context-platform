@@ -6,6 +6,7 @@ from typing import Any, Literal
 
 from agent_context_sdk import RedactionPolicyV1  # type: ignore[import-untyped, unused-ignore]
 from fastapi import FastAPI
+from fastapi.responses import JSONResponse
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 from starlette.routing import Route
 
@@ -37,6 +38,9 @@ from agent_context_platform.mcp.auth import (
     require_scope,
 )
 from agent_context_platform.mcp.server import MCP_PATH, build_mcp_mount, create_mcp_server
+from agent_context_platform.operations import migrate
+from agent_context_platform.operations.readiness import ReadinessProbe, ReadinessReport, build_probe
+from agent_context_platform.projection.neo4j import Neo4jStore
 from agent_context_platform.settings import Settings
 
 
@@ -107,17 +111,27 @@ def _utc_now() -> datetime:
     return datetime.now(UTC)
 
 
+def _shipped_head() -> str | None:
+    """The Alembic head next to this code (``None``: readiness reports it unconfigured)."""
+    try:
+        return migrate.image_head(migrate.alembic_config())
+    except migrate.MigrationError:
+        return None
+
+
 def create_app(
     settings: Settings | None = None,
     *,
     ingestion: IngestionRuntime | None = None,
     mcp_auth: McpAuthRuntime | None = None,
+    readiness: ReadinessProbe | None = None,
 ) -> FastAPI:
     """Create an isolated platform application with no external resources.
 
     ``ingestion`` and ``mcp_auth`` inject ready runtimes (tests); otherwise they are built
     from settings when the application starts. Until MCP authentication is bound, ``/mcp``
-    answers 401 without a token and 503 with one: it fails closed.
+    answers 401 without a token and 503 with one: it fails closed. ``readiness`` injects the
+    ``/health/ready`` probe; until one is bound the route answers 503.
     """
     resolved_settings = Settings() if settings is None else settings
     mcp_holder = McpAuthHolder(mcp_auth)
@@ -137,10 +151,21 @@ def create_app(
             application.state.ingestion = _build_ingestion(resolved_settings, sessions)
         if mcp_auth is None and sessions is not None:
             mcp_holder.runtime = _build_mcp_auth(resolved_settings, sessions)
+        store = None
+        if readiness is None:
+            store = (
+                None if resolved_settings.neo4j.uri is None else Neo4jStore(resolved_settings.neo4j)
+            )
+            application.state.readiness = build_probe(
+                resolved_settings, engine, store, None if engine is None else _shipped_head()
+            )
         try:
             async with mcp_mount.lifespan():
                 yield
         finally:
+            application.state.readiness = readiness
+            if store is not None:
+                await store.close()
             if engine is not None:
                 await engine.dispose()
 
@@ -162,6 +187,7 @@ def create_app(
 
     application.openapi = openapi  # type: ignore[method-assign]
     application.state.ingestion = ingestion
+    application.state.readiness = readiness
     application.include_router(router)
     application.add_middleware(RequestContextMiddleware)
     # Exact path, no Mount: a mount would redirect POST /mcp to /mcp/.
@@ -170,5 +196,21 @@ def create_app(
     @application.get("/health/live", include_in_schema=True)
     def health_live() -> dict[str, Literal["ok"]]:
         return {"status": "ok"}
+
+    @application.get(
+        "/health/ready",
+        include_in_schema=True,
+        response_class=JSONResponse,
+        responses={503: {"description": "Not ready: component names and coarse states only."}},
+    )
+    async def health_ready() -> JSONResponse:
+        """PostgreSQL at the image's Alembic head, Neo4j and S3 reachable (never cached)."""
+        probe: ReadinessProbe | None = application.state.readiness
+        report = ReadinessReport({}) if probe is None else await probe.probe()
+        return JSONResponse(
+            report.to_dict(),
+            status_code=200 if report.ready else 503,
+            headers={"Cache-Control": "no-store"},
+        )
 
     return application
