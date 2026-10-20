@@ -91,6 +91,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from agent_context_platform.catalog.models import ContentObjectRow
 from agent_context_platform.content.blob_store import BlobStore, StoredBlob
 from agent_context_platform.content.models import INLINE_MAX_BYTES, InlineContentRow
+from agent_context_platform.operations.faults import fault_point
 
 #: Fixed namespace for every advisory lock this module (and the orphan
 #: sweeper) takes on a content digest. Arbitrary but stable: changing it
@@ -484,7 +485,9 @@ class ContentService:
             # upload's verified result instead of paying a redundant
             # get_verified() round-trip inside put_verified()'s own reuse
             # check.
+            fault_point("content.before_s3_put")
             stored_blob = await self._blob_store.put_verified(data, _OBJECT_STORAGE_MEDIA_TYPE)
+            fault_point("content.after_head_verification")
             object_blob_cache[claim.content_sha256] = stored_blob
         ref = ContentRefV1(
             content_id=claim.content_id,

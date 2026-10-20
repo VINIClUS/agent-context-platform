@@ -257,6 +257,12 @@ uv run python scripts/export-openapi.py --check   # exit 1 on drift
 uv run python scripts/export-openapi.py           # rewrite the snapshot (new API versions only)
 ```
 
+## Crash-test fault points
+
+Test images can arm documented crash points (`AGENT_CONTEXT_FAULT_INJECTION__*`) that kill the API or
+the projection worker with exit code 137 at fixed boundaries; settings refuse them in production.
+See `docs/operations/fault-injection.md` for the labels, the variables and the recovery contract.
+
 ## Development workflow
 
 Create feature worktrees as siblings of repository checkouts, using an immutable SHA captured from

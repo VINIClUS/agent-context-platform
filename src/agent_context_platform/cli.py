@@ -50,7 +50,7 @@ from agent_context_platform.indexing.emitter import IndexingConfig, IndexingServ
 from agent_context_platform.indexing.identity import repository_namespace
 from agent_context_platform.indexing.pipeline import IndexReport, IndexRequest, index_checkout
 from agent_context_platform.ledger.service import IngestionService
-from agent_context_platform.operations import provisioning
+from agent_context_platform.operations import faults, provisioning
 from agent_context_platform.projection.neo4j import Neo4jStore
 from agent_context_platform.projection.registry import registered_projectors
 from agent_context_platform.projection.runtime import (
@@ -170,9 +170,11 @@ class Runtime:
 
 def _load_settings() -> Settings:
     try:
-        return Settings()
+        settings = Settings()
     except ValidationError:
         raise CliUsageError("invalid AGENT_CONTEXT_* configuration") from None
+    faults.configure(settings.fault_injection)
+    return settings
 
 
 def _engine(dsn: Secret[PostgresDsn] | None, name: str) -> AsyncEngine:

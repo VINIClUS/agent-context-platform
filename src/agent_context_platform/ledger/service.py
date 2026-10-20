@@ -62,6 +62,7 @@ from agent_context_platform.ledger.repository import (
     ResolvedEvent,
     StreamQuarantinedError,
 )
+from agent_context_platform.operations.faults import fault_point
 
 IDEMPOTENCY_CONFLICT: Final = "idempotency_conflict"
 STREAM_QUARANTINED: Final = "stream_quarantined"
@@ -126,10 +127,13 @@ class IngestionService:
     async def _commit(
         self, batch: IngestBatchRequestV1, prepared: PreparedContent
     ) -> IngestOutcome:
+        fault_point("ledger.before_db_transaction")
         async with self._session_factory() as session, session.begin():
             await self._content.attach(session, prepared)
             resolved = [_resolve(event, prepared) for event in batch.events]
             outcomes = await LedgerRepository.append_with_outcome(session, resolved)
+            fault_point("ledger.before_commit")
+        fault_point("ledger.after_commit_before_response")
         accepted = tuple(
             AcceptedEventV1(
                 event_id=outcome.stored.event_id,
