@@ -279,6 +279,41 @@ and `..._EMBEDDING_THREADS` bound the inference work. `tests/unit/retrieval/test
 compares the ONNX output with sentence-transformers and runs only when
 `AGENT_CONTEXT_TEST_MODEL_PARITY=1`.
 
+## Context packages
+
+`retrieval/composer.py` (`ContextComposer`) answers the five memory tools (`context_for_task`,
+`repository_overview`, `symbol_context`, `decision_history`, `failure_history`) with an SDK
+`ContextPackageV1`. It resolves the explicit scope first (unknown repository, project, revision
+or symbol: a typed error, never a wider answer), reads code as indexed at the requested commit or
+workspace snapshot, fuses graph, temporal and lexical/vector candidates deterministically, and
+enforces the item, byte and token budget (`ceil(bytes / 4)`). Every item cites at least one stored
+event; the evidence form, including the metadata-only form of events that carry no content, is
+documented in `docs/data/context-evidence.md`.
+
+Pagination cursors are opaque and HMAC-signed, so any replica can continue a page another one
+issued. Set the shared key (at least 32 characters, required in production):
+
+```bash
+export AGENT_CONTEXT_MCP__CURSOR_HMAC_KEY=...   # from the secret store, the same on every replica
+```
+
+A cursor is valid for the same tool, input, principal and projection snapshot until it expires
+(15 minutes); after new events are projected the client starts again from the first page.
+
+The composer reads the ledger and content as the API role, but projection checkpoints and dead
+letters (for `projection_checkpoint`, `staleness_ms` and the warnings) are only readable by the
+projector role today, so `FreshnessReader` takes its own session factory.
+
+`tests/evaluation/` holds the context-quality evaluation: 30 golden questions (6 per tool,
+`questions.json`) over a world seeded through the real ingestion service and projection runner.
+It needs the integration services and asserts provenance, budgets, zero unsupported claims, zero
+temporal leaks, required-evidence recall (90% overall, 80% per tool) and byte-identical answers
+after an empty-graph replay:
+
+```bash
+uv run pytest -q tests/evaluation
+```
+
 ## Ingestion API contract
 
 `openapi/agent-context-v1.json` freezes the ingestion v1 HTTP surface (`/v1/ingestion/*` and the
