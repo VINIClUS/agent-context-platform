@@ -1,0 +1,10 @@
+*
+!pyproject.toml
+!uv.lock
+!README.md
+!src
+!alembic.ini
+!alembic
+!containers/platform/healthcheck.py
+!build/sdk/*.whl
+**/__pycache__
