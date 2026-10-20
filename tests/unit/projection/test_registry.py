@@ -35,6 +35,8 @@ def test_registered_projectors_are_the_domain_projectors_then_search_in_dependen
         ("agent", "1"),
         ("git", "1"),
         ("code", "1"),
+        ("knowledge", "1"),
+        ("quality", "1"),
         ("search", "1"),
     ]
     assert all(isinstance(item, Projector) for item in projectors)

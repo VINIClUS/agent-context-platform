@@ -27,11 +27,20 @@ from agent_context_platform.projection.neo4j import Neo4jTransaction
 
 _LOCK_STATEMENTS: dict[str, LiteralString] = {
     "Branch": "MERGE (n:Branch {branch_id: $node_id}) SET n._lock = true REMOVE n._lock",
+    "CIRun": "MERGE (n:CIRun {ci_run_id: $node_id}) SET n._lock = true REMOVE n._lock",
     "Checkout": "MERGE (n:Checkout {checkout_id: $node_id}) SET n._lock = true REMOVE n._lock",
     "Commit": "MERGE (n:Commit {commit_id: $node_id}) SET n._lock = true REMOVE n._lock",
+    "Constraint": (
+        "MERGE (n:Constraint {constraint_id: $node_id}) SET n._lock = true REMOVE n._lock"
+    ),
+    "Decision": "MERGE (n:Decision {decision_id: $node_id}) SET n._lock = true REMOVE n._lock",
+    "Failure": "MERGE (n:Failure {failure_id: $node_id}) SET n._lock = true REMOVE n._lock",
+    "Finding": "MERGE (n:Finding {finding_id: $node_id}) SET n._lock = true REMOVE n._lock",
     "Project": "MERGE (n:Project {project_id: $node_id}) SET n._lock = true REMOVE n._lock",
     "Repository": "MERGE (n:Repository {repository_id: $node_id}) SET n._lock = true REMOVE n._lock",
     "Session": "MERGE (n:Session {session_id: $node_id}) SET n._lock = true REMOVE n._lock",
+    "Summary": "MERGE (n:Summary {summary_id: $node_id}) SET n._lock = true REMOVE n._lock",
+    "TestRun": "MERGE (n:TestRun {test_run_id: $node_id}) SET n._lock = true REMOVE n._lock",
     "ToolCall": "MERGE (n:ToolCall {tool_call_id: $node_id}) SET n._lock = true REMOVE n._lock",
     "Turn": "MERGE (n:Turn {turn_id: $node_id}) SET n._lock = true REMOVE n._lock",
     "Workspace": "MERGE (n:Workspace {workspace_id: $node_id}) SET n._lock = true REMOVE n._lock",
@@ -64,13 +73,22 @@ def event_lock_keys(event: StoredEventV1) -> list[tuple[str, str]]:
     Each projector derives its part from the same ID helpers it writes with.
     """
     # Imported here: the projector modules import this package.
-    from agent_context_platform.projection.projectors import agent, code, git, portfolio
+    from agent_context_platform.projection.projectors import (
+        agent,
+        code,
+        git,
+        knowledge,
+        portfolio,
+        quality,
+    )
 
     keys = {
         *agent.lock_keys(event),
         *code.lock_keys(event),
         *git.lock_keys(event),
+        *knowledge.lock_keys(event),
         *portfolio.lock_keys(event),
+        *quality.lock_keys(event),
     }
     return sorted(keys)
 
