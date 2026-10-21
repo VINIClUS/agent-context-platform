@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import re
 from pathlib import Path
 
 import pytest
@@ -99,23 +100,100 @@ def test_the_operations_doc_states_every_instrument_and_series() -> None:
         assert f"{bucket:g}" in text
 
 
-def test_the_closed_sets_are_the_documented_ones() -> None:
-    text = DOC.read_text()
-    for values in (
-        contract.INGESTION_OUTCOMES,
-        contract.INGESTION_REASONS,
-        contract.CONTENT_RESULTS,
-        contract.PROJECTION_RESULTS,
-        contract.INTEGRITY_CHECKS,
-        contract.INDEX_RESULTS,
-        contract.RETRIEVAL_OPERATIONS,
-        contract.RETRIEVAL_OUTCOMES,
-        contract.MCP_METHODS,
-        contract.MCP_TOOLS,
-        contract.MCP_OUTCOMES,
-    ):
-        for value in values:
-            assert value in text, value
+# Attribute keys each instrument records, and the closed value set of each documented key.
+ATTRIBUTE_KEYS = {
+    contract.INGESTION_BATCHES: {"outcome", "reason"},
+    contract.INGESTION_EVENTS: {"result"},
+    contract.INGESTION_DURATION: {"outcome"},
+    contract.CONTENT_OBJECTS: {"storage", "result"},
+    contract.PROJECTION_EVENTS: {"projector", "result"},
+    contract.PROJECTION_DURATION: {"projector"},
+    contract.PROJECTION_LAG: {"projector"},
+    contract.PROJECTION_OUTBOX_PENDING: set(),
+    contract.PROJECTION_DEAD_LETTERS: {"projector"},
+    contract.LEDGER_INTEGRITY_FAILURES: {"check"},
+    contract.INDEX_RUNS: {"result"},
+    contract.INDEX_DURATION: {"result"},
+    contract.RETRIEVAL_DURATION: {"operation", "outcome"},
+    contract.MCP_REQUESTS: {"method", "tool", "outcome"},
+    contract.MCP_DURATION: {"method", "tool"},
+    contract.HTTP_SERVER_DURATION: {
+        "http.request.method",
+        "http.route",
+        "http.response.status_code",
+    },
+}
+CLOSED_SETS = {
+    (contract.INGESTION_BATCHES, "outcome"): contract.INGESTION_OUTCOMES,
+    (contract.INGESTION_BATCHES, "reason"): contract.INGESTION_REASONS,
+    (contract.INGESTION_EVENTS, "result"): contract.EVENT_RESULTS,
+    (contract.CONTENT_OBJECTS, "storage"): contract.CONTENT_STORAGES,
+    (contract.CONTENT_OBJECTS, "result"): contract.CONTENT_RESULTS,
+    (contract.PROJECTION_EVENTS, "result"): contract.PROJECTION_RESULTS,
+    (contract.LEDGER_INTEGRITY_FAILURES, "check"): contract.INTEGRITY_CHECKS,
+    (contract.INDEX_RUNS, "result"): contract.INDEX_RESULTS,
+    (contract.RETRIEVAL_DURATION, "operation"): contract.RETRIEVAL_OPERATIONS,
+    (contract.RETRIEVAL_DURATION, "outcome"): contract.RETRIEVAL_OUTCOMES,
+    (contract.MCP_REQUESTS, "method"): contract.MCP_METHODS | {contract.OTHER},
+    (contract.MCP_REQUESTS, "tool"): contract.MCP_TOOLS | {contract.MCP_NO_TOOL},
+    (contract.MCP_REQUESTS, "outcome"): contract.MCP_OUTCOMES,
+}
+
+
+def _documented_attributes() -> dict[str, dict[str, frozenset[str] | None]]:
+    """Instrument -> {attribute key: documented closed set, or None when none is listed}."""
+    found: dict[str, dict[str, frozenset[str] | None]] = {}
+    for line in DOC.read_text().splitlines():
+        cells = [cell.strip() for cell in line.strip().strip("|").split("|")]
+        if (
+            len(cells) != 5
+            or not cells[0].startswith("`")
+            or cells[1]
+            not in {
+                "counter",
+                "histogram",
+                "gauge",
+            }
+        ):
+            continue
+        name = cells[0].strip("`")
+        attributes: dict[str, frozenset[str] | None] = {}
+        for part in re.split(r"[;,]", re.sub(r"\([^)]*\)", "", cells[3])):
+            key_match = re.match(r"\s*`([^`]+)`", part)
+            if key_match is None:
+                continue
+            values = part.split("=", 1)[1] if "=" in part else None
+            attributes[key_match.group(1)] = (
+                None
+                if values is None
+                else frozenset(value.strip() for value in values.split(" / "))
+            )
+        found[name] = attributes
+    return found
+
+
+def test_the_doc_states_each_instruments_attribute_keys_and_closed_sets() -> None:
+    documented = _documented_attributes()
+    assert set(documented) == set(ATTRIBUTE_KEYS)
+    for name, keys in ATTRIBUTE_KEYS.items():
+        assert set(documented[name]) == keys, name
+    for (name, key), values in CLOSED_SETS.items():
+        # A key restated by name only (`outcome` on a histogram) shares its counter's set.
+        assert documented[name][key] == values, (name, key)
+
+
+def test_every_instrument_records_exactly_the_documented_keys(telemetry: Capture) -> None:
+    _record_one_of_each(telemetry)
+    for name, keys in ATTRIBUTE_KEYS.items():
+        for attributes in telemetry.points(name):
+            assert {key for key, _value in attributes} == keys, name
+
+
+def test_http_method_labels_are_the_standard_methods_or_other() -> None:
+    for method in contract.HTTP_METHODS:
+        assert core.http_method_label(method) == method
+    assert core.http_method_label("BREW") == contract.HTTP_OTHER_METHOD
+    assert core.http_method_label("get") == contract.HTTP_OTHER_METHOD
 
 
 def test_mcp_methods_are_exactly_the_served_methods() -> None:
