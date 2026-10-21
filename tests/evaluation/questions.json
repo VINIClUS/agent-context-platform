@@ -1,5 +1,5 @@
 {
-  "description": "PLATFORM-043 context-quality evaluation: 30 questions (6 per tool) over the deterministic world of tests/evaluation/world.py. Placeholders: {NAME} is a world value (C1, C2, SNAPSHOT, REPOSITORY, PROJECT, FP_ROUNDING, FP_FLAKY, SYMBOL:<qualified name>); @H is T0 + H hours (ISO 8601). required_evidence names world events (EvalWorld.keys); forbidden_claims are case-sensitive substrings that must appear in no item title or content; not_after bounds the occurred_at of every cited event (exclusive); pages is how many pages are fetched by following next_cursor.",
+  "description": "PLATFORM-043 context-quality evaluation: 30 questions (6 per tool) over the deterministic world of tests/evaluation/world.py. Placeholders: {NAME} is a world value (C1, C2, SNAPSHOT, OTHER_C1, OTHER_SNAPSHOT, REPOSITORY, PROJECT, FP_ROUNDING, FP_FLAKY, SYMBOL:<qualified name>, OTHER_SYMBOL:<qualified name> of the second repository); @H is T0 + H hours (ISO 8601). required_evidence names world events (EvalWorld.keys); forbidden_claims are case-sensitive substrings that must appear in no item title or content; not_after bounds the occurred_at of every cited event (exclusive); every cited event must belong to the question's repository (project for project-scoped questions); pages is how many pages are fetched by following next_cursor.",
   "questions": [
     {
       "id": "task-01",
@@ -22,7 +22,8 @@
       "required_evidence": [
         "c1:symbol:pkg.calc.add",
         "failure:fail_rounding",
-        "session:sess_eval_1:tool_output"
+        "session:sess_eval_1:tool_output",
+        "decision:dec_rounding_v2"
       ],
       "forbidden_claims": [
         "pkg/draft.py",
@@ -32,7 +33,11 @@
         "dec_average",
         "decision dec_rounding_v1: ACTIVE",
         "ci_run_2",
-        "operator purged"
+        "late observed note",
+        "ci_other_1",
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@3",
       "expect_error": null
@@ -66,7 +71,11 @@
         "fail_dirty",
         "dec_average",
         "sess_eval_2",
-        "operator purged"
+        "late observed note",
+        "dirty workspace test output",
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@5",
       "expect_error": null
@@ -96,7 +105,9 @@
       ],
       "forbidden_claims": [
         "decision dec_rounding_v1: ACTIVE",
-        "operator purged"
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": null,
       "expect_error": null
@@ -129,7 +140,12 @@
         "sess_eval_2",
         "dec_average",
         "fail_dirty",
-        "operator purged"
+        "dirty workspace test output",
+        "late observed note",
+        "ci_run_dirty_output",
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@5",
       "expect_error": null
@@ -137,14 +153,14 @@
     {
       "id": "task-05",
       "tool": "context_for_task",
-      "question": "At C1, which rounding decision governs add?",
+      "question": "A workspace snapshot of ANOTHER repository, asked under this one.",
       "input": {
         "repository_id": "{REPOSITORY}",
         "revision": {
-          "kind": "commit",
-          "commit_id": "{C1}"
+          "kind": "workspace_snapshot",
+          "snapshot_id": "{OTHER_SNAPSHOT}"
         },
-        "task": "decimal rounding decision for add",
+        "task": "rounding drift in add",
         "budget": {
           "max_items": 20,
           "max_bytes": 40000,
@@ -152,18 +168,14 @@
         }
       },
       "pages": 1,
-      "required_evidence": [
-        "decision:dec_rounding_v2",
-        "c1:symbol:pkg.calc.add"
-      ],
+      "required_evidence": [],
       "forbidden_claims": [
-        "decision dec_rounding_v1: ACTIVE",
-        "dec_average",
-        "pkg/draft.py",
-        "operator purged"
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
-      "not_after": "@3",
-      "expect_error": null
+      "not_after": null,
+      "expect_error": "RevisionNotFound"
     },
     {
       "id": "task-06",
@@ -191,7 +203,10 @@
         "fail_dirty",
         "ci_run_5",
         "pkg.report.average",
-        "operator purged"
+        "dirty workspace test output",
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@5",
       "expect_error": null
@@ -223,7 +238,9 @@
         "fail_dirty",
         "fail_flaky",
         "decision dec_rounding_v1: ACTIVE",
-        "operator purged"
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@3",
       "expect_error": null
@@ -254,7 +271,9 @@
         "average",
         "fail_dirty",
         "failure fail_rounding (unresolved)",
-        "operator purged"
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@5",
       "expect_error": null
@@ -279,7 +298,9 @@
       "forbidden_claims": [
         "pkg/draft.py",
         "average",
-        "operator purged"
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@5",
       "expect_error": null
@@ -308,7 +329,9 @@
         "pkg/draft.py",
         "average",
         "fail_dirty",
-        "operator purged"
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@5",
       "expect_error": null
@@ -335,7 +358,9 @@
         "renamed pkg/legacy_parser.py",
         "pkg/draft.py",
         "subtract",
-        "operator purged"
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@3",
       "expect_error": null
@@ -343,10 +368,10 @@
     {
       "id": "overview-06",
       "tool": "repository_overview",
-      "question": "Overview at a commit that was never indexed.",
+      "question": "Overview at a commit of ANOTHER repository, asked under this one.",
       "input": {
         "repository_id": "{REPOSITORY}",
-        "commit_id": "ffffffffffffffffffffffffffffffffffffffff",
+        "commit_id": "{OTHER_C1}",
         "budget": {
           "max_items": 30,
           "max_bytes": 60000,
@@ -356,7 +381,9 @@
       "pages": 1,
       "required_evidence": [],
       "forbidden_claims": [
-        "operator purged"
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": null,
       "expect_error": "RevisionNotFound"
@@ -387,7 +414,9 @@
         "pkg/parser.py",
         "pkg.report.average",
         "decision dec_rounding_v1: ACTIVE",
-        "operator purged"
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@3",
       "expect_error": null
@@ -416,7 +445,9 @@
         "pkg.report.average",
         "pkg/draft.py",
         "decision dec_rounding_v1: ACTIVE",
-        "operator purged"
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@5",
       "expect_error": null
@@ -443,7 +474,9 @@
       "forbidden_claims": [
         "pkg/legacy_parser.py",
         "pkg.legacy_parser.parse_legacy",
-        "operator purged"
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@5",
       "expect_error": null
@@ -470,7 +503,9 @@
         "pkg/parser.py",
         "pkg.parser.parse_legacy",
         "dec_parser",
-        "operator purged"
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@3",
       "expect_error": null
@@ -497,7 +532,9 @@
       "forbidden_claims": [
         "pkg.report.average",
         "pkg/draft.py",
-        "operator purged"
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@5",
       "expect_error": null
@@ -505,11 +542,11 @@
     {
       "id": "symbol-06",
       "tool": "symbol_context",
-      "question": "Is the dirty average helper visible at commit C2?",
+      "question": "A symbol ID of ANOTHER repository (same qualified name), asked at C2.",
       "input": {
         "repository_id": "{REPOSITORY}",
         "commit_id": "{C2}",
-        "symbol_name": "average",
+        "symbol_id": "{OTHER_SYMBOL:pkg.calc.add}",
         "budget": {
           "max_items": 30,
           "max_bytes": 60000,
@@ -519,7 +556,9 @@
       "pages": 1,
       "required_evidence": [],
       "forbidden_claims": [
-        "operator purged"
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": null,
       "expect_error": "SymbolNotFound"
@@ -549,7 +588,9 @@
         "dec_rounding_v2",
         "dec_average",
         "dec_parser",
-        "operator purged"
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@1.5",
       "expect_error": null
@@ -579,7 +620,9 @@
       "forbidden_claims": [
         "decision dec_rounding_v1: ACTIVE",
         "dec_average",
-        "operator purged"
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@4",
       "expect_error": null
@@ -607,7 +650,9 @@
       ],
       "forbidden_claims": [
         "dec_average",
-        "operator purged"
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@4",
       "expect_error": null
@@ -636,7 +681,9 @@
       "forbidden_claims": [
         "dec_average",
         "decision dec_rounding_v1: ACTIVE",
-        "operator purged"
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@4",
       "expect_error": null
@@ -664,7 +711,9 @@
       ],
       "forbidden_claims": [
         "decision dec_rounding_v1: ACTIVE",
-        "operator purged"
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": null,
       "expect_error": null
@@ -693,7 +742,9 @@
       "forbidden_claims": [
         "dec_average",
         "decision dec_rounding_v1: ACTIVE",
-        "operator purged"
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@4",
       "expect_error": null
@@ -722,7 +773,10 @@
         "ci_run_2",
         "passed in run",
         "resolution: resolved",
-        "operator purged"
+        "ci_other_1",
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@2",
       "expect_error": null
@@ -751,7 +805,10 @@
       "forbidden_claims": [
         "SAME commit",
         "fail_dirty",
-        "operator purged"
+        "ci_other_1",
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@4",
       "expect_error": null
@@ -781,7 +838,9 @@
         "a different revision than the failing run",
         "fail_rounding",
         "fail_dirty",
-        "operator purged"
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@4",
       "expect_error": null
@@ -809,7 +868,10 @@
       "forbidden_claims": [
         "fail_dirty",
         "fail_flaky",
-        "operator purged"
+        "ci_other_1",
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@6",
       "expect_error": null
@@ -837,7 +899,9 @@
       "forbidden_claims": [
         "fail_rounding",
         "fail_flaky",
-        "operator purged"
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@7",
       "expect_error": null
@@ -862,7 +926,9 @@
       "forbidden_claims": [
         "fail_flaky",
         "fail_rounding",
-        "operator purged"
+        "operator purged",
+        "other-repository",
+        "banker"
       ],
       "not_after": "@7",
       "expect_error": null

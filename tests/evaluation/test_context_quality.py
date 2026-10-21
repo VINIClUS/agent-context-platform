@@ -25,7 +25,7 @@ import json
 import math
 from collections.abc import Iterator, Mapping
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from typing import Any
 from uuid import UUID
@@ -81,6 +81,7 @@ _INPUTS: Mapping[str, type[BaseModel]] = {
 class Seeded:
     keys: dict[str, str]
     symbols: dict[str, str]
+    other_symbols: dict[str, str]
     revisions: Revisions
 
 
@@ -116,7 +117,12 @@ def seeded(
                 await world.seed(tmp_path_factory.mktemp("evaluation"))
                 report = await world.project()
                 assert report.dead_lettered == 0 and report.retried == 0, report
-                return Seeded(dict(world.keys), dict(world.symbols), world.revisions)
+                return Seeded(
+                    dict(world.keys),
+                    dict(world.symbols),
+                    dict(world.other_symbols),
+                    world.revisions,
+                )
             finally:
                 await world.close()
 
@@ -139,10 +145,14 @@ def _value(raw: Any, seeded: Seeded) -> Any:
         return at(float(raw[1:])).isoformat()
     if raw.startswith("{SYMBOL:") and raw.endswith("}"):
         return seeded.symbols[raw[len("{SYMBOL:") : -1]]
+    if raw.startswith("{OTHER_SYMBOL:") and raw.endswith("}"):
+        return seeded.other_symbols[raw[len("{OTHER_SYMBOL:") : -1]]
     named = {
         "{C1}": seeded.revisions.c1,
         "{C2}": seeded.revisions.c2,
         "{SNAPSHOT}": seeded.revisions.snapshot,
+        "{OTHER_C1}": seeded.revisions.other_c1,
+        "{OTHER_SNAPSHOT}": seeded.revisions.other_snapshot,
         "{REPOSITORY}": REPOSITORY,
         "{PROJECT}": PROJECT,
         "{FP_ROUNDING}": FINGERPRINT_ROUNDING,
@@ -217,7 +227,9 @@ async def _ledger(world: EvalWorld, answers: Mapping[str, Answer]) -> Ledger:
     return Ledger(found)
 
 
-def _provenance_problems(page: ContextPackageV1, ledger: Ledger) -> list[str]:
+def _provenance_problems(
+    page: ContextPackageV1, ledger: Ledger, question: Mapping[str, Any]
+) -> list[str]:
     problems = []
     for item in page.items:
         if not item.evidence:
@@ -227,8 +239,13 @@ def _provenance_problems(page: ContextPackageV1, ledger: Ledger) -> list[str]:
             if event is None or not verify_event(event):
                 problems.append(f"{item.item_id}: cites a missing or unverifiable event")
                 continue
-            if event.context.repository_id != REPOSITORY and event.context.project_id != PROJECT:
-                problems.append(f"{item.item_id}: cites an event outside the scope")
+            scope = question["input"].get("scope", {"kind": "repository"})
+            if scope["kind"] == "project":
+                inside = event.context.project_id == PROJECT
+            else:
+                inside = event.context.repository_id == REPOSITORY
+            if not inside:
+                problems.append(f"{item.item_id}: cites an event outside the question's scope")
             content = ref.content_ref
             if content.disposition is ContentDisposition.METADATA_ONLY:
                 preimage = canonical_json_bytes(
@@ -252,7 +269,10 @@ def _provenance_problems(page: ContextPackageV1, ledger: Ledger) -> list[str]:
 
 
 def _budget_problems(page: ContextPackageV1, budget: Mapping[str, int]) -> list[str]:
-    size = sum(len(item.model_dump_json().encode()) for item in page.items)
+    # Exactly the `items` array as a client serializes the package.
+    array = "[" + ",".join(item.model_dump_json() for item in page.items) + "]"
+    assert f'"items":{array}' in page.model_dump_json()  # exactly what a client receives
+    size = len(array.encode())
     problems = []
     if len(page.items) > budget["max_items"]:
         problems.append("items over budget")
@@ -323,7 +343,7 @@ def test_context_quality_gates(
             continue
         cited: set[str] = set()
         for page in answer.pages:
-            problems += [f"{qid}: {p}" for p in _provenance_problems(page, ledger)]
+            problems += [f"{qid}: {p}" for p in _provenance_problems(page, ledger, question)]
             problems += [f"{qid}: {p}" for p in _budget_problems(page, question["input"]["budget"])]
             problems += [f"{qid}: {p}" for p in _claim_problems(page, question["forbidden_claims"])]
             problems += [f"{qid}: {p}" for p in _leak_problems(page, question["not_after"], ledger)]
@@ -372,9 +392,30 @@ def test_answers_are_byte_identical_on_a_second_run_and_after_an_empty_graph_rep
     assert _with_world(seeded, postgres_dsn, projection_engine, replayed) == first
 
 
-def test_the_world_clock_is_after_every_fixture_event(seeded: Seeded) -> None:
-    from .world import NOW, T0
+def test_answers_do_not_depend_on_the_wall_clock(
+    seeded: Seeded, postgres_dsn: str, projection_engine: AsyncEngine
+) -> None:
+    """The same snapshot read with the fixed clock and with the real one, a second apart, gives
+    the same packages except the documented time-dependent fields (open windows included)."""
 
-    assert timedelta(hours=8) == NOW - T0
-    assert seeded.revisions.c1 != seeded.revisions.c2
-    assert seeded.revisions.snapshot
+    async def body(world: EvalWorld) -> tuple[dict[str, str], dict[str, str]]:
+        fixed = await _answer_all(world, seeded)
+        await asyncio.sleep(1.1)
+        real = world.composer(clock=lambda: datetime.now(UTC))
+        live = {q["id"]: await _ask(real, q, seeded) for q in QUESTIONS}
+        return (
+            {qid: _timeless(answer) for qid, answer in fixed.items()},
+            {qid: _timeless(answer) for qid, answer in live.items()},
+        )
+
+    fixed, live = _with_world(seeded, postgres_dsn, projection_engine, body)
+    assert live == fixed
+
+
+def _timeless(answer: Answer) -> str:
+    if answer.error is not None:
+        return f"error:{answer.error}"
+    volatile = {"query_id", "generated_at", "staleness_ms", "next_cursor"}
+    return json.dumps(
+        [page.model_dump(mode="json", exclude=volatile) for page in answer.pages], sort_keys=True
+    )

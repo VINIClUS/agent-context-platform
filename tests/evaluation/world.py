@@ -95,6 +95,9 @@ T0 = datetime(2026, 9, 1, 8, 0, 0, tzinfo=UTC)
 NOW = T0 + timedelta(hours=8)  # the composer's fixed clock: every package is reproducible
 PROJECT = "prj_eval"
 REPOSITORY = "repo_eval"
+OTHER_PROJECT = "prj_other"
+OTHER_REPOSITORY = "repo_other"
+OTHER_WORKSPACE = "ws_other"
 WORKSPACE = "ws_eval"
 CURSOR_KEY = SecretStr("evaluation-cursor-key-0123456789abcdef")
 FINGERPRINT_ROUNDING = hashlib.sha256(b"fingerprint:rounding").hexdigest()
@@ -111,6 +114,7 @@ REPORT_V1 = (
 REPORT_DIRTY = REPORT_V1 + "\n\ndef average(values):\n    return total(values) / len(values)\n"
 PARSER = "def parse_legacy(text):\n    return text.split(',')\n"
 DRAFT = "def draft_helper():\n    return None\n"
+OTHER_CALC = "def add(left, right):\n    return round(left + right, 2)\n"
 
 _PRODUCER = ProducerV1(producer_id="evaluation-producer", name="Codex", version="1.0.0")
 
@@ -178,6 +182,8 @@ class Revisions:
     c1: str = ""
     c2: str = ""
     snapshot: str = ""
+    other_c1: str = ""  # the second repository's commit and dirty snapshot
+    other_snapshot: str = ""
 
 
 @dataclass
@@ -189,6 +195,7 @@ class EvalWorld:
     store: Neo4jStore
     keys: dict[str, str] = field(default_factory=dict)
     symbols: dict[str, str] = field(default_factory=dict)  # qualified name -> symbol ID
+    other_symbols: dict[str, str] = field(default_factory=dict)  # the same, second repository
     revisions: Revisions = field(default_factory=Revisions)
     embeddings: FakeEmbeddingProvider = field(default_factory=FakeEmbeddingProvider)
 
@@ -203,6 +210,7 @@ class EvalWorld:
         self.ingestion = IngestionService(self.content, self.api)
         self._services: list[Any] = []
         self._claims: dict[str, str] = {}
+        self._other = False  # seeding the second repository and project
 
     async def close(self) -> None:
         for service in self._services:
@@ -268,6 +276,62 @@ class EvalWorld:
         await self._index(repo, lineage, at(5), "snapshot")
 
         await self._after_snapshot()
+        await self._other_repository(tmp)
+
+    def _scope(self) -> tuple[str, str, str]:
+        if self._other:
+            return OTHER_REPOSITORY, OTHER_PROJECT, OTHER_WORKSPACE
+        return REPOSITORY, PROJECT, WORKSPACE
+
+    async def _other_repository(self, tmp: Path) -> None:
+        """A second repository AND project whose names overlap the first one's: the same paths
+        and qualified names, the same decision and failure IDs and failure fingerprint, rounding
+        words in its content, and its own dirty snapshot. Content IDs stay distinct (a content ID
+        is one search document). Its text says "other-repository", which no answer may quote."""
+        self._other = True
+        try:
+            repo = _Repo(tmp / "other")
+            repo.write("pkg/__init__.py", "")
+            repo.write("pkg/calc.py", OTHER_CALC)
+            repo.write("pkg/other_only.py", "def other_only():\n    return 0\n")
+            self.revisions.other_c1 = repo.commit(at(0.6), "other first")
+            lineage = self._lineage(repo, {})
+            await self._index(repo, lineage, at(1.2), "other:c1")
+            await self._session(
+                80,
+                "sess_other_1",
+                "turn_other_1",
+                1.6,
+                user="other-repository: why does add in calc drift with rounding in report totals?",
+                tool_output=None,
+                reply=None,
+            )
+            await self._ci_run(
+                90, "ci_other_1", 1.7, "test", "failure", commit=repo.git("rev-parse", "HEAD")
+            )
+            await self._failure(
+                91,
+                "fail_rounding",
+                1.72,
+                component="pytest",
+                operation="test_add_rounding",
+                error_class="AssertionError",
+                fingerprint=FINGERPRINT_ROUNDING,
+                ci_run="ci_other_1",
+                details="other-repository failure: rounding drift in add for report totals",
+                content_id="details_other_fail_rounding",
+            )
+            await self._decision(
+                5,
+                "dec_rounding_v2",
+                2.2,
+                "other-repository decision: use banker's rounding in add for report totals.",
+                content_id="content_other_dec_rounding_v2",
+            )
+            repo.write("pkg/calc.py", OTHER_CALC + "\n\ndef average(values):\n    return 0\n")
+            await self._index(repo, self._lineage(repo, lineage), at(4.75), "other:snapshot")
+        finally:
+            self._other = False
 
     def _lineage(
         self, repo: _Repo, inherited: dict[str, UUID], extra: Sequence[str] = ()
@@ -275,7 +339,7 @@ class EvalWorld:
         head = repo.git("rev-parse", "HEAD")
         paths = [p for p in repo.git("ls-files").splitlines() if p.endswith(".py")] + list(extra)
         return {
-            path: inherited.get(path) or identity.file_logical_id(REPOSITORY, path, head)
+            path: inherited.get(path) or identity.file_logical_id(self._scope()[0], path, head)
             for path in paths
         }
 
@@ -284,11 +348,12 @@ class EvalWorld:
     ) -> None:
         scan = scan_repository(repo.root)
         structural = parse_structural({"python": _InProcessPython()}, read_sources(scan))  # type: ignore[dict-item]
+        repository_id, project_id, workspace_id = self._scope()
         service = IndexingService(
             IndexingConfig(
-                repository_id=REPOSITORY,
-                project_id=PROJECT,
-                workspace_id=WORKSPACE,
+                repository_id=repository_id,
+                project_id=project_id,
+                workspace_id=workspace_id,
                 checkout_id="checkout-eval",
                 clock=lambda: when,
                 monotonic=lambda: 0.0,
@@ -306,7 +371,8 @@ class EvalWorld:
             payload = dict(draft.payload)
             if draft.event_type == "code.symbol.indexed":
                 names[str(payload["symbol_id"])] = str(payload["qualified_name"])
-                self.symbols[str(payload["qualified_name"])] = str(payload["symbol_id"])
+                symbols = self.other_symbols if self._other else self.symbols
+                symbols[str(payload["qualified_name"])] = str(payload["symbol_id"])
             elif draft.event_type == "code.file.indexed":
                 names[str(payload["file_id"])] = str(payload["path"])
         for draft in drafts:
@@ -318,7 +384,9 @@ class EvalWorld:
                 self.keys[f"{name}:file:{payload['path']}"] = str(draft.event_id)
             elif draft.event_type in ("code.index.started", "code.index.completed"):
                 self.keys[f"{name}:{draft.event_type}"] = str(draft.event_id)
-                if payload.get("snapshot_id"):
+                if payload.get("snapshot_id") and self._other:
+                    self.revisions.other_snapshot = str(payload["snapshot_id"])
+                elif payload.get("snapshot_id"):
                     self.revisions.snapshot = str(payload["snapshot_id"])
             elif draft.event_type == "code.relation.asserted":
                 subject = names.get(str(payload["subject_id"]), str(payload["subject_id"]))
@@ -397,6 +465,26 @@ class EvalWorld:
         await self._ci_run(43, "ci_run_4", 3.5, "lint", "success", commit=self.revisions.c2)
 
     async def _after_snapshot(self) -> None:
+        # CI output of the DIRTY workspace, inside C2's window: never evidence for a commit.
+        await self._ci_run(
+            55,
+            "ci_run_dirty_output",
+            4.5,
+            "dirty",
+            "failure",
+            snapshot=self.revisions.snapshot,
+            output="dirty workspace test output: the average helper in report failed",
+        )
+        # Occurred inside C2's window but observed (recorded) only after it: later knowledge.
+        await self._content_event(
+            70,
+            "late-observed-note",
+            4.0,
+            "sess_eval_3",
+            "turn_eval_3",
+            "late observed note: the average helper in report should reuse total",
+            observed=at(7.9),
+        )
         await self._ci_run(
             50, "ci_run_5", 5 + 10 / 60, "test", "failure", snapshot=self.revisions.snapshot
         )
@@ -439,8 +527,9 @@ class EvalWorld:
         *,
         supersedes: str | None = None,
         subjects: Sequence[str] = ("pkg.calc.add", "pkg/calc.py"),
+        content_id: str | None = None,
     ) -> None:
-        content_id = f"content_{decision_id}"
+        content_id = content_id or f"content_{decision_id}"
         item, claim = _content(content_id, body)
         moment = at(hours)
         event_id = await self._event(
@@ -459,7 +548,7 @@ class EvalWorld:
             claims=(claim,),
             items=(item,),
         )
-        self.keys[f"decision:{decision_id}"] = event_id
+        self.keys[f"{'other:' if self._other else ''}decision:{decision_id}"] = event_id
 
     async def _session(
         self,
@@ -549,7 +638,13 @@ class EvalWorld:
         *,
         commit: str | None = None,
         snapshot: str | None = None,
+        output: str | None = None,
     ) -> None:
+        claims: tuple[ContentClaimV1, ...] = ()
+        items: tuple[SanitizedContentItemV1, ...] = ()
+        if output is not None:
+            item, claim = _content(f"output_{run_id}", output)
+            claims, items = (claim,), (item,)
         payload: dict[str, Any] = {
             "ci_run_id": run_id,
             "provider": "github",
@@ -560,11 +655,12 @@ class EvalWorld:
             "duration_ms": 60_000,
             "commit_id": commit,
             "snapshot_id": snapshot,
+            "output_content_id": None if output is None else f"output_{run_id}",
         }
         if status != "success":
             payload["error_class"] = "JobFailed"
         self.keys[f"ci:{run_id}"] = await self._event(
-            number, "quality.ci_run.completed", at(hours), payload
+            number, "quality.ci_run.completed", at(hours), payload, claims=claims, items=items
         )
 
     async def _failure(
@@ -580,9 +676,10 @@ class EvalWorld:
         ci_run: str,
         details: str,
         session: str | None = None,
+        content_id: str | None = None,
     ) -> None:
-        item, claim = _content(f"details_{failure_id}", details)
-        self.keys[f"failure:{failure_id}"] = await self._event(
+        item, claim = _content(content_id or f"details_{failure_id}", details)
+        self.keys[f"{'other:' if self._other else ''}failure:{failure_id}"] = await self._event(
             number,
             "knowledge.failure.observed",
             at(hours),
@@ -603,7 +700,15 @@ class EvalWorld:
         )
 
     async def _content_event(
-        self, number: int, content_id: str, hours: float, session_id: str, turn_id: str, body: str
+        self,
+        number: int,
+        content_id: str,
+        hours: float,
+        session_id: str,
+        turn_id: str,
+        body: str,
+        *,
+        observed: datetime | None = None,
     ) -> None:
         item, claim = _content(content_id, body)
         self.keys[f"content:{content_id}"] = await self._event(
@@ -619,6 +724,7 @@ class EvalWorld:
             context={"session_id": session_id, "turn_id": turn_id},
             claims=(claim,),
             items=(item,),
+            observed=observed,
         )
 
     async def _purge(self, number: int, hours: float, content_id: str) -> None:
@@ -651,9 +757,11 @@ class EvalWorld:
         claims: Sequence[ContentClaimV1] = (),
         items: Sequence[SanitizedContentItemV1] = (),
         scoped: bool = True,
+        observed: datetime | None = None,
     ) -> str:
+        repository_id, project_id, workspace_id = self._scope()
         scope = (
-            {"workspace_id": WORKSPACE, "project_id": PROJECT, "repository_id": REPOSITORY}
+            {"workspace_id": workspace_id, "project_id": project_id, "repository_id": repository_id}
             if scoped
             else {}
         )
@@ -662,7 +770,7 @@ class EvalWorld:
             event_type=event_type,
             stream_id=f"evaluation-{number}",
             occurred_at=moment,
-            observed_at=moment,
+            observed_at=observed or moment,
             producer=_PRODUCER,
             payload={k: v for k, v in payload.items() if v is not None},
             context=EventContextV1(**scope, **(context or {})),
