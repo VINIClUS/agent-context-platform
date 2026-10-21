@@ -336,6 +336,14 @@ def test_decisions_flag_a_version_cap(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(temporal, "MAX_VERSIONS", 1)
     service = _service(lambda _q, _p: [version_row("a", 1), version_row("b", 2)])
     assert asyncio.run(service.decisions(TemporalScope("p"))).truncated
+    # the cut goes through `a` (accepted, then rejected): never answer from its first recording
+    split = [version_row("a", 1), version_row("a", 2, status="rejected"), version_row("b", 3)]
+    monkeypatch.setattr(temporal, "MAX_VERSIONS", 2)
+    whole_a = asyncio.run(_service(lambda _q, _p: split).decisions(TemporalScope("p")))
+    assert whole_a.truncated and whole_a.decisions == ()  # `a` complete and rejected; `b` cut
+    monkeypatch.setattr(temporal, "MAX_VERSIONS", 1)
+    partial = asyncio.run(_service(lambda _q, _p: split).decisions(TemporalScope("p")))
+    assert partial.truncated and partial.decisions == ()
 
 
 def test_decision_history_orders_older_links_self_then_newer_links() -> None:
@@ -567,15 +575,22 @@ def test_failures_classify_each_resolution_and_hide_resolved_by_default() -> Non
 
 
 def test_failures_flag_the_failure_and_observation_caps(monkeypatch: pytest.MonkeyPatch) -> None:
-    rows = [observation("f1", 1), observation("f2", 2), observation("f2", 3)]
+    # the database answers newest first: the caps keep the newest failures and observations
+    assert "ORDER BY o.valid_from DESC" in temporal._OBSERVATIONS
+    rows = [observation("f2", 3), observation("f2", 2), observation("f1", 1)]
     service = _service(lambda _q, _p: rows)
     monkeypatch.setattr(temporal, "MAX_FAILURES", 1)
     result = asyncio.run(service.failures(TemporalScope("p")))
-    assert result.truncated and [f.failure_id for f in result.failures] == ["f1"]
+    assert result.truncated and [f.failure_id for f in result.failures] == ["f2"]
+    assert result.failures[0].source_event_ids == ("evo2", "evo3")
     monkeypatch.setattr(temporal, "MAX_FAILURES", 500)
     monkeypatch.setattr(temporal, "MAX_OBSERVATIONS", 2)
     cut = asyncio.run(service.failures(TemporalScope("p")))
-    assert cut.truncated and [f.failure_id for f in cut.failures] == ["f1", "f2"]
+    assert cut.truncated and [f.failure_id for f in cut.failures] == ["f2"]
+    # a failure the cut goes through is partly read: it is left out, never returned partial
+    split = [observation("f2", 3), observation("f1", 2), observation("f2", 1)]
+    partial = asyncio.run(_service(lambda _q, _p: split).failures(TemporalScope("p")))
+    assert partial.truncated and [f.failure_id for f in partial.failures] == ["f1"]
 
 
 def test_from_settings_needs_complete_connection_settings() -> None:

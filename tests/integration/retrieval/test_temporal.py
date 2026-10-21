@@ -737,9 +737,9 @@ def test_result_caps_are_enforced_and_flagged(monkeypatch: pytest.MonkeyPatch) -
         monkeypatch.setattr(temporal, "MAX_FAILURES", 2)
         failures = await service.failures(P1, day(FAR), day(FAR))
         assert failures.truncated and [f.failure_id for f in failures.failures] == [
-            "fail_1",
-            "fail_2",
-        ]
+            "fail_3",
+            "fail_4",
+        ]  # the newest: a failure seen late is never hidden behind old ones
         monkeypatch.setattr(temporal, "MAX_FAILURES", 4)
         assert not (await service.failures(P1, day(FAR), day(FAR))).truncated
         monkeypatch.setattr(temporal, "MAX_CHAIN", 1)
@@ -1160,5 +1160,18 @@ def test_a_recurrence_outside_a_completed_ci_run_after_the_fix_keeps_the_failure
             # before the recurrence happened, the fix stands
             before = await service.failures(P1, T0 + timedelta(seconds=10), day(FAR), True)
             assert before.failures[0].resolution.status is FixStatus.RESOLVED
+
+    with_service(body)
+
+
+def test_a_version_cap_never_answers_from_part_of_a_decisions_recordings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def body(store: Neo4jStore, service: TemporalService) -> None:
+        await deliver(store, [decision(1, "dec_a"), decision(2, "dec_a", status="rejected")])
+        assert await active(service, P1, 5) == []
+        monkeypatch.setattr(temporal, "MAX_VERSIONS", 1)
+        cut = await service.decisions(P1, day(5), day(FAR), include_history=True)
+        assert cut.truncated and cut.decisions == ()  # not "accepted" from its first recording
 
     with_service(body)

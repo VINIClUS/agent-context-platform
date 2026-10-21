@@ -74,8 +74,10 @@ scope, or of another scope, is never returned.
 
 Bounds. Every query carries a `LIMIT`: 5,000 decision versions and 5,000 failure observations per
 request (so no unbounded collection exists, history included). `truncated=True` says a cap was
-hit. For `decisions` the cap is on versions, so a cut can drop recordings of a decision and the
-answer is then only as complete as the versions read. Results are limited to 500 decisions and
+hit. For `decisions` the cap is on versions: a decision the cut goes through is left out rather
+than answered from part of its recordings, and the answer is then only as complete as the
+versions read. Failure observations are read newest first, so the caps keep the newest
+observations and failures (a failure the observation cut goes through is left out too). Results are limited to 500 decisions and
 500 failures; a history lists at most 100 links per direction (depth at most 50) and the newest
 100 recordings of each: per decision at most 101 versions are read (newest first, the extra one
 only tells that more exist), at most 101 superseders per step, and 5,000 versions in all. One read
@@ -374,7 +376,7 @@ _OBSERVATIONS: Final[LiteralString] = (
     "o.fingerprint_sha256 AS fingerprint_sha256, o.valid_from AS valid_from, "
     "o.recorded_at AS recorded_at, o.session_id AS session_id, o.test_run_id AS test_run_id, "
     "o.ci_run_id AS ci_run_id "
-    "ORDER BY o.valid_from, o.failure_id, o.event_id LIMIT $limit"
+    "ORDER BY o.valid_from DESC, o.failure_id DESC, o.event_id DESC LIMIT $limit"
 )
 # A run is visible only in scope, once the platform had recorded it (a stub has no `recorded_at`
 # and never is) and once it had completed: a run still to complete at `valid_at` is omitted from
@@ -395,13 +397,15 @@ _TEST_RUNS: Final[LiteralString] = (
     "r.commit_id AS commit_id, r.snapshot_id AS snapshot_id, r.result_order AS result_order"
 )
 
-# For each failing CI run, the earliest later passing run of the same target.
+# For each failing CI run, the earliest later passing run of the same target: one row per failing
+# run (the subquery keeps only the first), never a collection of every later pass. The candidates
+# are still found by a CIRun label scan, as no index covers a CI target.
 _NEXT_PASS: Final[LiteralString] = (
     "UNWIND $run_ids AS run_id "
     "MATCH (r:CIRun {ci_run_id: run_id}) WHERE " + _in_scope("r") + " "
     "AND r.recorded_at <= $recorded_at AND r.completed_at <= $valid_at "
     "AND r.workflow IS NOT NULL AND r.job IS NOT NULL "
-    "OPTIONAL MATCH (p:CIRun) WHERE " + _in_scope("p") + " "
+    "CALL (r) { OPTIONAL MATCH (p:CIRun) WHERE " + _in_scope("p") + " "
     "AND p.status = 'success' AND p.provider = r.provider AND p.workflow = r.workflow "
     "AND p.job = r.job "
     "AND coalesce(p.project_id, '') = coalesce(r.project_id, '') "
@@ -410,8 +414,7 @@ _NEXT_PASS: Final[LiteralString] = (
     "AND (p.completed_at > r.completed_at "
     "OR (p.completed_at = r.completed_at AND p.ci_run_id > r.ci_run_id)) "
     "AND p.completed_at <= $valid_at AND p.recorded_at <= $recorded_at "
-    "WITH r, p ORDER BY p.completed_at, p.ci_run_id "
-    "WITH r, head(collect(p)) AS p "
+    "RETURN p ORDER BY p.completed_at, p.ci_run_id LIMIT 1 } "
     "RETURN r.ci_run_id AS failing_id, r.workflow AS workflow, r.job AS job, "
     "r.completed_at AS failing_completed_at, r.commit_id AS failing_commit_id, "
     "r.result_order AS failing_order, p.ci_run_id AS passing_id, "
@@ -661,7 +664,13 @@ async def _load_versions(
             },
         )
     ).records
-    return _version_rows(records[:MAX_VERSIONS]), len(records) > MAX_VERSIONS
+    if len(records) <= MAX_VERSIONS:
+        return _version_rows(records), False
+    # The cut may go through one decision's recordings (the one the row after it belongs to):
+    # answering from part of them could show an older status, so that decision is left out.
+    partial = records[MAX_VERSIONS]["decision_id"]
+    kept = [record for record in records[:MAX_VERSIONS] if record["decision_id"] != partial]
+    return _version_rows(kept), True
 
 
 def _classify(
@@ -983,12 +992,18 @@ async def _failures(
     rows = (
         await tx.run(_OBSERVATIONS, parameters={**parameters, "limit": MAX_OBSERVATIONS + 1})
     ).records
+    # Newest first, so the caps keep the newest observations and failures: one seen late is
+    # never hidden behind old ones. A failure the observation cut goes through is left out.
     truncated = len(rows) > MAX_OBSERVATIONS
+    partial = str(rows[MAX_OBSERVATIONS]["failure_id"]) if truncated else None
     found: dict[str, _Seen] = {}
     for row in rows[:MAX_OBSERVATIONS]:
-        found.setdefault(str(row["failure_id"]), _Seen([])).rows.append(row)
+        if str(row["failure_id"]) != partial:
+            found.setdefault(str(row["failure_id"]), _Seen([])).rows.append(row)
     truncated = truncated or len(found) > MAX_FAILURES
     kept = list(found.items())[:MAX_FAILURES]
+    for _, seen in kept:
+        seen.rows.reverse()  # oldest first, as each record describes them
     wanted = {
         key: sorted({str(row[key]) for _, seen in kept for row in seen.rows if row[key]})
         for key in ("ci_run_id", "test_run_id")
@@ -1014,6 +1029,7 @@ async def _failures(
     result = [
         _failure_record(failure_id, seen.rows, ci, tests, passes) for failure_id, seen in kept
     ]
+    result.sort(key=lambda record: (record.valid_from, record.failure_id))
     return tuple(result), truncated
 
 
