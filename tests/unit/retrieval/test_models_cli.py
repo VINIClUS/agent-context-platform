@@ -73,18 +73,14 @@ def test_models_fetch_requires_a_destination() -> None:
     assert result.exit_code == 2
 
 
-def test_without_a_model_directory_search_can_still_purge_but_not_index() -> None:
-    sessions = object()
-    runtime = SimpleNamespace(sessions=sessions)
-
-    projectors = asyncio.run(
-        cli._search_projectors(Settings(), runtime, write_documents=True)  # type: ignore[arg-type]
-    )
-
-    assert [item.name for item in projectors] == [item.name for item in registered_projectors()]
-    search = projectors[-1]
-    assert search._backend is None  # type: ignore[attr-defined]
-    assert search._purge_access.sessions is sessions  # type: ignore[attr-defined]
+def test_binding_search_without_a_model_directory_is_refused() -> None:
+    # Every caller refuses earlier with a clearer message; this is the last line of defence.
+    with pytest.raises(cli.CliUsageError, match="AGENT_CONTEXT_SEARCH__MODEL_DIR"):
+        asyncio.run(
+            cli._search_projectors(
+                Settings(), SimpleNamespace(sessions=object()), write_documents=True
+            )  # type: ignore[arg-type]
+        )
 
 
 async def _no_seed(*_args: Any) -> None:
@@ -372,3 +368,47 @@ def test_only_a_replay_that_never_writes_tombstones_seeds_purges_from_the_ledger
 
     assert projectors[-1].name == "search"
     assert seeded == ([] if write_documents else [sessions])
+
+
+def test_only_an_in_place_rebuild_checks_the_replay_and_does_so_before_the_rebuild(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = _env(monkeypatch, model=True)
+
+    async def projectors(*_args: Any, **_kwargs: Any) -> tuple[Any, ...]:
+        return ()
+
+    async def check(*_args: Any) -> None:
+        seen["calls"].append("check")
+
+    monkeypatch.setattr(cli, "_search_projectors", projectors)
+    monkeypatch.setattr(cli, "_check_search_replay", check)
+
+    _invoke("projection", "rebuild", "--in-place", "--confirm", "neo4j")
+    assert seen["calls"] == ["runtime", "preflight", "check", "rebuild"]
+    seen["calls"].clear()
+    _invoke("projection", "rebuild", *_TARGET, "--target-username", "op")
+    assert seen["calls"] == ["runtime", "preflight", "rebuild"]
+
+
+def test_a_failed_replay_check_stops_the_rebuild_with_a_content_free_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_context_platform.projection.projectors.search import SearchReplayIntegrityError
+
+    seen = _env(monkeypatch, model=True)
+
+    async def projectors(*_args: Any, **_kwargs: Any) -> tuple[Any, ...]:
+        return ()
+
+    async def check(*_args: Any) -> None:
+        raise SearchReplayIntegrityError("the replay would fail: 1 unreadable content object(s)")
+
+    monkeypatch.setattr(cli, "_search_projectors", projectors)
+    monkeypatch.setattr(cli, "_check_search_replay", check)
+
+    result = _invoke("projection", "rebuild", "--in-place", "--confirm", "neo4j")
+
+    assert result.exit_code == 1 and "SearchReplayIntegrityError" in result.stderr
+    assert "1 unreadable content object(s)" in result.stderr
+    assert "rebuild" not in seen["calls"]

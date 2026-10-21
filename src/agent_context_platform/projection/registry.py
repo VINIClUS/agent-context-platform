@@ -36,7 +36,6 @@ from agent_context_platform.projection.projectors.knowledge import KnowledgeProj
 from agent_context_platform.projection.projectors.portfolio import PortfolioProjector
 from agent_context_platform.projection.projectors.quality import QualityProjector
 from agent_context_platform.projection.projectors.search import (
-    PurgeAccess,
     SearchBackend,
     SearchProjector,
 )
@@ -103,27 +102,11 @@ def projectors_with_search(backend: SearchBackend) -> tuple[Projector, ...]:
     """The registered projectors with the search projector bound to a configured `backend`.
 
     `PROJECTORS` holds an unconfigured `SearchProjector`: it handles its events but fails closed
-    (typed error, so the runner retries then dead-letters) when asked to index. A process that
-    can embed (a worker, `agent-context projection rebuild` with a model directory) uses this.
+    (typed error, so the runner retries then dead-letters) when asked to index or purge. A
+    worker or `agent-context projection rebuild|verify` binds it here (a lexical-only worker binds
+    a backend with no embedder).
     """
     return register_projectors(
         projector.with_backend(backend) if isinstance(projector, SearchProjector) else projector
-        for projector in PROJECTORS
-    )
-
-
-def projectors_with_purge(
-    access: PurgeAccess, *, skip_index: bool = False
-) -> tuple[Projector, ...]:
-    """The registered projectors with a search projector that can purge but not index.
-
-    For a deployment with no embedding model: `content.purged` still removes search rows and
-    embeddings (it needs no model or content reader). Events that must be indexed fail closed,
-    unless `skip_index` (the worker's explicit purge-only mode) delivers them as counted no-ops.
-    """
-    return register_projectors(
-        projector.with_purge(access, skip_index=skip_index)
-        if isinstance(projector, SearchProjector)
-        else projector
         for projector in PROJECTORS
     )

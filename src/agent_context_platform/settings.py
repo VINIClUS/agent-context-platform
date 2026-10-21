@@ -196,8 +196,8 @@ class SearchSettings(BaseModel):
 
     The service never downloads the model: `agent-context models fetch --dest <dir>` does, and
     the service loads `model_dir`, failing closed on any digest mismatch. With no `model_dir`
-    the search projector cannot embed: the worker refuses to start unless it runs purge-only
-    (`projection run --without-search`, an explicit and counted skip), and replays refuse unless
+    the search projector cannot embed: the worker refuses to start unless it runs lexical-only
+    (`projection run --lexical-only`: rows without embeddings, counted), and replays refuse unless
     `--without-search` skips the projector.
     """
 

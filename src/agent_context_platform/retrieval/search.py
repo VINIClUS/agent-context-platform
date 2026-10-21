@@ -14,7 +14,8 @@ a deadline.
   cap is reached. A hit must also have its PostgreSQL row, which is also where the metadata comes
   from, so a purged document is never returned even if a stale node lingers.
 
-Both searches return only documents whose source event was delivered (see `_DELIVERED`).
+Both searches return only documents with a delivered source event, and report provenance from
+delivered events only (see `_DELIVERED_PROVENANCE`).
 
 Recall limit, not a leak: the Neo4j index returns its top-k over the WHOLE corpus and the scope
 filter runs afterwards, on at most `MAX_CANDIDATES` (1000) candidates. A small scope in a large
@@ -81,30 +82,43 @@ class SearchHit:
 
 
 _COLUMNS: Final = (
-    "d.content_id, d.project_id, d.repository_id, d.session_id, d.event_id, d.event_type, "
-    "d.occurred_at, d.source_event_ids, d.redaction"
+    "d.content_id, d.project_id, d.repository_id, first.session_id, first.event_id, "
+    "first.event_type, first.occurred_at, delivered.ids AS source_event_ids, d.redaction"
 )
 # A row is searchable only once one of its source events is DELIVERED (every projector, the graph
-# write included, committed). A row left by an event that was dead-lettered, or whose graph
-# commit has not happened yet (a crash after the PostgreSQL commit), stays invisible.
-_DELIVERED: Final = (
-    "EXISTS (SELECT 1 FROM projection.outbox o "
-    "WHERE o.event_id = ANY(d.source_event_ids) AND o.status = 'delivered')"
-)
+# write included, committed): the inner lateral join drops every other row. A row left by an event
+# that was dead-lettered, or whose graph commit has not happened yet (a crash after the PostgreSQL
+# commit), stays invisible. The provenance a hit reports comes from delivered events only: the
+# earliest one (as a rebuild, which replays delivered events, would record it) and the delivered
+# source IDs, never an event the graph never accepted.
+_DELIVERED_PROVENANCE: Final = """
+CROSS JOIN LATERAL (
+    SELECT e.event_id, e.event_type, e.context ->> 'session_id' AS session_id, e.occurred_at
+    FROM projection.outbox o JOIN ledger.events e ON e.event_id = o.event_id
+    WHERE o.event_id = ANY(d.source_event_ids) AND o.status = 'delivered'
+    ORDER BY e.occurred_at, e.event_id
+    LIMIT 1
+) AS first
+CROSS JOIN LATERAL (
+    SELECT array_agg(o.event_id ORDER BY o.event_id) AS ids
+    FROM projection.outbox o
+    WHERE o.event_id = ANY(d.source_event_ids) AND o.status = 'delivered'
+) AS delivered
+"""
 _LEXICAL: Final[str] = f"""
 WITH q AS (SELECT websearch_to_tsquery('{TEXT_SEARCH_CONFIG}', :query) AS tsq)
 SELECT {_COLUMNS}, ts_rank_cd(d.tsv, q.tsq) AS score
-FROM retrieval.search_documents d, q
+FROM q CROSS JOIN retrieval.search_documents d
+{_DELIVERED_PROVENANCE}
 WHERE d.project_id = :project_id AND d.repository_id = :repository_id AND d.tsv @@ q.tsq
-  AND {_DELIVERED}
 ORDER BY score DESC, d.content_id
 LIMIT :limit
 """
 _METADATA: Final[str] = f"""
 SELECT {_COLUMNS} FROM retrieval.search_documents d
+{_DELIVERED_PROVENANCE}
 WHERE d.content_id = ANY(:content_ids)
   AND d.project_id = :project_id AND d.repository_id = :repository_id
-  AND {_DELIVERED}
 """
 _VECTOR: Final[LiteralString] = (
     "CALL db.index.vector.queryNodes('vx_content_embedding_embedding', $k, $vector) "

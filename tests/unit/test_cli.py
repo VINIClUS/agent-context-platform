@@ -443,14 +443,34 @@ def test_status_lists_each_projector_read_only(
         return statuses
 
     monkeypatch.setattr(cli, "projection_status", fake)
+    monkeypatch.setattr(cli, "_search_status", _search_counts(documents=5, embeddings=3))
 
     human = run("projection", "status")
     assert human.exit_code == 0
     assert "git 1: state active, checkpoint 4/6, lag 2, last error RuntimeError" in human.output
     assert "code 1: state none" in human.output and "last run never" in human.output
+    assert "search: 5 documents, 3 embeddings (2 without embeddings: run" in human.output
 
     machine = json.loads(run("projection", "status", "--json").output)
     assert [item["name"] for item in machine["projectors"]] == ["git", "code"]
+    assert machine["search"] == {
+        "documents": 5,
+        "embeddings": 3,
+        "documents_without_embeddings": 2,
+    }
+    monkeypatch.setattr(cli, "_search_status", _search_counts(documents=3, embeddings=3))
+    assert "search: 3 documents, 3 embeddings\n" in run("projection", "status").output
+
+
+def _search_counts(*, documents: int, embeddings: int) -> Any:
+    async def counts(_runtime: Any) -> dict[str, int]:
+        return {
+            "documents": documents,
+            "embeddings": embeddings,
+            "documents_without_embeddings": max(documents - embeddings, 0),
+        }
+
+    return counts
 
 
 def test_a_missing_or_invalid_configuration_is_a_usage_error(
@@ -565,10 +585,12 @@ def test_the_real_runtime_opens_lazily_and_closes(monkeypatch: pytest.MonkeyPatc
         return []
 
     monkeypatch.setattr(cli, "projection_status", fake)
+    monkeypatch.setattr(cli, "_search_status", _search_counts(documents=0, embeddings=0))
 
     result = run("projection", "status", "--json")
 
-    assert result.exit_code == 0 and json.loads(result.output) == {"projectors": []}
+    assert result.exit_code == 0
+    assert json.loads(result.output)["projectors"] == []
 
 
 def test_server_keys_normalize_local_hosts_and_default_ports() -> None:

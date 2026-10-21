@@ -1755,7 +1755,7 @@ async def _rebuild_projections(
 class GrantRequirement:
     """One privilege a connection must hold, checked with `has_*_privilege` (inherited roles count)."""
 
-    kind: str  # "table", "column" or "sequence"
+    kind: str  # "table", "column", "sequence" or "function" (`obj` is its signature)
     obj: str
     privilege: str
     column: str | None = None
@@ -1841,6 +1841,9 @@ async def check_grants(
             elif item.kind == "column":
                 query = text("SELECT has_column_privilege(:obj, :col, :priv)")
                 params = {"obj": item.obj, "col": item.column, "priv": item.privilege}
+            elif item.kind == "function":
+                query = text("SELECT has_function_privilege(:obj, :priv)")
+                params = {"obj": item.obj, "priv": item.privilege}
             else:
                 query = text("SELECT has_sequence_privilege(:obj, :priv)")
                 params = {"obj": item.obj, "priv": item.privilege}

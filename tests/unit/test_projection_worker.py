@@ -299,8 +299,8 @@ def worker(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "AGENT_CONTEXT_NEO4J__URI": "bolt://live.example.test:7687",
         "AGENT_CONTEXT_NEO4J__USERNAME": "neo4j",
         "AGENT_CONTEXT_NEO4J__PASSWORD": PASSWORD,
-        # No model in these tests: the search projector runs purge-only, with no connection.
-        "AGENT_CONTEXT_PROJECTION_WITHOUT_SEARCH": "1",
+        # No model in these tests: the search projector runs lexical-only, with no connection.
+        cli.LEXICAL_ONLY_ENV: "1",
     }.items():
         monkeypatch.setenv(name, value)
 
@@ -390,21 +390,22 @@ def test_the_worker_builds_its_projectors_through_one_factory(
     from agent_context_platform.projection.registry import registered_projectors
     from agent_context_platform.settings import Settings
 
-    # Purge-only: a search projector that purges, never indexes, and counts what it skipped.
+    # Lexical-only: a search projector that reads and writes rows but holds no embedder.
     sessions = object()
     bound = asyncio.run(
-        cli.build_projectors(Settings(), SimpleNamespace(sessions=sessions), without_search=True)  # type: ignore[arg-type]
+        cli.build_projectors(Settings(), SimpleNamespace(sessions=sessions), lexical_only=True)  # type: ignore[arg-type]
     )
     assert [item.name for item in bound] == [item.name for item in registered_projectors()]
-    assert bound[-1]._purge_access.sessions is sessions  # type: ignore[attr-defined]
-    assert bound[-1]._backend is None and bound[-1]._skip_index  # type: ignore[attr-defined]
-    # Without a model and without the purge-only mode the factory refuses.
-    with pytest.raises(cli.CliUsageError, match="--without-search"):
+    backend = bound[-1]._backend  # type: ignore[attr-defined]
+    assert backend.sessions is sessions and backend.write_documents
+    assert backend.embeddings is None and backend.content is not None
+    # Without a model and without the lexical-only mode the factory refuses.
+    with pytest.raises(cli.CliUsageError, match="--lexical-only"):
         asyncio.run(cli.build_projectors(Settings(), SimpleNamespace(sessions=sessions)))  # type: ignore[arg-type]
     built: list[tuple[object, bool]] = []
 
-    async def fake_build(settings: object, runtime: object, *, without_search: bool) -> tuple[()]:
-        built.append((settings, without_search))
+    async def fake_build(settings: object, runtime: object, *, lexical_only: bool) -> tuple[()]:
+        built.append((settings, lexical_only))
         return ()
 
     monkeypatch.setattr(cli, "build_projectors", fake_build)
@@ -415,21 +416,41 @@ def test_the_worker_builds_its_projectors_through_one_factory(
 def test_without_a_model_the_worker_refuses_to_start_before_any_connection(
     worker: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    monkeypatch.delenv("AGENT_CONTEXT_PROJECTION_WITHOUT_SEARCH")
+    monkeypatch.delenv(cli.LEXICAL_ONLY_ENV)
 
     result = CliRunner().invoke(cli.app, ["projection", "run", "--once"])
 
     assert result.exit_code == 2
-    assert (
-        "AGENT_CONTEXT_SEARCH__MODEL_DIR" in result.stderr and "--without-search" in result.stderr
-    )
+    assert "AGENT_CONTEXT_SEARCH__MODEL_DIR" in result.stderr and "--lexical-only" in result.stderr
     assert "runtime_opened" not in worker
+
+
+def test_lexical_only_is_refused_while_a_model_is_configured(
+    worker: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    monkeypatch.setenv("AGENT_CONTEXT_SEARCH__MODEL_DIR", str(tmp_path))
+
+    result = CliRunner().invoke(cli.app, ["projection", "run", "--once"])
+
+    assert result.exit_code == 2 and "--lexical-only is refused" in result.stderr
+    assert "runtime_opened" not in worker
+
+
+def test_the_rebuild_flag_does_not_change_the_worker(
+    worker: dict[str, Any], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # `AGENT_CONTEXT_PROJECTION_WITHOUT_SEARCH` belongs to rebuild/verify, never to the worker.
+    monkeypatch.delenv(cli.LEXICAL_ONLY_ENV)
+    monkeypatch.setenv("AGENT_CONTEXT_PROJECTION_WITHOUT_SEARCH", "1")
+
+    assert CliRunner().invoke(cli.app, ["projection", "run", "--once"]).exit_code == 2
+    assert CliRunner().invoke(cli.app, ["projection", "run", "--without-search"]).exit_code == 2
 
 
 def test_a_model_and_no_flag_binds_the_indexing_search_projector(
     worker: dict[str, Any], monkeypatch: pytest.MonkeyPatch, tmp_path: Path
 ) -> None:
-    monkeypatch.delenv("AGENT_CONTEXT_PROJECTION_WITHOUT_SEARCH")
+    monkeypatch.delenv(cli.LEXICAL_ONLY_ENV)
     monkeypatch.setenv("AGENT_CONTEXT_SEARCH__MODEL_DIR", str(tmp_path))
     bound: list[bool] = []
 
@@ -443,26 +464,26 @@ def test_a_model_and_no_flag_binds_the_indexing_search_projector(
     assert bound == [True]
 
 
-def test_purge_only_skips_are_counted_and_reported_without_content(
+def test_lexical_only_counts_are_reported_without_content(
     worker: dict[str, Any], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     from agent_context_platform.projection.projectors.search import SearchProjector
 
-    skipping = SearchProjector(skip_index=True)
-    skipping.skipped_index_events = 3
+    lexical = SearchProjector()
+    lexical.unembedded_events = 3
 
     async def fake_build(*_args: Any, **_kwargs: Any) -> tuple[Any, ...]:
-        return (skipping,)
+        return (lexical,)
 
     monkeypatch.setattr(cli, "build_projectors", fake_build)
 
     result = CliRunner().invoke(cli.app, ["projection", "run", "--once", "--json"])
 
     assert result.exit_code == 0, result.output
-    assert json.loads(result.stdout)["search_index_skipped"] == 3
-    assert "projection_worker search_index_skipped 3" in result.stderr
+    assert json.loads(result.stdout)["search_unembedded"] == 3
+    assert "projection_worker search_unembedded 3" in result.stderr
     text_result = CliRunner().invoke(cli.app, ["projection", "run", "--once"])
-    assert "3 content events not indexed (purge-only)" in text_result.stdout
+    assert "3 content events indexed without embeddings" in text_result.stdout
 
 
 def test_an_interrupted_once_exits_1_and_is_not_a_drain() -> None:

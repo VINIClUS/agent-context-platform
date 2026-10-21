@@ -104,6 +104,10 @@ class SearchWorld:
             self.projector_sessions, self.content, embeddings or self.embeddings, write_documents
         )
 
+    def lexical_projectors(self) -> tuple[Any, ...]:
+        """The projectors of a lexical-only worker (no embedding model)."""
+        return projectors_with_search(SearchBackend(self.projector_sessions, self.content, None))
+
     def _tick(self) -> datetime:
         self._clock += timedelta(seconds=1)
         return self._clock

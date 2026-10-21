@@ -25,7 +25,6 @@ from agent_context_platform.content.service import ContentUnavailableError
 from agent_context_platform.projection.projectors import search
 from agent_context_platform.projection.projectors.search import (
     EmbeddingDimensionError,
-    PurgeAccess,
     SearchBackend,
     SearchBackendNotConfiguredError,
     SearchContentConflictError,
@@ -118,6 +117,7 @@ class Rig:
         existing: Any = None,
         embedder: Any = None,
         write_documents: bool = True,
+        lexical: bool = False,
     ) -> None:
         def script(sql: str, params: dict[str, Any]) -> list[Any]:
             if "content_tombstones WHERE" in sql:
@@ -130,7 +130,7 @@ class Rig:
 
         self.sessions = FakeSessions(script)
         self.content = FakeContent(blobs)
-        self.embedder = embedder or StubEmbedder()
+        self.embedder = None if lexical else embedder or StubEmbedder()
         self.projector = SearchProjector(
             SearchBackend(self.sessions, self.content, self.embedder, write_documents)  # type: ignore[arg-type]
         )
@@ -346,7 +346,7 @@ def test_the_same_content_under_the_same_scope_is_merged_in_the_graph() -> None:
     assert upsert["media_type"] == "text/plain"
 
 
-def test_resetting_the_tables_truncates_then_tombstones_every_ledger_purge() -> None:
+def test_resetting_the_tables_is_one_call_of_the_reset_and_reseed_function() -> None:
     sessions = FakeSessions()
 
     async def reset() -> int:
@@ -355,14 +355,8 @@ def test_resetting_the_tables_truncates_then_tombstones_every_ledger_purge() -> 
 
     asyncio.run(reset())
 
-    statements = [sql for sql, _params in sessions.log]
-    assert len(statements) == 2
-    assert statements[0].startswith(
-        "TRUNCATE retrieval.search_documents, retrieval.content_tombstones"
-    )
-    assert "INSERT INTO retrieval.content_tombstones" in statements[1]
-    assert "event_type = 'content.purged'" in statements[1]
-    assert "outbox" not in statements[1]  # whatever the purge's delivery status
+    # One SECURITY DEFINER call: the projector role holds no TRUNCATE and no tombstone DELETE.
+    assert [sql for sql, _params in sessions.log] == ["SELECT retrieval.reset_search_projection()"]
 
 
 def test_vectors_of_the_wrong_size_are_refused() -> None:
@@ -533,25 +527,15 @@ def test_indexing_and_purging_take_the_content_lock_before_checking_or_writing()
     assert "INSERT INTO retrieval.content_tombstones" in purge_statements[2]
 
 
-def test_a_projector_with_no_embedding_backend_still_purges_rows_tombstones_and_nodes() -> None:
-    sessions = FakeSessions()
-    projector = SearchProjector(purge=PurgeAccess(sessions))  # type: ignore[arg-type]
-    tx = FakeTx()
+def test_an_unconfigured_projector_neither_purges_nor_indexes() -> None:
+    projector = SearchProjector()
     purge = _event(
         [], event_type="content.purged", payload=_purge_payload("c-1"), context=EventContextV1()
     )
 
-    asyncio.run(projector.project(tx, purge))  # type: ignore[arg-type]
-
-    assert [
-        p["content_id"] for p in sessions.statements("INSERT INTO retrieval.content_tombstones")
-    ] == ["c-1"]
-    assert sessions.statements("DELETE FROM retrieval.search_documents") == [
-        {"content_ids": ["c-1"]}
-    ]
-    assert tx.with_fragment("DETACH DELETE") == [{"content_ids": ["c-1"]}]
-    with pytest.raises(SearchBackendNotConfiguredError):  # indexing still fails closed
-        asyncio.run(projector.project(tx, _event([_ref("c-1", b"x")])))  # type: ignore[arg-type]
+    for event in (purge, _event([_ref("c-1", b"x")])):
+        with pytest.raises(SearchBackendNotConfiguredError):
+            asyncio.run(projector.project(FakeTx(), event))  # type: ignore[arg-type]
 
 
 def test_seeded_ledger_purges_are_neither_read_nor_embedded() -> None:
@@ -569,43 +553,53 @@ def test_seeded_ledger_purges_are_neither_read_nor_embedded() -> None:
     assert rig.sessions.statements("INSERT INTO") == []
 
 
-def test_purge_only_mode_counts_index_events_and_still_purges(
+def test_lexical_only_writes_checked_rows_and_no_graph_node(
     caplog: pytest.LogCaptureFixture,
 ) -> None:
-    sessions = FakeSessions()
-    projector = SearchProjector(purge=PurgeAccess(sessions), skip_index=True)  # type: ignore[arg-type]
-    secret = b"secret body"
-    tx = FakeTx()
+    rig = Rig({"c-1": b"secret body", "c-2": b"other body"}, lexical=True)
 
     with caplog.at_level("WARNING"):
-        for _ in range(2):
-            asyncio.run(projector.project(tx, _event([_ref("c-1", secret)])))  # type: ignore[arg-type]
+        tx = rig.run(_event([_ref("c-1", b"secret body")]))
+        rig.run(_event([_ref("c-2", b"other body")]))
 
-    assert projector.skipped_index_events == 2
-    assert tx.queries == [] and sessions.log == []  # nothing read, embedded or written
+    upserts = rig.sessions.statements("INSERT INTO retrieval.search_documents")
+    assert [p["content_id"] for p in upserts] == ["c-1", "c-2"]
+    assert upserts[0]["content_sha256"] == hashlib.sha256(b"secret body").hexdigest()
+    assert rig.sessions.statements("content_tombstones WHERE")  # tombstones are honoured
+    assert tx.queries == []  # no embedding, no node, no link
+    assert rig.projector.unembedded_events == 2
     assert len(caplog.records) == 1 and "secret" not in caplog.text and "c-1" not in caplog.text
-    purge = _event(
-        [],
-        event_type="content.purged",
-        payload={
-            "purge_request_id": "purge-1",
-            "purged_contents": [{"content_id": "c-1", "content_sha256": "a" * 64}],
-            "reason": "operator_request",
-            "purged_at": MOMENT.isoformat(),
-            "affected_event_count": 1,
-            "storage_kinds": ["inline"],
-        },
-        context=EventContextV1(),
+
+
+def test_lexical_only_dead_letters_conflicts_and_unreadable_content_like_a_full_index() -> None:
+    conflicting = Rig(
+        {"c-1": b"x"},
+        lexical=True,
+        conflict=True,
+        existing=row(project_id="proj", repository_id="repo"),
     )
-    asyncio.run(projector.project(tx, purge))  # type: ignore[arg-type]
-    assert sessions.statements("INSERT INTO retrieval.content_tombstones")
+    with pytest.raises(SearchContentConflictError):
+        conflicting.run(_event([_ref("c-1", b"x")]))
+    with pytest.raises(ContentUnavailableError):
+        Rig({}, lexical=True).run(_event([_ref("c-1", b"x")]))
+    assert Rig({}, lexical=True).projector.unembedded_events == 0
+
+
+def test_lexical_only_still_purges_rows_tombstones_and_nodes() -> None:
+    rig = Rig({}, lexical=True)
+    tx = FakeTx()
+    purge = _event(
+        [], event_type="content.purged", payload=_purge_payload("c-1"), context=EventContextV1()
+    )
+
+    asyncio.run(rig.projector.project(tx, purge))  # type: ignore[arg-type]
+
+    assert [
+        p["content_id"] for p in rig.sessions.statements("INSERT INTO retrieval.content_tombstones")
+    ] == ["c-1"]
     assert tx.with_fragment("DETACH DELETE") == [{"content_ids": ["c-1"]}]
 
 
-def test_purge_only_never_applies_to_a_projector_that_can_index() -> None:
-    rig = Rig({"c-1": b"x"})
-    projector = SearchProjector(rig.projector._backend, skip_index=True)  # type: ignore[attr-defined]
-
-    asyncio.run(projector.project(FakeTx(), _event([_ref("c-1", b"x")])))  # type: ignore[arg-type]
-
-    assert projector.skipped_index_events == 0 and rig.content.reads == ["c-1"]
+def test_a_graph_replay_without_an_embedder_is_refused_at_construction() -> None:
+    with pytest.raises(ValueError, match="embedding provider"):
+        SearchBackend(FakeSessions(), FakeContent({}), None, write_documents=False)  # type: ignore[arg-type]

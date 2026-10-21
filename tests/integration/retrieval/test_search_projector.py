@@ -7,6 +7,7 @@ rebuild/verify contract with the projector registered.
 from __future__ import annotations
 
 import hashlib
+import json
 from collections.abc import Sequence
 from typing import Any
 
@@ -414,8 +415,9 @@ def test_every_search_grant_is_checked_by_preflight_before_anything_is_mutated(
         for item in grants:
             target = "agent_context_projector"
             privilege = f"{item.privilege} ({item.column})" if item.column else item.privilege
+            on = f"FUNCTION {item.obj}" if item.kind == "function" else item.obj
             async with world.owner.begin() as connection:
-                await connection.execute(text(f"REVOKE {privilege} ON {item.obj} FROM {target}"))
+                await connection.execute(text(f"REVOKE {privilege} ON {on} FROM {target}"))
             try:
                 with pytest.raises(MissingGrantError) as raised:
                     await preflight(
@@ -428,7 +430,7 @@ def test_every_search_grant_is_checked_by_preflight_before_anything_is_mutated(
                 ) == len(checkpoints)
             finally:
                 async with world.owner.begin() as connection:
-                    await connection.execute(text(f"GRANT {privilege} ON {item.obj} TO {target}"))
+                    await connection.execute(text(f"GRANT {privilege} ON {on} TO {target}"))
 
     with_world(body, dsn=postgres_dsn, owner=projection_engine)
 
@@ -540,12 +542,9 @@ def test_an_in_place_rebuild_resets_the_search_tables_and_rebuilds_them_from_the
     with_world(body, dsn=postgres_dsn, owner=projection_engine)
 
 
-def test_purges_work_on_a_deployment_with_no_embedding_model(
+def test_purges_work_on_a_lexical_only_deployment_with_no_embedding_model(
     postgres_dsn: str, projection_engine: AsyncEngine
 ) -> None:
-    from agent_context_platform.projection.projectors.search import PurgeAccess
-    from agent_context_platform.projection.registry import projectors_with_purge
-
     async def body(world: SearchWorld) -> None:
         await world.ingest("searchable until purged", "c-purge")
         await world.ingest("stays", "c-stay")
@@ -553,9 +552,7 @@ def test_purges_work_on_a_deployment_with_no_embedding_model(
         assert await world.documents() == ["c-purge", "c-stay"]
         await world.purge("c-purge")
 
-        report = await world.project(
-            projectors=projectors_with_purge(PurgeAccess(world.projector_sessions))
-        )
+        report = await world.project(projectors=world.lexical_projectors())
 
         assert (report.delivered, report.dead_lettered) == (1, 0)
         assert await world.documents() == ["c-stay"]
@@ -780,25 +777,250 @@ def test_a_searchless_replay_check_is_refused_because_its_digest_would_always_mi
     with_world(body, dsn=postgres_dsn, owner=projection_engine)
 
 
-def test_a_purge_only_worker_delivers_content_events_unindexed_and_applies_purges(
+def test_a_lexical_only_worker_writes_searchable_rows_and_applies_purges(
     postgres_dsn: str, projection_engine: AsyncEngine
 ) -> None:
-    from agent_context_platform.projection.projectors.search import PurgeAccess
-    from agent_context_platform.projection.registry import projectors_with_purge
-
     async def body(world: SearchWorld) -> None:
         await world.ingest("indexed while a model was configured", "c-old")
         await world.project()
-        await world.ingest("arrives in purge-only mode", "c-new", turn="turn-2")
+        await world.ingest("arrives in lexical-only mode", "c-new", turn="turn-2")
         await world.purge("c-old")
-        projectors = projectors_with_purge(PurgeAccess(world.projector_sessions), skip_index=True)
+        projectors = world.lexical_projectors()
 
         report = await world.project(projectors=projectors)
 
         assert (report.delivered, report.dead_lettered) == (2, 0)
-        assert projectors[-1].skipped_index_events == 1  # type: ignore[attr-defined]
-        assert await world.documents() == [] and await world.embedding_ids() == []
+        assert projectors[-1].unembedded_events == 1  # type: ignore[attr-defined]
+        assert await world.documents() == ["c-new"] and await world.embedding_ids() == []
+        assert _ids(await _service(world).lexical("lexical", SCOPE, 5)) == ["c-new"]
         tombstones = await _rows(world, "SELECT content_id FROM retrieval.content_tombstones")
         assert [r.content_id for r in tombstones] == ["c-old"]
+
+    with_world(body, dsn=postgres_dsn, owner=projection_engine)
+
+
+async def _rebuild_in_place(world: SearchWorld, projectors: Sequence[Any]) -> Any:
+    """What `projection rebuild --in-place` does with search bound: check, then rebuild."""
+    from agent_context_platform import cli
+    from agent_context_platform.projection.verify import rebuild_projections
+
+    await cli._check_search_replay(projectors, world.projector_sessions)
+    return await rebuild_projections(
+        world.projector_sessions,
+        world.store,
+        projectors,
+        target_description="live",
+        in_place=True,
+        runner_quiet_seconds=0,
+        before_replay=lambda: cli._prepare_search_replay(projectors, world.projector_sessions),
+    )
+
+
+async def _graph_state(world: SearchWorld) -> tuple[int, list[Any]]:
+    checkpoints = await _rows(
+        world,
+        "SELECT projector_name, last_outbox_id, state FROM projection.projection_checkpoints "
+        "ORDER BY 1",
+    )
+    return await _node_count(world), [tuple(item) for item in checkpoints]
+
+
+def test_a_lexical_only_worker_decides_conflicts_live_so_the_backfill_rebuild_succeeds(
+    postgres_dsn: str, projection_engine: AsyncEngine
+) -> None:
+    from agent_context_platform import cli
+
+    async def body(world: SearchWorld) -> None:
+        await world.ingest("an unrelated body", "c-other")
+        await world.ingest("the original body", "c-dup", turn="turn-2")
+        await world.ingest("a different body", "c-dup", turn="turn-3")
+        await world.ingest("a later body", "c-later", turn="turn-4")
+
+        report = await world.project(projectors=world.lexical_projectors())
+
+        # The reused content ID is refused live, without a model, exactly as with one.
+        assert (report.delivered, report.dead_lettered) == (3, 1)
+        (dead,) = await _rows(world, "SELECT error_class FROM projection.dead_letters")
+        assert dead.error_class == "SearchContentConflictError"
+        assert await world.documents() == ["c-dup", "c-later", "c-other"]
+        assert await world.embedding_ids() == []
+        runtime = cli.Runtime(world.projector_sessions, None, world.store)
+        assert await cli._search_status(runtime) == {
+            "documents": 3,
+            "embeddings": 0,
+            "documents_without_embeddings": 3,
+        }
+
+        # The backfill: an in-place rebuild with the model replays only what was delivered.
+        rebuilt = await _rebuild_in_place(world, projectors_with_search(world.backend()))
+
+        # The only verification problem is the dead-lettered event itself (an operator decision).
+        assert {problem.split(": ")[1] for problem in rebuilt.verification.problems()} == {
+            "dead_lettered_below_checkpoint"
+        }, json.dumps(rebuilt.to_dict(), default=str)
+        assert await world.embedding_ids() == ["c-dup", "c-later", "c-other"]
+        (node,) = await _cypher(
+            world, "MATCH (n:ContentEmbedding {content_id: 'c-dup'}) RETURN n.content_sha256 AS s"
+        )
+        assert node["s"] == hashlib.sha256(b"the original body").hexdigest()
+        assert (await cli._search_status(runtime))["documents_without_embeddings"] == 0
+
+    with_world(body, dsn=postgres_dsn, owner=projection_engine)
+
+
+def test_a_lexical_only_backfill_also_works_through_a_standby_graph(
+    postgres_dsn: str, projection_engine: AsyncEngine
+) -> None:
+    async def body(world: SearchWorld) -> None:
+        await world.ingest("standby body", "c-standby")
+        assert (await world.project(projectors=world.lexical_projectors())).dead_lettered == 0
+        rows_before = await _rows(
+            world, "SELECT content_id, indexed_at FROM retrieval.search_documents"
+        )
+        projectors = projectors_with_search(world.backend(write_documents=False))
+
+        await wipe_graph(world.store)  # the store stands in for the standby target here
+        await ensure_schema(world.store)
+        await replay_ledger(world.projector_sessions, world.store, projectors, delivered_only=False)
+
+        # The rows were written live; the standby graph gets the embeddings.
+        assert await world.embedding_ids() == ["c-standby"]
+        assert (
+            await _rows(world, "SELECT content_id, indexed_at FROM retrieval.search_documents")
+            == rows_before
+        )
+
+    with_world(body, dsn=postgres_dsn, owner=projection_engine)
+
+
+def test_unreadable_unpurged_content_stops_an_in_place_rebuild_before_anything_changes(
+    postgres_dsn: str, projection_engine: AsyncEngine
+) -> None:
+    from agent_context_platform.projection.projectors.search import SearchReplayIntegrityError
+
+    async def body(world: SearchWorld) -> None:
+        await world.ingest("kept text", "c-kept")
+        await world.ingest("bytes lost without a purge", "c-lost", turn="turn-2")
+        assert (await world.project()).dead_lettered == 0
+        async with world.owner.begin() as connection:  # storage loss: no content.purged
+            await connection.execute(text("SET LOCAL session_replication_role = replica"))
+            await connection.execute(
+                text("DELETE FROM catalog.inline_contents WHERE content_sha256 = :d"),
+                {"d": hashlib.sha256(b"bytes lost without a purge").hexdigest()},
+            )
+        before = await _graph_state(world)
+        documents = await world.documents()
+
+        with pytest.raises(SearchReplayIntegrityError, match="1 unreadable") as raised:
+            await _rebuild_in_place(world, projectors_with_search(world.backend()))
+
+        assert "c-lost" not in str(raised.value) and "lost" not in str(raised.value)
+        assert await _graph_state(world) == before  # nothing wiped, checkpoints untouched
+        assert await world.documents() == documents
+
+    with_world(body, dsn=postgres_dsn, owner=projection_engine)
+
+
+def test_conflicting_delivered_content_stops_an_in_place_rebuild_before_anything_changes(
+    postgres_dsn: str, projection_engine: AsyncEngine
+) -> None:
+    from agent_context_platform.projection.projectors.search import SearchReplayIntegrityError
+
+    async def body(world: SearchWorld) -> None:
+        await world.ingest("the original body", "c-dup")
+        assert (await world.project()).dead_lettered == 0
+        await world.ingest("a different body", "c-dup", turn="turn-2")
+        async with world.owner.begin() as connection:  # delivered by an older, unchecked worker
+            await connection.execute(
+                text(
+                    "UPDATE projection.outbox SET status = 'delivered', delivered_at = now() "
+                    "WHERE status = 'pending'"
+                )
+            )
+        before = await _graph_state(world)
+
+        with pytest.raises(SearchReplayIntegrityError, match="1 conflicting"):
+            await _rebuild_in_place(world, projectors_with_search(world.backend()))
+
+        assert await _graph_state(world) == before
+
+    with_world(body, dsn=postgres_dsn, owner=projection_engine)
+
+
+def test_the_reset_function_reseeds_tombstones_and_is_the_projectors_only_way_to_empty_them(
+    postgres_dsn: str, projection_engine: AsyncEngine
+) -> None:
+    from sqlalchemy.exc import ProgrammingError
+
+    from agent_context_platform.projection.projectors.search import reset_search_tables
+
+    async def body(world: SearchWorld) -> None:
+        await world.ingest("indexed", "c-a")
+        await world.purge("c-pending")  # never projected: only the ledger knows it
+        await world.project(projectors=())
+        await world.ingest("indexed too", "c-b", turn="turn-2")
+        await world.project()
+        async with world.owner.begin() as connection:
+            await connection.execute(
+                text(
+                    "INSERT INTO retrieval.content_tombstones "
+                    "VALUES ('c-stale', gen_random_uuid(), now())"
+                )
+            )
+        for statement in (
+            "TRUNCATE retrieval.content_tombstones",
+            "DELETE FROM retrieval.content_tombstones",
+            "TRUNCATE retrieval.search_documents",
+        ):
+            with pytest.raises(ProgrammingError, match="permission denied"):
+                async with world.projector_sessions() as session, session.begin():
+                    await session.execute(text(statement))
+
+        async with world.projector_sessions() as session, session.begin():
+            remaining = await reset_search_tables(session)
+
+        assert remaining == 1
+        tombstones = await _rows(world, "SELECT content_id FROM retrieval.content_tombstones")
+        assert [r.content_id for r in tombstones] == ["c-pending"]  # stale one dropped
+        assert await world.documents() == []
+
+    with_world(body, dsn=postgres_dsn, owner=projection_engine)
+
+
+def test_a_hit_reports_the_earliest_delivered_event_never_a_dead_lettered_one(
+    postgres_dsn: str, projection_engine: AsyncEngine
+) -> None:
+    from .search_harness import BASE_TIME
+
+    class _FailTurnTwo:
+        name = "fail-turn-2"
+        version = "1"
+
+        def handles(self, event_type: str) -> bool:
+            return event_type == "agent.turn.started"
+
+        async def project(self, _tx: object, event: Any) -> None:
+            if event.context.turn_id == "turn-2":
+                raise RuntimeError("graph write failed")
+
+    async def body(world: SearchWorld) -> None:
+        await world.ingest(
+            "shared provenance body", "c-prov", session="session-a", turn="turn-2", at=BASE_TIME
+        )
+        assert (await world.project(extra_projectors=[_FailTurnTwo()])).dead_lettered == 1
+        later = await world.ingest(
+            "shared provenance body",
+            "c-prov",
+            session="session-c",
+            turn="turn-3",
+            at=BASE_TIME.replace(hour=12),
+        )
+        assert (await world.project(extra_projectors=[_FailTurnTwo()])).dead_lettered == 0
+
+        (hit,) = await _service(world).lexical("provenance", SCOPE, 5)
+
+        assert (hit.event_id, hit.session_id) == (str(later), "session-c")
+        assert hit.occurred_at == BASE_TIME.replace(hour=12)
+        assert hit.source_event_ids == (str(later),)
 
     with_world(body, dsn=postgres_dsn, owner=projection_engine)
