@@ -47,8 +47,12 @@ class _Result:
 class _Session:
     def __init__(self, results: list[list[tuple[Any, ...]]]) -> None:
         self._results = results
+        self.settings: list[dict[str, Any]] = []
 
-    async def execute(self, _statement: Any) -> _Result:
+    async def execute(self, statement: Any, parameters: Any = None) -> _Result:
+        if "set_config" in str(statement):
+            self.settings.append(dict(parameters))
+            return _Result([])
         return _Result(self._results.pop(0))
 
     async def rollback(self) -> None:
@@ -60,8 +64,11 @@ def _factory(*results: list[tuple[Any, ...]], error: Exception | None = None) ->
     async def open_session() -> AsyncIterator[_Session]:
         if error is not None:
             raise error
-        yield _Session(list(results))
+        session = _Session(list(results))
+        open_session.sessions.append(session)  # type: ignore[attr-defined]
+        yield session
 
+    open_session.sessions = []  # type: ignore[attr-defined]
     return open_session
 
 
@@ -85,6 +92,16 @@ def test_the_sampler_reports_backlog_lag_and_dead_letters(telemetry: Capture) ->
         (("projector", "unattributed"),): 1,
         (("projector", "other"),): 5,
     }
+
+
+def test_the_sampler_bounds_its_queries_with_a_statement_timeout(telemetry: Capture) -> None:
+    factory = _factory([(0, None)], [])
+    sampler = ProjectionSampler(factory, ["agent"], statement_timeout_seconds=1.5)
+
+    assert asyncio.run(sampler.refresh()) is True
+
+    (session,) = factory.sessions
+    assert session.settings == [{"timeout": "1500ms"}]
 
 
 def test_an_empty_backlog_has_no_lag(telemetry: Capture) -> None:

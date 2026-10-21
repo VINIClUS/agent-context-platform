@@ -1,9 +1,10 @@
-"""The projection worker's gauge sampler: one bounded query per interval, never per scrape.
+"""The projection worker's gauge sampler: bounded queries per interval, never per scrape.
 
-`ProjectionSampler.refresh` reads the outstanding outbox rows (count and oldest creation time,
-served by the status index, so the cost follows the backlog like `ProjectionRunner.backlog`) and
-the open dead letters per projector, then replaces the snapshot the observable gauges report.
-A failed refresh clears the snapshot: the gauges stop reporting rather than report stale values.
+`ProjectionSampler.refresh` runs one short transaction with a statement timeout and two queries:
+the outstanding outbox rows (count and oldest creation time, filtered through the status index,
+so the cost follows the backlog like `ProjectionRunner.backlog`) and the open dead letters per
+projector. It then replaces the snapshot the observable gauges report. A failed or timed-out
+refresh clears the snapshot: the gauges stop reporting rather than report stale values.
 """
 
 from __future__ import annotations
@@ -14,7 +15,7 @@ from collections.abc import Callable, Sequence
 from datetime import UTC, datetime
 from typing import Final
 
-from sqlalchemy import func, select
+from sqlalchemy import func, select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_context_platform.observability import contract
@@ -30,6 +31,7 @@ from agent_context_platform.projection.models import (
 _UNATTRIBUTED_DEAD_LETTER: Final = "<projection.runtime>"
 
 Clock = Callable[[], datetime]
+DEFAULT_STATEMENT_TIMEOUT_SECONDS: Final = 2.0
 
 
 class ProjectionSampler:
@@ -40,14 +42,23 @@ class ProjectionSampler:
         session_factory: async_sessionmaker[AsyncSession],
         projector_names: Sequence[str],
         *,
+        statement_timeout_seconds: float = DEFAULT_STATEMENT_TIMEOUT_SECONDS,
         clock: Clock = lambda: datetime.now(UTC),
     ) -> None:
+        if statement_timeout_seconds <= 0:
+            raise ValueError("statement_timeout_seconds must be positive")
+        self._statement_timeout = f"{round(statement_timeout_seconds * 1000)}ms"
         self._session_factory = session_factory
         self._projector_names = tuple(dict.fromkeys(projector_names))
         self._clock = clock
 
     async def sample(self) -> ProjectionSnapshot:
         async with self._session_factory() as session:
+            # Transaction-local: a hung query fails the refresh instead of freezing the gauges.
+            await session.execute(
+                text("SELECT set_config('statement_timeout', :timeout, true)"),
+                {"timeout": self._statement_timeout},
+            )
             outstanding, oldest = (
                 await session.execute(
                     select(func.count(), func.min(OutboxRow.created_at)).where(

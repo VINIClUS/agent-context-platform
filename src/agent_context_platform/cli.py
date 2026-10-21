@@ -841,7 +841,8 @@ def run_command(
                 runner = ProjectionRunner(
                     runtime.sessions, runtime.store, projectors, worker_id=worker_id
                 )
-                if telemetry is not None:
+                # Gauges are metrics: sample them only when metrics are exported.
+                if telemetry is not None and telemetry.exports_metrics:
                     sampler = asyncio.create_task(
                         ProjectionSampler(
                             runtime.sessions, [projector.name for projector in projectors]
