@@ -62,6 +62,11 @@ from agent_context_platform.ledger.repository import (
     ResolvedEvent,
     StreamQuarantinedError,
 )
+from agent_context_platform.observability import (
+    SPAN_LEDGER_APPEND,
+    record_content_object,
+    traced,
+)
 from agent_context_platform.operations.faults import fault_point
 
 IDEMPOTENCY_CONFLICT: Final = "idempotency_conflict"
@@ -131,9 +136,16 @@ class IngestionService:
         async with self._session_factory() as session, session.begin():
             await self._content.attach(session, prepared)
             resolved = [_resolve(event, prepared) for event in batch.events]
-            outcomes = await LedgerRepository.append_with_outcome(session, resolved)
+            with traced(SPAN_LEDGER_APPEND, {"agent_context.event_count": len(resolved)}) as span:
+                outcomes = await LedgerRepository.append_with_outcome(session, resolved)
+                span.set_attribute(
+                    "agent_context.events.created", sum(1 for item in outcomes if item.created)
+                )
             fault_point("ledger.before_commit")
         fault_point("ledger.after_commit_before_response")
+        # Telemetry (PLATFORM-050): content counts as stored only once the batch committed.
+        for storage, result in prepared.storage_outcomes():
+            record_content_object(storage, result)
         accepted = tuple(
             AcceptedEventV1(
                 event_id=outcome.stored.event_id,

@@ -54,6 +54,11 @@ from agent_context_platform.ledger.auth import (
     ProducerPrincipal,
 )
 from agent_context_platform.ledger.service import IngestionService
+from agent_context_platform.observability import (
+    observe_ingestion,
+    record_ingestion_events,
+    set_span_attributes,
+)
 
 logger = logging.getLogger("agent_context_platform.ledger.api")
 
@@ -194,6 +199,7 @@ def _error(
         "error": {"code": code, "message": _MESSAGES[code]},
         "request_id": request.state.request_id,
     }
+    request.state.telemetry_codes = (code,)  # telemetry (PLATFORM-050): a fixed code only
     return JSONResponse(body, status_code=status, headers=dict(headers or {}))
 
 
@@ -341,6 +347,15 @@ router = APIRouter(prefix="/v1/ingestion", tags=["ingestion"])
     },
 )
 async def ingest_batch(request: Request) -> Response:
+    # Telemetry (PLATFORM-050): span, batch outcome and duration from fixed status and codes.
+    with observe_ingestion() as observation:
+        response = await _ingest_batch(request)
+        observation.status = response.status_code
+        observation.codes = getattr(request.state, "telemetry_codes", ())
+    return response
+
+
+async def _ingest_batch(request: Request) -> Response:
     runtime: IngestionRuntime | None = getattr(request.app.state, "ingestion", None)
     if runtime is None:
         return _error(
@@ -392,8 +407,20 @@ async def _handle(request: Request, runtime: IngestionRuntime) -> Response:
         code = ProducerMismatchError.code
         return _reject(request, principal, ProducerMismatchError.status_code, code)
 
+    set_span_attributes(
+        {
+            "agent_context.batch_id": str(batch.batch_id),
+            "agent_context.event_count": len(batch.events),
+        }
+    )
     outcome = await runtime.service.ingest(batch)
     response = outcome.response
+    # Telemetry (PLATFORM-050): per-event results and the batch's fixed error codes.
+    request.state.telemetry_codes = tuple(result.error_code for result in response.rejected)
+    record_ingestion_events(
+        created=sum(1 for result in response.accepted if result.status == "accepted"),
+        existing=sum(1 for result in response.accepted if result.status == "existing"),
+    )
     _log(
         request,
         "ingestion_completed",

@@ -56,10 +56,12 @@ class PostgreSQLSettings(BaseModel):
     # Least-privilege login roles for the operator CLI (members of `agent_context_projector` and
     # `agent_context_api`); each falls back to `dsn` when unset. `admin_dsn` is the operator
     # connection that provisions `operations.registered_producers` and `operations.mcp_tokens`
-    # (the API and projector roles may not write them).
+    # (the API and projector roles may not write them). `migration_dsn` is the schema owner that
+    # `agent-context db upgrade` runs Alembic as (the platform-migrate role, never the API).
     projector_dsn: Secret[PostgresDsn] | None = Field(default=None, repr=False)
     api_dsn: Secret[PostgresDsn] | None = Field(default=None, repr=False)
     admin_dsn: Secret[PostgresDsn] | None = Field(default=None, repr=False)
+    migration_dsn: Secret[PostgresDsn] | None = Field(default=None, repr=False)
 
     @property
     def effective_projector_dsn(self) -> Secret[PostgresDsn] | None:
@@ -73,7 +75,11 @@ class PostgreSQLSettings(BaseModel):
     def effective_admin_dsn(self) -> Secret[PostgresDsn] | None:
         return self.admin_dsn or self.dsn
 
-    @field_validator("dsn", "projector_dsn", "api_dsn", "admin_dsn")
+    @property
+    def effective_migration_dsn(self) -> Secret[PostgresDsn] | None:
+        return self.migration_dsn or self.dsn
+
+    @field_validator("dsn", "projector_dsn", "api_dsn", "admin_dsn", "migration_dsn")
     @classmethod
     def require_async_psycopg_database(
         cls, dsn: Secret[PostgresDsn] | None
@@ -224,6 +230,45 @@ class FaultInjectionSettings(BaseModel):
     after: int = Field(default=1, ge=1)
 
 
+# --- observability (PLATFORM-050) ---------------------------------------------------------------
+class ObservabilitySettings(BaseModel):
+    """OpenTelemetry export (docs/operations/telemetry.md); disabled while no endpoint is set.
+
+    ``otlp_endpoint`` is the OTLP/HTTP base URL; when unset the standard
+    ``OTEL_EXPORTER_OTLP_*ENDPOINT`` variables apply. Export headers (for example access tokens)
+    come only from the standard ``OTEL_EXPORTER_OTLP_*HEADERS`` variables, never from settings.
+    """
+
+    model_config = _SECTION_CONFIG
+
+    enabled: bool = True
+    otlp_endpoint: AnyHttpUrl | None = None
+    service_instance_id: str | None = Field(default=None, min_length=1, max_length=128)
+    export_timeout_seconds: float = Field(default=5.0, gt=0, le=60, allow_inf_nan=False)
+    max_queue_size: int = Field(default=2048, gt=0, le=65_536)
+    max_export_batch_size: int = Field(default=512, gt=0, le=65_536)
+    schedule_delay_seconds: float = Field(default=5.0, gt=0, le=300, allow_inf_nan=False)
+    metric_export_interval_seconds: float = Field(default=30.0, ge=1, le=3600, allow_inf_nan=False)
+    shutdown_timeout_seconds: float = Field(default=5.0, gt=0, le=60, allow_inf_nan=False)
+    projection_sample_seconds: float = Field(default=15.0, ge=1, le=3600, allow_inf_nan=False)
+
+    @field_validator("otlp_endpoint")
+    @classmethod
+    def reject_embedded_credentials(cls, url: AnyHttpUrl | None) -> AnyHttpUrl | None:
+        if url is not None and (url.username is not None or url.password is not None):
+            raise ValueError("OTLP endpoint must not contain credentials")
+        return url
+
+    @model_validator(mode="after")
+    def require_batch_within_queue(self) -> Self:
+        if self.max_export_batch_size > self.max_queue_size:
+            raise ValueError("max_export_batch_size must not exceed max_queue_size")
+        return self
+
+
+# --- end observability ---------------------------------------------------------------------------
+
+
 class Settings(BaseSettings):
     """Single process boundary for the Agent Context environment namespace."""
 
@@ -245,6 +290,7 @@ class Settings(BaseSettings):
     ingestion: IngestionSettings = Field(default_factory=IngestionSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
     fault_injection: FaultInjectionSettings = Field(default_factory=FaultInjectionSettings)
+    observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     # Structural indexer (PLATFORM-032b). Adapters are confined with Landlock and the runner
     # refuses to run them when the kernel cannot enforce it; this is the dev-only escape hatch
     # (AGENT_CONTEXT_INDEXER_ALLOW_UNCONFINED_ADAPTERS). Never enable it in production.

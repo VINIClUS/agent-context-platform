@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID
 
 import pytest
@@ -108,6 +109,9 @@ class FakeContent:
 
 
 class FakePrepared:
+    def storage_outcomes(self) -> tuple[tuple[str, str], ...]:
+        return (("inline", "stored"),)
+
     def resolve(self, claims: Sequence[ContentClaimV1]) -> tuple[()]:
         assert not claims
         return ()
@@ -328,3 +332,18 @@ def test_blob_store_outage_on_partial_replay_keeps_existing_and_retries_only_new
         True,
     )
     assert "begin" not in harness.log
+
+
+def test_content_is_counted_only_once_the_batch_commits(harness: Harness, telemetry: Any) -> None:
+    from agent_context_platform.observability import contract
+
+    draft = _draft("k1")
+    harness.append_result = ContentResolutionError("x")
+    assert _run(harness, _batch(draft)).http_status == 422
+    assert telemetry.points(contract.CONTENT_OBJECTS) == {}
+
+    harness.append_result = [_stored(draft, 1)]
+    assert _run(harness, _batch(draft)).http_status == 200
+    assert telemetry.points(contract.CONTENT_OBJECTS) == {
+        (("result", "stored"), ("storage", "inline")): 1
+    }

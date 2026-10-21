@@ -1,0 +1,132 @@
+name: Release image
+
+# Builds, tests and pushes the platform service image for a version tag only (PLATFORM-049).
+# INFRA-040 pins the printed digest (never the tag) together with the image's labels.
+on:
+  push:
+    tags: ["v*"]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: release-image-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  image:
+    name: Build and push platform image
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: read
+      packages: write
+    env:
+      IMAGE: ghcr.io/viniclus/agent-context-platform
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.28"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Python
+        run: uv python install "3.12"
+
+      - name: Require private SDK token
+        env:
+          SDK_READ_TOKEN: ${{ secrets.AGENT_CONTEXT_SDK_READ_TOKEN }}
+        run: |
+          if [ -z "$SDK_READ_TOKEN" ]; then
+            echo "::error::AGENT_CONTEXT_SDK_READ_TOKEN is required to download the private SDK release"
+            exit 1
+          fi
+
+      - name: Read release metadata
+        run: |
+          uv run --no-project --python "3.12" python <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          pyproject = tomllib.loads(Path("pyproject.toml").read_text())
+          metadata = pyproject["tool"]["agent-context"]["sdk"]
+          version = pyproject["project"]["version"]
+          tag = os.environ["GITHUB_REF_NAME"]
+          if tag != f"v{version}":
+              raise SystemExit(f"tag {tag} does not match the project version {version}")
+          variables = {
+              "VERSION": version,
+              "SDK_REPOSITORY": metadata["repository"],
+              "SDK_VERSION": metadata["version"],
+              "SDK_TAG": metadata["tag"],
+              "SDK_WHEEL_SHA256": metadata["wheel-sha256"],
+              "SDK_WHEEL": f"agent_context_sdk-{metadata['version']}-py3-none-any.whl",
+          }
+          with Path(os.environ["GITHUB_ENV"]).open("a") as github_env:
+              for name, value in variables.items():
+                  print(f"{name}={value}", file=github_env)
+          PY
+
+      - name: Download private SDK wheel
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_CONTEXT_SDK_READ_TOKEN }}
+        run: |
+          mkdir -p build/sdk
+          gh release download "$SDK_TAG" \
+            --repo "$SDK_REPOSITORY" \
+            --pattern "$SDK_WHEEL" \
+            --dir build/sdk
+
+      - name: Verify private SDK wheel
+        run: echo "$SDK_WHEEL_SHA256  build/sdk/$SDK_WHEEL" | sha256sum --check --strict -
+
+      - name: Verify lockfile
+        run: uv lock --check --python "3.12"
+
+      - name: Sync project
+        run: uv sync --frozen --python "3.12"
+
+      - name: Run unit and contract tests
+        run: uv run --frozen pytest -q tests/unit tests/contract --no-cov
+
+      - name: Build the platform image
+        run: |
+          ALEMBIC_HEAD="$(uv run --frozen python -c 'from agent_context_platform.operations.migrate import alembic_config, image_head; print(image_head(alembic_config()))')"
+          echo "ALEMBIC_HEAD=$ALEMBIC_HEAD" >> "$GITHUB_ENV"
+          docker build -f containers/platform/Dockerfile \
+            --build-arg REVISION="$GITHUB_SHA" \
+            --build-arg VERSION="$VERSION" \
+            --build-arg SDK_VERSION="$SDK_VERSION" \
+            --build-arg ALEMBIC_HEAD="$ALEMBIC_HEAD" \
+            -t "$IMAGE:$GITHUB_REF_NAME" .
+
+      - name: Run platform container tests
+        env:
+          AGENT_CONTEXT_TEST_CONTAINER: "1"
+          AGENT_CONTEXT_TEST_PLATFORM_IMAGE: ${{ env.IMAGE }}:${{ github.ref_name }}
+        run: uv run --frozen pytest -q tests/container/test_platform_image.py -m container --no-cov
+
+      - name: Push and print the digest
+        env:
+          REGISTRY_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          echo "$REGISTRY_TOKEN" | docker login ghcr.io --username "$GITHUB_ACTOR" --password-stdin
+          docker push "$IMAGE:$GITHUB_REF_NAME"
+          DIGEST="$(docker image inspect --format '{{index .RepoDigests 0}}' "$IMAGE:$GITHUB_REF_NAME")"
+          docker logout ghcr.io
+          echo "image digest: $DIGEST"
+          {
+            echo "### Platform image"
+            echo ""
+            echo "- digest: \`$DIGEST\`"
+            echo "- revision: \`$GITHUB_SHA\`"
+            echo "- version: \`$VERSION\`, SDK \`$SDK_VERSION\`, Alembic head \`$ALEMBIC_HEAD\`"
+          } >> "$GITHUB_STEP_SUMMARY"
