@@ -17,6 +17,7 @@ from agent_context_platform.projection.schema import (
     Neo4jSchemaMismatchError,
     ProjectionHistory,
     ensure_schema,
+    history_projectors,
     history_state,
     read_projection_history,
     record_projection_history,
@@ -307,3 +308,20 @@ def test_history_state_accepts_a_one_shot_iterable() -> None:
     old = ProjectionHistory(frozenset({"knowledge:1"}))
     pairs = (pair for pair in [("knowledge", "2"), ("quality", "2")])
     assert history_state(old, pairs) == (HistoryState.OUTDATED, ("knowledge:2", "quality:2"))
+
+
+def test_more_markers_than_ever_written_cover_nothing() -> None:
+    marker = {"marker_id": "ledger", "projectors": ["knowledge:2", "quality:2"]}
+    assert _history(*[marker] * 16) == ProjectionHistory(frozenset({"knowledge:2", "quality:2"}))
+    assert _history(*[marker] * 17) == ProjectionHistory(frozenset())
+
+
+def test_a_projector_that_records_no_history_is_never_named_in_the_marker() -> None:
+    class Purge:
+        name, version, records_history = "search", "1", False
+
+    class Plain:
+        name, version = "knowledge", "2"
+
+    assert history_projectors([Plain(), Purge()]) == [("knowledge", "2")]
+    assert schema.REQUIRED_HISTORY == (("knowledge", "2"), ("quality", "2"))

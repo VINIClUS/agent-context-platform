@@ -10,6 +10,8 @@ from typing import Final, LiteralString
 from neo4j import Record
 
 from agent_context_platform.projection.neo4j import Neo4jStore, Neo4jTransaction
+from agent_context_platform.projection.projectors.knowledge import KnowledgeProjector
+from agent_context_platform.projection.projectors.quality import QualityProjector
 
 
 @dataclass(frozen=True, slots=True)
@@ -392,17 +394,35 @@ def _validate_vector_config(record: Record, statement: SchemaStatement) -> None:
 # when it starts on an empty graph before any outbox row was delivered (every event is then still
 # to come, through the current projectors). Wiping the graph removes it. It is metadata about the
 # projection, not a projection of an event, so the graph digest leaves it out (`verify.py`).
-# Readers that depend on complete history (`retrieval/temporal.py`) refuse to serve without it.
+# Readers that depend on complete history (`retrieval/temporal.py`) refuse to serve without it,
+# and `REQUIRED_HISTORY` is the one list of what they need (`projection status`/`verify` report
+# against it too). A projector whose `records_history` attribute is False (one that projects no
+# history, such as a purge-only one) is never named in the marker (`history_projectors`). The
+# worker narrows the marker at start-up to the versions it runs (`narrow_projection_history`), so
+# rolling a projector back and forward again cannot leave a stale claim; restoring a Neo4j dump
+# restores the marker the dump holds, which is only true when the dump and the ledger agree, so
+# rebuild after a restore (README).
 
 HISTORY_LABEL: Final = "ProjectionHistory"
 HISTORY_MARKER_ID: Final = "ledger"
-_MAX_MARKERS: Final = 16
+_MAX_MARKERS: Final = 16  # more than this is never written; reading more fails closed
+
+# The projector versions whose complete history the temporal reads need.
+REQUIRED_HISTORY: Final = (
+    (KnowledgeProjector.name, KnowledgeProjector.version),
+    (QualityProjector.name, QualityProjector.version),
+)
 
 _RECORD_HISTORY: Final[LiteralString] = (
     "MERGE (m:ProjectionHistory {marker_id: $marker_id}) SET m.projectors = $projectors"
 )
 _DELETE_HISTORY: Final[LiteralString] = (
     "MATCH (m:ProjectionHistory) DETACH DELETE m RETURN count(*) AS deleted"
+)
+_NARROW_HISTORY: Final[LiteralString] = (
+    "MATCH (m:ProjectionHistory) SET m.projectors = CASE "
+    "WHEN valueType(m.projectors) STARTS WITH 'LIST' "
+    "THEN [item IN m.projectors WHERE item IN $running] ELSE [] END"
 )
 _READ_HISTORY: Final[LiteralString] = (
     "MATCH (m:ProjectionHistory) RETURN m.marker_id AS marker_id, m.projectors AS projectors "
@@ -443,9 +463,12 @@ async def read_projection_history(tx: Neo4jTransaction) -> ProjectionHistory | N
 
     Fail-closed: a marker of another ID, a `projectors` value that is not a list of strings, or
     several markers (the worker's start-up write has no uniqueness constraint) only ever narrow
-    the result, to the projectors every valid marker names.
+    the result, to the projectors every valid marker names; more than `_MAX_MARKERS` markers
+    cover nothing.
     """
-    records = (await tx.run(_READ_HISTORY, parameters={"limit": _MAX_MARKERS})).records
+    records = (await tx.run(_READ_HISTORY, parameters={"limit": _MAX_MARKERS + 1})).records
+    if len(records) > _MAX_MARKERS:  # not written by this code: trust none of them
+        return ProjectionHistory(frozenset())
     covered: frozenset[str] | None = None
     for record in records:
         value = record["projectors"]
@@ -456,6 +479,29 @@ async def read_projection_history(tx: Neo4jTransaction) -> ProjectionHistory | N
                 names = frozenset()
         covered = names if covered is None else covered & names
     return None if covered is None else ProjectionHistory(covered)
+
+
+def history_projectors(projectors: Iterable[object]) -> list[tuple[str, str]]:
+    """`(name, version)` of the projectors a marker may name: all but `records_history = False`."""
+    return [
+        (str(getattr(item, "name")), str(getattr(item, "version")))  # noqa: B009
+        for item in projectors
+        if getattr(item, "records_history", True) is not False
+    ]
+
+
+async def narrow_projection_history(store: Neo4jStore, running: Iterable[tuple[str, str]]) -> None:
+    """Keep only the marker entries the running projector versions match (worker start-up).
+
+    A version that is no longer running cannot vouch for the events this one projects, so its
+    claim goes; nothing is ever added here.
+    """
+    names = sorted({projector_key(*item) for item in running})
+
+    async def write(tx: Neo4jTransaction) -> None:
+        await tx.run(_NARROW_HISTORY, parameters={"running": names})
+
+    await store.execute_write(write)
 
 
 async def delete_projection_history(tx: Neo4jTransaction) -> int:

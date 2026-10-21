@@ -105,13 +105,12 @@ from agent_context_platform.projection.neo4j import Neo4jTransaction
 from agent_context_platform.projection.projectors.code import timestamp
 from agent_context_platform.projection.projectors.knowledge import (
     DecisionVersion,
-    KnowledgeProjector,
     active_decisions,
     decision_states,
     supersession_edges,
 )
-from agent_context_platform.projection.projectors.quality import QualityProjector
 from agent_context_platform.projection.schema import (
+    REQUIRED_HISTORY,
     HistoryState,
     history_state,
     read_projection_history,
@@ -130,12 +129,6 @@ MAX_CHAIN: Final = 100  # links per direction
 MAX_DEPTH: Final = 50
 MAX_ENTRY_VERSIONS: Final = 100  # recordings listed per history entry (the newest)
 MAX_OBSERVATIONS: Final = 5000
-
-# The projector versions whose complete history the reads need (see "Rebuild required").
-REQUIRED_HISTORY: Final = (
-    (KnowledgeProjector.name, KnowledgeProjector.version),
-    (QualityProjector.name, QualityProjector.version),
-)
 
 # `active_decisions` matches a subject token; scope is enforced in Cypher, so every version is
 # presented to it with this one subject.

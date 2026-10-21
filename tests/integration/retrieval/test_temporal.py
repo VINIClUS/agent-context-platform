@@ -32,7 +32,12 @@ from agent_context_platform.projection.projectors.knowledge import (
     decision_version,
 )
 from agent_context_platform.projection.projectors.quality import QualityProjector
-from agent_context_platform.projection.schema import record_projection_history
+from agent_context_platform.projection.schema import (
+    ProjectionHistory,
+    narrow_projection_history,
+    projection_history,
+    record_projection_history,
+)
 from agent_context_platform.projection.verify import wipe_graph
 from agent_context_platform.retrieval import temporal
 from agent_context_platform.retrieval.graph import RetrievalDeadlineExceeded
@@ -1097,5 +1102,36 @@ def test_a_batched_wipe_refuses_every_read_from_its_first_batch() -> None:
         finally:
             store.execute_write = commit  # type: ignore[method-assign]
         assert len(seen) > 3 and seen == [None] * len(seen)
+
+    with_service(body)
+
+
+def test_a_worker_start_narrows_the_marker_to_the_versions_it_runs() -> None:
+    # Rolled back to knowledge "1" (which projects no history) and forward again: the claim
+    # "2" made before the rollback must not survive it.
+    async def body(store: Neo4jStore, service: TemporalService) -> None:
+        await deliver(store, [decision(1, "dec_a")])
+        running = [(p.name, p.version) for p in ALL]
+        await narrow_projection_history(store, running)  # the same versions: nothing changes
+        assert await active(service, P1, 5) == ["dec_a"]
+        rolled_back = [(name, "1" if name == "knowledge" else v) for name, v in running]
+        await narrow_projection_history(store, rolled_back)
+        history = await projection_history(store)
+        assert history is not None and "knowledge:2" not in history.projectors
+        assert "quality:2" in history.projectors
+        with pytest.raises(temporal.TemporalProjectionOutdated, match="knowledge:2"):
+            await service.decisions(P1)
+        await narrow_projection_history(store, running)  # never adds a claim back
+        with pytest.raises(temporal.TemporalProjectionOutdated):
+            await service.decisions(P1)
+
+        async def corrupt(tx: Neo4jTransaction) -> None:
+            await tx.run(
+                "MATCH (m:ProjectionHistory) SET m.projectors = 'knowledge:2'", parameters={}
+            )
+
+        await store.execute_write(corrupt)
+        await narrow_projection_history(store, running)
+        assert await projection_history(store) == ProjectionHistory(frozenset())
 
     with_service(body)

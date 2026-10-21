@@ -84,6 +84,7 @@ from agent_context_platform.projection.schema import (
     HISTORY_LABEL,
     delete_projection_history,
     ensure_schema,
+    history_projectors,
     record_projection_history,
 )
 
@@ -1705,7 +1706,7 @@ async def _rebuild_projections(
                 session_factory, target, projectors, replay, batch_size
             )
         if verification.ok():
-            await record_projection_history(target, ((p.name, p.version) for p in projectors))
+            await record_projection_history(target, history_projectors(projectors))
     except Exception as error:
         if recorder is not None:
             with contextlib.suppress(Exception):  # the original failure is the one to surface
@@ -1777,7 +1778,7 @@ async def record_history_if_fresh(
         )
     if delivered is not None:
         return False
-    await record_projection_history(store, ((p.name, p.version) for p in projectors))
+    await record_projection_history(store, history_projectors(projectors))
     return True
 
 

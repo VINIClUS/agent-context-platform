@@ -300,6 +300,7 @@ def worker(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         "rebuild_held": False,
         "fresh": False,
         "history_checks": [],
+        "narrowed": [],
     }
     for name, value in {
         "AGENT_CONTEXT_POSTGRESQL__DSN": DSN,
@@ -342,7 +343,11 @@ def worker(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
         state["history_checks"].append((store, projectors))
         return bool(state["fresh"])
 
+    async def narrow(store: Any, running: Any) -> None:
+        state["narrowed"].append((store, list(running)))
+
     monkeypatch.setattr(cli, "_shared_rebuild_lock", shared_lock)
+    monkeypatch.setattr(cli, "narrow_projection_history", narrow)
     monkeypatch.setattr(cli, "record_history_if_fresh", fresh)
     monkeypatch.setattr(cli, "_runtime", runtime)
     monkeypatch.setattr(cli, "ProjectionRunner", Runner)
@@ -376,10 +381,14 @@ def test_run_records_the_history_marker_on_a_fresh_graph_unless_a_rebuild_holds_
     worker["fresh"] = True
     fresh = CliRunner().invoke(cli.app, ["projection", "run", "--once"])
     assert fresh.exit_code == 0 and "projection_worker history_marker_recorded" in fresh.stderr
+    # every start narrows the marker to the versions this worker runs, before the fresh check
+    assert len(worker["narrowed"]) == 2
+    assert worker["narrowed"][0][1] == [(p.name, p.version) for p in projectors]
     worker["rebuild_held"] = True
     worker["history_checks"].clear()
+    worker["narrowed"].clear()
     held = CliRunner().invoke(cli.app, ["projection", "run", "--once"])
-    assert held.exit_code == 0 and worker["history_checks"] == []
+    assert held.exit_code == 0 and worker["history_checks"] == worker["narrowed"] == []
 
 
 def test_run_exit_codes_for_dead_letters_and_timeout(worker: dict[str, Any]) -> None:

@@ -83,7 +83,7 @@ def test_run_once_projects_the_fixture_ledger_to_the_golden_digest(ledger: World
     # current projectors, which is what the history marker records.
     assert "projection_worker history_marker_recorded" in result.stderr
     status = json.loads(invoke(["projection", "status", "--json"], ledger.env(api=None)).stdout)
-    assert status["history"] == {"state": "complete", "missing": []}
+    assert status["history"] == {"state": "complete", "missing": [], "others_missing": []}
 
     # Nothing left: a second drain claims nothing and still exits 0.
     second = invoke(["projection", "run", "--once", "--json"], ledger.env(api=None))

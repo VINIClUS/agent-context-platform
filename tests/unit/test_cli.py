@@ -94,6 +94,9 @@ def calls(monkeypatch: pytest.MonkeyPatch) -> Calls:
 
 
 REGISTERED = sorted(f"{item.name}:{item.version}" for item in registered_projectors())
+REQUIRED = ["knowledge:2", "quality:2"]
+OTHERS = [item for item in REGISTERED if item not in REQUIRED]
+MISSING = {"state": "missing", "missing": REQUIRED, "others_missing": OTHERS}
 
 
 def projector(*issues: str) -> ProjectorVerification:
@@ -192,7 +195,7 @@ def test_verify_reports_a_match_as_json_and_exit_zero(
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["ok"] and payload["graph"]["digest"] == "d" * 64
-    assert payload["history"] == {"state": "missing", "missing": REGISTERED}
+    assert payload["history"] == MISSING
     options = calls.verify[0]
     assert options["require_caught_up"] is False and options["replay_target"] is None
     assert options["recorder"] is not None and options["batch_size"] == 1000
@@ -212,7 +215,13 @@ def test_verify_human_output_and_no_record(monkeypatch: pytest.MonkeyPatch, call
     assert "knowledge:2" in lines[-2] and lines[-1] == "verified"
     calls.history = ProjectionHistory(frozenset(REGISTERED))
     complete = run("projection", "verify", "--no-record")
-    assert "history: complete (projected from the start of the ledger)" in complete.output
+    assert "history: complete for temporal reads\n" in complete.output
+    # the same set the temporal reads check: other projectors are only listed
+    calls.history = ProjectionHistory(frozenset(REQUIRED))
+    required_only = run("projection", "verify", "--no-record")
+    assert "history: complete for temporal reads; other projectors not replayed from the" in (
+        required_only.output
+    )
     # the marker is reported, never a verification failure of its own
     calls.history = ProjectionHistory(frozenset({"knowledge:1"}))
     outdated = run("projection", "verify", "--no-record")
@@ -438,10 +447,10 @@ def test_status_lists_each_projector_read_only(
 
     machine = json.loads(run("projection", "status", "--json").output)
     assert [item["name"] for item in machine["projectors"]] == ["git", "code"]
-    assert machine["history"] == {"state": "missing", "missing": REGISTERED}
+    assert machine["history"] == MISSING
     calls.history = ProjectionHistory(frozenset(REGISTERED))
     machine = json.loads(run("projection", "status", "--json").output)
-    assert machine["history"] == {"state": "complete", "missing": []}
+    assert machine["history"] == {"state": "complete", "missing": [], "others_missing": []}
 
 
 def test_a_missing_or_invalid_configuration_is_a_usage_error(
@@ -565,7 +574,7 @@ def test_the_real_runtime_opens_lazily_and_closes(monkeypatch: pytest.MonkeyPatc
 
     assert result.exit_code == 0 and json.loads(result.output) == {
         "projectors": [],
-        "history": {"state": "missing", "missing": REGISTERED},
+        "history": MISSING,
     }
 
 

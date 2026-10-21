@@ -766,7 +766,7 @@ def test_in_place_rebuild_reproduces_digest_counts_and_ids(world: World) -> None
     # Only now, verified, does the graph claim complete history (what temporal reads require).
     assert payload["history_recorded"] is True
     status = report(invoke(["projection", "status", "--json"], world.env()))
-    assert status["history"] == {"state": "complete", "missing": []}
+    assert status["history"] == {"state": "complete", "missing": [], "others_missing": []}
 
     # The report events the rebuild itself recorded are handled by no projector: still caught up.
     after = invoke(

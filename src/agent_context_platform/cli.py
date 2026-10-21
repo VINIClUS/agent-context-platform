@@ -60,8 +60,11 @@ from agent_context_platform.projection.runtime import (
     Projector,
 )
 from agent_context_platform.projection.schema import (
+    REQUIRED_HISTORY,
     HistoryState,
+    history_projectors,
     history_state,
+    narrow_projection_history,
     projection_history,
 )
 from agent_context_platform.projection.verify import (
@@ -459,19 +462,27 @@ def verify_command(
 
 
 async def _history(store: Neo4jStore, projectors: Sequence[Projector]) -> dict[str, Any]:
-    """Whether these projector versions projected the live graph from the ledger's start."""
-    state, missing = history_state(
-        await projection_history(store), ((item.name, item.version) for item in projectors)
-    )
-    return {"state": state.value, "missing": list(missing)}
+    """Whether the live graph has the complete history the temporal reads need (the same
+    `REQUIRED_HISTORY` they check), and, for information, which other registered projector
+    versions did not project it from the ledger's start."""
+    history = await projection_history(store)
+    state, missing = history_state(history, REQUIRED_HISTORY)
+    _, others = history_state(history, history_projectors(projectors))
+    return {
+        "state": state.value,
+        "missing": list(missing),
+        "others_missing": [item for item in others if item not in missing],
+    }
 
 
 def _history_line(history: dict[str, Any]) -> str:
+    others = history["others_missing"]
+    tail = f"; other projectors not replayed from the start: {', '.join(others)}" if others else ""
     if history["state"] == HistoryState.COMPLETE:
-        return "history: complete (projected from the start of the ledger)"
+        return f"history: complete for temporal reads{tail}"
     return (
         f"history: {history['state']}, rebuild required before temporal reads "
-        f"(not replayed from the start: {', '.join(history['missing']) or 'none'})"
+        f"(not replayed from the start: {', '.join(history['missing'])}){tail}"
     )
 
 
@@ -865,13 +876,18 @@ def run_command(
                 runner = ProjectionRunner(
                     runtime.sessions, runtime.store, projectors, worker_id=worker_id
                 )
-                # A worker starting on an empty graph with nothing delivered projects the whole
-                # ledger: record that (the history marker); never while a rebuild holds the lock.
+                # The history marker: narrowed to the versions this worker runs, and recorded
+                # when it starts on an empty graph with nothing delivered (it then projects the
+                # whole ledger); never while a rebuild holds the lock.
                 async with _shared_rebuild_lock(runtime.sessions) as blocked:
-                    if not blocked and await record_history_if_fresh(
-                        runtime.sessions, runtime.store, projectors
-                    ):
-                        log("history_marker_recorded")
+                    if not blocked:
+                        await narrow_projection_history(
+                            runtime.store, history_projectors(projectors)
+                        )
+                        if await record_history_if_fresh(
+                            runtime.sessions, runtime.store, projectors
+                        ):
+                            log("history_marker_recorded")
                 touch()
                 log("started")
                 try:
