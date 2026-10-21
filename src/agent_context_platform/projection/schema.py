@@ -401,6 +401,9 @@ _MAX_MARKERS: Final = 16
 _RECORD_HISTORY: Final[LiteralString] = (
     "MERGE (m:ProjectionHistory {marker_id: $marker_id}) SET m.projectors = $projectors"
 )
+_DELETE_HISTORY: Final[LiteralString] = (
+    "MATCH (m:ProjectionHistory) DETACH DELETE m RETURN count(*) AS deleted"
+)
 _READ_HISTORY: Final[LiteralString] = (
     "MATCH (m:ProjectionHistory) RETURN m.marker_id AS marker_id, m.projectors AS projectors "
     "LIMIT $limit"
@@ -453,6 +456,11 @@ async def read_projection_history(tx: Neo4jTransaction) -> ProjectionHistory | N
                 names = frozenset()
         covered = names if covered is None else covered & names
     return None if covered is None else ProjectionHistory(covered)
+
+
+async def delete_projection_history(tx: Neo4jTransaction) -> int:
+    """Delete every marker (the first step of a wipe); return how many there were."""
+    return int((await tx.run(_DELETE_HISTORY, parameters={})).records[0]["deleted"])
 
 
 async def projection_history(store: Neo4jStore) -> ProjectionHistory | None:

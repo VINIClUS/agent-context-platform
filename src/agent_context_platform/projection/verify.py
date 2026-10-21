@@ -82,6 +82,7 @@ from agent_context_platform.projection.runtime import (
 from agent_context_platform.projection.schema import (
     CONSTRAINT_STATEMENTS,
     HISTORY_LABEL,
+    delete_projection_history,
     ensure_schema,
     record_projection_history,
 )
@@ -1174,8 +1175,12 @@ async def count_nodes(store: Neo4jStore) -> int:
 
 
 async def wipe_graph(store: Neo4jStore, *, batch: int = _WIPE_BATCH) -> int:
-    """Delete every node and relationship in bounded transactions; return the nodes deleted."""
-    deleted = 0
+    """Delete every node and relationship in bounded transactions; return the nodes deleted.
+
+    The projection history marker goes first, in its own committed transaction: the batches that
+    follow leave a partial graph behind them, and no reader that trusts the marker may see one.
+    """
+    deleted = await store.execute_write(delete_projection_history)
 
     async def delete_batch(tx: Neo4jTransaction) -> int:
         result = await tx.run(

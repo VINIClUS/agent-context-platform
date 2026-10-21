@@ -117,7 +117,7 @@ class FakeTx:
         graph = self.graph
         if "count(n) AS nodes" in query:
             return Rows([Rec(nodes=len(graph.nodes))])
-        if "DETACH DELETE" in query:
+        if "DETACH DELETE" in query and query != schema._DELETE_HISTORY:
             doomed = list(graph.nodes)[: parameters["limit"]]
             for node_id in doomed:
                 del graph.nodes[node_id]
@@ -132,6 +132,11 @@ class FakeTx:
                 projectors=parameters["projectors"],
             )
             return Rows([])
+        if query == schema._DELETE_HISTORY:
+            doomed = [i for i, (labels, _) in graph.nodes.items() if HISTORY_LABEL in labels]
+            for i in doomed:
+                del graph.nodes[i]
+            return Rows([Rec(deleted=len(doomed))])
         if query == schema._READ_HISTORY:
             return Rows(
                 [
@@ -1165,7 +1170,7 @@ async def test_count_and_wipe_work_in_bounded_batches() -> None:
     assert await verify.count_nodes(store) == 5  # type: ignore[arg-type]
     assert await verify.wipe_graph(store, batch=2) == 5  # type: ignore[arg-type]
     assert await verify.count_nodes(store) == 0  # type: ignore[arg-type]
-    assert store.writes == 4  # 2 + 2 + 1, then an empty batch
+    assert store.writes == 5  # the history marker, 2 + 2 + 1, then an empty batch
 
 
 async def test_a_scratch_replay_needs_an_empty_or_confirmed_target(
@@ -1442,6 +1447,23 @@ async def test_only_a_verified_rebuild_records_the_projection_history_marker(
     with pytest.raises(RuntimeError):
         await rebuild(broken, in_place=False, target=target)
     assert await schema.projection_history(target) is None  # type: ignore[arg-type]
+
+
+async def test_a_wipe_deletes_the_history_marker_before_any_other_node() -> None:
+    graph = sample_graph()
+    store = FakeStore(graph)
+    await schema.record_projection_history(store, [("p", "1")])  # type: ignore[arg-type]
+    seen: list[bool] = []
+    commit = store.execute_write
+
+    async def write(callback: Any) -> Any:
+        result = await commit(callback)
+        seen.append(await schema.projection_history(store) is None)  # type: ignore[arg-type]
+        return result
+
+    store.execute_write = write  # type: ignore[method-assign]
+    assert await verify.wipe_graph(store, batch=2) == 6  # type: ignore[arg-type]
+    assert seen and all(seen) and graph.nodes == {}
 
 
 async def test_a_worker_records_the_history_marker_only_on_a_fresh_graph() -> None:

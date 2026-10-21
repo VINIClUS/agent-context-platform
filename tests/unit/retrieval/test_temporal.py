@@ -410,6 +410,20 @@ def test_a_graph_without_complete_history_is_refused_until_rebuilt() -> None:
         asyncio.run(service.decisions(TemporalScope("p")))
 
 
+def test_a_marker_deleted_while_the_data_is_read_refuses_the_answer() -> None:
+    tx = _Tx(lambda _q, _p: [])
+
+    def wiped_meanwhile(_query: str, _parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        tx.history = []  # a wipe started after the first check: read-committed sees it
+        return [version_row("a", 1)]
+
+    tx.script = wiped_meanwhile
+    service = TemporalService(_Driver(tx), database="neo4j", clock=lambda: at(30))  # type: ignore[arg-type]
+    with pytest.raises(temporal.TemporalProjectionOutdated, match=r"\(missing\)"):
+        asyncio.run(service.decisions(TemporalScope("p")))
+    assert tx.queries.count(schema._READ_HISTORY) == 2
+
+
 def test_history_finds_the_decision_whatever_precedes_it_in_the_scope(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

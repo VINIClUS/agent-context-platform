@@ -33,6 +33,7 @@ from agent_context_platform.projection.projectors.knowledge import (
 )
 from agent_context_platform.projection.projectors.quality import QualityProjector
 from agent_context_platform.projection.schema import record_projection_history
+from agent_context_platform.projection.verify import wipe_graph
 from agent_context_platform.retrieval import temporal
 from agent_context_platform.retrieval.graph import RetrievalDeadlineExceeded
 from agent_context_platform.retrieval.temporal import (
@@ -1067,5 +1068,34 @@ def test_a_recurrence_after_a_fix_reopens_the_failure_until_it_is_fixed_again() 
             assert path is not None
             assert (path.failing_run_id, path.passing_run_id) == ("ci_3", "ci_4")
             assert (await service.failures(P1, day(FAR), day(FAR))).failures == ()
+
+    with_service(body)
+
+
+def test_a_batched_wipe_refuses_every_read_from_its_first_batch() -> None:
+    # An in-place rebuild wipes in batches while the API keeps serving: no read may see a graph
+    # that is partly gone, so the marker goes first, in its own transaction.
+    events = [decision(n, f"dec_{n:02d}", valid_from=0) for n in range(1, 13)]
+
+    async def body(store: Neo4jStore, service: TemporalService) -> None:
+        await deliver(store, events)
+        assert len(await active(service, P1, 5)) == 12
+        seen: list[int | None] = []
+        commit = store.execute_write
+
+        async def write_then_read(work: Any) -> Any:
+            result = await commit(work)
+            try:
+                seen.append(len((await service.decisions(P1, day(5), day(FAR))).decisions))
+            except temporal.TemporalProjectionOutdated:
+                seen.append(None)
+            return result
+
+        store.execute_write = write_then_read  # type: ignore[method-assign]
+        try:
+            await wipe_graph(store, batch=4)
+        finally:
+            store.execute_write = commit  # type: ignore[method-assign]
+        assert len(seen) > 3 and seen == [None] * len(seen)
 
     with_service(body)

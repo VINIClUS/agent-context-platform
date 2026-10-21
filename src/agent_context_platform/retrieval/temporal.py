@@ -569,19 +569,18 @@ class TemporalService:
     ) -> ResultT:
         """Run `work` after checking, in the same transaction, that the history is complete.
 
-        Checked on every read, not once per instance: an in-place rebuild wipes the marker and
-        records it again only after verifying its replay, and nothing is served in between.
+        Checked on every read, not once per instance: an in-place rebuild deletes the marker
+        before it wipes anything and records it again only after verifying its replay, and
+        nothing is served in between. Neo4j reads are read-committed, not a snapshot, so the
+        marker is checked again AFTER the data was read: a wipe that started meanwhile deleted
+        it first, and the answer is refused rather than served from a partly wiped graph.
         """
 
         async def guarded(tx: Neo4jTransaction) -> ResultT:
-            state, missing = history_state(await read_projection_history(tx), REQUIRED_HISTORY)
-            if state is not HistoryState.COMPLETE:
-                raise TemporalProjectionOutdated(
-                    f"the graph has no complete history for {', '.join(missing)} ({state.value}): "
-                    "run `agent-context projection rebuild` (README, rebuild required on upgrade) "
-                    "before reading it"
-                )
-            return await work(tx)
+            await _require_history(tx)
+            result = await work(tx)
+            await _require_history(tx)
+            return result
 
         return await self._run(deadline_seconds, guarded)
 
@@ -610,6 +609,16 @@ class TemporalService:
             if "TransactionTimedOut" in (error.code or ""):
                 raise RetrievalDeadlineExceeded("temporal request exceeded its deadline") from error
             raise
+
+
+async def _require_history(tx: Neo4jTransaction) -> None:
+    state, missing = history_state(await read_projection_history(tx), REQUIRED_HISTORY)
+    if state is not HistoryState.COMPLETE:
+        raise TemporalProjectionOutdated(
+            f"the graph has no complete history for {', '.join(missing)} ({state.value}): "
+            "run `agent-context projection rebuild` (README, rebuild required on upgrade) "
+            "before reading it"
+        )
 
 
 def _aware(moment: datetime, name: str) -> datetime:
