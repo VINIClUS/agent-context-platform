@@ -26,6 +26,8 @@ from agent_context_platform.ledger.auth import (
     ProducerAuthenticator,
     SqlProducerLookup,
 )
+from agent_context_platform.ledger.otlp_api import OtlpReceiverRuntime
+from agent_context_platform.ledger.otlp_api import router as otlp_router
 from agent_context_platform.ledger.service import IngestionService
 from agent_context_platform.mcp.auth import (
     MEMORY_READ_SCOPE,
@@ -78,6 +80,31 @@ def _build_ingestion(
         ),
         max_request_body_bytes=ingestion.max_request_body_bytes,
     )
+
+
+# --- Codex OTLP trace receiver (PLATFORM-053) ----------------------------------------------------
+def _build_otlp_receiver(
+    settings: Settings, ingestion: IngestionRuntime | None
+) -> OtlpReceiverRuntime | None:
+    """The receiver shares ingestion's authenticator and service; ``None`` (503) until both
+    ingestion and the stable idempotency key are configured."""
+    receiver = settings.otel_receiver
+    if ingestion is None or receiver.idempotency_hmac_key is None:
+        return None
+    return OtlpReceiverRuntime(
+        authenticator=ingestion.authenticator,
+        service=ingestion.service,
+        limiter=TokenBucketLimiter(
+            rate_per_second=receiver.rate_limit_per_second, burst=receiver.rate_limit_burst
+        ),
+        hmac_key=receiver.idempotency_hmac_key.get_secret_value().strip().encode(),
+        max_request_body_bytes=receiver.max_request_body_bytes,
+        max_decompressed_bytes=receiver.max_decompressed_bytes,
+        max_spans=receiver.max_spans,
+    )
+
+
+# --- end Codex OTLP trace receiver ---------------------------------------------------------------
 
 
 def _build_mcp_auth(
@@ -133,13 +160,15 @@ def create_app(
     ingestion: IngestionRuntime | None = None,
     mcp_auth: McpAuthRuntime | None = None,
     readiness: ReadinessProbe | None = None,
+    otlp_receiver: OtlpReceiverRuntime | None = None,
 ) -> FastAPI:
     """Create an isolated platform application with no external resources.
 
     ``ingestion`` and ``mcp_auth`` inject ready runtimes (tests); otherwise they are built
     from settings when the application starts. Until MCP authentication is bound, ``/mcp``
     answers 401 without a token and 503 with one: it fails closed. ``readiness`` injects the
-    ``/health/ready`` probe; until one is bound the route answers 503.
+    ``/health/ready`` probe; until one is bound the route answers 503. ``otlp_receiver`` injects
+    the Codex OTLP receiver; otherwise it is built with ingestion (503 until configured).
     """
     resolved_settings = Settings() if settings is None else settings
     faults.configure(resolved_settings.fault_injection)
@@ -168,6 +197,10 @@ def create_app(
         sessions = None if engine is None else session_factory(engine)
         if ingestion is None and sessions is not None:
             application.state.ingestion = _build_ingestion(resolved_settings, sessions)
+        if otlp_receiver is None:
+            application.state.otlp_receiver = _build_otlp_receiver(
+                resolved_settings, application.state.ingestion
+            )
         if mcp_auth is None and sessions is not None:
             mcp_holder.runtime = _build_mcp_auth(resolved_settings, sessions)
         store = None
@@ -213,7 +246,9 @@ def create_app(
     application.openapi = openapi  # type: ignore[method-assign]
     application.state.ingestion = ingestion
     application.state.readiness = readiness
+    application.state.otlp_receiver = otlp_receiver
     application.include_router(router)
+    application.include_router(otlp_router)  # PLATFORM-053; outside the frozen OpenAPI
     # Inside the request-context middleware: the server span is a child of the caller's trace.
     application.add_middleware(HttpTelemetryMiddleware)
     application.add_middleware(RequestContextMiddleware)

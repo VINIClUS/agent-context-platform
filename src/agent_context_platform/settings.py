@@ -251,6 +251,39 @@ class ObservabilitySettings(BaseModel):
 # --- end observability ---------------------------------------------------------------------------
 
 
+# --- Codex OTLP trace receiver (PLATFORM-053) ----------------------------------------------------
+class OtelReceiverSettings(BaseModel):
+    """Limits of ``POST /v1/otel/traces`` (docs/data/codex-otel-mapping.md, "Receiver").
+
+    ``idempotency_hmac_key`` keys the mapper's idempotency digest; it must stay stable across
+    restarts and replicas or re-exported records stop deduplicating, so the receiver answers 503
+    until it is set (there is no per-process fallback).
+    """
+
+    model_config = _SECTION_CONFIG
+
+    idempotency_hmac_key: SecretStr | None = Field(default=None, repr=False)
+    # Counted while streaming, before decompression.
+    max_request_body_bytes: int = Field(default=4_194_304, gt=0)
+    # Bound on gzip output: a decompression bomb fails as 413 without being inflated.
+    max_decompressed_bytes: int = Field(default=16_777_216, gt=0)
+    # Spans per request; also bounds the mapped records (one ingestion batch holds 500 events).
+    max_spans: int = Field(default=500, gt=0, le=500)
+    # Per-producer, per-replica token bucket.
+    rate_limit_per_second: float = Field(default=5.0, gt=0, allow_inf_nan=False)
+    rate_limit_burst: int = Field(default=20, gt=0)
+
+    @field_validator("idempotency_hmac_key")
+    @classmethod
+    def require_long_hmac_key(cls, key: SecretStr | None) -> SecretStr | None:
+        if key is not None and len(key.get_secret_value().strip()) < 32:
+            raise ValueError("OTel receiver HMAC key must be at least 32 characters")
+        return key
+
+
+# --- end Codex OTLP trace receiver ---------------------------------------------------------------
+
+
 class Settings(BaseSettings):
     """Single process boundary for the Agent Context environment namespace."""
 
@@ -272,6 +305,7 @@ class Settings(BaseSettings):
     ingestion: IngestionSettings = Field(default_factory=IngestionSettings)
     fault_injection: FaultInjectionSettings = Field(default_factory=FaultInjectionSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
+    otel_receiver: OtelReceiverSettings = Field(default_factory=OtelReceiverSettings)
     # Structural indexer (PLATFORM-032b). Adapters are confined with Landlock and the runner
     # refuses to run them when the kernel cannot enforce it; this is the dev-only escape hatch
     # (AGENT_CONTEXT_INDEXER_ALLOW_UNCONFINED_ADAPTERS). Never enable it in production.

@@ -72,6 +72,14 @@ roll back to an image whose head matches the database, or restore. And the API r
 although only MCP retrieval reads it, because the MCP tools query the graph (PLATFORM-046); an
 API without Neo4j would answer MCP calls it cannot serve.
 
+## Codex OTLP receiver
+
+`POST /v1/otel/traces` accepts Codex trace-safe OTLP/HTTP exports (protobuf) from the collector,
+authenticated with an `events:ingest` producer token, and appends the mapped events to the ledger.
+It answers 503 until `AGENT_CONTEXT_OTEL_RECEIVER__IDEMPOTENCY_HMAC_KEY` is set. Limits, records and
+the collector configuration are in
+[docs/data/codex-otel-mapping.md](docs/data/codex-otel-mapping.md#receiver).
+
 ## Telemetry
 
 The platform exports its own OpenTelemetry traces and metrics over OTLP/HTTP when

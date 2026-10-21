@@ -185,6 +185,16 @@ def _check_service(resource: Mapping[str, object]) -> None:
         raise CodexOtelError(RejectionReason.UNKNOWN_SERVICE)
 
 
+def check_resource(resource: Mapping[str, object]) -> None:
+    """Reject a resource that is not an allowlisted Codex service (loop prevention, bounds).
+
+    The batch entry point for the OTLP receiver: it checks each resource once, so every span of
+    a platform-origin or unknown resource is rejected even when it carries no Codex event.
+    Raises `CodexOtelError` with a fixed reason code.
+    """
+    _check_service(resource)
+
+
 def _check_scalars(attributes: Mapping[str, object]) -> None:
     for key, value in attributes.items():
         if not isinstance(key, str):

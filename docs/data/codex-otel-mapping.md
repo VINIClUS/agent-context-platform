@@ -1,8 +1,8 @@
 # Codex OTel mapping (PLATFORM-051)
 
 `agent_context_platform.ledger.codex_otel` is a pure mapping library: it turns one decoded
-Codex OTel record into an `EventDraftV1`, or into nothing. It does no I/O; the OTLP receiver is
-PLATFORM-050. The SDK is pinned at **v0.3.2**; no private contract exists. Anything without a
+Codex OTel record into an `EventDraftV1`, or into nothing. It does no I/O; the OTLP receiver
+(PLATFORM-053) is described under [Receiver](#receiver). The SDK is pinned at **v0.3.2**; no private contract exists. Anything without a
 v0.3.2 contract is listed in the gap table below and is the input to **SDK-019** (v0.4.0, then
 the PIN-P update).
 
@@ -65,6 +65,45 @@ sandbox export.
   envelope context), the same input the P025 agent projector uses (`session_node_id`), so hook-
   and OTel-origin observations of a session land on one `Session` node. The telemetry source
   event is preserved as its own ledger event; coalescing happens in projection.
+
+## Receiver
+
+`POST /v1/otel/traces` (`ledger/otlp_api.py`) takes an OTLP/HTTP `ExportTraceServiceRequest` and
+feeds every Codex event record through this mapper. It is not part of the frozen
+`/v1/ingestion/*` OpenAPI document.
+
+- **Encoding.** `Content-Type: application/x-protobuf` only (OTLP/JSON is not accepted: 415), with
+  `Content-Encoding` identity or `gzip` (anything else: 415).
+- **Auth.** Exactly the ingestion producers' credentials: `Authorization: Bearer <prefix>.<secret>`
+  of a registered producer with scope `events:ingest` (a `memory:read` token is 403), verified on the
+  same bounded Argon2 path. Every mapped draft names that producer (`name`
+  `codex-otel-receiver`, version `1.0.0`) and the stream `codex-otel:<producer_id>`.
+- **Limits** (`AGENT_CONTEXT_OTEL_RECEIVER__*`): request body 4 MiB counted while streaming
+  (`MAX_REQUEST_BODY_BYTES`), gzip output 16 MiB (`MAX_DECOMPRESSED_BYTES`; a bomb fails as 413
+  without being inflated, a truncated or trailing-data member is 400), 500 spans per request
+  (`MAX_SPANS`, also the bound on mapped records: one atomic ingestion batch), a per-producer token
+  bucket of 5/s, burst 20 (`RATE_LIMIT_PER_SECOND`, `RATE_LIMIT_BURST`; 429 with `Retry-After`).
+- **Idempotency key.** `IDEMPOTENCY_HMAC_KEY` (>= 32 characters) keys the mapper's digest. It must
+  be stable across restarts and replicas; until it is set (and ingestion is configured) the route
+  answers 503. `observed_at` is the record's own OTLP time (span event time, else span end), so a
+  collector retry of the same export maps to identical drafts and is answered `existing`.
+- **Records.** A span whose attributes carry `event.name` is one record; so is each span event that
+  does (Codex's `trace_event!` inside a span). The resource is checked once per `ResourceSpans`
+  (`check_resource`): a platform-origin or unknown resource rejects all its spans. Records the
+  mapper does not model are unmapped (counted, not errors); records it refuses, or that have no
+  OTLP time, reject their span. Records with the same idempotency key in one export collapse into
+  one draft. All drafts of one request are appended as one atomic batch.
+- **Response.** 200 with an `ExportTraceServiceResponse`; when spans were rejected,
+  `partial_success.rejected_spans` and the fixed `error_message` `spans rejected: <reason codes>`
+  (sorted fixed codes such as `platform_origin` or `idempotency_conflict`, never a value). Errors
+  answer a `google.rpc.Status` with a fixed message: 400 malformed, 401/403 credentials, 413, 415,
+  429, and 503 (with `Retry-After`) when unconfigured or on a retryable outage, so the collector
+  retries. Logs carry ids, counts and fixed codes only.
+- **For the collector (INFRA-050).** The `otlphttp` exporter targets
+  `http://platform-api:8000/v1/otel/traces` (set `traces_endpoint`, since the path is not the OTLP
+  default) with `encoding: proto`, optionally `compression: gzip`, and the header
+  `Authorization: Bearer <producer token>` of a producer registered with scope `events:ingest`. It
+  forwards only the Codex trace-safe pipeline, never platform-origin signals.
 
 ## Mapped (SDK v0.3.2)
 
