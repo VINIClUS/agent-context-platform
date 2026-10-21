@@ -18,6 +18,8 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from agent_context_platform.operations.faults import FaultLabel
+
 # Where the indexer image mounts the checkout being indexed (containers/indexer/Dockerfile).
 DEFAULT_CHECKOUT_ROOTS = ("/work",)
 Environment = Literal["development", "test", "production"]
@@ -208,6 +210,20 @@ class SearchSettings(BaseModel):
     embedding_threads: int = Field(default=1, ge=1, le=16)
 
 
+class FaultInjectionSettings(BaseModel):
+    """Crash-test fault points (docs/operations/fault-injection.md); inert by default.
+
+    Armed only when ``enabled`` is true and ``crash_at`` names a label; ``after`` fires on
+    that label's n-th hit. ``Settings`` refuses ``enabled`` in production.
+    """
+
+    model_config = _SECTION_CONFIG
+
+    enabled: bool = False
+    crash_at: FaultLabel | None = None
+    after: int = Field(default=1, ge=1)
+
+
 class Settings(BaseSettings):
     """Single process boundary for the Agent Context environment namespace."""
 
@@ -228,6 +244,7 @@ class Settings(BaseSettings):
     mcp: MCPSettings = Field(default_factory=MCPSettings)
     ingestion: IngestionSettings = Field(default_factory=IngestionSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
+    fault_injection: FaultInjectionSettings = Field(default_factory=FaultInjectionSettings)
     # Structural indexer (PLATFORM-032b). Adapters are confined with Landlock and the runner
     # refuses to run them when the kernel cannot enforce it; this is the dev-only escape hatch
     # (AGENT_CONTEXT_INDEXER_ALLOW_UNCONFINED_ADAPTERS). Never enable it in production.
@@ -242,6 +259,8 @@ class Settings(BaseSettings):
     def require_complete_production_settings(self) -> Self:
         if self.environment != "production":
             return self
+        if self.fault_injection.enabled:
+            raise ValueError("fault injection must not be enabled in production")
 
         neo4j_password = (
             None if self.neo4j.password is None else self.neo4j.password.get_secret_value()

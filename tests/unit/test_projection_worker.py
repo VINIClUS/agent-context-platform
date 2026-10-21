@@ -7,6 +7,7 @@ import json
 from collections.abc import AsyncIterator, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 
 import pytest
@@ -14,6 +15,7 @@ from typer.testing import CliRunner
 
 from agent_context_platform import cli
 from agent_context_platform.projection.runtime import OutboxBacklog, ProjectionRunReport
+from agent_context_platform.projection.schema import history_projectors
 
 pytestmark = pytest.mark.unit
 
@@ -293,7 +295,15 @@ class FakeStore:
 
 @pytest.fixture
 def worker(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
-    state: dict[str, Any] = {"released": 0, "drive_error": None, "outcome": "drained"}
+    state: dict[str, Any] = {
+        "released": 0,
+        "drive_error": None,
+        "outcome": "drained",
+        "rebuild_held": False,
+        "fresh": False,
+        "history_checks": [],
+        "narrowed": [],
+    }
     for name, value in {
         "AGENT_CONTEXT_POSTGRESQL__DSN": DSN,
         "AGENT_CONTEXT_NEO4J__URI": "bolt://live.example.test:7687",
@@ -329,6 +339,20 @@ def worker(monkeypatch: pytest.MonkeyPatch) -> dict[str, Any]:
     async def status(*_args: Any) -> list[Any]:
         return []
 
+    @asynccontextmanager
+    async def shared_lock(_sessions: Any) -> AsyncIterator[bool]:
+        yield state["rebuild_held"]
+
+    async def fresh(_sessions: Any, store: Any, projectors: Any) -> bool:
+        state["history_checks"].append((store, projectors))
+        return bool(state["fresh"])
+
+    async def narrow(store: Any, running: Any) -> None:
+        state["narrowed"].append((store, list(running)))
+
+    monkeypatch.setattr(cli, "_shared_rebuild_lock", shared_lock)
+    monkeypatch.setattr(cli, "narrow_projection_history", narrow)
+    monkeypatch.setattr(cli, "record_history_if_fresh", fresh)
     monkeypatch.setattr(cli, "_runtime", runtime)
     monkeypatch.setattr(cli, "ProjectionRunner", Runner)
     monkeypatch.setattr(cli, "_drive_worker", drive_worker)
@@ -349,6 +373,32 @@ def test_run_prints_the_summary_and_removes_the_health_file(
     assert not health.exists()
     assert worker["released"] == 1 and worker["runtime_closed"]
     assert PASSWORD not in result.output and "db.example.test" not in result.output
+
+
+def test_run_records_the_history_marker_on_a_fresh_graph_unless_a_rebuild_holds_the_lock(
+    worker: dict[str, Any],
+) -> None:
+    quiet = CliRunner().invoke(cli.app, ["projection", "run", "--once"])
+    assert quiet.exit_code == 0 and "history_marker_recorded" not in quiet.stderr
+    (store, projectors), *_ = worker["history_checks"]
+    bound = asyncio.run(
+        cli.build_projectors(cli.Settings(), SimpleNamespace(sessions=None), lexical_only=True)  # type: ignore[arg-type]
+    )
+    assert isinstance(store, FakeStore)
+    assert [(p.name, p.version) for p in projectors] == [(p.name, p.version) for p in bound]
+    worker["fresh"] = True
+    fresh = CliRunner().invoke(cli.app, ["projection", "run", "--once"])
+    assert fresh.exit_code == 0 and "projection_worker history_marker_recorded" in fresh.stderr
+    # every start narrows the marker to the versions this worker runs, before the fresh check
+    assert len(worker["narrowed"]) == 2
+    # a lexical-only search projector projects no embeddings, so the marker never names it
+    assert worker["narrowed"][0][1] == history_projectors(projectors)
+    assert ("search", "1") not in worker["narrowed"][0][1]
+    worker["rebuild_held"] = True
+    worker["history_checks"].clear()
+    worker["narrowed"].clear()
+    held = CliRunner().invoke(cli.app, ["projection", "run", "--once"])
+    assert held.exit_code == 0 and worker["history_checks"] == worker["narrowed"] == []
 
 
 def test_run_exit_codes_for_dead_letters_and_timeout(worker: dict[str, Any]) -> None:

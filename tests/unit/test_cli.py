@@ -15,6 +15,9 @@ from agent_context_sdk.events.system import ProjectionOutcome
 from typer.testing import CliRunner
 
 from agent_context_platform import cli
+from agent_context_platform.projection.neo4j import Neo4jStore
+from agent_context_platform.projection.registry import registered_projectors
+from agent_context_platform.projection.schema import ProjectionHistory
 from agent_context_platform.projection.verify import (
     GraphDigest,
     MissingGrantError,
@@ -60,6 +63,7 @@ class Calls:
         self.preflight: list[tuple[bool, bool]] = []
         self.preflight_error: Exception | None = None
         self.extra_grants: list[tuple[Any, ...]] = []
+        self.history: ProjectionHistory | None = None
 
 
 @pytest.fixture
@@ -87,10 +91,21 @@ def calls(monkeypatch: pytest.MonkeyPatch) -> Calls:
     async def no_search_projectors(*_args: Any, **_kwargs: Any) -> tuple[Any, ...]:
         return ()  # the model is never loaded here; the search wiring has its own tests
 
+    async def fake_history(store: Any) -> ProjectionHistory | None:
+        assert store is seen.runtime_store  # the live graph, never a scratch or standby target
+        return seen.history
+
     monkeypatch.setattr(cli, "_runtime", runtime)
     monkeypatch.setattr(cli, "preflight", fake_preflight)
     monkeypatch.setattr(cli, "_search_projectors", no_search_projectors)
+    monkeypatch.setattr(cli, "projection_history", fake_history)
     return seen
+
+
+REGISTERED = sorted(f"{item.name}:{item.version}" for item in registered_projectors())
+REQUIRED = ["knowledge:2", "quality:2"]
+OTHERS = [item for item in REGISTERED if item not in REQUIRED]
+MISSING = {"state": "missing", "missing": REQUIRED, "others_missing": OTHERS}
 
 
 def projector(*issues: str) -> ProjectorVerification:
@@ -218,6 +233,7 @@ def test_verify_reports_a_match_as_json_and_exit_zero(
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["ok"] and payload["graph"]["digest"] == "d" * 64
+    assert payload["history"] == MISSING
     options = calls.verify[0]
     assert options["require_caught_up"] is False and options["replay_target"] is None
     assert options["recorder"] is not None and options["batch_size"] == 1000
@@ -232,6 +248,22 @@ def test_verify_human_output_and_no_record(monkeypatch: pytest.MonkeyPatch, call
     assert "graph digest " + "d" * 64 in result.output and "verified" in result.output
     assert "replay digest" in result.output and "recorded 1 new" in result.output
     assert calls.verify[0]["recorder"] is None and calls.verify[0]["batch_size"] == 5
+    lines = result.output.splitlines()
+    assert lines[-2].startswith("history: missing, rebuild required before temporal reads")
+    assert "knowledge:2" in lines[-2] and lines[-1] == "verified"
+    calls.history = ProjectionHistory(frozenset(REGISTERED))
+    complete = run("projection", "verify", "--no-record")
+    assert "history: complete for temporal reads\n" in complete.output
+    # the same set the temporal reads check: other projectors are only listed
+    calls.history = ProjectionHistory(frozenset(REQUIRED))
+    required_only = run("projection", "verify", "--no-record")
+    assert "history: complete for temporal reads; other projectors not replayed from the" in (
+        required_only.output
+    )
+    # the marker is reported, never a verification failure of its own
+    calls.history = ProjectionHistory(frozenset({"knowledge:1"}))
+    outdated = run("projection", "verify", "--no-record")
+    assert outdated.exit_code == 0 and "history: outdated, rebuild required" in outdated.output
 
 
 def test_verify_exits_one_on_a_mismatch(monkeypatch: pytest.MonkeyPatch, calls: Calls) -> None:
@@ -451,8 +483,14 @@ def test_status_lists_each_projector_read_only(
     assert "code 1: state none" in human.output and "last run never" in human.output
     assert "search: 5 documents, 3 embeddings (2 without embeddings: run" in human.output
 
+    assert "history: missing, rebuild required before temporal reads" in human.output
+
     machine = json.loads(run("projection", "status", "--json").output)
     assert [item["name"] for item in machine["projectors"]] == ["git", "code"]
+    assert machine["history"] == MISSING
+    calls.history = ProjectionHistory(frozenset(REGISTERED))
+    machine = json.loads(run("projection", "status", "--json").output)
+    assert machine["history"] == {"state": "complete", "missing": [], "others_missing": []}
     assert machine["search"] == {
         "documents": 5,
         "embeddings": 3,
@@ -584,13 +622,20 @@ def test_the_real_runtime_opens_lazily_and_closes(monkeypatch: pytest.MonkeyPatc
         assert sessions is not None
         return []
 
+    async def history(store: Any) -> None:
+        assert isinstance(store, Neo4jStore)
+
     monkeypatch.setattr(cli, "projection_status", fake)
+    monkeypatch.setattr(cli, "projection_history", history)
     monkeypatch.setattr(cli, "_search_status", _search_counts(documents=0, embeddings=0))
 
     result = run("projection", "status", "--json")
 
-    assert result.exit_code == 0
-    assert json.loads(result.output)["projectors"] == []
+    assert result.exit_code == 0 and json.loads(result.output) == {
+        "projectors": [],
+        "history": MISSING,
+        "search": {"documents": 0, "embeddings": 0, "documents_without_embeddings": 0},
+    }
 
 
 def test_server_keys_normalize_local_hosts_and_default_ports() -> None:

@@ -17,6 +17,7 @@ from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 # Module import (not `from ... import`): ledger.repository imports projection.models,
 # so binding the attribute at call time keeps either import order cycle-free.
 import agent_context_platform.ledger.repository as ledger_repository
+from agent_context_platform.operations.faults import fault_point
 from agent_context_platform.projection.checkpoints import CheckpointRepository
 from agent_context_platform.projection.models import (
     DeadLetterRow,
@@ -406,6 +407,7 @@ class ProjectionRunner:
                 failing_projector = projector
                 await projector.project(tx, event)
             failing_projector = None
+            fault_point("projection.during_mutation")
 
         try:
             await self._neo4j.execute_write(run_matching)
@@ -467,6 +469,10 @@ class ProjectionRunner:
                 await session.rollback()
                 return False
 
+            if matching:
+                # Only an event a projector handled reached Neo4j and has checkpoints to
+                # advance; an unhandled one (e.g. `projection.rebuilt`) neither fires nor counts.
+                fault_point("projection.before_checkpoint")
             for projector in matching:
                 await CheckpointRepository.advance(
                     session,

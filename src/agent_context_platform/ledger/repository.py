@@ -61,6 +61,7 @@ from agent_context_platform.ledger.models import (
     RedactionReportRow,
     StreamStatus,
 )
+from agent_context_platform.operations.faults import fault_point
 from agent_context_platform.projection.models import OutboxRow, OutboxStatus
 
 _IDEMPOTENCY_CONSTRAINT = "uq_events_producer_id"
@@ -534,6 +535,7 @@ async def _insert_or_recover(
             session.add_all(_content_ref_rows_from_sealed(sealed))
             await session.flush()
 
+            fault_point("ledger.after_event_before_outbox")
             session.add_all(_redaction_report_rows(sealed.event_id, resolved.redaction_reports))
             session.add(_outbox_row(sealed.event_id, now=insertion_time))
             await session.flush()

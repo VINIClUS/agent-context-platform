@@ -107,6 +107,34 @@ agent-context projection rebuild --target-uri bolt://standby:7687 --target-datab
 agent-context projection rebuild --in-place --confirm neo4j   # stop the projection runner first
 ```
 
+* **Rebuild required on upgrade.** Checkpoints are per `(projector, version)` and a delivered
+  outbox row is never claimed again, so a projector version deployed over a populated graph only
+  sees the events delivered after it. The `knowledge` and `quality` projectors are version `2`:
+  they add the `DecisionVersion` and `FailureObservation` history nodes and the
+  `project_id`/`repository_id`/`recorded_at` run properties the temporal reads
+  (`retrieval/temporal.py`) need, and after an upgrade every older entity lacks some or all of
+  that history. The graph therefore carries a projection history marker
+  (`(:ProjectionHistory {marker_id: "ledger"})`, `projection/schema.py`) naming the projector
+  versions that projected it from the START of the ledger. Only two things record it: a rebuild
+  (in place or into a standby) once its full replay has verified, and `projection run` when it
+  starts on an empty graph before any outbox row was delivered. A wipe deletes the marker in its
+  own transaction BEFORE any other node, and the graph digest leaves it out. At every start the
+  worker also narrows the marker to the projector versions it runs, so rolling a projector back
+  and forward again drops the old claim. `TemporalService` checks the marker in every read
+  transaction, before and again after reading the data (reads are read-committed, so a wipe that
+  starts meanwhile is seen), and raises `TemporalProjectionOutdated` unless it names the current
+  `knowledge` and `quality` versions (`projection.schema.REQUIRED_HISTORY`); it never serves
+  partial history. `projection status` and `projection verify` print
+  `history: complete|outdated|missing` against that same set (JSON `history.state`, with the
+  versions not replayed from the start in `history.missing`, and other registered projectors in
+  `history.others_missing`, for information only); it is reported, not a verification failure
+  (an upgrade without a rebuild already fails `verify` with `processed_count_mismatch`).
+  **Operator procedure on upgrade:** stop the projection runner, deploy, run
+  `projection rebuild --in-place --confirm <database>` (or a standby rebuild and cutover), check
+  that `projection status` prints `history: complete for temporal reads`, then start the runner.
+  **Also rebuild after restoring a Neo4j dump** (the restored marker is only true if the dump and
+  the ledger agree) **and after rolling a projector version back.** The temporal reads use
+  `CALL (...) { ... }` subqueries and need Neo4j 5.23 or later (tests pin 5.26).
 * **Running the projector.** `agent-context projection run` is the worker process: it drives the
   existing `ProjectionRunner` over the registered projectors with the projector-role connection
   (`AGENT_CONTEXT_POSTGRESQL__PROJECTOR_DSN`, falling back to `__DSN`) and the live Neo4j settings.
@@ -339,6 +367,12 @@ fixtures (see its README).
 uv run python scripts/export-openapi.py --check   # exit 1 on drift
 uv run python scripts/export-openapi.py           # rewrite the snapshot (new API versions only)
 ```
+
+## Crash-test fault points
+
+Test images can arm documented crash points (`AGENT_CONTEXT_FAULT_INJECTION__*`) that kill the API or
+the projection worker with exit code 137 at fixed boundaries; settings refuse them in production.
+See `docs/operations/fault-injection.md` for the labels, the variables and the recovery contract.
 
 ## Development workflow
 
