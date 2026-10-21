@@ -14,7 +14,7 @@ authorization headers, cookies, tokens, DSNs, file paths, repository names or ex
 | --- | --- | --- |
 | Endpoint | `AGENT_CONTEXT_OBSERVABILITY__OTLP_ENDPOINT` (base URL, `/v1/traces` and `/v1/metrics` are appended), else the standard `OTEL_EXPORTER_OTLP_ENDPOINT`, `OTEL_EXPORTER_OTLP_TRACES_ENDPOINT`, `OTEL_EXPORTER_OTLP_METRICS_ENDPOINT` | unset: telemetry is **disabled** (no-op providers, nothing is exported) |
 | Kill switch | `OTEL_SDK_DISABLED=true` or `AGENT_CONTEXT_OBSERVABILITY__ENABLED=false` | enabled when an endpoint is set |
-| Headers | standard `OTEL_EXPORTER_OTLP_HEADERS` / `..._TRACES_HEADERS` / `..._METRICS_HEADERS` (for example the Cloudflare Access service-token headers) | none |
+| Headers | standard `OTEL_EXPORTER_OTLP_HEADERS` / `..._TRACES_HEADERS` / `..._METRICS_HEADERS` (for example the Cloudflare Access service-token headers). A signal whose headers are not all `key=value` entries is not exported, and only a fixed, value-free warning is logged | none |
 | Protocol | OTLP/HTTP protobuf | fixed |
 | Export timeout | `AGENT_CONTEXT_OBSERVABILITY__EXPORT_TIMEOUT_SECONDS` | 5 s |
 | Span queue | `..._MAX_QUEUE_SIZE` / `..._MAX_EXPORT_BATCH_SIZE` / `..._SCHEDULE_DELAY_SECONDS` | 2048 / 512 / 5 s |
@@ -78,33 +78,33 @@ Duration histograms use the explicit bucket boundaries
 ### Semantics
 
 - **Ingestion.** One `batches` sample per `POST /v1/ingestion/batches`, with the duration of the
-  whole request. `accepted` means every event was stored or already present (HTTP 200).
-  `rejected` reasons: `auth` (401/403 credential or scope), `schema` (missing or mismatched
-  `Idempotency-Key`, invalid request or payload schema, and the batch-level content codes
-  `duplicate_idempotency_key`, `duplicate_content_id`, `unsupported_media_type`,
-  `invalid_content_encoding`, `content_resolution_mismatch`), `redaction_required`
-  (`content_requires_redaction`), `too_large` (413), `producer_mismatch`, `conflict`
-  (`idempotency_conflict`, `stream_quarantined`). `error` with `internal` covers ingestion not
-  configured, authentication overload, retryable datastore or blob-store outages and unexpected
-  failures. `events` counts the per-event results of accepted batches and the already-stored events
-  reported in rejected ones.
-- **Content.** One sample per content item prepared for a batch: `stored` (written, or inline and
-  recorded idempotently), `reused` (an object-storage digest already uploaded earlier in the same
-  batch), `rejected` (the item failed validation or the redaction re-check; `storage` is derived from
-  the claimed size).
+  whole request. `accepted` means every event was stored or already present (HTTP 200). `rejected`
+  reasons: `auth` (401/403 credential or scope), `schema` (missing or mismatched `Idempotency-Key`,
+  invalid request or payload schema, and the batch-level content codes `duplicate_idempotency_key`,
+  `duplicate_content_id`, `unsupported_media_type`, `invalid_content_encoding`,
+  `content_resolution_mismatch`), `redaction_required` (`content_requires_redaction`), `too_large`
+  (413), `producer_mismatch`, `conflict` (`idempotency_conflict`, `stream_quarantined`). `error`
+  with `internal` covers ingestion not configured, authentication overload, retryable datastore or
+  blob-store outages and unexpected failures. `events` counts the per-event results of accepted
+  batches and the already-stored events reported in rejected ones.
+- **Content.** One sample per content item of a batch. `stored` (written, or inline and recorded
+  idempotently) and `reused` (an object-storage digest already uploaded earlier in the same batch)
+  are recorded once the batch has committed, so a rejected or rolled-back batch counts none of them.
+  `rejected` is recorded when the item fails validation or the redaction re-check; its `storage` is
+  derived from the claimed size.
 - **Projection.** Recorded by the `projection run` worker. A delivered outbox row counts once per
   matching projector (`projector=none` when no projector handles the event type). A retried or
   dead-lettered row counts once for the failing projector (`unattributed` when the event could not
   be loaded or verified). A lost lease is not counted. `duration` is the time of each projector's
   `project` call. The gauges are refreshed by the worker every
-  `AGENT_CONTEXT_OBSERVABILITY__PROJECTION_SAMPLE_SECONDS` (default 15 s) with one bounded query on
-  the projector connection (outstanding outbox rows through the status index, open dead letters by
-  projector); a scrape never queries the database. `outbox_pending` counts outstanding rows
-  (pending, including those waiting out a retry backoff, plus leased). `lag` is the age of the
-  oldest outstanding outbox row, 0 when none is outstanding; it is reported for every running
-  projector because projectors of one event commit together. When a refresh fails the gauges stop
-  reporting until the next successful refresh (alert on absence). The API process never reports
-  these gauges.
+  `AGENT_CONTEXT_OBSERVABILITY__PROJECTION_SAMPLE_SECONDS` (default 15 s), only while metrics are
+  exported, in one short transaction on the projector connection: a 2 s statement timeout and two
+  queries (outstanding outbox rows through the status index, open dead letters by projector); a
+  scrape never queries the database. `outbox_pending` counts outstanding rows (pending, including
+  those waiting out a retry backoff, plus leased). `lag` is the age of the oldest outstanding outbox
+  row, 0 when none is outstanding; it is reported for every running projector because projectors of
+  one event commit together. When a refresh fails or times out the gauges stop reporting until the
+  next successful refresh (alert on absence). The API process never reports these gauges.
 - **Integrity.** `digest_mismatch`: a stored event failed its payload/envelope digest verification
   when the projector loaded it, or an object failed verification when it was attached.
   `missing_object`: an object referenced by an attach was gone. `hash_chain` and `checkpoint` are
@@ -114,17 +114,18 @@ Duration histograms use the explicit bucket boundaries
   unavailable).
 - **Retrieval.** One sample per retrieval operation, recorded with
   `observability.retrieval_span(operation, client_errors=..., deadline_errors=...)` (or the
-  `traced_retrieval` decorator); the composer and MCP tools adopt it. `client_error` is a typed request error
-  (bad scope, depth, anchor not found), `deadline` the request deadline, `server_error` anything
-  else. Graph traversals record `operation=graph`.
-- **MCP.** One sample per request reaching `/mcp`, authentication and transport rejections
-  included, classified from the HTTP status: 2xx `ok`, 401 and 403 `auth_error`, 429
-  `rate_limited`, 5xx `server_error`, any other 4xx (Host/Origin, method, version, size, unknown
-  JSON-RPC method) and a request abandoned before any answer `client_error`. A tool result flagged
-  `isError` is a protocol-level `ok`; its cause is visible in the retrieval metrics. `method` is the
-  validated body method (else the `Mcp-Method` header) and `tool` the `Mcp-Name` header of a
-  `tools/call` (the SDK rejects a header that disagrees with the body), both bounded to the sets
-  above; the body, arguments and results are never read.
+  `traced_retrieval` decorator); the composer and MCP tools adopt it. `client_error` is a typed
+  request error (bad scope, depth, anchor not found), `deadline` the request deadline,
+  `server_error` anything else. Graph traversals record `operation=graph`.
+- **MCP.** One sample per request reaching `/mcp`, authentication and transport rejections included,
+  classified from the HTTP status and its cause: 2xx `ok`, 401 and 403 answered by the access gate
+  `auth_error`, 429 `rate_limited`, 5xx `server_error`, any other 4xx (the guard's Host 421 and
+  Origin 403 before authentication, method, version, size, unknown JSON-RPC method) and a request
+  abandoned before any answer `client_error`. A tool result flagged `isError` is a protocol-level
+  `ok`; its cause is visible in the retrieval metrics. `method` is the validated body method (else
+  the `Mcp-Method` header) and `tool` the `Mcp-Name` header of a `tools/call` (the SDK rejects a
+  header that disagrees with the body), both bounded to the sets above; the body, arguments and
+  results are never read.
 
 ## Spans
 
@@ -139,6 +140,13 @@ Duration histograms use the explicit bucket boundaries
 | `agent_context.index.run` | internal | `agent_context.result`, `agent_context.events.submitted` |
 | `agent_context.retrieval.<operation>` | internal | `agent_context.operation`, `agent_context.outcome` |
 | MCP request, named by `method` (e.g. `tools/call`) | internal | `mcp.method.name`, `gen_ai.tool.name` (one of the five tools), `agent_context.outcome`. Spans recorded by tools nest under it. |
+
+Every platform span is sampled: a caller's `traceparent` links the platform spans into the
+caller's trace, but its sampled flag never drops them. Exported span, parent and link contexts carry
+no `tracestate`. The MCP SDK's own OpenTelemetry middleware (it imports the whole `params._meta`
+carrier, `tracestate` and baggage included) is replaced: per the 2026-07-28 profile a request's
+`params._meta.traceparent` still parents the spans recorded while serving it, but only `traceparent`
+is read. Without a valid one, those spans nest under the platform's MCP request span.
 
 Span attributes pass an allowlist when a span ends: keys outside the list are dropped, closed-set
 values are checked, ids must be UUIDs and counts integers. Span events are dropped except

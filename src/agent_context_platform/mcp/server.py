@@ -4,6 +4,7 @@ from collections.abc import AsyncIterator
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from typing import Any, Final
 
+from mcp.server._otel import OpenTelemetryMiddleware
 from mcp.server.caching import CacheHint
 from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
 from mcp.server.mcpserver import MCPServer
@@ -14,7 +15,12 @@ from starlette.applications import Starlette
 from starlette.types import ASGIApp
 
 from agent_context_platform.mcp.protocol_guard import AccessGate, ProtocolGuard
-from agent_context_platform.mcp.telemetry import McpSpanScope, McpTelemetry
+from agent_context_platform.mcp.telemetry import (
+    McpSpanScope,
+    McpTelemetry,
+    MetaTraceContext,
+    ObservedAccessGate,
+)
 from agent_context_platform.settings import MCPSettings
 
 MCP_PATH: Final = "/mcp"
@@ -63,12 +69,20 @@ class _SortedToolsServer(MCPServer[Any]):
 
 def create_mcp_server(*, advertise_tools: bool = False) -> MCPServer[Any]:
     """Build the read-only MCP server; tools are registered by PLATFORM-046."""
-    return _SortedToolsServer(
+    server = _SortedToolsServer(
         SERVER_NAME,
         version=SERVER_VERSION,
         cache_hints={"tools/list": LIST_CACHE_HINT},
         middleware=[_ServedSurface(advertise_tools=advertise_tools)],
     )
+    # The SDK's default OpenTelemetry middleware (its documented opt-out is removing it) imports
+    # the whole `params._meta` carrier, tracestate and baggage included; the platform's own keeps
+    # only `traceparent` (PLATFORM-050).
+    server.middleware[:] = [
+        MetaTraceContext() if isinstance(middleware, OpenTelemetryMiddleware) else middleware
+        for middleware in server.middleware
+    ]
+    return server
 
 
 class MCPMount:
@@ -107,7 +121,7 @@ def build_mcp_mount(
         allowed_hosts=settings.allowed_hosts,
         allowed_origins=settings.allowed_origins,
         max_body_bytes=settings.max_request_body_bytes,
-        access_gate=access_gate,
+        access_gate=ObservedAccessGate(access_gate),
     )
     # Telemetry outermost, so authentication and transport rejections are counted too.
     return MCPMount(McpTelemetry(guarded), sdk_app)

@@ -12,7 +12,9 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import logging
 import os
+import re
 import threading
 import time
 import uuid
@@ -29,6 +31,7 @@ from opentelemetry.sdk.metrics.export import MetricExporter, PeriodicExportingMe
 from opentelemetry.sdk.resources import Resource
 from opentelemetry.sdk.trace import TracerProvider
 from opentelemetry.sdk.trace.export import BatchSpanProcessor, SpanExporter
+from opentelemetry.sdk.trace.sampling import ALWAYS_ON
 
 from agent_context_platform.observability import contract
 from agent_context_platform.observability.core import Telemetry, current, install
@@ -39,6 +42,17 @@ _SDK_DISABLED: Final = "OTEL_SDK_DISABLED"
 _GENERIC_ENDPOINT: Final = "OTEL_EXPORTER_OTLP_ENDPOINT"
 _TRACES_ENDPOINT: Final = "OTEL_EXPORTER_OTLP_TRACES_ENDPOINT"
 _METRICS_ENDPOINT: Final = "OTEL_EXPORTER_OTLP_METRICS_ENDPOINT"
+_GENERIC_HEADERS: Final = "OTEL_EXPORTER_OTLP_HEADERS"
+_TRACES_HEADERS: Final = "OTEL_EXPORTER_OTLP_TRACES_HEADERS"
+_METRICS_HEADERS: Final = "OTEL_EXPORTER_OTLP_METRICS_HEADERS"
+# The SDK's liberal `key=value` entry shape (opentelemetry.util.re); an entry outside it would be
+# logged verbatim by the SDK, secret value included.
+_HEADER_KEY: Final = r"[\x21\x23-\x27\x2a\x2b\x2d\x2e\x30-\x39\x41-\x5a\x5e-\x7a\x7c\x7e]+"
+_HEADER_ENTRY: Final = re.compile(
+    rf"[ \t]*{_HEADER_KEY}[ \t]*=[ \t]*[\x20\x21\x23-\x2b\x2d-\x3a\x3c-\x5b\x5d-\x7e]*[ \t]*"
+)
+_HEADER_DELIMITER: Final = re.compile(r"[ \t]*,[ \t]*")
+_LOG = logging.getLogger(__name__)
 _PACKAGE: Final = "agent-context-platform"
 _UNKNOWN_VERSION: Final = "0+unknown"
 
@@ -69,17 +83,36 @@ def build_resource(settings: Settings) -> Resource:
     )
 
 
+def _headers_well_formed(environ: Mapping[str, str], specific: str) -> bool:
+    """Whether the export headers the exporter will read (signal-specific first) parse cleanly.
+
+    Malformed entries are never logged here: the caller logs one fixed, value-free message.
+    """
+    raw = environ.get(specific) or environ.get(_GENERIC_HEADERS, "")
+    return all(
+        _HEADER_ENTRY.fullmatch(entry) for entry in _HEADER_DELIMITER.split(raw) if entry.strip()
+    )
+
+
 def _signal_endpoint(
-    settings: Settings, environ: Mapping[str, str], specific: str, path: str
+    settings: Settings, environ: Mapping[str, str], specific: str, path: str, headers: str
 ) -> tuple[bool, str | None]:
     """Whether a signal is exported, and the explicit endpoint (``None``: the exporter reads env)."""
     observability = settings.observability
     if not observability.enabled or environ.get(_SDK_DISABLED, "").strip().lower() == "true":
         return False, None
     if observability.otlp_endpoint is not None:
-        return True, str(observability.otlp_endpoint).rstrip("/") + path
-    configured = environ.get(specific, "").strip() or environ.get(_GENERIC_ENDPOINT, "").strip()
-    return bool(configured), None
+        configured, endpoint = True, str(observability.otlp_endpoint).rstrip("/") + path
+    else:
+        endpoint = None
+        configured = bool(
+            environ.get(specific, "").strip() or environ.get(_GENERIC_ENDPOINT, "").strip()
+        )
+    if configured and not _headers_well_formed(environ, headers):
+        # Fail closed (no export without its credentials) and never echo a header value.
+        _LOG.warning("telemetry export disabled: malformed OTLP headers")
+        return False, None
+    return configured, endpoint
 
 
 def build_telemetry(
@@ -96,8 +129,12 @@ def build_telemetry(
     """
     env = os.environ if environ is None else environ
     observability = settings.observability
-    traces, traces_endpoint = _signal_endpoint(settings, env, _TRACES_ENDPOINT, "/v1/traces")
-    metrics, metrics_endpoint = _signal_endpoint(settings, env, _METRICS_ENDPOINT, "/v1/metrics")
+    traces, traces_endpoint = _signal_endpoint(
+        settings, env, _TRACES_ENDPOINT, "/v1/traces", _TRACES_HEADERS
+    )
+    metrics, metrics_endpoint = _signal_endpoint(
+        settings, env, _METRICS_ENDPOINT, "/v1/metrics", _METRICS_HEADERS
+    )
     if not traces and not metrics:
         return None
     resource = build_resource(settings)
@@ -108,7 +145,9 @@ def build_telemetry(
     spans: SpanExporter | None = None
     if traces:
         spans = span_exporter or OTLPSpanExporter(endpoint=traces_endpoint, timeout=timeout)
-        sdk_tracer = TracerProvider(resource=resource)
+        # Always sampled: a caller's `traceparent` links the trace but its sampled flag never
+        # decides whether the platform's own spans exist.
+        sdk_tracer = TracerProvider(resource=resource, sampler=ALWAYS_ON)
         sdk_tracer.add_span_processor(
             SanitizingSpanProcessor(
                 BatchSpanProcessor(
@@ -165,8 +204,19 @@ def _bounded(call: Callable[[], object], seconds: float) -> None:
 
 
 def start(settings: Settings) -> Telemetry | None:
-    """Install the configured handle; ``None`` (the no-op handle stays) when disabled."""
-    telemetry = build_telemetry(settings)
+    """Install the configured handle; ``None`` (the no-op handle stays) when disabled.
+
+    Never raises: a setup failure (for example an invalid ``OTEL_*`` limit) logs one fixed
+    message and leaves telemetry disabled instead of stopping the process.
+    """
+    try:
+        telemetry = build_telemetry(settings)
+    except Exception as error:
+        _LOG.warning(
+            "telemetry setup failed; continuing without export",
+            extra={"error_class": type(error).__name__},
+        )
+        return None
     if telemetry is not None:
         install(telemetry)
     return telemetry

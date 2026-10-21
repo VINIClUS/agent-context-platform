@@ -86,6 +86,8 @@ class Telemetry:
         meter = meter_provider.get_meter(contract.INSTRUMENTATION_SCOPE)
         self._shutdown = shutdown
         self._projection: ProjectionSnapshot | None = None
+        # Whether metrics leave the process (the projection worker samples its gauges only then).
+        self.exports_metrics = not isinstance(meter_provider, metrics_api.NoOpMeterProvider)
 
         def histogram(name: str, description: str) -> metrics_api.Histogram:
             return meter.create_histogram(
@@ -335,6 +337,8 @@ def _finish_retrieval(
     started: float,
     error: BaseException | None,
 ) -> None:
+    # `RetrievalObservation.outcome` is public: bound it here too.
+    outcome = contract.closed(outcome, contract.RETRIEVAL_OUTCOMES)
     span.set_attribute("agent_context.outcome", outcome)
     if outcome in {"server_error", "deadline"}:
         mark_error(span, error if error is not None else outcome)
@@ -458,12 +462,16 @@ def set_projection_snapshot(snapshot: ProjectionSnapshot | None) -> None:
 # --- MCP and HTTP -------------------------------------------------------------------------------
 
 
-def mcp_outcome(status: int) -> str:
-    """The MCP ``outcome`` for the HTTP status the request was answered with."""
+def mcp_outcome(status: int, *, reached_access_gate: bool = True) -> str:
+    """The MCP ``outcome`` for the HTTP status the request was answered with.
+
+    401/403 are ``auth_error`` only when the access gate answered them; the transport guard's
+    Host/Origin rejections (421/403, before authentication) are ``client_error``.
+    """
     if 200 <= status < 400:
         return "ok"
     if status in {401, 403}:
-        return "auth_error"
+        return "auth_error" if reached_access_gate else "client_error"
     if status == 429:
         return "rate_limited"
     if status >= 500:

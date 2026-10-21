@@ -17,7 +17,7 @@ from typing import Final
 
 from opentelemetry.context import Context
 from opentelemetry.sdk.trace import Event, ReadableSpan, Span, SpanProcessor
-from opentelemetry.trace import Link, Status
+from opentelemetry.trace import Link, SpanContext, Status, TraceState
 from opentelemetry.util.types import Attributes
 
 from agent_context_platform.observability import contract
@@ -125,17 +125,30 @@ def _sanitize_events(events: Sequence[Event]) -> tuple[Event, ...]:
     return tuple(kept)
 
 
+def _without_trace_state(context: SpanContext | None) -> SpanContext | None:
+    """``context`` without its W3C ``tracestate``: caller-chosen text, never exported."""
+    if context is None:
+        return None
+    return SpanContext(
+        context.trace_id, context.span_id, context.is_remote, context.trace_flags, TraceState()
+    )
+
+
 def sanitize_span(span: ReadableSpan) -> ReadableSpan:
     """A copy of ``span`` holding only what the allowlist permits."""
     name = span.name if _SPAN_NAME.fullmatch(span.name) else _FALLBACK_SPAN_NAME
     return ReadableSpan(
         name=name,
-        context=span.context,
-        parent=span.parent,
+        context=_without_trace_state(span.context),
+        parent=_without_trace_state(span.parent),
         resource=span.resource,
         attributes=sanitize_attributes(span.attributes),
         events=_sanitize_events(span.events),
-        links=tuple(Link(link.context) for link in span.links),
+        links=tuple(
+            Link(context)
+            for context in map(_without_trace_state, (link.context for link in span.links))
+            if context is not None
+        ),
         kind=span.kind,
         status=Status(span.status.status_code),
         start_time=span.start_time,
