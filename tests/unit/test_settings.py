@@ -374,7 +374,35 @@ def test_role_dsns_fall_back_to_the_shared_dsn_and_never_print() -> None:
     assert "projector-secret" not in repr(split) and "shared-secret" not in repr(split)
 
 
-@pytest.mark.parametrize("field", ["projector_dsn", "api_dsn", "admin_dsn"])
+def test_the_migration_dsn_falls_back_to_the_shared_dsn_and_never_prints() -> None:
+    shared = "postgresql+psycopg://platform:shared-secret@postgres/agent_context"
+    migration = "postgresql+psycopg://migrator:migration-secret@postgres/agent_context"
+
+    only_shared = Settings(postgresql={"dsn": shared})
+    split = Settings(postgresql={"dsn": shared, "migration_dsn": migration})
+
+    assert only_shared.postgresql.effective_migration_dsn is only_shared.postgresql.dsn
+    assert Settings().postgresql.effective_migration_dsn is None
+    assert split.postgresql.effective_migration_dsn is not None
+    assert split.postgresql.effective_migration_dsn.get_secret_value().unicode_string() == migration
+    assert split.postgresql.effective_api_dsn is split.postgresql.dsn
+    assert "migration-secret" not in repr(split) and "migration-secret" not in str(split)
+
+
+def test_the_migration_dsn_is_read_from_its_own_variable(monkeypatch: pytest.MonkeyPatch) -> None:
+    migration = "postgresql+psycopg://migrator:migration-secret@postgres/agent_context"
+    monkeypatch.setenv("AGENT_CONTEXT_POSTGRESQL__MIGRATION_DSN", migration)
+
+    settings = Settings()
+
+    assert settings.postgresql.dsn is None
+    assert settings.postgresql.effective_migration_dsn is not None
+    assert settings.postgresql.effective_migration_dsn.get_secret_value().unicode_string() == (
+        migration
+    )
+
+
+@pytest.mark.parametrize("field", ["projector_dsn", "api_dsn", "admin_dsn", "migration_dsn"])
 @pytest.mark.parametrize(
     "dsn",
     ["postgresql://u:p@postgres/agent", "postgresql+psycopg://u:p@postgres", "mysql://u:p@h/d"],

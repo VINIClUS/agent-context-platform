@@ -50,6 +50,28 @@ uv run --frozen uvicorn agent_context_platform.app:create_app \
 The process-only liveness endpoint is `GET http://127.0.0.1:8000/health/live`. It does not
 represent readiness of PostgreSQL, object storage, Neo4j, or any other external service.
 
+`GET /health/ready` does: it checks, concurrently and each within two seconds, that PostgreSQL
+answers and `public.alembic_version` holds exactly the Alembic head this code ships, that Neo4j
+accepts a connectivity check and that the S3 bucket answers `HeadBucket`. It answers `200
+{"status":"ready"}` or `503 {"status":"not_ready","components":{...}}` with only the component
+names (`postgresql`, `schema`, `neo4j`, `s3`) and coarse states (`ok`, `unconfigured`,
+`unavailable`, `timeout`, `forbidden`, `mismatch`, `unknown`), never a host, DSN or error text,
+and always with `Cache-Control: no-store`. It only reads (one `SELECT` in a read-only
+transaction) and concurrent requests share a probe while it is younger than the timeout. The
+bound holds even when a dependency vanishes mid-request: a timed-out check is cancelled but never
+awaited (at most four are kept per check), and PostgreSQL is reached over readiness's own unpooled
+engine with libpq connect, keepalive and TCP user timeouts plus a statement timeout, so a dead
+socket left by a failover is never reused. The API's login role needs `SELECT` on
+`public.alembic_version`, which the migrations do not grant yet: without it the schema is
+reported `forbidden` (not ready), never assumed current.
+
+Two consequences of these rules are deliberate. Readiness requires the *exact* head, so a
+replica running an older image leaves rotation as soon as a newer image's migration commits
+(even a purely additive one), and an image-only rollback after a migration never becomes ready:
+roll back to an image whose head matches the database, or restore. And the API requires Neo4j
+although only MCP retrieval reads it, because the MCP tools query the graph (PLATFORM-046); an
+API without Neo4j would answer MCP calls it cannot serve.
+
 ## Quality gates
 
 Run the same gates as CI:
@@ -271,6 +293,88 @@ agent-context mcp-token revoke mcp_AbCd1234xyz            # prefix from `mcp-tok
   `last_used_at`/`updated_at` on producers) and the projector role nothing, so the admin
   connection must be the schema owner or a role granted `SELECT, INSERT, UPDATE` on them. The
   grants are checked before any write; a missing one exits `1` naming it. The DSN is never printed.
+
+### Migrating the schema
+
+`agent-context db upgrade [--expect-head <rev>] [--lock-timeout <seconds>] [--json]` upgrades the
+database to the single Alembic head shipped with the code, through
+`AGENT_CONTEXT_POSTGRESQL__MIGRATION_DSN` (the schema owner; falls back to `__DSN`). It runs
+Alembic in-process on one connection holding a session-level advisory lock for the whole run, so
+two migrate jobs serialize: the second waits (at most `--lock-timeout`, default 600 s) and then
+finds the schema at head and changes nothing. It asserts the resulting revision is exactly the
+head, and `--expect-head` fails before connecting unless it names that head. A database at a
+revision the code does not ship (migrated by a newer image) is refused, never downgraded.
+`agent-context db current [--json]` prints the revision against the head (`at_head`, `behind`,
+`empty` or `unknown`) and takes no lock. Both find `alembic.ini` through `--alembic-config` or
+`AGENT_CONTEXT_ALEMBIC_CONFIG` (default `./alembic.ini`) and never print the DSN.
+`--lock-timeout` must be finite, positive and at most 2147483 s (PostgreSQL's `lock_timeout`).
+SIGTERM or SIGINT (`docker stop` on the migrate container) cancels the run: the lock wait or the
+single migration transaction is abandoned and the connection closed, and the command exits
+`1` with `interrupted` (`db current` shows where the schema is). Exit codes: `0` on success
+(`current`: at head); `1` on a failed or mismatched migration, a lock timeout, an interruption
+or a schema not at head; `2` on a usage error (bad option, missing DSN or Alembic
+configuration) or the downgrade refusal.
+
+## Container image
+
+`containers/platform/Dockerfile` builds the one immutable image every platform role runs (the
+INFRA-040 services): a pinned `python:3.12-slim` digest, the locked environment from
+`uv sync --frozen --no-dev --no-editable` with the verified private SDK wheel, `alembic.ini` and
+`alembic/`, and a stdlib health probe. It adds no compiler, curl, git or shell tooling, runs as
+the dedicated numeric user `10002:10002` (distinct from the indexer image's `10001`), and its
+default command is exec-form.
+
+```bash
+docker build -f containers/platform/Dockerfile \
+  --build-arg REVISION="$(git rev-parse HEAD)" --build-arg VERSION=0.1.0 \
+  --build-arg SDK_VERSION=0.6.0 --build-arg ALEMBIC_HEAD=20260929_0001 \
+  -t agent-context-platform:dev .
+```
+
+The build arguments fill the labels `org.opencontainers.image.revision`,
+`org.opencontainers.image.version`, `io.agent-context.sdk.version` and
+`io.agent-context.alembic.head`; each one that is set is checked against what the image actually
+contains, and the build fails on a mismatch (only `VERSION` may carry a leading `v`, as a tag
+does). Unset, they read `unknown`/`dev` (local builds).
+
+| Role | Command | Environment |
+| --- | --- | --- |
+| `platform-migrate` (one-shot, before the API) | `agent-context db upgrade --expect-head <io.agent-context.alembic.head>` | `AGENT_CONTEXT_POSTGRESQL__MIGRATION_DSN` |
+| `platform-api` (2 replicas) | default: `uvicorn agent_context_platform.app:create_app --factory --host 0.0.0.0 --port 8000 --no-access-log --no-server-header` | `AGENT_CONTEXT_ENVIRONMENT=production`, `__POSTGRESQL__DSN` (API login), `__NEO4J__*`, `__S3__*`, `__MCP__TOKEN_HMAC_KEY`, `__MCP__ALLOWED_HOSTS`/`__ALLOWED_ORIGINS` |
+| `platform-projector` | `agent-context projection run` | `__POSTGRESQL__PROJECTOR_DSN`, `__NEO4J__*` |
+| `platform-indexer` | `agent-context index --repository-id <id> --checkout /work` | `__POSTGRESQL__API_DSN`; run with `user: "10001:10001"` |
+
+The migrate role needs only its DSN: it does not set `AGENT_CONTEXT_ENVIRONMENT=production`,
+whose completeness check covers the serving roles. Only the API serves HTTP, so the image declares
+no `HEALTHCHECK`; the API's compose service uses the stdlib probe (no curl, no shell):
+`test: ["CMD", "python", "/app/healthcheck.py", "/health/ready"]` (`/health/live` is the
+default path, port `8000` the default port). Gate the API on `service_completed_successfully` of
+`platform-migrate`. The structural indexer's adapter sandbox relies on `RLIMIT_NPROC`, which is
+per UID, so the indexer role runs as the indexer image's dedicated `10001`, which no other role
+uses (or runs `containers/indexer/Dockerfile` itself, with its documented flags and a read-only
+`/work` mount).
+
+Every role runs with a read-only root filesystem and a scratch tmpfs; the image needs no
+writable path besides `/tmp` and no capability:
+
+```bash
+docker run --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m --cap-drop ALL \
+  --security-opt no-new-privileges --pids-limit 256 --memory 1g agent-context-platform:dev
+```
+
+Semantic-search model files (`AGENT_CONTEXT_SEARCH__MODEL_DIR`, PLATFORM-042) are not baked into
+the image: provision them into a read-only volume and point the variable at its mount.
+
+`tests/container/test_platform_image.py` (the `Platform image` CI job) checks the user, the
+read-only boot, dropped capabilities, the labels, the exec-form command, the absence of compilers
+and network tools, `agent-context --help`, the shipped head and `/health/live` inside the
+container. Run it with `AGENT_CONTEXT_TEST_CONTAINER=1` (and `AGENT_CONTEXT_TEST_PLATFORM_IMAGE`
+to test an already built tag). A `v*` tag runs `.github/workflows/release-image.yml`, which checks
+that the tag is `v<project version>` and the lockfile, runs the unit and contract tests, builds
+with the labels, runs the same container tests, pushes `ghcr.io/viniclus/agent-context-platform:<tag>` and
+prints the digest; infra pins that digest (`image: ghcr.io/viniclus/agent-context-platform@sha256:...`)
+in its `versions.lock`, never the tag, and passes the `io.agent-context.alembic.head` label to
+`--expect-head`.
 
 ## Ingestion API contract
 

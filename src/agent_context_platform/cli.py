@@ -3,7 +3,8 @@
 It exposes `agent-context projection rebuild|verify|status` (PLATFORM-039) and the credential
 provisioning commands `agent-context producer register|revoke|list` and
 `agent-context mcp-token create|revoke|list` (PLATFORM-039B), plus `agent-context index` (PLATFORM-039C,
-which indexes one git checkout into the ledger as the indexer producer). Every command reads the process environment through `Settings` (`AGENT_CONTEXT_*`), runs in one `asyncio.run`,
+which indexes one git checkout into the ledger as the indexer producer) and
+`agent-context db upgrade|current` (PLATFORM-049, the platform-migrate role). Every command reads the process environment through `Settings` (`AGENT_CONTEXT_*`), runs in one `asyncio.run`,
 and never prints a DSN, a password or an exception message: failures are reported by class name.
 
 Exit codes: 0 success, 1 verification mismatch or a failed operation, 2 usage error (bad or
@@ -20,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import os
 import signal
 import stat
@@ -50,7 +52,7 @@ from agent_context_platform.indexing.emitter import IndexingConfig, IndexingServ
 from agent_context_platform.indexing.identity import repository_namespace
 from agent_context_platform.indexing.pipeline import IndexReport, IndexRequest, index_checkout
 from agent_context_platform.ledger.service import IngestionService
-from agent_context_platform.operations import faults, provisioning
+from agent_context_platform.operations import faults, migrate, provisioning
 from agent_context_platform.projection.neo4j import Neo4jStore
 from agent_context_platform.projection.registry import registered_projectors
 from agent_context_platform.projection.runtime import (
@@ -344,6 +346,9 @@ def _run(main: Callable[[], Coroutine[Any, Any, int]]) -> None:
     except provisioning.CommitAfterDeliveryError as error:
         typer.echo(f"error: {_recovery_message(error)}", err=True)
         code = EXIT_FAILED
+    except migrate.MigrationError as error:
+        typer.echo(f"error: {error.code}: {error}", err=True)
+        code = EXIT_USAGE if error.usage_error else EXIT_FAILED
     except provisioning.ProvisioningError as error:
         typer.echo(f"error: {error.code}{_PROVISIONING_HINTS.get(error.code, '')}", err=True)
         code = EXIT_USAGE
@@ -1376,6 +1381,136 @@ def mcp_token_list_command(json_output: _JSON = False) -> None:
         return EXIT_OK
 
     _run(main)
+
+
+# --- `agent-context db` (PLATFORM-049): schema migrations for the platform-migrate role. ---------
+# It connects with AGENT_CONTEXT_POSTGRESQL__MIGRATION_DSN (falling back to __DSN) and runs only
+# the Alembic scripts shipped next to it (see operations/migrate.py).
+
+db_app = typer.Typer(
+    help="Upgrade and inspect the database schema.",
+    no_args_is_help=True,
+    add_completion=False,
+    pretty_exceptions_enable=False,
+)
+app.add_typer(db_app, name="db")
+
+_ALEMBIC_CONFIG = Annotated[
+    Path | None,
+    typer.Option(
+        "--alembic-config",
+        envvar=migrate.ALEMBIC_CONFIG_ENV,
+        help=f"The shipped alembic.ini (or ${migrate.ALEMBIC_CONFIG_ENV}; default ./alembic.ini).",
+    ),
+]
+
+
+@db_app.command("upgrade")
+def db_upgrade_command(
+    expect_head: Annotated[
+        str | None,
+        typer.Option("--expect-head", help="Fail unless the image's head is this revision."),
+    ] = None,
+    lock_timeout: Annotated[
+        float,
+        typer.Option(
+            "--lock-timeout",
+            help="Seconds to wait for a concurrent migration "
+            f"(at most {migrate.MAX_LOCK_TIMEOUT_SECONDS:.0f}).",
+        ),
+    ] = migrate.DEFAULT_LOCK_TIMEOUT_SECONDS,
+    alembic_config: _ALEMBIC_CONFIG = None,
+    json_output: _JSON = False,
+) -> None:
+    """Upgrade to the image's Alembic head under the migration lock; never downgrades."""
+
+    async def main() -> int:
+        if not (
+            math.isfinite(lock_timeout) and 0 < lock_timeout <= migrate.MAX_LOCK_TIMEOUT_SECONDS
+        ):
+            raise CliUsageError(
+                f"--lock-timeout must be in (0, {migrate.MAX_LOCK_TIMEOUT_SECONDS:.0f}] seconds"
+            )
+        settings = _load_settings()
+        config = migrate.alembic_config(alembic_config)
+        engine = _engine(settings.postgresql.effective_migration_dsn, "MIGRATION_DSN")
+        # As PID 1 of the migrate container, `docker stop` sends SIGTERM: cancel the run so the
+        # lock wait (or the migration transaction) is abandoned and the connection closed,
+        # instead of being SIGKILLed while the server backend keeps waiting.
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+        interrupted = asyncio.Event()
+
+        def stop() -> None:
+            interrupted.set()
+            if task is not None:
+                task.cancel()
+
+        handled: list[signal.Signals] = []
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+                loop.add_signal_handler(sig, stop)
+                handled.append(sig)
+        try:
+            report = await migrate.upgrade(
+                engine, config, expect_head=expect_head, lock_timeout_seconds=lock_timeout
+            )
+        except BaseException:
+            if not interrupted.is_set():
+                raise
+            if task is not None:
+                task.uncancel()
+            raise migrate.MigrationError(
+                "interrupted", "stopped by a signal; run `db current` to see the revision"
+            ) from None
+        finally:
+            # A second signal during clean-up gets the default action.
+            for sig in handled:
+                loop.remove_signal_handler(sig)
+            await engine.dispose()
+        line = (
+            f"schema upgraded from {report.before or 'an empty database'} to {report.after}"
+            if report.applied
+            else f"schema already at head {report.after}"
+        )
+        _emit(
+            {
+                "before": report.before,
+                "after": report.after,
+                "head": report.head,
+                "applied": report.applied,
+            },
+            as_json=json_output,
+            lines=[line],
+        )
+        return EXIT_OK
+
+    _run(main)
+
+
+@db_app.command("current")
+def db_current_command(alembic_config: _ALEMBIC_CONFIG = None, json_output: _JSON = False) -> None:
+    """Show the database's revision against the image's head (exit 1 unless at head)."""
+
+    async def main() -> int:
+        settings = _load_settings()
+        config = migrate.alembic_config(alembic_config)
+        engine = _engine(settings.postgresql.effective_migration_dsn, "MIGRATION_DSN")
+        try:
+            report = await migrate.current(engine, config)
+        finally:
+            await engine.dispose()
+        _emit(
+            {"revision": report.revision, "head": report.head, "state": report.state},
+            as_json=json_output,
+            lines=[f"revision {report.revision or 'none'} head {report.head}: {report.state}"],
+        )
+        return EXIT_OK if report.state == "at_head" else EXIT_FAILED
+
+    _run(main)
+
+
+# --- end of `agent-context db` ------------------------------------------------------------------
 
 
 if __name__ == "__main__":

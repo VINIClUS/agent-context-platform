@@ -15,6 +15,7 @@ from agent_context_sdk.events.system import ProjectionOutcome
 from typer.testing import CliRunner
 
 from agent_context_platform import cli
+from agent_context_platform.operations import migrate
 from agent_context_platform.projection.neo4j import Neo4jStore
 from agent_context_platform.projection.registry import registered_projectors
 from agent_context_platform.projection.schema import ProjectionHistory
@@ -621,3 +622,201 @@ def test_the_runner_quiet_period_is_an_option_and_dead_letters_are_reported(
     assert skipped["count"] == 11 and skipped["event_ids"][0] == str(poison)
     assert "skipped 11 dead-lettered events" in custom.output and "..." in custom.output
     assert "MUST be stopped" in run("projection", "rebuild", "--help").output.replace("\n", " ")
+
+
+# --- `agent-context db` (PLATFORM-049) ------------------------------------------------------------
+
+
+class MigrateCalls:
+    def __init__(self) -> None:
+        self.upgrade: list[dict[str, Any]] = []
+        self.current = 0
+        self.disposed = 0
+
+
+@pytest.fixture
+def migrations(monkeypatch: pytest.MonkeyPatch) -> MigrateCalls:
+    calls = MigrateCalls()
+    monkeypatch.delenv("AGENT_CONTEXT_POSTGRESQL__MIGRATION_DSN", raising=False)
+    monkeypatch.delenv(migrate.ALEMBIC_CONFIG_ENV, raising=False)
+
+    class Engine:
+        def __init__(self, url: str) -> None:
+            self.url = url
+
+        async def dispose(self) -> None:
+            calls.disposed += 1
+
+    def fake_engine(url: str, **_kwargs: Any) -> Engine:
+        calls.upgrade.append({"url": url})
+        return Engine(url)
+
+    monkeypatch.setattr(cli, "create_async_engine", fake_engine)
+    return calls
+
+
+def _migration_report(*, applied: bool) -> migrate.MigrationReport:
+    return migrate.MigrationReport(
+        "20260823_0001" if applied else "20260929_0001", "20260929_0001", "20260929_0001", applied
+    )
+
+
+def test_db_upgrade_uses_the_migration_dsn_and_reports_without_secrets(
+    monkeypatch: pytest.MonkeyPatch, migrations: MigrateCalls
+) -> None:
+    migration_password = "migration-only-secret"
+    monkeypatch.setenv(
+        "AGENT_CONTEXT_POSTGRESQL__MIGRATION_DSN",
+        f"postgresql+psycopg://migrator:{migration_password}@db.example.test/agent",
+    )
+    seen: dict[str, Any] = {}
+
+    async def fake_upgrade(engine: Any, config: Any, **options: Any) -> migrate.MigrationReport:
+        seen.update(options, url=engine.url, config=config.config_file_name)
+        return _migration_report(applied=True)
+
+    monkeypatch.setattr(migrate, "upgrade", fake_upgrade)
+
+    result = CliRunner().invoke(
+        cli.app, ["db", "upgrade", "--expect-head", "20260929_0001", "--lock-timeout", "5"]
+    )
+
+    assert result.exit_code == cli.EXIT_OK, result.stderr
+    assert result.stdout.strip() == "schema upgraded from 20260823_0001 to 20260929_0001"
+    assert seen["url"].startswith("postgresql+psycopg://migrator:")
+    assert seen["expect_head"] == "20260929_0001"
+    assert seen["lock_timeout_seconds"] == 5
+    assert seen["config"] == "alembic.ini"
+    assert migrations.disposed == 1
+    assert migration_password not in result.output and PASSWORD not in result.output
+
+
+def test_db_upgrade_falls_back_to_the_shared_dsn_and_reports_a_no_op_as_json(
+    monkeypatch: pytest.MonkeyPatch, migrations: MigrateCalls
+) -> None:
+    async def fake_upgrade(engine: Any, config: Any, **options: Any) -> migrate.MigrationReport:
+        assert engine.url == DSN
+        return _migration_report(applied=False)
+
+    monkeypatch.setattr(migrate, "upgrade", fake_upgrade)
+
+    result = CliRunner().invoke(cli.app, ["db", "upgrade", "--json"])
+
+    assert result.exit_code == cli.EXIT_OK
+    assert json.loads(result.stdout) == {
+        "before": "20260929_0001",
+        "after": "20260929_0001",
+        "head": "20260929_0001",
+        "applied": False,
+    }
+    result = CliRunner().invoke(cli.app, ["db", "upgrade"])
+    assert result.stdout.strip() == "schema already at head 20260929_0001"
+
+
+@pytest.mark.parametrize(
+    ("error", "exit_code"),
+    [
+        (migrate.MigrationError("unknown_revision", "refusing to downgrade"), cli.EXIT_USAGE),
+        (migrate.MigrationError("alembic_config_missing", "not found"), cli.EXIT_USAGE),
+        (migrate.MigrationError("interrupted", "stopped by a signal"), cli.EXIT_FAILED),
+        (migrate.MigrationError("head_mismatch", "not at head"), cli.EXIT_FAILED),
+        (migrate.MigrationError("lock_timeout", "held too long"), cli.EXIT_FAILED),
+        (RuntimeError(f"connection to {DSN} failed"), cli.EXIT_FAILED),
+    ],
+)
+def test_db_upgrade_failures_map_to_exit_codes_without_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+    migrations: MigrateCalls,
+    error: Exception,
+    exit_code: int,
+) -> None:
+    async def fake_upgrade(*_args: Any, **_options: Any) -> migrate.MigrationReport:
+        raise error
+
+    monkeypatch.setattr(migrate, "upgrade", fake_upgrade)
+
+    result = CliRunner().invoke(cli.app, ["db", "upgrade"])
+
+    assert result.exit_code == exit_code
+    assert result.stdout == ""
+    assert PASSWORD not in result.output and "db.example.test" not in result.output
+    assert migrations.disposed == 1
+    if isinstance(error, migrate.MigrationError):
+        assert result.stderr.strip() == f"error: {error.code}: {error}"
+
+
+def test_db_commands_need_a_dsn_and_the_alembic_scripts(
+    monkeypatch: pytest.MonkeyPatch, migrations: MigrateCalls, tmp_path: Any
+) -> None:
+    monkeypatch.delenv("AGENT_CONTEXT_POSTGRESQL__DSN")
+    result = CliRunner().invoke(cli.app, ["db", "upgrade"])
+    assert result.exit_code == cli.EXIT_USAGE
+    assert "AGENT_CONTEXT_POSTGRESQL__MIGRATION_DSN (or __DSN) is required" in result.stderr
+
+    missing = str(tmp_path / "missing.ini")
+    result = CliRunner().invoke(cli.app, ["db", "current", "--alembic-config", missing])
+    assert result.exit_code == cli.EXIT_USAGE
+    assert result.stderr.startswith("error: alembic_config_missing: ")
+    assert migrations.upgrade == []
+
+
+@pytest.mark.parametrize(
+    ("state", "exit_code"),
+    [("at_head", cli.EXIT_OK), ("behind", cli.EXIT_FAILED), ("empty", cli.EXIT_FAILED)],
+)
+def test_db_current_reports_the_state(
+    monkeypatch: pytest.MonkeyPatch, migrations: MigrateCalls, state: str, exit_code: int
+) -> None:
+    revision = None if state == "empty" else "20260929_0001"
+    report = migrate.CurrentReport(revision, "20260929_0001", state)  # type: ignore[arg-type]
+
+    async def fake_current(*_args: Any) -> migrate.CurrentReport:
+        return report
+
+    monkeypatch.setattr(migrate, "current", fake_current)
+
+    result = CliRunner().invoke(cli.app, ["db", "current"])
+    as_json = CliRunner().invoke(cli.app, ["db", "current", "--json"])
+
+    assert result.exit_code == exit_code
+    assert result.stdout.strip() == f"revision {revision or 'none'} head 20260929_0001: {state}"
+    assert json.loads(as_json.stdout) == {
+        "revision": revision,
+        "head": "20260929_0001",
+        "state": state,
+    }
+    assert migrations.disposed == 2
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "0", "-1", "1e12", "2147484"])
+def test_db_upgrade_rejects_a_lock_timeout_postgresql_cannot_hold(
+    monkeypatch: pytest.MonkeyPatch, migrations: MigrateCalls, value: str
+) -> None:
+    async def fake_upgrade(*_args: Any, **_options: Any) -> migrate.MigrationReport:
+        raise AssertionError("must not upgrade")
+
+    monkeypatch.setattr(migrate, "upgrade", fake_upgrade)
+
+    result = CliRunner().invoke(cli.app, ["db", "upgrade", "--lock-timeout", value])
+
+    assert result.exit_code == cli.EXIT_USAGE
+    assert migrations.upgrade == []
+
+
+def test_db_upgrade_accepts_the_largest_lock_timeout(
+    monkeypatch: pytest.MonkeyPatch, migrations: MigrateCalls
+) -> None:
+    seen: dict[str, Any] = {}
+
+    async def fake_upgrade(engine: Any, config: Any, **options: Any) -> migrate.MigrationReport:
+        seen.update(options)
+        return _migration_report(applied=False)
+
+    monkeypatch.setattr(migrate, "upgrade", fake_upgrade)
+
+    result = CliRunner().invoke(
+        cli.app, ["db", "upgrade", "--lock-timeout", str(migrate.MAX_LOCK_TIMEOUT_SECONDS)]
+    )
+
+    assert result.exit_code == cli.EXIT_OK, result.stderr
+    assert seen["lock_timeout_seconds"] == migrate.MAX_LOCK_TIMEOUT_SECONDS
