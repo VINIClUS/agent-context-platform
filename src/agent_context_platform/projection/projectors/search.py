@@ -301,9 +301,10 @@ class SearchProjector:
 
     def __init__(self, backend: SearchBackend | None = None) -> None:
         self._backend = backend
-        # The history marker (`schema.history_projectors`) may name this projector only when it
-        # projects everything it handles, embeddings included: never lexical-only or unbound.
-        self.records_history = backend is not None and backend.embeddings is not None
+        # The history marker (`schema.history_projectors`) never names a lexical-only projector:
+        # it projects no embeddings, so its start narrows the claim away and `projection status`
+        # (which expects the registered, full projector) reports search history as missing.
+        self.records_history = backend is None or backend.embeddings is not None
         # Events whose rows were written without an embedding (lexical-only mode); counts only.
         self.unembedded_events = 0
         # Purges seen by THIS instance while it replays into a graph-only target
