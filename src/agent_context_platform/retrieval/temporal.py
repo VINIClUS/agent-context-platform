@@ -39,7 +39,10 @@ workflow and job, in the same project and repository, has status `success` and a
 order; the graph holds no commit order, so `commit_changed` says whether the passing run's commit
 differs from the failing one (`None` when either is unknown). Resolution follows the LATEST
 visible failing run of each target: a failure that recurs after an earlier fix is `unresolved`
-until a pass follows that latest run, and the path reported is for the latest occurrence. A rerun that passes on the SAME
+until a pass follows that latest run, and the path reported is for the latest occurrence. The
+pass also vouches only for what happened before it: a failure observed again after the passing
+run's completion (its occurrence is its visible CI run's completion, else its own valid time, so
+a session, a test run or a CI run not completed at the cut counts) is `unresolved`. A rerun that passes on the SAME
 commit is `resolved` with `commit_changed=False`; the composer must read the flag. The earliest
 such run wins. The path is Failure -> failing CI run -> passing CI run -> validated commit or
 snapshot. A run, failing or passing, counts only in scope, once its own `recorded_at` (the
@@ -941,6 +944,14 @@ def _fix_path(failure_id: str, record: Record) -> FixPath:
     )
 
 
+def _occurrence(row: Record, ci: dict[str, Record]) -> datetime:
+    """When an observation happened: its visible CI run's completion, else its own valid time."""
+    run = ci.get(str(row["ci_run_id"])) if row["ci_run_id"] else None
+    if run is not None and run["completed_at"] is not None:
+        return _parse(run["completed_at"])
+    return _parse(row["valid_from"])
+
+
 def _occurred(run: ObservedRun) -> tuple[datetime, str]:
     return (run.completed_at or datetime.min.replace(tzinfo=UTC), run.run_id)
 
@@ -1044,9 +1055,26 @@ def _failure_record(
         for run in latest.values()
         if run.run_id in passes and passes[run.run_id]["passing_id"] is not None
     ]
+    late: list[str] = []
+    path: FixPath | None = None
     if latest and len(fixed) == len(latest):
         _, record = max(fixed, key=lambda item: _occurred(item[0]))
-        resolution = FixResolution(FixStatus.RESOLVED, path=_fix_path(failure_id, record))
+        path = _fix_path(failure_id, record)
+        # The pass fixes only what happened before it: an observation that occurred later (in a
+        # session, a test run or a CI run not completed at the cut) is a recurrence it cannot
+        # vouch for.
+        late = sorted(
+            str(row["event_id"])
+            for row in observations
+            if _occurrence(row, ci) > path.passing_completed_at
+        )
+    if path is not None and not late:
+        resolution = FixResolution(FixStatus.RESOLVED, path=path)
+    elif path is not None:
+        resolution = FixResolution(
+            FixStatus.UNRESOLVED,
+            f"observed again after the passing run {path.passing_run_id}: {', '.join(late)}",
+        )
     elif ci_runs:
         open_runs = sorted(
             run.run_id for run in latest.values() if run not in [item[0] for item in fixed]

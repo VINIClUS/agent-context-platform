@@ -682,3 +682,39 @@ def test_a_recurrence_after_a_fix_is_unresolved_until_a_pass_follows_the_latest_
         "ci_3",
         "ci_4",
     )
+
+
+@pytest.mark.parametrize(
+    ("recurrence", "resolved"),
+    [
+        (observation("f_r", 6, session="sess_9"), False),  # seen again in a session
+        (observation("f_r", 6, test="tr_9"), False),  # in a test run
+        (observation("f_r", 6, ci="ci_unseen"), False),  # in a CI run not completed at the cut
+        (observation("f_r", 4, session="sess_9"), True),  # before the passing run: fixed by it
+        ({**observation("f_r", 9, ci="ci_1")}, True),  # reported late, but ci_1 ran before
+    ],
+)
+def test_a_recurrence_after_the_passing_run_outside_a_ci_run_keeps_the_failure_open(
+    recurrence: dict[str, Any], resolved: bool
+) -> None:
+    observations = [observation("f_r", 1, ci="ci_1"), recurrence]
+    runs = [ci_row("ci_1")]  # completed at 1
+    tests = [{**ci_row("tr_9"), "workflow": None, "job": None, "completed_at": stamp(6)}]
+    passes = [pass_row("ci_1", "ci_2", commit="b" * 40)]  # ci_2 passed at 5
+
+    def script(query: str, _p: dict[str, Any]) -> list[dict[str, Any]]:
+        if query is temporal._OBSERVATIONS:
+            return observations
+        if query is temporal._TEST_RUNS:
+            return tests
+        return runs if query is temporal._CI_RUNS else passes
+
+    (found,) = asyncio.run(
+        _service(script).failures(TemporalScope("p"), at(30), at(30), include_resolved=True)
+    ).failures
+    if resolved:
+        assert found.resolution.status is FixStatus.RESOLVED and found.resolution.path is not None
+    else:
+        assert found.resolution.status is FixStatus.UNRESOLVED and found.resolution.path is None
+        assert "after the passing run ci_2" in (found.resolution.reason or "")
+        assert "evo6" in (found.resolution.reason or "")

@@ -1135,3 +1135,30 @@ def test_a_worker_start_narrows_the_marker_to_the_versions_it_runs() -> None:
         assert await projection_history(store) == ProjectionHistory(frozenset())
 
     with_service(body)
+
+
+def test_a_recurrence_outside_a_completed_ci_run_after_the_fix_keeps_the_failure_open() -> None:
+    fixed = [
+        ci_run(1, "ci_1", "failure", commit=OID_A),
+        ci_run(2, "ci_2", "success", commit=OID_B),
+        failure(10, "fail_1", ci_run_id="ci_1"),  # reported late, but ci_1 ran before the pass
+    ]
+    recurrences = [
+        failure(11, "fail_1", session_id="sess_1"),
+        failure(12, "fail_1", ci_run_id="ci_unfinished"),
+    ]
+
+    async def body(store: Neo4jStore, service: TemporalService) -> None:
+        await deliver(store, fixed)
+        (found,) = (await service.failures(P1, day(FAR), day(FAR), True)).failures
+        assert found.resolution.status is FixStatus.RESOLVED
+        for recurrence in recurrences:
+            await deliver(store, [*fixed, recurrence])
+            (found,) = (await service.failures(P1, day(FAR), day(FAR))).failures  # not hidden
+            assert found.resolution.status is FixStatus.UNRESOLVED
+            assert str(recurrence.event_id) in (found.resolution.reason or "")
+            # before the recurrence happened, the fix stands
+            before = await service.failures(P1, T0 + timedelta(seconds=10), day(FAR), True)
+            assert before.failures[0].resolution.status is FixStatus.RESOLVED
+
+    with_service(body)
