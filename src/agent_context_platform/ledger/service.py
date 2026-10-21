@@ -62,7 +62,11 @@ from agent_context_platform.ledger.repository import (
     ResolvedEvent,
     StreamQuarantinedError,
 )
-from agent_context_platform.observability import SPAN_LEDGER_APPEND, traced
+from agent_context_platform.observability import (
+    SPAN_LEDGER_APPEND,
+    record_content_object,
+    traced,
+)
 
 IDEMPOTENCY_CONFLICT: Final = "idempotency_conflict"
 STREAM_QUARANTINED: Final = "stream_quarantined"
@@ -135,6 +139,9 @@ class IngestionService:
                 span.set_attribute(
                     "agent_context.events.created", sum(1 for item in outcomes if item.created)
                 )
+        # Telemetry (PLATFORM-050): content counts as stored only once the batch committed.
+        for storage, result in prepared.storage_outcomes():
+            record_content_object(storage, result)
         accepted = tuple(
             AcceptedEventV1(
                 event_id=outcome.stored.event_id,

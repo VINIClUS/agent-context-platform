@@ -287,6 +287,8 @@ class _PreparedItem:
     redaction_report: RedactionReportV1
     data: bytes | None
     stored_blob: StoredBlob | None
+    # Telemetry (PLATFORM-050): an object digest already uploaded earlier in this batch.
+    reused: bool = False
 
 
 class PreparedContent:
@@ -353,6 +355,15 @@ class PreparedContent:
             return self._by_content_id[content_id].redaction_report
         except KeyError:
             raise ContentResolutionError("no prepared content for that content_id") from None
+
+    def storage_outcomes(self) -> tuple[tuple[str, str], ...]:
+        """``(storage, result)`` telemetry labels per item, recorded once the batch commits."""
+        return tuple(
+            ("object", "reused" if item.reused else "stored")
+            if item.stored_blob is not None
+            else ("inline", "stored")
+            for item in self._items
+        )
 
     @property
     def redaction_reports(self) -> Mapping[str, RedactionReportV1]:
@@ -486,7 +497,6 @@ class ContentService:
     ) -> _PreparedItem:
         claim = item.claim
         if len(data) <= self._inline_threshold:
-            record_content_object("inline", "stored")  # telemetry (PLATFORM-050)
             ref = ContentRefV1(
                 content_id=claim.content_id,
                 content_sha256=claim.content_sha256,
@@ -514,7 +524,6 @@ class ContentService:
             # check.
             stored_blob = await self._blob_store.put_verified(data, _OBJECT_STORAGE_MEDIA_TYPE)
             object_blob_cache[claim.content_sha256] = stored_blob
-        record_content_object("object", "reused" if reused else "stored")  # telemetry
         ref = ContentRefV1(
             content_id=claim.content_id,
             content_sha256=claim.content_sha256,
@@ -531,6 +540,7 @@ class ContentService:
             redaction_report=item.redaction_report,
             data=None,
             stored_blob=stored_blob,
+            reused=reused,
         )
 
     def _storage_for(self, size: int) -> str:

@@ -26,7 +26,7 @@ from agent_context_platform.content.service import (
     ContentService,
     InvalidContentEncodingError,
 )
-from agent_context_platform.observability import contract
+from agent_context_platform.observability import contract, record_content_object
 
 from ._capture import Canaries, Capture
 
@@ -86,8 +86,17 @@ def test_items_are_counted_by_storage_and_result(telemetry: Capture, canaries: C
         _item("object-2", large),  # same digest: the batch reuses the first upload
     ]
 
-    asyncio.run(_service(MemoryBlobStore()).prepare(items))
+    prepared = asyncio.run(_service(MemoryBlobStore()).prepare(items))
 
+    # Counted by the ingestion service once its transaction commits, never during prepare.
+    assert telemetry.points(contract.CONTENT_OBJECTS) == {}
+    assert prepared.storage_outcomes() == (
+        ("inline", "stored"),
+        ("object", "stored"),
+        ("object", "reused"),
+    )
+    for storage, result in prepared.storage_outcomes():
+        record_content_object(storage, result)
     assert telemetry.value(contract.CONTENT_OBJECTS, storage="inline", result="stored") == 1
     assert telemetry.value(contract.CONTENT_OBJECTS, storage="object", result="stored") == 1
     assert telemetry.value(contract.CONTENT_OBJECTS, storage="object", result="reused") == 1
