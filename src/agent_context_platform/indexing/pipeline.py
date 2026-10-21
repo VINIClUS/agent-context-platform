@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import time
 import uuid
 from collections import Counter
 from collections.abc import Iterable, Mapping
@@ -41,6 +42,12 @@ from agent_context_platform.indexing.scip import (
     import_scip,
 )
 from agent_context_platform.indexing.tree_sitter.base import StructuralError
+from agent_context_platform.observability import (
+    SPAN_INDEX_RUN,
+    mark_error,
+    record_index_run,
+    traced,
+)
 from agent_context_platform.settings import Settings
 
 _LOG = logging.getLogger(__name__)
@@ -173,6 +180,19 @@ def _summarize(drafts: Iterable[Any], diagnostics: Counter[str]) -> dict[str, An
     return summary
 
 
+# --- telemetry (PLATFORM-050) -------------------------------------------------------------------
+# Failures refused before anything was indexed: a precondition, not an indexing error.
+_REFUSED: Final = frozenset({"repository_mismatch", SCAN_FAILED})
+
+
+def run_result(report: IndexReport) -> str:
+    """The bounded telemetry ``result`` of a run: ``success``, ``refused`` or ``failed``."""
+    if report.success:
+        return "success"
+    code = report.error_class or ""
+    return "refused" if code in _REFUSED or code.startswith("structural_") else "failed"
+
+
 async def index_checkout(
     request: IndexRequest, settings: Settings, service: IndexingService
 ) -> IndexReport:
@@ -180,8 +200,30 @@ async def index_checkout(
 
     Never raises for an indexing failure: the report carries ``error_class`` and the counts known
     so far. A bad ``repository_id`` raises ``ValueError`` and a missing checkout ``OSError``
-    (usage errors the caller reports before running).
+    (usage errors the caller reports before running). Traced as ``agent_context.index.run``.
     """
+    started = time.perf_counter()
+    result = "failed"
+    try:
+        with traced(SPAN_INDEX_RUN) as span:
+            report = await _index_checkout(request, settings, service)
+            result = run_result(report)
+            span.set_attributes(
+                {"agent_context.result": result, "agent_context.events.submitted": report.submitted}
+            )
+            if result != "success":
+                mark_error(span, result)
+            return report
+    finally:
+        record_index_run(result, time.perf_counter() - started)
+
+
+# --- end telemetry -------------------------------------------------------------------------------
+
+
+async def _index_checkout(
+    request: IndexRequest, settings: Settings, service: IndexingService
+) -> IndexReport:
     if service.config.repository_id != request.repository_id:
         return _failure(request, "repository_mismatch")
     try:

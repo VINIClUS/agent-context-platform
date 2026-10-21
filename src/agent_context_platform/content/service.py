@@ -89,8 +89,19 @@ from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_context_platform.catalog.models import ContentObjectRow
-from agent_context_platform.content.blob_store import BlobStore, StoredBlob
+from agent_context_platform.content.blob_store import (
+    BlobIntegrityError,
+    BlobNotFoundError,
+    BlobStore,
+    StoredBlob,
+)
 from agent_context_platform.content.models import INLINE_MAX_BYTES, InlineContentRow
+from agent_context_platform.observability import (
+    SPAN_CONTENT_PREPARE,
+    record_content_object,
+    record_integrity_failure,
+    traced,
+)
 from agent_context_platform.operations.faults import fault_point
 
 #: Fixed namespace for every advisory lock this module (and the orphan
@@ -277,6 +288,8 @@ class _PreparedItem:
     redaction_report: RedactionReportV1
     data: bytes | None
     stored_blob: StoredBlob | None
+    # Telemetry (PLATFORM-050): an object digest already uploaded earlier in this batch.
+    reused: bool = False
 
 
 class PreparedContent:
@@ -344,6 +357,15 @@ class PreparedContent:
         except KeyError:
             raise ContentResolutionError("no prepared content for that content_id") from None
 
+    def storage_outcomes(self) -> tuple[tuple[str, str], ...]:
+        """``(storage, result)`` telemetry labels per item, recorded once the batch commits."""
+        return tuple(
+            ("object", "reused" if item.reused else "stored")
+            if item.stored_blob is not None
+            else ("inline", "stored")
+            for item in self._items
+        )
+
     @property
     def redaction_reports(self) -> Mapping[str, RedactionReportV1]:
         """Every prepared item's report, keyed by ``content_id``."""
@@ -378,6 +400,14 @@ class ContentService:
     async def prepare(self, items: Sequence[SanitizedContentItemV1]) -> PreparedContent:
         """Validate, re-check, and store every item; fail the whole batch atomically.
 
+        Traced as ``agent_context.content.prepare`` (PLATFORM-050); see ``_prepare``.
+        """
+        with traced(SPAN_CONTENT_PREPARE, {"agent_context.item_count": len(items)}):
+            return await self._prepare(items)
+
+    async def _prepare(self, items: Sequence[SanitizedContentItemV1]) -> PreparedContent:
+        """Validate, re-check, and store every item; fail the whole batch atomically.
+
         Every item is validated (unique ``content_id``, supported media
         type, valid encoding, and a defense-in-depth redaction re-check)
         *before* any bytes are uploaded to object storage, so a batch that
@@ -395,28 +425,35 @@ class ContentService:
         """
         validated: list[tuple[SanitizedContentItemV1, bytes]] = []
         seen_content_ids: set[str] = set()
-        for item in items:
-            content_id = item.claim.content_id
-            if content_id in seen_content_ids:
-                raise DuplicateContentIdError("duplicate content_id in prepare() batch")
-            seen_content_ids.add(content_id)
+        try:
+            for item in items:
+                content_id = item.claim.content_id
+                if content_id in seen_content_ids:
+                    raise DuplicateContentIdError("duplicate content_id in prepare() batch")
+                seen_content_ids.add(content_id)
 
-            try:
-                data = base64.b64decode(item.sanitized_bytes_base64, validate=True)
-            except (binascii.Error, ValueError):
-                raise InvalidContentEncodingError("content base64 could not be decoded") from None
+                try:
+                    data = base64.b64decode(item.sanitized_bytes_base64, validate=True)
+                except (binascii.Error, ValueError):
+                    raise InvalidContentEncodingError(
+                        "content base64 could not be decoded"
+                    ) from None
 
-            # Pydantic validates the claim's shape, not its relation to the
-            # bytes, and model_construct() skips even that: recompute both
-            # so bytes can never be stored under a digest they do not have.
-            if (
-                hashlib.sha256(data).hexdigest() != item.claim.content_sha256
-                or len(data) != item.claim.uncompressed_bytes
-            ):
-                raise ContentResolutionError("content bytes do not match their claim")
+                # Pydantic validates the claim's shape, not its relation to the
+                # bytes, and model_construct() skips even that: recompute both
+                # so bytes can never be stored under a digest they do not have.
+                if (
+                    hashlib.sha256(data).hexdigest() != item.claim.content_sha256
+                    or len(data) != item.claim.uncompressed_bytes
+                ):
+                    raise ContentResolutionError("content bytes do not match their claim")
 
-            self._recheck_redaction(item.claim.media_type, data)
-            validated.append((item, data))
+                self._recheck_redaction(item.claim.media_type, data)
+                validated.append((item, data))
+        except ContentServiceError:
+            # Telemetry (PLATFORM-050): the item being validated is the one rejected.
+            record_content_object(self._storage_for(item.claim.uncompressed_bytes), "rejected")
+            raise
 
         object_blob_cache: dict[str, StoredBlob] = {}
         prepared_items = [
@@ -479,6 +516,7 @@ class ContentService:
             )
 
         stored_blob = object_blob_cache.get(claim.content_sha256)
+        reused = stored_blob is not None
         if stored_blob is None:
             # Fixed media type (see module docstring); also cached per
             # digest for this batch so a repeated digest reuses the first
@@ -505,7 +543,12 @@ class ContentService:
             redaction_report=item.redaction_report,
             data=None,
             stored_blob=stored_blob,
+            reused=reused,
         )
+
+    def _storage_for(self, size: int) -> str:
+        """The telemetry ``storage`` label an item of ``size`` bytes gets (PLATFORM-050)."""
+        return "inline" if size <= self._inline_threshold else "object"
 
     async def attach(self, session: AsyncSession, prepared: PreparedContent) -> None:
         """Durably record prepared content in the caller's transaction.
@@ -545,7 +588,14 @@ class ContentService:
         for digest in sorted(object_items):
             stored_blob = object_items[digest]
             await self._lock_digest(session, digest)
-            await self._blob_store.get_verified(stored_blob.object_key, digest)
+            try:
+                await self._blob_store.get_verified(stored_blob.object_key, digest)
+            except BlobNotFoundError:
+                record_integrity_failure("missing_object")  # telemetry (PLATFORM-050)
+                raise
+            except BlobIntegrityError:
+                record_integrity_failure("digest_mismatch")  # telemetry (PLATFORM-050)
+                raise
             insert_object = (
                 pg_insert(ContentObjectRow)
                 .values(

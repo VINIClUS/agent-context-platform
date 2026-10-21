@@ -72,6 +72,13 @@ roll back to an image whose head matches the database, or restore. And the API r
 although only MCP retrieval reads it, because the MCP tools query the graph (PLATFORM-046); an
 API without Neo4j would answer MCP calls it cannot serve.
 
+## Telemetry
+
+The platform exports its own OpenTelemetry traces and metrics over OTLP/HTTP when
+`AGENT_CONTEXT_OBSERVABILITY__OTLP_ENDPOINT` (or a standard `OTEL_EXPORTER_OTLP_*ENDPOINT`) is set,
+and nothing otherwise. The instruments, attributes and privacy rules are the contract in
+[docs/operations/telemetry.md](docs/operations/telemetry.md).
+
 ## Quality gates
 
 Run the same gates as CI:
