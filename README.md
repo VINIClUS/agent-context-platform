@@ -57,9 +57,20 @@ accepts a connectivity check and that the S3 bucket answers `HeadBucket`. It ans
 names (`postgresql`, `schema`, `neo4j`, `s3`) and coarse states (`ok`, `unconfigured`,
 `unavailable`, `timeout`, `forbidden`, `mismatch`, `unknown`), never a host, DSN or error text,
 and always with `Cache-Control: no-store`. It only reads (one `SELECT` in a read-only
-transaction) and concurrent requests share one in-flight probe. The API's login role needs
-`SELECT` on `public.alembic_version`, which the migrations do not grant: without it the schema is
+transaction) and concurrent requests share a probe while it is younger than the timeout. The
+bound holds even when a dependency vanishes mid-request: a timed-out check is cancelled but never
+awaited (at most four are kept per check), and PostgreSQL is reached over readiness's own unpooled
+engine with libpq connect, keepalive and TCP user timeouts plus a statement timeout, so a dead
+socket left by a failover is never reused. The API's login role needs `SELECT` on
+`public.alembic_version`, which the migrations do not grant yet: without it the schema is
 reported `forbidden` (not ready), never assumed current.
+
+Two consequences of these rules are deliberate. Readiness requires the *exact* head, so a
+replica running an older image leaves rotation as soon as a newer image's migration commits
+(even a purely additive one), and an image-only rollback after a migration never becomes ready:
+roll back to an image whose head matches the database, or restore. And the API requires Neo4j
+although only MCP retrieval reads it, because the MCP tools query the graph (PLATFORM-046); an
+API without Neo4j would answer MCP calls it cannot serve.
 
 ## Quality gates
 
@@ -267,9 +278,14 @@ head, and `--expect-head` fails before connecting unless it names that head. A d
 revision the code does not ship (migrated by a newer image) is refused, never downgraded.
 `agent-context db current [--json]` prints the revision against the head (`at_head`, `behind`,
 `empty` or `unknown`) and takes no lock. Both find `alembic.ini` through `--alembic-config` or
-`AGENT_CONTEXT_ALEMBIC_CONFIG` (default `./alembic.ini`), never print the DSN, and exit `0`
-on success (`current`: at head), `1` on a failed or mismatched migration, a lock timeout or a
-schema not at head, and `2` on a usage error or the downgrade refusal.
+`AGENT_CONTEXT_ALEMBIC_CONFIG` (default `./alembic.ini`) and never print the DSN.
+`--lock-timeout` must be finite, positive and at most 2147483 s (PostgreSQL's `lock_timeout`).
+SIGTERM or SIGINT (`docker stop` on the migrate container) cancels the run: the lock wait or the
+single migration transaction is abandoned and the connection closed, and the command exits
+`1` with `interrupted` (`db current` shows where the schema is). Exit codes: `0` on success
+(`current`: at head); `1` on a failed or mismatched migration, a lock timeout, an interruption
+or a schema not at head; `2` on a usage error (bad option, missing DSN or Alembic
+configuration) or the downgrade refusal.
 
 ## Container image
 
@@ -290,7 +306,8 @@ docker build -f containers/platform/Dockerfile \
 The build arguments fill the labels `org.opencontainers.image.revision`,
 `org.opencontainers.image.version`, `io.agent-context.sdk.version` and
 `io.agent-context.alembic.head`; each one that is set is checked against what the image actually
-contains, and the build fails on a mismatch. Unset, they read `unknown`/`dev` (local builds).
+contains, and the build fails on a mismatch (only `VERSION` may carry a leading `v`, as a tag
+does). Unset, they read `unknown`/`dev` (local builds).
 
 | Role | Command | Environment |
 | --- | --- | --- |
@@ -324,8 +341,9 @@ the image: provision them into a read-only volume and point the variable at its 
 read-only boot, dropped capabilities, the labels, the exec-form command, the absence of compilers
 and network tools, `agent-context --help`, the shipped head and `/health/live` inside the
 container. Run it with `AGENT_CONTEXT_TEST_CONTAINER=1` (and `AGENT_CONTEXT_TEST_PLATFORM_IMAGE`
-to test an already built tag). A `v*` tag runs `.github/workflows/release-image.yml`, which builds
-with the labels, runs the same tests, pushes `ghcr.io/viniclus/agent-context-platform:<tag>` and
+to test an already built tag). A `v*` tag runs `.github/workflows/release-image.yml`, which checks
+that the tag is `v<project version>` and the lockfile, runs the unit and contract tests, builds
+with the labels, runs the same container tests, pushes `ghcr.io/viniclus/agent-context-platform:<tag>` and
 prints the digest; infra pins that digest (`image: ghcr.io/viniclus/agent-context-platform@sha256:...`)
 in its `versions.lock`, never the tag, and passes the `io.agent-context.alembic.head` label to
 `--expect-head`.
