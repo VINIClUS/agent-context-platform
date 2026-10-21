@@ -71,6 +71,7 @@ RESOURCE_SCHEME: Final = "agent-context://"
 MAX_READ_BYTES: Final = INLINE_MAX_BYTES
 MAX_SNIPPET_CHARS: Final = 480
 MAX_EVENTS_PER_LOAD: Final = 1000
+DEFAULT_STATEMENT_TIMEOUT_SECONDS: Final = 5.0
 _READABLE_MEDIA_TYPES: Final = frozenset({"text/plain", "application/json"})
 
 _PURGED: Final[str] = (
@@ -82,8 +83,9 @@ _PURGED: Final[str] = (
 # never reached the graph or the search material, so nothing the package says rests on it.
 _DELIVERED: Final[str] = (
     "SELECT event_id FROM projection.outbox WHERE event_id = ANY(CAST(:ids AS uuid[])) "
-    "AND status = 'delivered'"
+    "AND status = 'delivered' AND (CAST(:max AS bigint) IS NULL OR outbox_id <= CAST(:max AS bigint))"
 )
+_TIMEOUT: Final[str] = "SELECT set_config('statement_timeout', :millis, true)"
 _RANK: Final[str] = f"""
 WITH q AS (SELECT websearch_to_tsquery('{TEXT_SEARCH_CONFIG}', :query) AS tsq)
 SELECT d.source_event_ids AS source_event_ids, ts_rank_cd(d.tsv, q.tsq) AS score
@@ -98,13 +100,26 @@ LIMIT :limit
 
 @dataclass(frozen=True, slots=True)
 class EvidenceScope:
-    """The scope a cited event must belong to: its envelope context must match every given ID."""
+    """What a cited event must satisfy beyond existing, being delivered and verifying.
+
+    - Its envelope `context` matches every given scope ID.
+    - `before` (exclusive) bounds its `occurred_at`, `recorded_before` its `observed_at`: a
+      revision's window end bounds both (a fact first recorded after the window is later
+      knowledge, whenever it says it happened); `failure_history` bounds valid time only.
+    - In a revision query (`revision_mode`), an event whose payload names a workspace snapshot
+      (`snapshot_id`) is dirty evidence unless it is the requested snapshot (`snapshot_id`;
+      `None` for a commit): CI or test output of a dirty workspace never backs a commit answer.
+    - `max_outbox_id` bounds its outbox position to the package's `as_of_event_id`, so an event
+      delivered after the snapshot (while an earlier one was still pending) is never cited.
+    """
 
     project_id: str | None = None
     repository_id: str | None = None
-    # Exclusive upper bound on the cited events' `occurred_at` (a revision's window end): a fact
-    # first recorded by a later event is never cited, whatever the candidate claims.
     before: datetime | None = None
+    recorded_before: datetime | None = None
+    revision_mode: bool = False
+    snapshot_id: str | None = None
+    max_outbox_id: int | None = None
 
     def __post_init__(self) -> None:
         if self.project_id is None and self.repository_id is None:
@@ -114,9 +129,17 @@ class EvidenceScope:
         context = event.context
         if self.project_id is not None and context.project_id != self.project_id:
             return False
+        if self.repository_id is not None and context.repository_id != self.repository_id:
+            return False
         if self.before is not None and event.occurred_at >= self.before:
             return False
-        return self.repository_id is None or context.repository_id == self.repository_id
+        if self.recorded_before is not None and event.observed_at >= self.recorded_before:
+            return False
+        if self.revision_mode:
+            named = event.payload.get("snapshot_id")
+            if named is not None and str(named) != self.snapshot_id:
+                return False
+        return True
 
 
 @dataclass(frozen=True, slots=True)
@@ -230,9 +253,22 @@ def _uuid(value: str) -> UUID | None:
 class EvidenceLedger:
     """Loads cited events and gated content through one PostgreSQL role (the API role suffices)."""
 
-    def __init__(self, sessions: async_sessionmaker[AsyncSession], content: ContentService) -> None:
+    def __init__(
+        self,
+        sessions: async_sessionmaker[AsyncSession],
+        content: ContentService,
+        *,
+        statement_timeout_seconds: float = DEFAULT_STATEMENT_TIMEOUT_SECONDS,
+    ) -> None:
+        if not statement_timeout_seconds > 0:
+            raise ValueError("statement_timeout_seconds must be positive")
         self._sessions = sessions
         self._content = content
+        self._timeout = str(max(1, int(statement_timeout_seconds * 1000)))
+
+    async def _bound(self, session: AsyncSession) -> None:
+        """Bound every statement of the session's transaction (the request deadline bounds all)."""
+        await session.execute(text(_TIMEOUT), {"millis": self._timeout})
 
     async def events(
         self, event_ids: Iterable[str], scope: EvidenceScope
@@ -246,7 +282,11 @@ class EvidenceLedger:
             events: list[StoredEventV1] = []
             delivered = set()
             if wanted:
-                rows = await session.execute(text(_DELIVERED), {"ids": [str(e) for e in wanted]})
+                await self._bound(session)
+                rows = await session.execute(
+                    text(_DELIVERED),
+                    {"ids": [str(e) for e in wanted], "max": scope.max_outbox_id},
+                )
                 delivered = {UUID(str(row.event_id)) for row in rows}
             for event_id in wanted:
                 if event_id not in delivered:
@@ -282,6 +322,11 @@ class EvidenceLedger:
         if media not in _READABLE_MEDIA_TYPES or ref.uncompressed_bytes > MAX_READ_BYTES:
             return None
         async with self._sessions() as session:
+            await self._bound(session)
+            # Re-checked in the read's own transaction: a purge recorded since `events` loaded
+            # the event must still win.
+            if (await session.execute(text(_PURGED), {"content_ids": [ref.content_id]})).first():
+                return None
             try:
                 data = await self._content.read(session, ref)
             except ContentServiceError:
@@ -297,6 +342,7 @@ class EvidenceLedger:
         if not ids or not query.strip():
             return {}
         async with self._sessions() as session:
+            await self._bound(session)
             rows = await session.execute(
                 text(_RANK), {"query": query, "event_ids": ids, "limit": limit}
             )

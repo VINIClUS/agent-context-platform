@@ -8,7 +8,8 @@ JSON (sorted keys, no spaces) of:
 - `q`: SHA-256 of the normalized query: the tool's input without its `cursor`, plus the principal
   the page was composed for (`query_digest`);
 - `p`: the position of the next item in the ranked candidate list;
-- `a`: the `as_of_event_id` of the snapshot the ranking was computed at;
+- `a`: the projection snapshot the ranking was computed at (the composer binds the
+  `as_of_event_id` and the `projection_checkpoint`);
 - `e`: expiry, whole seconds since the epoch (UTC).
 
 The signature is HMAC-SHA256 over a domain-separated payload with the server key, checked in
@@ -17,7 +18,7 @@ key comes from settings (`mcp.cursor_hmac_key`, required in production); every r
 same key, so any replica can continue a page another one issued and no server state exists.
 
 A cursor is accepted only for the same tool, the same normalized query, the same principal and the
-same `as_of_event_id`: a cursor signed with another key, or edited, is `CursorInvalid`; one past
+same snapshot: a cursor signed with another key, or edited, is `CursorInvalid`; one past
 its expiry is `CursorExpired`; one issued for another query, tool or principal is
 `CursorMismatch`; one issued at another projection snapshot is `CursorStale` (the ranking cannot be
 recomputed at an older snapshot, so the client starts again from the first page). Messages are

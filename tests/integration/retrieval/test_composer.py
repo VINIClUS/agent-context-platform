@@ -131,7 +131,7 @@ def test_unknown_scope_ids_fail_with_typed_errors_and_never_widen(
         c1 = seeded.revisions.c1
         with pytest.raises(ScopeNotFound):
             await composer.context_for_task(
-                task(commit(c1)).model_copy(update={"repository_id": "repo_other"}), PRINCIPAL
+                task(commit(c1)).model_copy(update={"repository_id": "repo_absent"}), PRINCIPAL
             )
         with pytest.raises(RevisionNotFound):
             await composer.context_for_task(
@@ -167,7 +167,7 @@ def test_unknown_scope_ids_fail_with_typed_errors_and_never_widen(
             await composer.failure_history(
                 FailureHistoryInputV1.model_validate(
                     {
-                        "repository_id": "repo_other",
+                        "repository_id": "repo_absent",
                         "query": "rounding",
                         "valid_from": at(0).isoformat(),
                         "valid_to": at(4).isoformat(),
@@ -236,16 +236,20 @@ def test_budgets_are_exact_and_a_budget_below_one_item_is_a_typed_error(
         full = await composer.repository_overview(overview(c1), PRINCIPAL)
         sizes = [len(item.model_dump_json().encode()) for item in full.items]
         assert len(sizes) >= 3
-        # A byte budget that fits exactly the first two items stops before the third.
-        exact = {"max_items": 30, "max_bytes": sizes[0] + sizes[1], "max_tokens": 15_000}
+        # The byte budget is the serialized items array: "[a,b]" is sizes[0] + sizes[1] + 3.
+        pair = sizes[0] + sizes[1] + 3
+        exact = {"max_items": 30, "max_bytes": pair, "max_tokens": 15_000}
         page = await composer.repository_overview(overview(c1, exact), PRINCIPAL)
         assert [i.item_id for i in page.items] == [i.item_id for i in full.items[:2]]
         assert page.truncated and page.next_cursor
+        short = {"max_items": 30, "max_bytes": pair - 1, "max_tokens": 15_000}
+        page = await composer.repository_overview(overview(c1, short), PRINCIPAL)
+        assert [i.item_id for i in page.items] == [full.items[0].item_id]
         # The token estimate is ceil(bytes / 4): one token short drops the second item.
         tokens = {
             "max_items": 30,
             "max_bytes": 60_000,
-            "max_tokens": -(-(sizes[0] + sizes[1]) // 4) - 1,
+            "max_tokens": -(-pair // 4) - 1,
         }
         page = await composer.repository_overview(overview(c1, tokens), PRINCIPAL)
         assert [i.item_id for i in page.items] == [full.items[0].item_id]
@@ -371,7 +375,7 @@ def test_purged_or_foreign_content_is_never_read(
         assert events[purged_event].purged == {"purged-transcript"}
         assert await ledger.snippet(events[seeded.keys["decision:dec_parser"]], None)
         foreign = await ledger.events(
-            [seeded.keys["decision:dec_parser"]], EvidenceScope(repository_id="repo_other")
+            [seeded.keys["decision:dec_parser"]], EvidenceScope(repository_id="repo_absent")
         )
         assert foreign == {}
         later = await ledger.events(
@@ -474,3 +478,88 @@ def test_the_same_request_twice_gives_the_same_package(
     first, second = run_in_world(seeded, postgres_dsn, projection_engine, body)
     assert first == second
     assert first["items"]
+
+
+def test_dirty_ci_output_and_late_knowledge_back_only_the_snapshot_answer(
+    seeded: Seeded, postgres_dsn: str, projection_engine: AsyncEngine
+) -> None:
+    probes = {seeded.keys["ci:ci_run_dirty_output"], seeded.keys["content:late-observed-note"]}
+
+    async def body(world: EvalWorld) -> tuple[ContextPackageV1, ContextPackageV1]:
+        composer = world.composer()
+        ask = "average helper in report output"
+        dirty = await composer.context_for_task(
+            task({"kind": "workspace_snapshot", "snapshot_id": seeded.revisions.snapshot}, ask),
+            PRINCIPAL,
+        )
+        clean = await composer.context_for_task(task(commit(seeded.revisions.c2), ask), PRINCIPAL)
+        return dirty, clean
+
+    dirty, clean = run_in_world(seeded, postgres_dsn, projection_engine, body)
+
+    def cited(page: ContextPackageV1) -> set[str]:
+        return {str(ref.source_event_id) for item in page.items for ref in item.evidence}
+
+    # The snapshot's own CI output and the note (occurred at 4:00, observed at 7:54) are evidence
+    # for the open snapshot window, so the probes are real candidates ...
+    assert probes <= cited(dirty)
+    assert any(item.kind == "ci_output" for item in dirty.items)
+    # ... but at C2 (window [3:00, 5:00)) one is dirty and the other later knowledge.
+    assert not probes & cited(clean)
+    text_ = "\n".join(item.content for item in clean.items)
+    assert "dirty workspace test output" not in text_ and "late observed note" not in text_
+
+
+def test_a_delivery_past_a_still_pending_row_stales_the_cursor_and_is_never_cited(
+    seeded: Seeded, postgres_dsn: str, projection_engine: AsyncEngine
+) -> None:
+    def history(cursor: str | None = None) -> Any:
+        return DecisionHistoryInputV1.model_validate(
+            {
+                "scope": {"kind": "project", "project_id": PROJECT},
+                "query": "rounding",
+                "valid_at": at(9).isoformat(),
+                "budget": {"max_items": 1, "max_bytes": 60_000, "max_tokens": 15_000},
+            }
+            | ({"cursor": cursor} if cursor else {})
+        )
+
+    async def body(world: EvalWorld) -> None:
+        composer = world.composer()
+        first = await composer.decision_history(history(), PRINCIPAL)
+        assert first.next_cursor is not None
+        await world._decision(97, "dec_pending", 8.5, "A rounding decision held back.")
+        await world._decision(98, "dec_rounding_v3", 8.6, "Round half even in add.")
+        pending = seeded_event = world.keys["decision:dec_pending"]
+        async with world.owner.begin() as connection:  # postpone the earlier row
+            await connection.execute(
+                text(
+                    "UPDATE projection.outbox SET available_at = now() + interval '1 day' "
+                    "WHERE event_id = :id"
+                ),
+                {"id": pending},
+            )
+        try:
+            assert (await world.project()).delivered == 1  # only dec_rounding_v3
+            later = await composer.decision_history(history(), PRINCIPAL)
+            assert later.as_of_event_id == first.as_of_event_id  # the watermark did not move
+            assert later.projection_checkpoint != first.projection_checkpoint
+            with pytest.raises(CursorStale):
+                await composer.decision_history(history(first.next_cursor), PRINCIPAL)
+            everything = await composer.decision_history(
+                history().model_copy(
+                    update={"budget": history().budget.model_copy(update={"max_items": 30})}
+                ),
+                PRINCIPAL,
+            )
+            cited = {str(r.source_event_id) for i in everything.items for r in i.evidence}
+            assert world.keys["decision:dec_rounding_v3"] not in cited  # delivered after as_of
+        finally:
+            async with world.owner.begin() as connection:
+                await connection.execute(
+                    text("UPDATE projection.outbox SET available_at = now() WHERE event_id = :id"),
+                    {"id": seeded_event},
+                )
+            await world.project()
+
+    run_in_world(seeded, postgres_dsn, projection_engine, body)

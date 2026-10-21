@@ -211,15 +211,38 @@ def test_a_page_stops_at_the_first_item_that_does_not_fit_and_drops_uncited_item
         ledger, ranked, QueryBudgetV1(max_items=2, max_bytes=10**6, max_tokens=10**6)
     )
     assert [i.item_id for i in items] == ["a", "b"] and position == 3 and dropped == 1
-    size = len(items[0].model_dump_json().encode())
+    # max_bytes is the exact size of the serialized items array, brackets and commas included.
+    pair = "[" + ",".join(item.model_dump_json() for item in items) + "]"
+    one = len(items[0].model_dump_json().encode()) + 2
     items, position, _ = page(
-        ledger, ranked, QueryBudgetV1(max_items=9, max_bytes=size, max_tokens=10**6)
+        ledger, ranked, QueryBudgetV1(max_items=9, max_bytes=len(pair.encode()), max_tokens=10**6)
+    )
+    assert [i.item_id for i in items] == ["a", "b"] and position == 3
+    items, position, _ = page(
+        ledger,
+        ranked,
+        QueryBudgetV1(max_items=9, max_bytes=len(pair.encode()) - 1, max_tokens=10**6),
     )
     assert [i.item_id for i in items] == ["a"] and position == 2  # past the dropped orphan
+    items, _, _ = page(
+        ledger, ranked, QueryBudgetV1(max_items=9, max_bytes=one, max_tokens=-(-one // 4))
+    )
+    assert [i.item_id for i in items] == ["a"]
     items, position, _ = page(
         ledger, ranked, QueryBudgetV1(max_items=9, max_bytes=10**6, max_tokens=10**6), start=2
     )
     assert [i.item_id for i in items] == ["b", "c"] and position == 4
+
+
+def test_a_page_is_never_followed_by_an_empty_one() -> None:
+    ledger = FakeLedger({str(EVENT): ledger_event()})
+    orphans = [candidate(f"z{n}", citations=(Citation("missing", "git", 1.0),)) for n in range(3)]
+    items, position, dropped = page(
+        ledger,
+        [candidate("a"), *orphans],
+        QueryBudgetV1(max_items=1, max_bytes=10**6, max_tokens=10**6),
+    )
+    assert [i.item_id for i in items] == ["a"] and position == 4 and dropped == 3
 
 
 def test_a_first_item_too_large_with_its_excerpt_is_sent_without_it_or_refused() -> None:
@@ -315,9 +338,10 @@ def test_decisions_say_whether_they_are_active_and_why_not() -> None:
         )
     ]
     assert "ACTIVE at" in texts[0]
-    assert "superseded by decision dec-2" in texts[1]
+    assert "superseded by dec-2" in texts[1]
+    assert all("2026-09-03" not in text for text in texts)  # no reading time in the content
     assert "expired at" in texts[2]
-    assert "end time unknown" in texts[3]
+    assert "end unknown" in texts[3]
 
 
 def _run(run_id: str, *, status: str, snapshot: str | None = None) -> ObservedRun:
@@ -363,9 +387,12 @@ def test_fix_paths_never_claim_more_than_the_runs_show() -> None:
 
 
 def test_a_commit_query_drops_runs_and_fixes_of_dirty_snapshots() -> None:
-    assert _without_dirty(_failure(True, snapshot="snap-1")) is None
+    assert _without_dirty(_failure(True, snapshot="snap-1"), None) is None
+    assert _without_dirty(_failure(True, snapshot="snap-2"), "snap-1") is None
+    own = _failure(True, snapshot="snap-1")
+    assert _without_dirty(own, "snap-1") == own  # the requested snapshot's own runs count
     clean = _failure(True)
-    assert _without_dirty(clean) == clean
+    assert _without_dirty(clean, None) == clean
     mixed = replace(
         clean,
         observed_in=(
@@ -374,7 +401,7 @@ def test_a_commit_query_drops_runs_and_fixes_of_dirty_snapshots() -> None:
         ),
         resolution=_failure(True, snapshot="s").resolution,
     )
-    kept = _without_dirty(mixed)
+    kept = _without_dirty(mixed, None)
     assert kept is not None and [r.run_id for r in kept.observed_in] == ["ci-1"]
     assert kept.resolution.status is FixStatus.UNRESOLVED and kept.resolution.path is None
 
@@ -402,7 +429,10 @@ def test_content_candidates_are_typed_by_event_and_quote_their_own_content() -> 
     assert (found.kind, found.tier, found.excerpt) == ("ci_output", 5, (str(EVENT), "c-1"))
     assert "the repository" in found.title and found.item_id.startswith("content:")
     other = _content_candidate(
-        SearchHit("c-2", 1.0, "p", "r", "s-1", str(EVENT), "agent.unknown", T, (), "sanitized"), 1.0
+        SearchHit(
+            "c-2", 1.0, "p", "r", "s-1", str(EVENT), "agent.unknown", T, (str(EVENT),), "sanitized"
+        ),
+        1.0,
     )
     assert (other.kind, other.tier) == ("session_content", 1)
 
@@ -431,6 +461,19 @@ def test_evidence_scopes_match_the_envelope_and_the_window() -> None:
     assert EvidenceScope(repository_id="repo-1", before=T + timedelta(seconds=1)).admits(event)
     with pytest.raises(ValueError):
         EvidenceScope()
+    late = stored().model_copy(update={"observed_at": T + timedelta(hours=1)})
+    assert not EvidenceScope(
+        repository_id="repo-1", recorded_before=T + timedelta(minutes=1)
+    ).admits(late)
+    dirty = stored().model_copy(update={"payload": {**stored().payload, "snapshot_id": "snap-1"}})
+    assert EvidenceScope(repository_id="repo-1").admits(dirty)  # history tools: any run
+    assert not EvidenceScope(repository_id="repo-1", revision_mode=True).admits(dirty)
+    assert EvidenceScope(repository_id="repo-1", revision_mode=True, snapshot_id="snap-1").admits(
+        dirty
+    )
+    assert not EvidenceScope(
+        repository_id="repo-1", revision_mode=True, snapshot_id="snap-2"
+    ).admits(dirty)
 
 
 def test_clean_text_removes_control_and_format_characters_and_bounds_length() -> None:
@@ -451,8 +494,10 @@ class _Rows(list[Any]):
 class _Outbox:
     def __init__(self, waiting: Any, mark: Any, checkpoints: list[Any], dead: list[Any]) -> None:
         self._answers = [
+            _Rows([]),  # statement timeout
             _Rows([waiting]),
             _Rows([mark] if mark else []),
+            *([_Recorded()] if mark else []),
             _Rows(checkpoints),
             _Rows(dead),
         ]
@@ -471,6 +516,11 @@ class _Outbox:
 
     async def execute(self, *_: object) -> Any:
         return self._answers.pop(0)
+
+
+class _Recorded:
+    def scalar_one(self) -> datetime:
+        return T
 
 
 def _row(**fields: Any) -> Any:
@@ -492,6 +542,9 @@ def test_freshness_needs_a_projected_event_and_reports_missing_checkpoints() -> 
     )
     assert fresh.staleness_ms == 0  # a clock behind the outbox never yields a negative lag
     assert fresh.as_of_event_id == str(EVENT)
+    assert (fresh.as_of_outbox_id, fresh.as_of_recorded_at) == (4, T)
+    with pytest.raises(ValueError):
+        FreshnessReader(empty, statement_timeout_seconds=0)  # type: ignore[arg-type]
     assert fresh.warnings == ("projection_dead_letters:code", "projection_not_started:search")
 
 
@@ -501,3 +554,36 @@ def test_the_dependency_table_names_registered_projectors() -> None:
     registered = {(p.name, p.version) for p in registered_projectors()}
     for tool in composer_module.TOOLS:
         assert set(composer_module.DEPENDENCIES[tool]) <= registered
+
+
+def test_a_request_can_shorten_the_deadline_but_never_extend_it() -> None:
+    from agent_context_sdk.contracts.mcp import DecisionHistoryInputV1
+
+    from agent_context_platform.retrieval.graph import RetrievalDeadlineExceeded
+
+    class SlowFreshness:
+        async def read(self, *_: object) -> Any:
+            await asyncio.sleep(1)
+            raise AssertionError("the deadline should have fired first")
+
+    fake: Any = object()
+    slow = ContextComposer(
+        graph=fake,
+        graph_reader=fake,
+        temporal=fake,
+        search=fake,
+        ledger=fake,
+        freshness=SlowFreshness(),  # type: ignore[arg-type]
+        cursor=CursorCodec.ephemeral(),
+        default_deadline_seconds=0.05,
+    )
+    request = DecisionHistoryInputV1.model_validate(
+        {
+            "scope": {"kind": "project", "project_id": "p"},
+            "query": "q",
+            "valid_at": T.isoformat(),
+            "budget": {"max_items": 1, "max_bytes": 1000, "max_tokens": 1000},
+        }
+    )
+    with pytest.raises(RetrievalDeadlineExceeded):
+        asyncio.run(slow.decision_history(request, RequestContext("p", deadline_seconds=60)))

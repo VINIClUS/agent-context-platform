@@ -298,11 +298,18 @@ export AGENT_CONTEXT_MCP__CURSOR_HMAC_KEY=...   # from the secret store, the sam
 ```
 
 A cursor is valid for the same tool, input, principal and projection snapshot until it expires
-(15 minutes); after new events are projected the client starts again from the first page.
+(15 minutes); once the projection moves (a new event delivered to a projector the answer depends
+on) the client starts again from the first page.
 
-The composer reads the ledger and content as the API role, but projection checkpoints and dead
-letters (for `projection_checkpoint`, `staleness_ms` and the warnings) are only readable by the
-projector role today, so `FreshnessReader` takes its own session factory.
+The composer runs as the API role (never the projector role, which can write projection state).
+`FreshnessReader` also reads projection checkpoints and dead letters (for `projection_checkpoint`,
+`staleness_ms` and the warnings); the API role's SELECT grants on them come with a separate
+migration, and until it lands the reader's session factory is injected (the tests pass one that
+has the grants).
+
+`query_id`, `generated_at`, `staleness_ms` and `next_cursor` (it carries an expiry) are the only
+fields that depend on the wall clock: everything else is a function of the request and the
+projection snapshot.
 
 `tests/evaluation/` holds the context-quality evaluation: 30 golden questions (6 per tool,
 `questions.json`) over a world seeded through the real ingestion service and projection runner.

@@ -12,9 +12,11 @@ exist. Code is read AS INDEXED AT the revision, from the per-run facts (`Revisio
 the current pointers, so a commit query cannot see a later or dirty snapshot's code, and a
 snapshot query sees its uncommitted revisions. The revision's window `[run start, next run)`
 bounds everything else: decisions and failures are read at `valid_at = recorded_at =` the end of
-the window (or now, when the window is open) and session content is kept only when it occurred
-inside it, so no later fact leaks into a revision. In commit mode CI and test runs tied to a
-workspace snapshot (dirty state) are not evidence either.
+the window (when the window is open: the instant the ledger recorded the package's
+`as_of_event_id`, never the wall clock), and every cited event, session content included, must
+have occurred AND been observed inside the window. CI, test and other output of a workspace
+snapshot other than the requested one (dirty state, for a commit: any snapshot) is never evidence:
+such events are not citable and such runs are dropped from failures (`EvidenceScope`).
 
 Candidates. Graph proximity comes from PLATFORM-040 (`neighborhood`, depth 2, around the code the
 task names) and from the revision's own relations; every node 040 returns is admitted only if the
@@ -34,26 +36,35 @@ Fusion is deterministic: an integer score of
   +   3 * recency (rank of the fact's time among the candidates, normalized to [0, 1])
 
 in micro-units, ties broken by the stable `item_id`. Same input and same ledger state give a
-byte-identical package except `query_id` and `generated_at`.
+byte-identical package except the time-dependent fields: `query_id`, `generated_at`,
+`staleness_ms` (lag at the wall clock) and `next_cursor` (it carries an expiry). Item content
+holds no wall-clock time.
 
 Evidence and trust. Every item cites at least one `EvidenceRefV1` built from a real stored event
 in scope (`evidence.py`); a candidate with none is dropped and reported (`items_without_evidence`).
-Item `content` is `untrusted_evidence`. Control fields (`item_id`, `kind`, `title`, evidence) are
-built only from IDs and structured facts; titles are cleaned and bounded; stored text appears only
-as a quoted, bounded excerpt inside `content`. A relation whose confidence is below 1 is rendered
+Item `content` is `untrusted_evidence`. Control fields (`item_id`, `kind`, evidence) are built
+only from IDs and structured facts. Titles name what an item is about and so carry
+producer-supplied names (paths, qualified names, session IDs): they are untrusted too, cleaned of
+control and format characters and bounded. Stored text (decision bodies, messages, tool output)
+appears only as a quoted, bounded excerpt inside `content`. A relation whose confidence is below 1 is rendered
 as heuristic with its evidence kind, confidence and extractor; it is never stated as fact.
 
-Budgets. `max_items`, `max_bytes` (the UTF-8 bytes of the serialized items, `model_dump_json`) and
-`max_tokens` (estimated as `ceil(bytes / 4)` over the same bytes) are enforced exactly, together
+Budgets. `max_items`, `max_bytes` (the exact UTF-8 size of the serialized `items` JSON array,
+brackets and commas included, as `model_dump_json` writes it) and `max_tokens` (estimated as
+`ceil(bytes / 4)` over the same bytes) are enforced exactly, together
 with internal ceilings (`MAX_PAGE_ITEMS` items, `MAX_CANDIDATES` ranked candidates, the
 retrieval modules' own node and row caps, and the request deadline). Items are taken in rank order
 and a page stops at the first item that does not fit, so pages are contiguous. `truncated` is true
-exactly when ranked items remain, and `next_cursor` is then set (the SDK invariant). A first item
-that cannot fit even without its excerpt raises `ContextBudgetTooSmall`.
+exactly when a ranked item with citable evidence remains, and `next_cursor` is then set (the SDK
+invariant), so a page is never followed by an empty one. A first item that cannot fit even without
+its excerpt raises `ContextBudgetTooSmall`.
 
 Cursor. Opaque and HMAC-signed (`cursor.py`): it binds the tool, the normalized input (all fields
-but the cursor), the principal, the position and the `as_of_event_id`, with an expiry. Ranking is
-recomputed on every page, so a cursor is only valid at the same projection snapshot.
+but the cursor), the principal, the position and the projection snapshot, with an expiry. The
+snapshot is the `as_of_event_id` AND the `projection_checkpoint`, because a later row can be
+delivered while an earlier one is still pending (the watermark does not move, the answer does).
+Ranking is recomputed on every page, so a cursor is only valid at the same snapshot. No package
+cites an event delivered after its `as_of_event_id` (outbox order).
 
 Freshness. `as_of_event_id`, `projection_checkpoint` and `staleness_ms` come from
 `freshness.py`, over the projectors each tool depends on. An outdated temporal projection
@@ -62,7 +73,9 @@ Freshness. `as_of_event_id`, `projection_checkpoint` and `staleness_ms` come fro
 
 Bounds and safety. Inputs are data: no SQL, Cypher, path or URL is ever taken from them (all
 statements are static and parameterized, all graph reads go through the read-only facades). The
-whole request runs under one deadline (`RetrievalDeadlineExceeded`). Nothing is logged here.
+whole request runs under one deadline (`RetrievalDeadlineExceeded`); a request may shorten the
+composer's deadline, never extend it, and every PostgreSQL statement has its own timeout. Nothing
+is logged here.
 """
 
 from __future__ import annotations
@@ -149,6 +162,7 @@ from agent_context_platform.retrieval.temporal import (
 
 DEFAULT_DEADLINE_SECONDS: Final = 10.0
 MAX_PAGE_ITEMS: Final = 100
+LOAD_WINDOW: Final = 50  # candidates whose cited events are loaded together
 MAX_CANDIDATES: Final = 500
 MAX_EVIDENCE_PER_ITEM: Final = 8
 MAX_QUERY_CHARS: Final = 1000
@@ -250,7 +264,7 @@ class _Candidate:
 class _Gathered:
     candidates: dict[str, _Candidate] = field(default_factory=dict)
     warnings: set[str] = field(default_factory=set)
-    before: datetime | None = None  # no cited event may occur at or after this (window end)
+    evidence: EvidenceScope | None = None  # the scope cited events must satisfy, if narrower
 
     def add(self, candidate: _Candidate) -> None:
         held = self.candidates.get(candidate.item_id)
@@ -277,8 +291,38 @@ class _Window:
     end: datetime | None
     at: datetime
 
-    def admits(self, moment: datetime) -> bool:
-        return self.end is None or moment < self.end
+
+class _Renderer:
+    """Renders ranked candidates for one page, loading cited events a window at a time."""
+
+    def __init__(
+        self, composer: ContextComposer, ranked: Sequence[_Candidate], scope: EvidenceScope
+    ) -> None:
+        self._composer = composer
+        self._ranked = ranked
+        self._scope = scope
+        self._events: dict[str, LedgerEvent] = {}
+        self._loaded_to = 0
+
+    async def _load(self, position: int) -> None:
+        if position < self._loaded_to:
+            return
+        window = self._ranked[position : position + LOAD_WINDOW]
+        wanted = {c.event_id for cand in window for c in cand.citations} - set(self._events)
+        if wanted:
+            self._events.update(await self._composer._ledger.events(wanted, self._scope))
+        self._loaded_to = position + len(window)
+
+    async def citable(self, position: int) -> bool:
+        await self._load(position)
+        return any(
+            c.event_id in self._events and evidence_ref(self._events[c.event_id], c) is not None
+            for c in self._ranked[position].citations
+        )
+
+    async def render(self, position: int, *, quote: bool) -> ContextItemV1 | None:
+        await self._load(position)
+        return await self._composer._render(self._ranked[position], self._events, quote=quote)
 
 
 class ContextComposer:
@@ -322,7 +366,7 @@ class ContextComposer:
             RepositoryScopeV1(kind="repository", repository_id=request.repository_id),
             request.revision,
             EvidenceScope(repository_id=request.repository_id),
-            lambda now: self._task_candidates(request, now),
+            lambda fresh: self._task_candidates(request, fresh),
         )
 
     async def repository_overview(
@@ -336,7 +380,7 @@ class ContextComposer:
             RepositoryScopeV1(kind="repository", repository_id=request.repository_id),
             revision,
             EvidenceScope(repository_id=request.repository_id),
-            lambda now: self._overview_candidates(request.repository_id, revision, now),
+            lambda fresh: self._overview_candidates(request.repository_id, revision, fresh),
         )
 
     async def symbol_context(
@@ -352,7 +396,7 @@ class ContextComposer:
             RepositoryScopeV1(kind="repository", repository_id=request.repository_id),
             revision,
             EvidenceScope(repository_id=request.repository_id),
-            lambda now: self._symbol_candidates(request, revision, now),
+            lambda fresh: self._symbol_candidates(request, revision, fresh),
         )
 
     async def decision_history(
@@ -370,7 +414,7 @@ class ContextComposer:
             request.scope,
             None,
             scope,
-            lambda now: self._decision_candidates(request, now),
+            lambda fresh: self._decision_candidates(request, fresh),
         )
 
     async def failure_history(
@@ -385,7 +429,7 @@ class ContextComposer:
             RepositoryScopeV1(kind="repository", repository_id=request.repository_id),
             None,
             EvidenceScope(repository_id=request.repository_id),
-            lambda now: self._failure_candidates(request, now),
+            lambda fresh: self._failure_candidates(request, fresh),
         )
 
     # --- the shared pipeline ---
@@ -398,9 +442,9 @@ class ContextComposer:
         scope: ProjectScopeV1 | RepositoryScopeV1,
         revision: CommitRevisionV1 | WorkspaceSnapshotRevisionV1 | None,
         evidence_scope: EvidenceScope,
-        gather: Callable[[datetime], Awaitable[_Gathered]],
+        gather: Callable[[Freshness], Awaitable[_Gathered]],
     ) -> ContextPackageV1:
-        deadline = context.deadline_seconds or self._deadline
+        deadline = min(context.deadline_seconds or self._deadline, self._deadline)
         budget: QueryBudgetV1 = getattr(request, "budget")  # noqa: B009 (every tool input has one)
         cursor: str | None = getattr(request, "cursor")  # noqa: B009
         now = self._clock()
@@ -414,17 +458,18 @@ class ContextComposer:
                         cursor,
                         tool=tool,
                         digest=digest,
-                        as_of_event_id=freshness.as_of_event_id,
+                        as_of_event_id=_snapshot_token(freshness),
                         now=now,
                     ).position
-                gathered = await gather(now)
+                gathered = await gather(freshness)
                 ranked = _rank(gathered.candidates.values())
                 if len(ranked) > MAX_CANDIDATES:
                     ranked = ranked[:MAX_CANDIDATES]
                     gathered.warnings.add("candidates_capped")
-                items, next_position, dropped = await self._page(
-                    ranked, start, budget, replace(evidence_scope, before=gathered.before)
+                cited = replace(
+                    gathered.evidence or evidence_scope, max_outbox_id=freshness.as_of_outbox_id
                 )
+                items, next_position, dropped = await self._page(ranked, start, budget, cited)
         except TimeoutError:
             raise RetrievalDeadlineExceeded("context request exceeded its deadline") from None
         if dropped:
@@ -435,7 +480,7 @@ class ContextComposer:
                 tool=tool,
                 digest=digest,
                 position=next_position,
-                as_of_event_id=freshness.as_of_event_id,
+                as_of_event_id=_snapshot_token(freshness),
                 now=now,
             )
         return _package(
@@ -449,38 +494,42 @@ class ContextComposer:
         budget: QueryBudgetV1,
         scope: EvidenceScope,
     ) -> tuple[list[ContextItemV1], int, int]:
+        """Items from `start` in rank order, and the position after the last one taken.
+
+        `max_bytes` is the exact UTF-8 size of the serialized `items` array (`[`, `,`, `]`
+        included, as `ContextPackageV1.model_dump_json` writes it); `max_tokens` bounds the same
+        bytes with the documented `ceil(bytes / 4)` estimate. The returned position skips every
+        following candidate that has no citable evidence, so a page is never followed by an
+        empty one.
+        """
         max_items = min(budget.max_items, MAX_PAGE_ITEMS)
         max_bytes = min(budget.max_bytes, budget.max_tokens * BYTES_PER_TOKEN)
+        renderer = _Renderer(self, ranked, scope)
         items: list[ContextItemV1] = []
-        used = 0
+        used = 2  # the array's brackets
         dropped = 0
         position = start
-        events: dict[str, LedgerEvent] = {}
         while position < len(ranked) and len(items) < max_items:
-            window = ranked[position : position + max_items]
-            wanted = {c.event_id for cand in window for c in cand.citations} - set(events)
-            if wanted:
-                events.update(await self._ledger.events(wanted, scope))
-            for candidate in window:
-                if len(items) >= max_items:
-                    break
-                item = await self._render(candidate, events, quote=True)
-                if item is None:
-                    dropped += 1
-                    position += 1
-                    continue
+            item = await renderer.render(position, quote=True)
+            if item is None:
+                dropped += 1
+                position += 1
+                continue
+            size = _size(item) + (1 if items else 0)  # a separating comma after the first
+            if used + size > max_bytes:
+                if items:
+                    return items, position, dropped
+                item = await renderer.render(position, quote=False)
+                assert item is not None  # the same citations resolved a moment ago
                 size = _size(item)
                 if used + size > max_bytes:
-                    if items:
-                        return items, position, dropped
-                    item = await self._render(candidate, events, quote=False)
-                    assert item is not None  # the same citations resolved a moment ago
-                    size = _size(item)
-                    if size > max_bytes:
-                        raise ContextBudgetTooSmall("the budget cannot hold the first item")
-                items.append(item)
-                used += size
-                position += 1
+                    raise ContextBudgetTooSmall("the budget cannot hold the first item")
+            items.append(item)
+            used += size
+            position += 1
+        while position < len(ranked) and not await renderer.citable(position):
+            dropped += 1
+            position += 1
         return items, position, dropped
 
     async def _render(
@@ -528,23 +577,44 @@ class ContextComposer:
             raise ScopeNotFound("the repository is unknown")
         return await self._revisions.view(repository_id, revision)
 
-    def _window(self, view: RevisionView, now: datetime) -> _Window:
+    def _window(self, view: RevisionView, freshness: Freshness) -> _Window:
+        """The revision's window; an open one is read at the projection snapshot's instant."""
         start = window_bound(view.run.occurred_at)
         end = window_bound(view.window_end)
         assert start is not None
-        at = now if end is None else max(start, end - _ONE_MICROSECOND)
-        return _Window(start, end, at)
+        at = freshness.as_of_recorded_at if end is None else end - _ONE_MICROSECOND
+        return _Window(start, end, max(start, at))
+
+    @staticmethod
+    def _revision_scope(
+        repository_id: str,
+        revision: CommitRevisionV1 | WorkspaceSnapshotRevisionV1,
+        window: _Window,
+        freshness: Freshness,
+    ) -> EvidenceScope:
+        snapshot = None if isinstance(revision, CommitRevisionV1) else revision.snapshot_id
+        return EvidenceScope(
+            repository_id=repository_id,
+            before=window.end,
+            recorded_before=window.end,
+            revision_mode=True,
+            snapshot_id=snapshot,
+            max_outbox_id=freshness.as_of_outbox_id,
+        )
 
     # --- context_for_task ---
 
-    async def _task_candidates(self, request: ContextForTaskInputV1, now: datetime) -> _Gathered:
+    async def _task_candidates(
+        self, request: ContextForTaskInputV1, freshness: Freshness
+    ) -> _Gathered:
         repository_id = request.repository_id
         view = await self._view(repository_id, request.revision)
-        window = self._window(view, now)
-        gathered = _Gathered(before=window.end)
+        window = self._window(view, freshness)
+        scope = self._revision_scope(repository_id, request.revision, window, freshness)
+        gathered = _Gathered(evidence=scope)
         _view_warnings(view, gathered)
         tokens = _tokens(request.task)
-        commit_mode = isinstance(request.revision, CommitRevisionV1)
+        snapshot = None if isinstance(request.revision, CommitRevisionV1) else scope.snapshot_id
         code = _CodeIndex(view)
         matches = code.matches(tokens)
         anchors = [node for node, _ in matches[:MAX_ANCHORS]]
@@ -569,9 +639,8 @@ class ContextComposer:
         temporal = TemporalScope(repository_id=repository_id)
         decisions = await self._decisions(temporal, window.at, window.at, False, gathered)
         failures = await self._failures(temporal, window.at, window.at, gathered)
-        if commit_mode:
-            failures = [clean for f in failures if (clean := _without_dirty(f)) is not None]
-        hits = await self._search_hits(repository_id, request.task, tokens, window, gathered)
+        failures = [clean for f in failures if (clean := _without_dirty(f, snapshot)) is not None]
+        hits = await self._search_hits(repository_id, request.task, tokens, scope, gathered)
         hit_match = {event: score for hit, score in hits for event in hit.source_event_ids}
         decision_events = {e for d in decisions for e in d.source_event_ids}
         failure_events = {e for f in failures for e in f.source_event_ids}
@@ -629,9 +698,15 @@ class ContextComposer:
         repository_id: str,
         task: str,
         tokens: Sequence[str],
-        window: _Window,
+        scope: EvidenceScope,
         gathered: _Gathered,
     ) -> list[tuple[SearchHit, float]]:
+        """Lexical and vector hits whose content some citable event of the revision carries.
+
+        A search row only knows when its content occurred; whether an event that carries it was
+        recorded inside the window, is delivered by the snapshot, and is not output of another
+        (dirty) workspace is the ledger's to say (`EvidenceScope`), so every hit is checked there.
+        """
         projects = await self._revisions.projects_of(repository_id, MAX_SEARCH_PROJECTS + 1)
         if not projects:
             gathered.warnings.add("search_scope_unresolved")
@@ -639,40 +714,53 @@ class ContextComposer:
         if len(projects) > MAX_SEARCH_PROJECTS:
             projects = projects[:MAX_SEARCH_PROJECTS]
             gathered.warnings.add("search_projects_capped")
+        lexical: list[SearchHit] = []
+        vector: list[SearchHit] = []
+        for project in projects:
+            search_scope = SearchScope(project, repository_id)
+            if tokens:
+                query = " or ".join(tokens)
+                lexical += await self._search.lexical(query, search_scope, MAX_SEARCH_HITS)
+            try:
+                vector += await self._search.vector(task, search_scope, MAX_SEARCH_HITS)
+            except SearchRequestError:
+                gathered.warnings.add("vector_search_unavailable")
+        citable = await self._ledger.events(
+            {e for hit in (*lexical, *vector) for e in (hit.event_id, *hit.source_event_ids)},
+            scope,
+        )
+
+        def admitted(hit: SearchHit) -> SearchHit | None:
+            events = tuple(sorted(e for e in {hit.event_id, *hit.source_event_ids} if e in citable))
+            return replace(hit, source_event_ids=events) if events else None
+
         found: dict[str, tuple[SearchHit, float]] = {}
 
         def keep(hit: SearchHit, score: float) -> None:
-            if not window.admits(hit.occurred_at):
-                return
             held = found.get(hit.content_id)
             if held is None or score > held[1]:
                 found[hit.content_id] = (hit, score)
 
-        for project in projects:
-            scope = SearchScope(project, repository_id)
-            if tokens:
-                lexical = await self._search.lexical(" or ".join(tokens), scope, MAX_SEARCH_HITS)
-                top = max((hit.score for hit in lexical), default=0.0)
-                for hit in lexical:
-                    keep(hit, _quantize(hit.score / top) if top > 0 else 0.0)
-            try:
-                vector = await self._search.vector(task, scope, MAX_SEARCH_HITS)
-            except SearchRequestError:
-                gathered.warnings.add("vector_search_unavailable")
-                continue
-            for hit in vector:
-                if hit.score >= MIN_VECTOR_SCORE:  # below it, nearness is noise, not relevance
-                    keep(hit, _quantize(min(1.0, hit.score) * VECTOR_WEIGHT))
+        kept = [hit for hit in map(admitted, lexical) if hit is not None]
+        top = max((hit.score for hit in kept), default=0.0)
+        for hit in kept:
+            keep(hit, _quantize(hit.score / top) if top > 0 else 0.0)
+        for raw in vector:
+            near = admitted(raw)
+            if near is not None and near.score >= MIN_VECTOR_SCORE:  # below: noise, not relevance
+                keep(near, _quantize(min(1.0, near.score) * VECTOR_WEIGHT))
         return [found[key] for key in sorted(found)]
 
     # --- repository_overview ---
 
     async def _overview_candidates(
-        self, repository_id: str, revision: CommitRevisionV1, now: datetime
+        self, repository_id: str, revision: CommitRevisionV1, freshness: Freshness
     ) -> _Gathered:
         view = await self._view(repository_id, revision)
-        window = self._window(view, now)
-        gathered = _Gathered(before=window.end)
+        window = self._window(view, freshness)
+        gathered = _Gathered(
+            evidence=self._revision_scope(repository_id, revision, window, freshness)
+        )
         _view_warnings(view, gathered)
         code = _CodeIndex(view)
         gathered.add(code.summary(revision.commit_id))
@@ -688,7 +776,7 @@ class ContextComposer:
         for record in await self._decisions(temporal, window.at, window.at, False, gathered):
             gathered.add(_decision_candidate(record, window.at, priority=3))
         for failure in await self._failures(temporal, window.at, window.at, gathered):
-            clean = _without_dirty(failure)
+            clean = _without_dirty(failure, None)
             if clean is None or clean.resolution.status is FixStatus.RESOLVED:
                 continue
             for candidate in _failure_candidates(clean, priority=3):
@@ -698,11 +786,13 @@ class ContextComposer:
     # --- symbol_context ---
 
     async def _symbol_candidates(
-        self, request: SymbolContextInputV1, revision: CommitRevisionV1, now: datetime
+        self, request: SymbolContextInputV1, revision: CommitRevisionV1, freshness: Freshness
     ) -> _Gathered:
         view = await self._view(request.repository_id, revision)
-        window = self._window(view, now)
-        gathered = _Gathered(before=window.end)
+        window = self._window(view, freshness)
+        gathered = _Gathered(
+            evidence=self._revision_scope(request.repository_id, revision, window, freshness)
+        )
         _view_warnings(view, gathered)
         code = _CodeIndex(view)
         symbol = code.resolve_symbol(request.symbol_id, request.symbol_name)
@@ -733,7 +823,7 @@ class ContextComposer:
     # --- decision_history ---
 
     async def _decision_candidates(
-        self, request: DecisionHistoryInputV1, now: datetime
+        self, request: DecisionHistoryInputV1, freshness: Freshness
     ) -> _Gathered:
         if isinstance(request.scope, ProjectScopeV1):
             temporal = TemporalScope(project_id=request.scope.project_id)
@@ -744,7 +834,9 @@ class ContextComposer:
         if not exists:
             raise ScopeNotFound("the project or repository is unknown")
         gathered = _Gathered()
-        result = await self._temporal.decisions(temporal, request.valid_at, now, True)
+        # Known as of the projection snapshot, not the wall clock: the same snapshot, the same answer.
+        known = freshness.as_of_recorded_at
+        result = await self._temporal.decisions(temporal, request.valid_at, known, True)
         if result.truncated:
             gathered.warnings.add("decisions_capped")
         records = list(result.decisions)
@@ -785,13 +877,17 @@ class ContextComposer:
 
     # --- failure_history ---
 
-    async def _failure_candidates(self, request: FailureHistoryInputV1, now: datetime) -> _Gathered:
+    async def _failure_candidates(
+        self, request: FailureHistoryInputV1, freshness: Freshness
+    ) -> _Gathered:
         if not await self._revisions.repository_exists(request.repository_id):
             raise ScopeNotFound("the repository is unknown")
-        gathered = _Gathered(before=request.valid_to)
+        gathered = _Gathered(
+            evidence=EvidenceScope(repository_id=request.repository_id, before=request.valid_to)
+        )
         temporal = TemporalScope(repository_id=request.repository_id)
         at = request.valid_to - _ONE_MICROSECOND
-        result = await self._temporal.failures(temporal, at, now, True)
+        result = await self._temporal.failures(temporal, at, freshness.as_of_recorded_at, True)
         if result.truncated:
             gathered.warnings.add("failures_capped")
         failures = [f for f in result.failures if _in_window(f, request.valid_from, at)]
@@ -1243,13 +1339,13 @@ def _decision_candidate(
     record: DecisionRecord, at: datetime, *, match: float = 0.0, priority: int = 0
 ) -> _Candidate:
     if record.standing is DecisionStanding.ACTIVE:
-        standing = f"ACTIVE at {_iso(at)}"
+        standing = "ACTIVE at the requested time"
     elif record.reason is HistoricalReason.SUPERSEDED:
-        standing = f"HISTORICAL at {_iso(at)}: superseded by decision {record.superseded_by}"
+        standing = f"HISTORICAL at the requested time: superseded by {record.superseded_by}"
     elif record.reason is HistoricalReason.EXPIRED:
-        standing = f"HISTORICAL at {_iso(at)}: expired at {_iso(record.effective_valid_to)}"
+        standing = f"HISTORICAL at the requested time: expired at {_iso(record.effective_valid_to)}"
     else:
-        standing = f"HISTORICAL at {_iso(at)}: recorded as superseded, end time unknown"
+        standing = "HISTORICAL at the requested time: recorded as superseded, end unknown"
     body = (
         f"decision {record.decision_id}: {standing}\n"
         f"recorded status: {record.status}; valid from {_iso(record.valid_from)} to "
@@ -1386,13 +1482,13 @@ def _content_candidate(hit: SearchHit, score: float) -> _Candidate:
                 valid_from=hit.occurred_at,
                 content_id=hit.content_id,
             )
-            for event_id in sorted({hit.event_id, *hit.source_event_ids})
+            for event_id in hit.source_event_ids  # the citable ones (`_search_hits`)
         ),
         tier=5 if executed else 1,
         exact_scope=False,
         match=score,
         recency=_iso(hit.occurred_at),
-        excerpt=(hit.event_id, hit.content_id),
+        excerpt=(hit.source_event_ids[0], hit.content_id),
     )
 
 
@@ -1429,13 +1525,17 @@ def _run_line(run: ObservedRun) -> str:
     return ", ".join(parts)
 
 
-def _without_dirty(failure: FailureRecord) -> FailureRecord | None:
-    """A failure as seen from a commit: runs on a workspace snapshot are dirty, not evidence."""
-    runs = tuple(run for run in failure.observed_in if run.snapshot_id is None)
+def _without_dirty(failure: FailureRecord, snapshot: str | None) -> FailureRecord | None:
+    """A failure as seen from a revision: runs on any other workspace snapshot are dirty, not
+    evidence (`snapshot` is the requested one, `None` for a commit)."""
+    runs = tuple(run for run in failure.observed_in if run.snapshot_id in (None, snapshot))
     if failure.observed_in and not runs:
         return None
     resolution = failure.resolution
-    if resolution.path is not None and resolution.path.validated_snapshot_id is not None:
+    if resolution.path is not None and resolution.path.validated_snapshot_id not in (
+        None,
+        snapshot,
+    ):
         resolution = replace(resolution, status=FixStatus.UNRESOLVED, reason="dirty_fix", path=None)
     return replace(failure, observed_in=runs, resolution=resolution)
 
@@ -1467,6 +1567,12 @@ def _failure_words(failure: FailureRecord) -> tuple[str, ...]:
 # --------------------------------------------------------------------------------------------
 # Ranking, budgets and helpers
 # --------------------------------------------------------------------------------------------
+
+
+def _snapshot_token(freshness: Freshness) -> str:
+    """What a cursor binds as its snapshot: the watermark AND the dependent checkpoints, so any
+    delivery that changes an answer (even one past a still-pending earlier row) makes it stale."""
+    return f"{freshness.as_of_event_id}|{freshness.projection_checkpoint}"
 
 
 def _rank(candidates: Iterable[_Candidate]) -> list[_Candidate]:

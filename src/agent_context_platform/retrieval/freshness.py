@@ -17,8 +17,9 @@
   and `projection_not_started:<projector>` when it has no checkpoint at all.
 
 Reading checkpoints and dead letters needs SELECT on `projection.projection_checkpoints` and
-`projection.dead_letters`, which only the projector role holds today, so this reader takes its own
-session factory (the outbox is readable by the API role too).
+`projection.dead_letters`. The reader is meant to run as the API role (never the projector role,
+which may write projection state); the API role's read grants come with a dedicated migration, and
+until then the session factory is injected so tests can use a role that has them.
 """
 
 from __future__ import annotations
@@ -44,6 +45,8 @@ _WATERMARK: Final[str] = (
     "AND (CAST(:low AS bigint) IS NULL OR outbox_id < CAST(:low AS bigint)) "
     "ORDER BY outbox_id DESC LIMIT 1"
 )
+_RECORDED: Final[str] = "SELECT recorded_at FROM ledger.events WHERE event_id = :event_id"
+_TIMEOUT: Final[str] = "SELECT set_config('statement_timeout', :millis, true)"
 _CHECKPOINTS: Final[str] = (
     "SELECT projector_name, projector_version, last_outbox_id, state "
     "FROM projection.projection_checkpoints"
@@ -61,19 +64,38 @@ class ProjectionNotReady(RetrievalError):
 @dataclass(frozen=True, slots=True)
 class Freshness:
     as_of_event_id: str
+    as_of_outbox_id: int
+    # When the ledger recorded the as-of event: the instant an open revision window is read at,
+    # so an answer depends on the projection snapshot and not on the wall clock.
+    as_of_recorded_at: datetime
     projection_checkpoint: str
     staleness_ms: int
     warnings: tuple[str, ...]
 
 
 class FreshnessReader:
-    def __init__(self, sessions: async_sessionmaker[AsyncSession]) -> None:
+    """Reads the projection state. Needs SELECT on the outbox, `ledger.events`, checkpoints and
+    dead letters: the API role once its read grants exist (today only the projector role has the
+    last two), so the session factory is injected."""
+
+    def __init__(
+        self, sessions: async_sessionmaker[AsyncSession], *, statement_timeout_seconds: float = 5.0
+    ) -> None:
+        if not statement_timeout_seconds > 0:
+            raise ValueError("statement_timeout_seconds must be positive")
         self._sessions = sessions
+        self._timeout = str(max(1, int(statement_timeout_seconds * 1000)))
 
     async def read(self, projectors: Sequence[tuple[str, str]], now: datetime) -> Freshness:
         async with self._sessions() as session, session.begin():
+            await session.execute(text(_TIMEOUT), {"millis": self._timeout})
             waiting = (await session.execute(text(_WAITING))).one()
             mark = (await session.execute(text(_WATERMARK), {"low": waiting.low})).first()
+            recorded = None
+            if mark is not None:
+                recorded = (
+                    await session.execute(text(_RECORDED), {"event_id": mark.event_id})
+                ).scalar_one()
             checkpoints = {
                 (str(row.projector_name), str(row.projector_version)): row
                 for row in await session.execute(text(_CHECKPOINTS))
@@ -82,7 +104,7 @@ class FreshnessReader:
                 (str(row.projector_name), str(row.projector_version)): int(row.open)
                 for row in await session.execute(text(_DEAD_LETTERS))
             }
-        if mark is None:
+        if mark is None or recorded is None:
             raise ProjectionNotReady("no event has been projected yet")
         material: list[list[object]] = []
         warnings: list[str] = []
@@ -106,6 +128,8 @@ class FreshnessReader:
             staleness = max(0, int((now - waiting.oldest).total_seconds() * 1000))
         return Freshness(
             as_of_event_id=str(mark.event_id),
+            as_of_outbox_id=int(mark.outbox_id),
+            as_of_recorded_at=recorded,
             projection_checkpoint=f"pc1-{digest[:40]}",
             staleness_ms=staleness,
             warnings=tuple(dict.fromkeys(warnings)),
