@@ -8,8 +8,13 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
+import signal
+import subprocess
+import sys
 from collections.abc import Iterator
 from pathlib import Path
+from typing import Any
 
 import pytest
 from alembic.config import Config
@@ -189,7 +194,7 @@ def test_an_expected_head_mismatch_fails_before_connecting(dsn: str) -> None:
         asyncio.run(_upgrade(dsn, expect_head=FIRST_REVISION))
 
     assert raised.value.code == "expected_head_mismatch"
-    assert not raised.value.refusal
+    assert not raised.value.usage_error
     assert asyncio.run(_scalar(dsn, "SELECT to_regclass('alembic_version')")) is None
 
 
@@ -212,7 +217,7 @@ def test_a_database_ahead_of_the_image_is_refused_not_downgraded(dsn: str) -> No
         with pytest.raises(migrate.MigrationError) as raised:
             asyncio.run(_upgrade(dsn))
         assert raised.value.code == "unknown_revision"
-        assert raised.value.refusal
+        assert raised.value.usage_error
         assert asyncio.run(_scalar(dsn, "SELECT to_regclass('ledger.events') IS NOT NULL"))
         assert asyncio.run(
             _scalar(dsn, f"SELECT pg_try_advisory_lock({migrate.MIGRATION_LOCK_KEY})")
@@ -283,3 +288,64 @@ def test_the_cli_reports_an_unreachable_database_by_class_only(dsn: str) -> None
     assert code == cli.EXIT_FAILED
     assert out == ""
     assert err.startswith("error: ") and make_url(dsn).password not in err  # type: ignore[operator]
+
+
+def test_sigterm_while_waiting_for_the_lock_exits_and_leaves_no_waiter(dsn: str) -> None:
+    """As PID 1 of the migrate container `docker stop` sends SIGTERM: stop waiting, release."""
+
+    async def waiting_backends(connection: Any) -> int:
+        count = await connection.scalar(
+            text(
+                "SELECT count(*) FROM pg_locks WHERE locktype = 'advisory' AND NOT granted "
+                "AND database = (SELECT oid FROM pg_database WHERE datname = current_database())"
+            )
+        )
+        await connection.commit()
+        return int(count or 0)
+
+    async def scenario() -> tuple[int | None, str, int]:
+        holder = _engine(dsn)
+        try:
+            async with holder.connect() as connection:
+                await connection.execute(
+                    text("SELECT pg_advisory_lock(:key)"), {"key": migrate.MIGRATION_LOCK_KEY}
+                )
+                await connection.commit()
+                process = subprocess.Popen(
+                    [sys.executable, "-m", "agent_context_platform.cli", "db", "upgrade"],
+                    env={
+                        **os.environ,
+                        "AGENT_CONTEXT_POSTGRESQL__MIGRATION_DSN": dsn,
+                        migrate.ALEMBIC_CONFIG_ENV: str(ALEMBIC_INI),
+                    },
+                    stdout=subprocess.PIPE,
+                    stderr=subprocess.PIPE,
+                    text=True,
+                )
+                try:
+                    for _ in range(300):
+                        if await waiting_backends(connection) == 1:
+                            break
+                        await asyncio.sleep(0.05)
+                    assert await waiting_backends(connection) == 1
+                    process.send_signal(signal.SIGTERM)
+                    _, stderr = await asyncio.to_thread(process.communicate, timeout=30)
+                finally:
+                    if process.poll() is None:
+                        process.kill()
+                for _ in range(100):
+                    if await waiting_backends(connection) == 0:
+                        break
+                    await asyncio.sleep(0.05)
+                return process.returncode, stderr, await waiting_backends(connection)
+        finally:
+            await holder.dispose()
+
+    code, stderr, left = asyncio.run(scenario())
+
+    assert code == cli.EXIT_FAILED
+    assert stderr.startswith("error: interrupted: "), stderr[-500:]
+    assert make_url(dsn).password not in stderr  # type: ignore[operator]
+    assert left == 0
+    assert asyncio.run(_scalar(dsn, "SELECT to_regclass('alembic_version')")) is None
+    assert asyncio.run(_upgrade(dsn)).applied

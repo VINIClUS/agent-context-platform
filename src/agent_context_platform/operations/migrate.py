@@ -33,6 +33,8 @@ from alembic import command
 ALEMBIC_CONFIG_ENV: Final = "AGENT_CONTEXT_ALEMBIC_CONFIG"
 DEFAULT_ALEMBIC_CONFIG: Final = "alembic.ini"
 DEFAULT_LOCK_TIMEOUT_SECONDS: Final = 600
+# PostgreSQL's lock_timeout is an int of milliseconds.
+MAX_LOCK_TIMEOUT_SECONDS: Final = 2_147_483.0
 
 # One key for every migration run, derived from a fixed name (as the rebuild lock).
 MIGRATION_LOCK_NAME: Final = "agent-context.schema.migrate"
@@ -49,9 +51,11 @@ MigrationErrorCode = Literal[
     "unknown_revision",
     "lock_timeout",
     "head_mismatch",
+    "interrupted",
 ]
-# Exit code 2 for an unsafe refusal (the database is ahead of the image), 1 otherwise.
-_REFUSALS: Final = frozenset({"unknown_revision"})
+# Exit code 2 for an unsafe refusal (the database is ahead of the image) or a missing Alembic
+# configuration (a usage error), 1 otherwise.
+_USAGE_ERRORS: Final = frozenset({"unknown_revision", "alembic_config_missing"})
 
 
 class MigrationError(Exception):
@@ -62,8 +66,8 @@ class MigrationError(Exception):
         self.code: MigrationErrorCode = code
 
     @property
-    def refusal(self) -> bool:
-        return self.code in _REFUSALS
+    def usage_error(self) -> bool:
+        return self.code in _USAGE_ERRORS
 
 
 @dataclass(frozen=True, slots=True)

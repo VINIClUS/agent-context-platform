@@ -672,6 +672,8 @@ def test_db_upgrade_falls_back_to_the_shared_dsn_and_reports_a_no_op_as_json(
     ("error", "exit_code"),
     [
         (migrate.MigrationError("unknown_revision", "refusing to downgrade"), cli.EXIT_USAGE),
+        (migrate.MigrationError("alembic_config_missing", "not found"), cli.EXIT_USAGE),
+        (migrate.MigrationError("interrupted", "stopped by a signal"), cli.EXIT_FAILED),
         (migrate.MigrationError("head_mismatch", "not at head"), cli.EXIT_FAILED),
         (migrate.MigrationError("lock_timeout", "held too long"), cli.EXIT_FAILED),
         (RuntimeError(f"connection to {DSN} failed"), cli.EXIT_FAILED),
@@ -708,7 +710,7 @@ def test_db_commands_need_a_dsn_and_the_alembic_scripts(
 
     missing = str(tmp_path / "missing.ini")
     result = CliRunner().invoke(cli.app, ["db", "current", "--alembic-config", missing])
-    assert result.exit_code == cli.EXIT_FAILED
+    assert result.exit_code == cli.EXIT_USAGE
     assert result.stderr.startswith("error: alembic_config_missing: ")
     assert migrations.upgrade == []
 
@@ -739,3 +741,37 @@ def test_db_current_reports_the_state(
         "state": state,
     }
     assert migrations.disposed == 2
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "0", "-1", "1e12", "2147484"])
+def test_db_upgrade_rejects_a_lock_timeout_postgresql_cannot_hold(
+    monkeypatch: pytest.MonkeyPatch, migrations: MigrateCalls, value: str
+) -> None:
+    async def fake_upgrade(*_args: Any, **_options: Any) -> migrate.MigrationReport:
+        raise AssertionError("must not upgrade")
+
+    monkeypatch.setattr(migrate, "upgrade", fake_upgrade)
+
+    result = CliRunner().invoke(cli.app, ["db", "upgrade", "--lock-timeout", value])
+
+    assert result.exit_code == cli.EXIT_USAGE
+    assert migrations.upgrade == []
+
+
+def test_db_upgrade_accepts_the_largest_lock_timeout(
+    monkeypatch: pytest.MonkeyPatch, migrations: MigrateCalls
+) -> None:
+    seen: dict[str, Any] = {}
+
+    async def fake_upgrade(engine: Any, config: Any, **options: Any) -> migrate.MigrationReport:
+        seen.update(options)
+        return _migration_report(applied=False)
+
+    monkeypatch.setattr(migrate, "upgrade", fake_upgrade)
+
+    result = CliRunner().invoke(
+        cli.app, ["db", "upgrade", "--lock-timeout", str(migrate.MAX_LOCK_TIMEOUT_SECONDS)]
+    )
+
+    assert result.exit_code == cli.EXIT_OK, result.stderr
+    assert seen["lock_timeout_seconds"] == migrate.MAX_LOCK_TIMEOUT_SECONDS

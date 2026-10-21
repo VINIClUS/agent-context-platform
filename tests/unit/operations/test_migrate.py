@@ -116,13 +116,20 @@ def test_an_expected_head_mismatch_never_connects() -> None:
         )
 
     assert raised.value.code == "expected_head_mismatch"
-    assert raised.value.refusal is False
+    assert raised.value.usage_error is False
 
 
-def test_only_a_database_ahead_of_the_image_is_a_refusal() -> None:
-    assert migrate.MigrationError("unknown_revision", "x").refusal
-    assert not migrate.MigrationError("head_mismatch", "x").refusal
-    assert not migrate.MigrationError("lock_timeout", "x").refusal
+def test_only_unsafe_refusals_and_a_missing_config_are_usage_errors() -> None:
+    assert migrate.MigrationError("unknown_revision", "x").usage_error
+    assert migrate.MigrationError("alembic_config_missing", "x").usage_error
+    assert not migrate.MigrationError("head_mismatch", "x").usage_error
+    assert not migrate.MigrationError("lock_timeout", "x").usage_error
+    assert not migrate.MigrationError("interrupted", "x").usage_error
+
+
+def test_the_largest_lock_timeout_fits_postgresql() -> None:
+    # lock_timeout is an int of milliseconds.
+    assert migrate.MAX_LOCK_TIMEOUT_SECONDS * 1000 <= 2**31 - 1
 
 
 def test_the_lock_key_is_stable_and_distinct_from_the_rebuild_lock() -> None:

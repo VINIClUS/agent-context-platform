@@ -21,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import os
 import signal
 import stat
@@ -336,7 +337,7 @@ def _run(main: Callable[[], Coroutine[Any, Any, int]]) -> None:
         code = EXIT_FAILED
     except migrate.MigrationError as error:
         typer.echo(f"error: {error.code}: {error}", err=True)
-        code = EXIT_USAGE if error.refusal else EXIT_FAILED
+        code = EXIT_USAGE if error.usage_error else EXIT_FAILED
     except provisioning.ProvisioningError as error:
         typer.echo(f"error: {error.code}{_PROVISIONING_HINTS.get(error.code, '')}", err=True)
         code = EXIT_USAGE
@@ -1360,7 +1361,9 @@ def db_upgrade_command(
     lock_timeout: Annotated[
         float,
         typer.Option(
-            "--lock-timeout", min=0.001, help="Seconds to wait for a concurrent migration."
+            "--lock-timeout",
+            help="Seconds to wait for a concurrent migration "
+            f"(at most {migrate.MAX_LOCK_TIMEOUT_SECONDS:.0f}).",
         ),
     ] = migrate.DEFAULT_LOCK_TIMEOUT_SECONDS,
     alembic_config: _ALEMBIC_CONFIG = None,
@@ -1369,14 +1372,48 @@ def db_upgrade_command(
     """Upgrade to the image's Alembic head under the migration lock; never downgrades."""
 
     async def main() -> int:
+        if not (
+            math.isfinite(lock_timeout) and 0 < lock_timeout <= migrate.MAX_LOCK_TIMEOUT_SECONDS
+        ):
+            raise CliUsageError(
+                f"--lock-timeout must be in (0, {migrate.MAX_LOCK_TIMEOUT_SECONDS:.0f}] seconds"
+            )
         settings = _load_settings()
         config = migrate.alembic_config(alembic_config)
         engine = _engine(settings.postgresql.effective_migration_dsn, "MIGRATION_DSN")
+        # As PID 1 of the migrate container, `docker stop` sends SIGTERM: cancel the run so the
+        # lock wait (or the migration transaction) is abandoned and the connection closed,
+        # instead of being SIGKILLed while the server backend keeps waiting.
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+        interrupted = asyncio.Event()
+
+        def stop() -> None:
+            interrupted.set()
+            if task is not None:
+                task.cancel()
+
+        handled: list[signal.Signals] = []
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+                loop.add_signal_handler(sig, stop)
+                handled.append(sig)
         try:
             report = await migrate.upgrade(
                 engine, config, expect_head=expect_head, lock_timeout_seconds=lock_timeout
             )
+        except BaseException:
+            if not interrupted.is_set():
+                raise
+            if task is not None:
+                task.uncancel()
+            raise migrate.MigrationError(
+                "interrupted", "stopped by a signal; run `db current` to see the revision"
+            ) from None
         finally:
+            # A second signal during clean-up gets the default action.
+            for sig in handled:
+                loop.remove_signal_handler(sig)
             await engine.dispose()
         line = (
             f"schema upgraded from {report.before or 'an empty database'} to {report.after}"
