@@ -111,7 +111,7 @@ GO_MAIN = (
 
 # The G3 golden graph of this ledger. Every ID in it derives from pinned inputs (git dates, the
 # indexer clock, fixed fixture event IDs), so a change here is a real change of the projection.
-GOLDEN_DIGEST = "f631bf218b10fbc44d336c1d9f6dfe5cfc8b3a2b55de1515bc3bee53a68e18f1"
+GOLDEN_DIGEST = "348c3543a3fad2eb24131eb2218109d9b5b53f83f95cfac388f5cfce8899b6dd"
 GOLDEN_EVENTS = 135
 GOLDEN_NODES = {
     "Assertion": 31,
@@ -121,8 +121,10 @@ GOLDEN_NODES = {
     "Commit": 5,
     "Constraint": 1,
     "Decision": 2,
+    "DecisionVersion": 2,
     "Dependency": 1,
     "Failure": 1,
+    "FailureObservation": 1,
     "File": 4,
     "FileRevision": 5,
     "Finding": 1,
@@ -149,10 +151,12 @@ GOLDEN_RELATIONSHIPS = {
     "DEFINES": 16,
     "DEPENDS_ON": 1,
     "HAS_PARENT": 1,
+    "HAS_OBSERVATION": 1,
     "HAS_PROJECT": 1,
     "HAS_REVISION": 25,
     "HAS_SNAPSHOT": 1,
     "HAS_TURN": 1,
+    "HAS_VERSION": 2,
     "IMPORTS": 1,
     "INDEXED": 3,
     "INVOKED": 1,
@@ -249,7 +253,10 @@ async def read_facts(store: Neo4jStore) -> GraphFacts:
     async def read(tx: Neo4jTransaction) -> tuple[frozenset[str], frozenset[tuple[str, str, str]]]:
         nodes = (
             await tx.run(
-                "MATCH (n) RETURN labels(n) AS labels, properties(n) AS props", parameters={}
+                # The history marker is metadata about the graph, not projected data.
+                "MATCH (n) WHERE NOT n:ProjectionHistory "
+                "RETURN labels(n) AS labels, properties(n) AS props",
+                parameters={},
             )
         ).records
         rels = (
@@ -756,6 +763,10 @@ def test_in_place_rebuild_reproduces_digest_counts_and_ids(world: World) -> None
 
     rebuilt = asyncio.run(graph_facts())  # step 3
     assert rebuilt == world.facts
+    # Only now, verified, does the graph claim complete history (what temporal reads require).
+    assert payload["history_recorded"] is True
+    status = report(invoke(["projection", "status", "--json"], world.env()))
+    assert status["history"] == {"state": "complete", "missing": [], "others_missing": []}
 
     # The report events the rebuild itself recorded are handled by no projector: still caught up.
     after = invoke(
@@ -785,13 +796,14 @@ def test_standby_rebuild_into_an_empty_target_matches_the_digest(world: World) -
     assert result.exit_code == 0, result.output
     payload = report(result)
     assert payload["mode"] == "standby" and payload["verified_target"]
-    assert payload["graph_digest"] == world.facts.digest
+    assert payload["graph_digest"] == world.facts.digest and payload["history_recorded"]
     assert asyncio.run(graph_facts()) == world.facts
 
     wiped = invoke([*args, "--wipe-target", "--confirm", "neo4j"], world.target_env(live_uri=live))
     assert wiped.exit_code == 0, wiped.output
     assert report(wiped)["graph_digest"] == world.facts.digest
-    assert report(wiped)["wiped_nodes"] == sum(world.facts.nodes.values())
+    # every projected node, plus the history marker the first standby rebuild recorded
+    assert report(wiped)["wiped_nodes"] == sum(world.facts.nodes.values()) + 1
     assert asyncio.run(graph_facts()) == world.facts
     # A standby rebuild never touches the live checkpoints.
     assert (
