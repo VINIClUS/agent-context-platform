@@ -53,7 +53,8 @@ import os, sys; from importlib.metadata import version; \
 from agent_context_platform.operations.migrate import alembic_config, image_head; \
 actual = {'VERSION': version('agent-context-platform'), 'SDK_VERSION': version('agent-context-sdk'), \
 'ALEMBIC_HEAD': image_head(alembic_config())}; \
-wrong = [k for k, v in actual.items() if os.environ[k] and os.environ[k].removeprefix('v') != v]; \
+given = {k: os.environ[k].removeprefix('v') if k == 'VERSION' else os.environ[k] for k in actual}; \
+wrong = [k for k, v in actual.items() if given[k] and given[k] != v]; \
 print('image contents:', actual); \
 sys.exit('build arguments do not match the image: ' + ', '.join(wrong) if wrong else 0)"
 
