@@ -7,6 +7,8 @@ from typing import NoReturn
 import pytest
 from fastapi.testclient import TestClient
 from pydantic import ValidationError
+from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.pool import NullPool
 
 from agent_context_platform import app as app_module
 from agent_context_platform.app import create_app
@@ -174,7 +176,9 @@ def test_health_ready_wires_the_shipped_head_and_closes_its_clients(
         assert client.get("/health/ready").status_code == 200
 
     assert captured["head"] == migrate.image_head(migrate.alembic_config())
-    assert captured["engine"] is not None
+    # Readiness's own unpooled engine, never the application's pooled one.
+    assert isinstance(captured["engine"], AsyncEngine)
+    assert isinstance(captured["engine"].pool, NullPool)
     assert isinstance(captured["store"], Neo4jStore)
     assert closed == [captured["store"]]
 

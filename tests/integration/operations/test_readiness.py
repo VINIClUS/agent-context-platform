@@ -3,7 +3,11 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import os
+import socket
+import threading
+import time
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -213,3 +217,78 @@ def test_wrong_credentials_are_forbidden(
 
     assert status == 503
     assert body == _not_ready(neo4j="forbidden", s3="forbidden")
+
+
+class BlackholeProxy:
+    """A TCP proxy to PostgreSQL that can silently drop every byte, like a vanished peer."""
+
+    def __init__(self, host: str, port: int) -> None:
+        self._target = (host, port)
+        self.blackhole = threading.Event()
+        self._closed = threading.Event()
+        self._sockets: list[socket.socket] = []
+        self._listener = socket.create_server(("127.0.0.1", 0))
+        self._listener.settimeout(0.2)
+        self.port = int(self._listener.getsockname()[1])
+        self._thread = threading.Thread(target=self._accept, daemon=True)
+        self._thread.start()
+
+    def _accept(self) -> None:
+        while not self._closed.is_set():
+            try:
+                client, _ = self._listener.accept()
+            except TimeoutError:
+                continue
+            except OSError:
+                return
+            upstream = socket.create_connection(self._target)
+            self._sockets += [client, upstream]
+            for source, sink in ((client, upstream), (upstream, client)):
+                threading.Thread(target=self._pump, args=(source, sink), daemon=True).start()
+
+    def _pump(self, source: socket.socket, sink: socket.socket) -> None:
+        with contextlib.suppress(OSError):
+            while data := source.recv(65536):
+                if not self.blackhole.is_set():
+                    sink.sendall(data)
+
+    def close(self) -> None:
+        self._closed.set()
+        self._listener.close()
+        for item in self._sockets:
+            with contextlib.suppress(OSError):
+                item.close()
+
+
+def test_a_blackholed_database_is_reported_within_the_bound_and_recovers(
+    migrated: str, services: dict[str, str], monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setenv(migrate.ALEMBIC_CONFIG_ENV, str(ALEMBIC_INI))
+    url = make_url(migrated)
+    assert url.host is not None and url.port is not None
+    proxy = BlackholeProxy(url.host, url.port)
+    dsn = url.set(host="127.0.0.1", port=proxy.port).render_as_string(hide_password=False)
+    try:
+        with TestClient(create_app(_settings(dsn, services))) as client:
+            assert client.get("/health/ready").status_code == 200
+
+            proxy.blackhole.set()
+            for _ in range(3):
+                started = time.monotonic()
+                response = client.get("/health/ready")
+                elapsed = time.monotonic() - started
+                assert response.status_code == 503
+                assert response.json() == _not_ready(postgresql="timeout", schema="unknown")
+                assert elapsed < 4.0
+
+            proxy.blackhole.clear()
+            deadline = time.monotonic() + 30
+            status = 503
+            while status != 200 and time.monotonic() < deadline:
+                status = client.get("/health/ready").status_code
+                if status != 200:
+                    time.sleep(0.5)
+            assert status == 200
+    finally:
+        proxy.blackhole.clear()
+        proxy.close()

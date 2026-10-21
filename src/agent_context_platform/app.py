@@ -39,7 +39,13 @@ from agent_context_platform.mcp.auth import (
 )
 from agent_context_platform.mcp.server import MCP_PATH, build_mcp_mount, create_mcp_server
 from agent_context_platform.operations import migrate
-from agent_context_platform.operations.readiness import ReadinessProbe, ReadinessReport, build_probe
+from agent_context_platform.operations.readiness import (
+    DEFAULT_TIMEOUT_SECONDS,
+    ReadinessProbe,
+    ReadinessReport,
+    build_probe,
+    readiness_engine,
+)
 from agent_context_platform.projection.neo4j import Neo4jStore
 from agent_context_platform.settings import Settings
 
@@ -152,12 +158,16 @@ def create_app(
         if mcp_auth is None and sessions is not None:
             mcp_holder.runtime = _build_mcp_auth(resolved_settings, sessions)
         store = None
+        readiness_db = None
         if readiness is None:
-            store = (
-                None if resolved_settings.neo4j.uri is None else Neo4jStore(resolved_settings.neo4j)
-            )
+            neo4j = resolved_settings.neo4j
+            store = None if neo4j.uri is None else Neo4jStore(neo4j)
+            readiness_db = None if dsn is None else readiness_engine(dsn, DEFAULT_TIMEOUT_SECONDS)
             application.state.readiness = build_probe(
-                resolved_settings, engine, store, None if engine is None else _shipped_head()
+                resolved_settings,
+                readiness_db,
+                store,
+                None if readiness_db is None else _shipped_head(),
             )
         try:
             async with mcp_mount.lifespan():
@@ -166,6 +176,8 @@ def create_app(
             application.state.readiness = readiness
             if store is not None:
                 await store.close()
+            if readiness_db is not None:
+                await readiness_db.dispose()
             if engine is not None:
                 await engine.dispose()
 

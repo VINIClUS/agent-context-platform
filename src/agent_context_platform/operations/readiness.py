@@ -7,27 +7,33 @@ connectivity check and a ``HeadBucket``.
 
 The result holds component names and coarse states only, never a DSN, a host or an exception
 text. Concurrent requests share one in-flight probe, so a burst of polls costs one round of
-checks.
+checks. PostgreSQL is checked over readiness's own unpooled engine with libpq connect and TCP
+timeouts, so a dead socket left by a failover is never reused.
 """
 
 from __future__ import annotations
 
 import asyncio
+import math
 from collections.abc import Awaitable, Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from typing import Any, Final, Literal
 
 import boto3
 from botocore.config import Config as BotoConfig
 from botocore.exceptions import BotoCoreError, ClientError
+from pydantic import PostgresDsn, Secret
 from sqlalchemy import text
 from sqlalchemy.exc import DBAPIError, SQLAlchemyError
-from sqlalchemy.ext.asyncio import AsyncEngine
+from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
+from sqlalchemy.pool import NullPool
 
 from agent_context_platform.projection.neo4j import Neo4jStore
 from agent_context_platform.settings import S3Settings, Settings
 
 DEFAULT_TIMEOUT_SECONDS: Final = 2.0
+MAX_ABANDONED_PER_CHECK: Final = 4
+READINESS_APPLICATION_NAME: Final = "agent-context-readiness"
 
 ComponentState = Literal[
     "ok",  # reachable and as expected
@@ -61,21 +67,34 @@ class ReadinessReport:
         return {"status": "not_ready", "components": dict(sorted(self.components.items()))}
 
 
-async def _bounded(check: Check, timeout: float, on_timeout: Components) -> Components:
-    try:
-        return await asyncio.wait_for(check(), timeout)
-    except TimeoutError:
-        return on_timeout
-    except Exception:
-        # Never surface the exception: its text may hold a host or a DSN.
-        return {
-            name: "unavailable" if state == "timeout" else state
-            for name, state in on_timeout.items()
-        }
+def _failed(on_timeout: Components) -> Components:
+    return {
+        name: "unavailable" if state == "timeout" else state for name, state in on_timeout.items()
+    }
+
+
+@dataclass(slots=True)
+class _Entry:
+    check: Check
+    on_timeout: Components
+    # Timed-out checks, cancelled but not awaited: strong references until they finish.
+    abandoned: set[asyncio.Task[Components]] = field(default_factory=set)
+
+    def reap(self, task: asyncio.Task[Components]) -> None:
+        self.abandoned.discard(task)
+        if not task.cancelled():
+            task.exception()  # retrieved, so it is never logged; its text may hold a host
 
 
 class ReadinessProbe:
-    """Runs the named checks concurrently; ``timeout_states`` are reported when one times out."""
+    """Runs the named checks concurrently; a check's ``on_timeout`` states report a timeout.
+
+    The bound holds even for a check that ignores cancellation (psycopg answers a cancellation
+    by asking the server to cancel and then waiting for it): a timed-out check is cancelled but
+    never awaited, and at most ``MAX_ABANDONED_PER_CHECK`` of them are kept per check; beyond
+    that the check reports ``on_timeout`` without starting another. A request joins an
+    in-flight probe only while it is younger than the timeout.
+    """
 
     def __init__(
         self,
@@ -83,27 +102,57 @@ class ReadinessProbe:
         *,
         timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
     ) -> None:
-        self._checks = dict(checks)
+        self._entries = {
+            name: _Entry(check, dict(on_timeout)) for name, (check, on_timeout) in checks.items()
+        }
         self._timeout = timeout_seconds
-        self._in_flight: asyncio.Task[ReadinessReport] | None = None
+        self._in_flight: tuple[asyncio.Future[ReadinessReport], float] | None = None
+        self._probes: set[asyncio.Future[ReadinessReport]] = set()
+
+    def abandoned(self, name: str) -> int:
+        return len(self._entries[name].abandoned)
 
     async def probe(self) -> ReadinessReport:
-        if self._in_flight is None or self._in_flight.done():
-            self._in_flight = asyncio.create_task(self._probe())
+        loop = asyncio.get_running_loop()
+        now = loop.time()
+        if (
+            self._in_flight is None
+            or self._in_flight[0].done()
+            or now - self._in_flight[1] >= self._timeout
+        ):
+            task = asyncio.ensure_future(self._probe())
+            self._probes.add(task)
+            task.add_done_callback(self._probes.discard)
+            self._in_flight = (task, now)
         # Shielded: a client that disconnects must not cancel the probe others are awaiting.
-        return await asyncio.shield(self._in_flight)
+        return await asyncio.shield(self._in_flight[0])
 
     async def _probe(self) -> ReadinessReport:
-        results = await asyncio.gather(
-            *(
-                _bounded(check, self._timeout, on_timeout)
-                for check, on_timeout in self._checks.values()
-            )
-        )
+        results = await asyncio.gather(*(self._bounded(entry) for entry in self._entries.values()))
         components: Components = {}
         for result in results:
             components.update(result)
         return ReadinessReport(components)
+
+    async def _bounded(self, entry: _Entry) -> Components:
+        if len(entry.abandoned) >= MAX_ABANDONED_PER_CHECK:
+            return dict(entry.on_timeout)
+        task = asyncio.ensure_future(entry.check())
+        try:
+            done, _ = await asyncio.wait({task}, timeout=self._timeout)
+        except asyncio.CancelledError:
+            task.cancel()
+            raise
+        if not done:
+            task.cancel()
+            entry.abandoned.add(task)
+            task.add_done_callback(entry.reap)
+            return dict(entry.on_timeout)
+        try:
+            return task.result()
+        except Exception:
+            # Never surface the exception: its text may hold a host or a DSN.
+            return _failed(entry.on_timeout)
 
 
 def unconfigured(*names: str) -> tuple[Check, Components]:
@@ -115,17 +164,47 @@ def unconfigured(*names: str) -> tuple[Check, Components]:
     return check, states
 
 
-def postgresql_check(engine: AsyncEngine, expected_head: str | None) -> tuple[Check, Components]:
+def readiness_connect_args(timeout_seconds: float) -> dict[str, Any]:
+    """libpq options that bound a connect and make a dead socket fail instead of hang."""
+    return {
+        "application_name": READINESS_APPLICATION_NAME,
+        "connect_timeout": max(2, math.ceil(timeout_seconds)),  # libpq's minimum is 2
+        "keepalives": 1,
+        "keepalives_idle": 5,
+        "keepalives_interval": 2,
+        "keepalives_count": 2,
+        "tcp_user_timeout": max(1000, math.ceil(timeout_seconds * 2000)),
+    }
+
+
+def readiness_engine(dsn: Secret[PostgresDsn], timeout_seconds: float) -> AsyncEngine:
+    """Readiness's own engine: a fresh, bounded connection per probe, never a pooled one."""
+    return create_async_engine(
+        dsn.get_secret_value().unicode_string(),
+        poolclass=NullPool,
+        connect_args=readiness_connect_args(timeout_seconds),
+    )
+
+
+def postgresql_check(
+    engine: AsyncEngine,
+    expected_head: str | None,
+    *,
+    timeout_seconds: float = DEFAULT_TIMEOUT_SECONDS,
+) -> tuple[Check, Components]:
     """Connect, read ``alembic_version`` read-only and compare it with the image's head.
 
     The connecting role needs ``SELECT`` on ``public.alembic_version``; without it the schema
     is reported ``forbidden`` (fail closed), never assumed current.
     """
 
+    statement_ms = max(1, math.ceil(timeout_seconds * 1000))
+
     async def check() -> Components:
         try:
             async with engine.connect() as connection:
                 await connection.execute(text("SET TRANSACTION READ ONLY"))
+                await connection.execute(text(f"SET LOCAL statement_timeout = {statement_ms}"))
                 try:
                     rows = (
                         await connection.execute(
@@ -219,7 +298,7 @@ def build_probe(
     checks = {
         "postgresql": unconfigured("postgresql", "schema")
         if engine is None
-        else postgresql_check(engine, expected_head),
+        else postgresql_check(engine, expected_head, timeout_seconds=timeout_seconds),
         "neo4j": unconfigured("neo4j") if store is None else neo4j_check(store),
         "s3": unconfigured("s3")
         if s3.endpoint_url is None

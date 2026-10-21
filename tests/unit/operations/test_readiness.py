@@ -3,11 +3,13 @@
 from __future__ import annotations
 
 import asyncio
+import contextlib
 from typing import Any
 
 import pytest
 from botocore.exceptions import ClientError, EndpointConnectionError
 from sqlalchemy.exc import OperationalError, ProgrammingError
+from sqlalchemy.pool import NullPool
 
 from agent_context_platform.operations import readiness
 from agent_context_platform.operations.readiness import (
@@ -138,6 +140,7 @@ def test_postgresql_check_only_reads_in_a_read_only_transaction() -> None:
 
     assert engine.statements == [
         "SET TRANSACTION READ ONLY",
+        "SET LOCAL statement_timeout = 2000",
         "SELECT version_num FROM public.alembic_version",
     ]
     assert engine.rollbacks == 1
@@ -358,3 +361,96 @@ def test_the_s3_client_never_retries_and_honours_the_probe_timeout() -> None:
     assert (config.connect_timeout, config.read_timeout) == (1.5, 1.5)
     assert config.retries["total_max_attempts"] == 1
     assert client.meta.endpoint_url.rstrip("/") == "http://garage.example.test:3900"
+
+
+def test_a_check_that_ignores_cancellation_cannot_hold_the_probe_past_its_bound() -> None:
+    """psycopg reacts to cancellation by re-waiting for the server; the probe must not wait."""
+
+    async def scenario() -> tuple[list[ReadinessReport], list[float], int, int]:
+        release = asyncio.Event()
+        started = 0
+
+        async def stubborn() -> Components:
+            nonlocal started
+            started += 1
+            while not release.is_set():
+                with contextlib.suppress(asyncio.CancelledError):
+                    await asyncio.sleep(0.05)
+            return {"pg": "ok"}
+
+        probe = ReadinessProbe(
+            {
+                "pg": (stubborn, {"pg": "timeout"}),
+                "s3": (_static({"s3": "ok"}), {"s3": "timeout"}),
+            },
+            timeout_seconds=0.2,
+        )
+        loop = asyncio.get_running_loop()
+        reports: list[ReadinessReport] = []
+        elapsed: list[float] = []
+        for _ in range(readiness.MAX_ABANDONED_PER_CHECK + 3):
+            begin = loop.time()
+            reports.append(await probe.probe())
+            elapsed.append(loop.time() - begin)
+        abandoned = probe.abandoned("pg")
+        release.set()
+        for _ in range(100):
+            if probe.abandoned("pg") == 0:
+                break
+            await asyncio.sleep(0.02)
+        return reports, elapsed, started, abandoned
+
+    reports, elapsed, started, abandoned = asyncio.run(scenario())
+
+    assert all(dict(report.components) == {"pg": "timeout", "s3": "ok"} for report in reports)
+    assert max(elapsed) < 0.6
+    # At most MAX_ABANDONED_PER_CHECK stuck checks are kept; later probes answer "timeout" at once.
+    assert started == readiness.MAX_ABANDONED_PER_CHECK
+    assert abandoned == readiness.MAX_ABANDONED_PER_CHECK
+
+
+def test_a_request_never_joins_a_probe_older_than_the_timeout() -> None:
+    async def scenario() -> tuple[ReadinessReport, float, int]:
+        release = asyncio.Event()
+        calls = 0
+
+        async def slow() -> Components:
+            nonlocal calls
+            calls += 1
+            await release.wait()
+            return {"x": "ok"}
+
+        probe = ReadinessProbe({"x": (slow, {"x": "timeout"})}, timeout_seconds=0.2)
+        # Simulate a probe task that is stuck beyond its bound (e.g. a wedged event loop step).
+        stuck = asyncio.get_running_loop().create_future()
+        probe._in_flight = (asyncio.ensure_future(stuck), asyncio.get_running_loop().time() - 1.0)
+        loop = asyncio.get_running_loop()
+        begin = loop.time()
+        report = await probe.probe()
+        took = loop.time() - begin
+        release.set()
+        stuck.cancel()
+        return report, took, calls
+
+    report, took, calls = asyncio.run(scenario())
+
+    assert dict(report.components) == {"x": "timeout"}
+    assert took < 0.6
+    assert calls == 1
+
+
+def test_the_readiness_engine_never_pools_and_bounds_connects_and_dead_sockets() -> None:
+    dsn = Settings(
+        postgresql={"dsn": "postgresql+psycopg://api:secret@db.example.test/agent"}
+    ).postgresql.dsn
+    assert dsn is not None
+
+    engine = readiness.readiness_engine(dsn, 2.0)
+
+    assert isinstance(engine.pool, NullPool)
+    connect_args = readiness.readiness_connect_args(2.0)
+    assert connect_args["connect_timeout"] == 2
+    assert connect_args["keepalives"] == 1
+    assert 0 < connect_args["tcp_user_timeout"] <= 10_000
+    assert readiness.readiness_connect_args(0.5)["connect_timeout"] == 2  # libpq minimum
+    asyncio.run(engine.dispose())
