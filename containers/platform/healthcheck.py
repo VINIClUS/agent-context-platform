@@ -23,10 +23,10 @@ def main(argv: list[str]) -> int:
     port = int(argv[2]) if len(argv) > 2 else DEFAULT_PORT
     if not path.startswith("/health/"):
         return 1
+    # No proxy handler: http_proxy in the environment must never reroute a loopback probe.
+    opener = urllib.request.build_opener(urllib.request.ProxyHandler({}))
     try:
-        with urllib.request.urlopen(
-            f"http://127.0.0.1:{port}{path}", timeout=TIMEOUT_SECONDS
-        ) as response:
+        with opener.open(f"http://127.0.0.1:{port}{path}", timeout=TIMEOUT_SECONDS) as response:
             return 0 if response.status == 200 else 1
     except (OSError, ValueError, urllib.error.URLError):
         return 1
