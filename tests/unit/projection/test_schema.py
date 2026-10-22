@@ -7,13 +7,20 @@ from typing import Any
 import pytest
 
 from agent_context_platform import projection
+from agent_context_platform.projection import schema
 from agent_context_platform.projection.neo4j import Neo4jTransaction
 from agent_context_platform.projection.schema import (
     CONSTRAINT_STATEMENTS,
     INDEX_STATEMENTS,
     SCHEMA_STATEMENTS,
+    HistoryState,
     Neo4jSchemaMismatchError,
+    ProjectionHistory,
     ensure_schema,
+    history_projectors,
+    history_state,
+    read_projection_history,
+    record_projection_history,
 )
 
 pytestmark = pytest.mark.unit
@@ -233,3 +240,88 @@ def test_ensure_schema_times_out_when_an_index_never_becomes_online(
 
     with pytest.raises(TimeoutError, match="Neo4j indexes did not become ONLINE"):
         asyncio.run(ensure_schema(store))  # type: ignore[arg-type]
+
+
+class _HistoryTx:
+    def __init__(self, records: list[dict[str, Any]]) -> None:
+        self.records = records
+        self.parameters: dict[str, Any] = {}
+
+    async def run(self, query: str, *, parameters: dict[str, Any]) -> Any:
+        assert query == schema._READ_HISTORY
+        self.parameters = parameters
+        return type("Result", (), {"records": self.records[: parameters["limit"]]})()
+
+
+def _history(*records: dict[str, Any]) -> ProjectionHistory | None:
+    return asyncio.run(read_projection_history(_HistoryTx(list(records))))  # type: ignore[arg-type]
+
+
+def test_the_projection_history_marker_reads_fail_closed() -> None:
+    assert _history() is None
+    marker = {"marker_id": "ledger", "projectors": ["knowledge:2", "quality:2"]}
+    assert _history(marker) == ProjectionHistory(frozenset({"knowledge:2", "quality:2"}))
+    for broken in (
+        {"marker_id": "other", "projectors": ["knowledge:2"]},
+        {"marker_id": "ledger", "projectors": "knowledge:2"},
+        {"marker_id": "ledger", "projectors": ["knowledge:2", 7]},
+        {"marker_id": "ledger", "projectors": ["knowledge:2", "knowledge:2"]},
+        {"marker_id": "ledger", "projectors": None},
+    ):
+        assert _history(broken) == ProjectionHistory(frozenset()), broken
+    # several markers only ever narrow what is covered
+    narrower = {"marker_id": "ledger", "projectors": ["knowledge:2"]}
+    assert _history(marker, narrower) == ProjectionHistory(frozenset({"knowledge:2"}))
+
+
+def test_history_state_names_what_a_marker_lacks() -> None:
+    required = [("quality", "2"), ("knowledge", "2")]
+    assert history_state(None, required) == (
+        HistoryState.MISSING,
+        ("knowledge:2", "quality:2"),
+    )
+    old = ProjectionHistory(frozenset({"knowledge:1", "quality:2", "git:1"}))
+    assert history_state(old, required) == (HistoryState.OUTDATED, ("knowledge:2",))
+    current = ProjectionHistory(frozenset({"knowledge:2", "quality:2"}))
+    assert history_state(current, required) == (HistoryState.COMPLETE, ())
+
+
+def test_recording_the_marker_replaces_its_projector_list() -> None:
+    written: list[dict[str, Any]] = []
+
+    class Tx:
+        async def run(self, query: str, *, parameters: dict[str, Any]) -> None:
+            assert query == schema._RECORD_HISTORY
+            written.append(parameters)
+
+    class Store:
+        async def execute_write(self, work: Callable[[Any], Awaitable[None]]) -> None:
+            await work(Tx())
+
+    asyncio.run(
+        record_projection_history(Store(), [("quality", "2"), ("knowledge", "2"), ("quality", "2")])  # type: ignore[arg-type]
+    )
+    assert written == [{"marker_id": "ledger", "projectors": ["knowledge:2", "quality:2"]}]
+
+
+def test_history_state_accepts_a_one_shot_iterable() -> None:
+    old = ProjectionHistory(frozenset({"knowledge:1"}))
+    pairs = (pair for pair in [("knowledge", "2"), ("quality", "2")])
+    assert history_state(old, pairs) == (HistoryState.OUTDATED, ("knowledge:2", "quality:2"))
+
+
+def test_more_markers_than_ever_written_cover_nothing() -> None:
+    marker = {"marker_id": "ledger", "projectors": ["knowledge:2", "quality:2"]}
+    assert _history(*[marker] * 16) == ProjectionHistory(frozenset({"knowledge:2", "quality:2"}))
+    assert _history(*[marker] * 17) == ProjectionHistory(frozenset())
+
+
+def test_a_projector_that_records_no_history_is_never_named_in_the_marker() -> None:
+    class Purge:
+        name, version, records_history = "search", "1", False
+
+    class Plain:
+        name, version = "knowledge", "2"
+
+    assert history_projectors([Plain(), Purge()]) == [("knowledge", "2")]
+    assert schema.REQUIRED_HISTORY == (("knowledge", "2"), ("quality", "2"))

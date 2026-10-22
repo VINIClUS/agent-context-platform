@@ -44,6 +44,9 @@ class FakeSession:
         self._log.append((sql, values))
         return FakeResult(self._script(sql, values))
 
+    async def scalar(self, statement: Any, params: dict[str, Any] | None = None) -> Any:
+        return (await self.execute(statement, params)).first()
+
     async def get(self, model: Any, key: Any) -> Any:
         self._log.append((f"get {model.__name__}", {"key": key}))
         return self._script("get", {"key": key})[0] if self._script("get", {"key": key}) else None

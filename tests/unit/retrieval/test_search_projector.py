@@ -25,9 +25,9 @@ from agent_context_platform.content.service import ContentUnavailableError
 from agent_context_platform.projection.projectors import search
 from agent_context_platform.projection.projectors.search import (
     EmbeddingDimensionError,
-    PurgeAccess,
     SearchBackend,
     SearchBackendNotConfiguredError,
+    SearchContentConflictError,
     SearchProjector,
     SearchScopeConflictError,
     extract_text,
@@ -114,25 +114,29 @@ class Rig:
         *,
         tombstoned: frozenset[str] = frozenset(),
         conflict: bool = False,
+        existing: Any = None,
         embedder: Any = None,
         write_documents: bool = True,
+        lexical: bool = False,
     ) -> None:
         def script(sql: str, params: dict[str, Any]) -> list[Any]:
             if "content_tombstones WHERE" in sql:
                 return [row(one=1)] if params["content_id"] in tombstoned else []
             if "INSERT INTO retrieval.search_documents" in sql:
                 return [] if conflict else [row(content_id=params["content_id"])]
+            if "SELECT project_id, repository_id FROM retrieval.search_documents" in sql:
+                return [existing] if existing is not None else []
             return []
 
         self.sessions = FakeSessions(script)
         self.content = FakeContent(blobs)
-        self.embedder = embedder or StubEmbedder()
+        self.embedder = None if lexical else embedder or StubEmbedder()
         self.projector = SearchProjector(
             SearchBackend(self.sessions, self.content, self.embedder, write_documents)  # type: ignore[arg-type]
         )
 
-    def run(self, event: StoredEventV1) -> FakeTx:
-        tx = FakeTx()
+    def run(self, event: StoredEventV1, graph: Any = None) -> FakeTx:
+        tx = FakeTx(graph)
         asyncio.run(self.projector.project(tx, event))  # type: ignore[arg-type]
         return tx
 
@@ -255,7 +259,14 @@ def test_a_non_agent_event_writes_the_embedding_without_an_owner_link() -> None:
     event = _event(
         [_ref("c-s", data)],
         event_type="knowledge.summary.recorded",
-        payload={"content_id": "c-s"},
+        payload={
+            "summary_id": "sum-1",
+            "subjects": ["topic"],
+            "content_id": "c-s",
+            "valid_from": MOMENT.isoformat(),
+            "recorded_at": MOMENT.isoformat(),
+            "source_event_ids": ["0190f5e0-0000-7000-8000-000000000001"],
+        },
         context=EventContextV1(project_id="proj", repository_id="repo"),
     )
 
@@ -275,6 +286,77 @@ def test_a_scope_collision_in_the_database_is_refused_before_the_graph_is_touche
 
     with pytest.raises(SearchScopeConflictError):
         rig.run(_event([_ref("c-1", b"x")]))
+
+
+@pytest.mark.parametrize(
+    ("existing", "error"),
+    [
+        (row(project_id="proj", repository_id="repo"), SearchContentConflictError),
+        (row(project_id="proj", repository_id="other-repo"), SearchScopeConflictError),
+        (None, SearchScopeConflictError),
+    ],
+)
+def test_a_refused_upsert_is_named_as_a_content_or_a_scope_collision_without_content(
+    existing: Any, error: type[Exception]
+) -> None:
+    rig = Rig({"c-1": b"secret body"}, conflict=True, existing=existing)
+
+    with pytest.raises(error) as raised:
+        rig.run(_event([_ref("c-1", b"secret body")]))
+
+    assert "secret" not in str(raised.value) and "c-1" not in str(raised.value)
+    (upsert,) = rig.sessions.statements("INSERT INTO retrieval.search_documents")
+    assert upsert["content_sha256"] == hashlib.sha256(b"secret body").hexdigest()
+    assert upsert["media_type"] == "text/plain"
+
+
+@pytest.mark.parametrize(
+    ("record", "error"),
+    [
+        ({"same_scope": True, "same_content": False}, SearchContentConflictError),
+        ({"same_scope": False, "same_content": True}, SearchScopeConflictError),
+        ({"same_scope": True, "same_content": None}, SearchContentConflictError),
+    ],
+)
+def test_an_embedding_node_of_other_content_or_scope_is_never_overwritten(
+    record: dict[str, Any], error: type[Exception]
+) -> None:
+    def graph(query: str, _parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        return [record] if "same_content" in query else []
+
+    rig = Rig({"c-1": b"x"}, write_documents=False)  # a replay: no PostgreSQL check runs
+
+    with pytest.raises(error):
+        rig.run(_event([_ref("c-1", b"x")]), graph)
+    tx = FakeTx(graph)
+    with pytest.raises(error):
+        asyncio.run(rig.projector.project(tx, _event([_ref("c-1", b"x")])))  # type: ignore[arg-type]
+    assert tx.with_fragment("setNodeVectorProperty") == []
+
+
+def test_the_same_content_under_the_same_scope_is_merged_in_the_graph() -> None:
+    def graph(query: str, _parameters: dict[str, Any]) -> list[dict[str, Any]]:
+        return [{"same_scope": True, "same_content": True}] if "same_content" in query else []
+
+    tx = Rig({"c-1": b"x"}).run(_event([_ref("c-1", b"x")]), graph)
+
+    (identity,) = tx.with_fragment("same_content")
+    assert identity["content_sha256"] == hashlib.sha256(b"x").hexdigest()
+    (upsert,) = tx.with_fragment("setNodeVectorProperty")
+    assert upsert["media_type"] == "text/plain"
+
+
+def test_resetting_the_tables_is_one_call_of_the_reset_and_reseed_function() -> None:
+    sessions = FakeSessions()
+
+    async def reset() -> int:
+        async with sessions() as session:
+            return await search.reset_search_tables(session)  # type: ignore[arg-type]
+
+    asyncio.run(reset())
+
+    # One SECURITY DEFINER call: the projector role holds no TRUNCATE and no tombstone DELETE.
+    assert [sql for sql, _params in sessions.log] == ["SELECT retrieval.reset_search_projection()"]
 
 
 def test_vectors_of_the_wrong_size_are_refused() -> None:
@@ -445,25 +527,15 @@ def test_indexing_and_purging_take_the_content_lock_before_checking_or_writing()
     assert "INSERT INTO retrieval.content_tombstones" in purge_statements[2]
 
 
-def test_a_projector_with_no_embedding_backend_still_purges_rows_tombstones_and_nodes() -> None:
-    sessions = FakeSessions()
-    projector = SearchProjector(purge=PurgeAccess(sessions))  # type: ignore[arg-type]
-    tx = FakeTx()
+def test_an_unconfigured_projector_neither_purges_nor_indexes() -> None:
+    projector = SearchProjector()
     purge = _event(
         [], event_type="content.purged", payload=_purge_payload("c-1"), context=EventContextV1()
     )
 
-    asyncio.run(projector.project(tx, purge))  # type: ignore[arg-type]
-
-    assert [
-        p["content_id"] for p in sessions.statements("INSERT INTO retrieval.content_tombstones")
-    ] == ["c-1"]
-    assert sessions.statements("DELETE FROM retrieval.search_documents") == [
-        {"content_ids": ["c-1"]}
-    ]
-    assert tx.with_fragment("DETACH DELETE") == [{"content_ids": ["c-1"]}]
-    with pytest.raises(SearchBackendNotConfiguredError):  # indexing still fails closed
-        asyncio.run(projector.project(tx, _event([_ref("c-1", b"x")])))  # type: ignore[arg-type]
+    for event in (purge, _event([_ref("c-1", b"x")])):
+        with pytest.raises(SearchBackendNotConfiguredError):
+            asyncio.run(projector.project(FakeTx(), event))  # type: ignore[arg-type]
 
 
 def test_seeded_ledger_purges_are_neither_read_nor_embedded() -> None:
@@ -479,3 +551,62 @@ def test_seeded_ledger_purges_are_neither_read_nor_embedded() -> None:
     assert seeded == 1
     assert rig.content.reads == [] and tx.queries == []
     assert rig.sessions.statements("INSERT INTO") == []
+
+
+def test_lexical_only_writes_checked_rows_and_no_graph_node(
+    caplog: pytest.LogCaptureFixture,
+) -> None:
+    rig = Rig({"c-1": b"secret body", "c-2": b"other body"}, lexical=True)
+
+    with caplog.at_level("WARNING"):
+        tx = rig.run(_event([_ref("c-1", b"secret body")]))
+        rig.run(_event([_ref("c-2", b"other body")]))
+
+    upserts = rig.sessions.statements("INSERT INTO retrieval.search_documents")
+    assert [p["content_id"] for p in upserts] == ["c-1", "c-2"]
+    assert upserts[0]["content_sha256"] == hashlib.sha256(b"secret body").hexdigest()
+    assert rig.sessions.statements("content_tombstones WHERE")  # tombstones are honoured
+    assert tx.queries == []  # no embedding, no node, no link
+    assert rig.projector.unembedded_events == 2
+    assert len(caplog.records) == 1 and "secret" not in caplog.text and "c-1" not in caplog.text
+
+
+def test_lexical_only_dead_letters_conflicts_and_unreadable_content_like_a_full_index() -> None:
+    conflicting = Rig(
+        {"c-1": b"x"},
+        lexical=True,
+        conflict=True,
+        existing=row(project_id="proj", repository_id="repo"),
+    )
+    with pytest.raises(SearchContentConflictError):
+        conflicting.run(_event([_ref("c-1", b"x")]))
+    with pytest.raises(ContentUnavailableError):
+        Rig({}, lexical=True).run(_event([_ref("c-1", b"x")]))
+    assert Rig({}, lexical=True).projector.unembedded_events == 0
+
+
+def test_lexical_only_still_purges_rows_tombstones_and_nodes() -> None:
+    rig = Rig({}, lexical=True)
+    tx = FakeTx()
+    purge = _event(
+        [], event_type="content.purged", payload=_purge_payload("c-1"), context=EventContextV1()
+    )
+
+    asyncio.run(rig.projector.project(tx, purge))  # type: ignore[arg-type]
+
+    assert [
+        p["content_id"] for p in rig.sessions.statements("INSERT INTO retrieval.content_tombstones")
+    ] == ["c-1"]
+    assert tx.with_fragment("DETACH DELETE") == [{"content_ids": ["c-1"]}]
+
+
+def test_a_graph_replay_without_an_embedder_is_refused_at_construction() -> None:
+    with pytest.raises(ValueError, match="embedding provider"):
+        SearchBackend(FakeSessions(), FakeContent({}), None, write_documents=False)  # type: ignore[arg-type]
+
+
+def test_the_search_projector_is_never_named_in_the_history_marker() -> None:
+    from agent_context_platform.projection.schema import history_projectors
+
+    for projector in (Rig({}).projector, Rig({}, lexical=True).projector, SearchProjector()):
+        assert history_projectors([projector]) == []

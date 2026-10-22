@@ -1,7 +1,7 @@
 """PostgreSQL lexical search material (PLATFORM-042): the `retrieval` schema.
 
 `search_documents` holds one row per sanitized content object: its scope, provenance and a
-`tsvector`. The text itself is NOT stored here (the content service owns it; a snippet is fetched
+`tsvector`, plus the digest and media type of the sanitized bytes. The text itself is NOT stored here (the content service owns it; a snippet is fetched
 through it later). The rows are a projection: rebuildable from the ledger, written only by the
 search projector. `content_tombstones` remembers purged content IDs so a redelivered original
 event can never index purged content again.
@@ -28,6 +28,7 @@ class SearchDocumentRow(Base):
     __table_args__ = (
         CheckConstraint("cardinality(source_event_ids) > 0", name="source_event_ids_not_empty"),
         CheckConstraint("event_id = ANY(source_event_ids)", name="event_id_in_sources"),
+        CheckConstraint("content_sha256 ~ '^[0-9a-f]{64}$'", name="content_sha256_hex"),
         Index("ix_search_documents_tsv", "tsv", postgresql_using="gin"),
         Index("ix_search_documents_scope", "project_id", "repository_id"),
         {"schema": "retrieval"},
@@ -46,6 +47,9 @@ class SearchDocumentRow(Base):
     session_id: Mapped[str | None] = mapped_column(Text, nullable=True)
     occurred_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), nullable=False)
     redaction: Mapped[str] = mapped_column(String(25), nullable=False)
+    # The sanitized bytes' identity: a content ID reused for other bytes is refused, never merged.
+    content_sha256: Mapped[str] = mapped_column(String(64), nullable=False)
+    media_type: Mapped[str] = mapped_column(String(255), nullable=False)
     tsv: Mapped[str] = mapped_column(TSVECTOR, nullable=False)
     indexed_at: Mapped[datetime] = mapped_column(
         DateTime(timezone=True), nullable=False, server_default=func.now()

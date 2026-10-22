@@ -13,6 +13,7 @@ import zstandard as zstd
 from botocore.config import Config
 from botocore.exceptions import ClientError
 
+from agent_context_platform.operations.faults import fault_point
 from agent_context_platform.settings import S3Settings
 
 _CANONICAL_KEY = re.compile(
@@ -137,6 +138,7 @@ class S3BlobStore:
             "ContentEncoding": "zstd",
         }
         created = await self._put(request)
+        fault_point("content.after_s3_put")
         if created:
             head = await self._head(object_key)
             self._verify_expected_metadata(

@@ -1,10 +1,13 @@
 """Add the retrieval schema: lexical search documents and purge tombstones.
 
 ``retrieval.search_documents`` holds, per sanitized content object, its scope, provenance and a
-``simple``-configuration ``tsvector`` with a GIN index. It never stores the text. The projector
+``simple``-configuration ``tsvector`` with a GIN index, plus the sanitized content's digest and media
+type, so a producer-chosen ``content_id`` reused for different bytes is refused instead of
+overwritten. It never stores the text. The projector
 role writes it (and deletes rows on purge); the API role only reads it. ``retrieval.content_tombstones``
 records purged content IDs (insert-only for the projector) so a redelivered original event cannot
-re-index purged content.
+re-index purged content. ``retrieval.reset_search_projection()`` (SECURITY DEFINER) is the only reset:
+it empties the documents and reseeds the tombstones from the ledger in one call.
 
 Revision ID: 20261002_0001
 Revises: 20260929_0001
@@ -26,6 +29,42 @@ branch_labels: str | Sequence[str] | None = None
 depends_on: str | Sequence[str] | None = None
 
 
+# The ONLY way to empty the search projection (an in-place rebuild, before it replays the ledger).
+# SECURITY DEFINER so the projector role needs no TRUNCATE or tombstone DELETE: the tombstones are
+# reseeded from every `content.purged` the ledger records (whatever its outbox status) in the same
+# statement that drops the stale ones, so purge knowledge can never be emptied without the reseed.
+# Locks follow the projector's purge order (tombstones, then documents) under a lock timeout; the
+# ledger scans run before the documents table is locked.
+RESET_FUNCTION = """
+CREATE FUNCTION retrieval.reset_search_projection() RETURNS bigint
+LANGUAGE plpgsql SECURITY DEFINER
+SET search_path = pg_catalog, pg_temp
+SET lock_timeout = '10s'
+AS $$
+DECLARE
+    remaining bigint;
+BEGIN
+    INSERT INTO retrieval.content_tombstones (content_id, purged_event_id, purged_at)
+    SELECT DISTINCT ON (item ->> 'content_id')
+        item ->> 'content_id', e.event_id, CAST(e.payload ->> 'purged_at' AS timestamptz)
+    FROM ledger.events e, jsonb_array_elements(e.payload -> 'purged_contents') AS item
+    WHERE e.event_type = 'content.purged'
+    ORDER BY item ->> 'content_id', e.recorded_at, e.event_id
+    ON CONFLICT (content_id) DO NOTHING;
+    DELETE FROM retrieval.content_tombstones t
+    WHERE t.content_id NOT IN (
+        SELECT item ->> 'content_id'
+        FROM ledger.events e, jsonb_array_elements(e.payload -> 'purged_contents') AS item
+        WHERE e.event_type = 'content.purged'
+    );
+    TRUNCATE retrieval.search_documents;
+    SELECT count(*) INTO remaining FROM retrieval.content_tombstones;
+    RETURN remaining;
+END
+$$
+"""
+
+
 def upgrade() -> None:
     timestamp = sa.DateTime(timezone=True)
     uuid = postgresql.UUID(as_uuid=True)
@@ -41,6 +80,8 @@ def upgrade() -> None:
         sa.Column("session_id", sa.Text(), nullable=True),
         sa.Column("occurred_at", timestamp, nullable=False),
         sa.Column("redaction", sa.String(25), nullable=False),
+        sa.Column("content_sha256", sa.String(64), nullable=False),
+        sa.Column("media_type", sa.String(255), nullable=False),
         sa.Column("tsv", postgresql.TSVECTOR(), nullable=False),
         sa.Column("indexed_at", timestamp, server_default=sa.func.now(), nullable=False),
         sa.CheckConstraint(
@@ -49,6 +90,9 @@ def upgrade() -> None:
         ),
         sa.CheckConstraint(
             "event_id = ANY(source_event_ids)", name="ck_search_documents_event_id_in_sources"
+        ),
+        sa.CheckConstraint(
+            "content_sha256 ~ '^[0-9a-f]{64}$'", name="ck_search_documents_content_sha256_hex"
         ),
         sa.PrimaryKeyConstraint("content_id", name="pk_search_documents"),
         schema="retrieval",
@@ -77,16 +121,18 @@ def upgrade() -> None:
     op.execute("GRANT USAGE ON SCHEMA retrieval TO agent_context_api, agent_context_projector")
     op.execute("GRANT SELECT ON retrieval.search_documents TO agent_context_api")
     op.execute(
-        "GRANT SELECT, INSERT, DELETE, TRUNCATE ON retrieval.search_documents "
-        "TO agent_context_projector"
+        "GRANT SELECT, INSERT, DELETE ON retrieval.search_documents TO agent_context_projector"
     )
     op.execute(
         "GRANT UPDATE (event_id, source_event_ids, event_type, session_id, occurred_at, "
         "redaction, tsv, indexed_at) ON retrieval.search_documents TO agent_context_projector"
     )
-    # TRUNCATE: an in-place rebuild resets both projection tables before replaying the ledger.
+    # Insert-only for the projector role: it can never remove a tombstone itself.
+    op.execute("GRANT SELECT, INSERT ON retrieval.content_tombstones TO agent_context_projector")
+    op.execute(RESET_FUNCTION)
+    op.execute("REVOKE ALL ON FUNCTION retrieval.reset_search_projection() FROM PUBLIC")
     op.execute(
-        "GRANT SELECT, INSERT, TRUNCATE ON retrieval.content_tombstones TO agent_context_projector"
+        "GRANT EXECUTE ON FUNCTION retrieval.reset_search_projection() TO agent_context_projector"
     )
 
 

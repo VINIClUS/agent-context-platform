@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import pytest
 
+# Telemetry capture fixtures (PLATFORM-050), shared by every unit test package.
+from observability._capture import canaries, telemetry  # noqa: F401
+
 PRODUCTION_ENV = {
     "AGENT_CONTEXT_ENVIRONMENT": "production",
     "AGENT_CONTEXT_POSTGRESQL__DSN": (

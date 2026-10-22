@@ -32,6 +32,13 @@ from agent_context_platform.projection.projectors.knowledge import (
     decision_version,
 )
 from agent_context_platform.projection.projectors.quality import QualityProjector
+from agent_context_platform.projection.schema import (
+    ProjectionHistory,
+    narrow_projection_history,
+    projection_history,
+    record_projection_history,
+)
+from agent_context_platform.projection.verify import wipe_graph
 from agent_context_platform.retrieval import temporal
 from agent_context_platform.retrieval.graph import RetrievalDeadlineExceeded
 from agent_context_platform.retrieval.temporal import (
@@ -250,10 +257,15 @@ async def graph_active(store: Neo4jStore, moment: float) -> list[str]:
     return await store.execute_read(read)
 
 
-async def deliver(store: Neo4jStore, events: list[StoredEventV1]) -> None:
+async def deliver(
+    store: Neo4jStore, events: list[StoredEventV1], *, from_start: bool = True
+) -> None:
+    """Project `events` into an empty graph; `from_start` records that, as a rebuild would."""
     await wipe(store)
     for event in events:
         await project_event(store, event, ALL)
+    if from_start:
+        await record_projection_history(store, ((p.name, p.version) for p in ALL))
 
 
 async def active(
@@ -725,9 +737,9 @@ def test_result_caps_are_enforced_and_flagged(monkeypatch: pytest.MonkeyPatch) -
         monkeypatch.setattr(temporal, "MAX_FAILURES", 2)
         failures = await service.failures(P1, day(FAR), day(FAR))
         assert failures.truncated and [f.failure_id for f in failures.failures] == [
-            "fail_1",
-            "fail_2",
-        ]
+            "fail_3",
+            "fail_4",
+        ]  # the newest: a failure seen late is never hidden behind old ones
         monkeypatch.setattr(temporal, "MAX_FAILURES", 4)
         assert not (await service.failures(P1, day(FAR), day(FAR))).truncated
         monkeypatch.setattr(temporal, "MAX_CHAIN", 1)
@@ -908,41 +920,65 @@ def test_a_history_lists_only_the_newest_recordings_and_says_so(
     with_service(body)
 
 
-def test_a_graph_projected_before_the_history_nodes_is_refused() -> None:
-    legacy: dict[str, LiteralString] = {
-        "decisions": "CREATE (:Decision {decision_id: 'old', state_order: 'x', project_id: 'prj_1'})",
-        "failures": "CREATE (:Failure {failure_id: 'old', project_id: 'prj_1'})",
-        "ci": "CREATE (:CIRun {ci_run_id: 'old', workflow: 'ci', project_id: 'prj_1'})",
-    }
+def test_a_graph_without_complete_history_is_refused_whatever_its_entities_hold() -> None:
+    # An upgrade without a rebuild: the decision and the failure each received one event through
+    # the current projectors (so each has a history edge), but nothing says their earlier events
+    # were projected by them. Only the history marker can tell, and it is absent.
+    events = [
+        decision(1, "dec_a", valid_from=0),
+        decision(2, "dec_a", valid_from=0, status="superseded", observed=20),
+        failure(3, "fail_1", ci_run_id="ci_1"),
+        ci_run(4, "ci_1", "failure"),
+    ]
 
     async def body(store: Neo4jStore, service: TemporalService) -> None:
-        async def create(statement: LiteralString) -> None:
-            async def run(tx: Neo4jTransaction) -> None:
-                await tx.run(statement, parameters={})
+        async def refused() -> None:
+            for call in (
+                lambda: service.decisions(P1, day(5), day(10)),
+                lambda: service.decision_history("dec_a", P1),
+                lambda: service.failures(P1),
+            ):
+                with pytest.raises(temporal.TemporalProjectionOutdated, match="rebuild"):
+                    await call()
 
-            await store.execute_write(run)
+        await deliver(store, events, from_start=False)
+        await refused()
+        outdated = [(p.name, "1" if p.name == "knowledge" else p.version) for p in ALL]
+        await record_projection_history(store, outdated)
+        await refused()
+        await record_projection_history(store, ((p.name, p.version) for p in ALL))
+        assert await active(service, P1, 5, 10) == ["dec_a"]  # served once the marker is complete
+        assert (await service.failures(P1)).failures
+        await wipe(store)  # what an in-place rebuild does first: nothing is served until it ends
+        await refused()
 
-        await deliver(store, [decision(1, "dec_a"), failure(2, "fail_1", ci_run_id="ci_1")])
-        assert await active(service, P1, 5) == ["dec_a"]  # a current graph is served
-        await create(legacy["decisions"])
-        fresh = TemporalService.from_settings(neo4j_integration_settings())
-        try:
-            with pytest.raises(temporal.TemporalProjectionOutdated):
-                await fresh.decisions(P1)
-            with pytest.raises(temporal.TemporalProjectionOutdated):
-                await fresh.decision_history("dec_a", P1)
-            assert (await fresh.failures(P1)).failures  # failures are checked on their own
-        finally:
-            await fresh.close()
-        for kind in ("failures", "ci"):
-            await wipe(store)
-            await create(legacy[kind])
-            fresh = TemporalService.from_settings(neo4j_integration_settings())
-            try:
-                with pytest.raises(temporal.TemporalProjectionOutdated):
-                    await fresh.failures(P1)
-            finally:
-                await fresh.close()
+    with_service(body)
+
+
+def test_decision_history_is_anchored_on_the_decision_however_many_precede_it(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # `dec_z` sorts after every other decision of the scope; the global version cap of a scope
+    # read would drop it, a history anchored on its ID cannot.
+    events = [decision(n, f"dec_{n}", valid_from=n) for n in range(1, 7)]
+    events += [decision(7, "dec_z", supersedes="dec_1", valid_from=9)]
+
+    async def body(store: Neo4jStore, service: TemporalService) -> None:
+        await deliver(store, events)
+        monkeypatch.setattr(temporal, "MAX_VERSIONS", 3)
+        listed = await service.decisions(P1, day(FAR), day(FAR))
+        assert listed.truncated and "dec_z" not in {d.decision_id for d in listed.decisions}
+        history = await service.decision_history("dec_z", P1)
+        assert not history.truncated
+        assert [(e.decision_id, e.relation) for e in history.entries] == [
+            ("dec_1", ChainRelation.EARLIER),
+            ("dec_z", ChainRelation.SELF),
+        ]
+        assert history.entries[0].effective_valid_to == day(9)
+        assert history.entries[1].source_event_ids == (str(event_uuid(7)),)
+        monkeypatch.setattr(temporal, "MAX_VERSIONS", 1)  # the budget still bounds the walk
+        cut = await service.decision_history("dec_z", P1)
+        assert cut.truncated and [e.decision_id for e in cut.entries] == ["dec_z"]
 
     with_service(body)
 
@@ -1037,5 +1073,105 @@ def test_a_recurrence_after_a_fix_reopens_the_failure_until_it_is_fixed_again() 
             assert path is not None
             assert (path.failing_run_id, path.passing_run_id) == ("ci_3", "ci_4")
             assert (await service.failures(P1, day(FAR), day(FAR))).failures == ()
+
+    with_service(body)
+
+
+def test_a_batched_wipe_refuses_every_read_from_its_first_batch() -> None:
+    # An in-place rebuild wipes in batches while the API keeps serving: no read may see a graph
+    # that is partly gone, so the marker goes first, in its own transaction.
+    events = [decision(n, f"dec_{n:02d}", valid_from=0) for n in range(1, 13)]
+
+    async def body(store: Neo4jStore, service: TemporalService) -> None:
+        await deliver(store, events)
+        assert len(await active(service, P1, 5)) == 12
+        seen: list[int | None] = []
+        commit = store.execute_write
+
+        async def write_then_read(work: Any) -> Any:
+            result = await commit(work)
+            try:
+                seen.append(len((await service.decisions(P1, day(5), day(FAR))).decisions))
+            except temporal.TemporalProjectionOutdated:
+                seen.append(None)
+            return result
+
+        store.execute_write = write_then_read  # type: ignore[method-assign]
+        try:
+            await wipe_graph(store, batch=4)
+        finally:
+            store.execute_write = commit  # type: ignore[method-assign]
+        assert len(seen) > 3 and seen == [None] * len(seen)
+
+    with_service(body)
+
+
+def test_a_worker_start_narrows_the_marker_to_the_versions_it_runs() -> None:
+    # Rolled back to knowledge "1" (which projects no history) and forward again: the claim
+    # "2" made before the rollback must not survive it.
+    async def body(store: Neo4jStore, service: TemporalService) -> None:
+        await deliver(store, [decision(1, "dec_a")])
+        running = [(p.name, p.version) for p in ALL]
+        await narrow_projection_history(store, running)  # the same versions: nothing changes
+        assert await active(service, P1, 5) == ["dec_a"]
+        rolled_back = [(name, "1" if name == "knowledge" else v) for name, v in running]
+        await narrow_projection_history(store, rolled_back)
+        history = await projection_history(store)
+        assert history is not None and "knowledge:2" not in history.projectors
+        assert "quality:2" in history.projectors
+        with pytest.raises(temporal.TemporalProjectionOutdated, match="knowledge:2"):
+            await service.decisions(P1)
+        await narrow_projection_history(store, running)  # never adds a claim back
+        with pytest.raises(temporal.TemporalProjectionOutdated):
+            await service.decisions(P1)
+
+        async def corrupt(tx: Neo4jTransaction) -> None:
+            await tx.run(
+                "MATCH (m:ProjectionHistory) SET m.projectors = 'knowledge:2'", parameters={}
+            )
+
+        await store.execute_write(corrupt)
+        await narrow_projection_history(store, running)
+        assert await projection_history(store) == ProjectionHistory(frozenset())
+
+    with_service(body)
+
+
+def test_a_recurrence_outside_a_completed_ci_run_after_the_fix_keeps_the_failure_open() -> None:
+    fixed = [
+        ci_run(1, "ci_1", "failure", commit=OID_A),
+        ci_run(2, "ci_2", "success", commit=OID_B),
+        failure(10, "fail_1", ci_run_id="ci_1"),  # reported late, but ci_1 ran before the pass
+    ]
+    recurrences = [
+        failure(11, "fail_1", session_id="sess_1"),
+        failure(12, "fail_1", ci_run_id="ci_unfinished"),
+    ]
+
+    async def body(store: Neo4jStore, service: TemporalService) -> None:
+        await deliver(store, fixed)
+        (found,) = (await service.failures(P1, day(FAR), day(FAR), True)).failures
+        assert found.resolution.status is FixStatus.RESOLVED
+        for recurrence in recurrences:
+            await deliver(store, [*fixed, recurrence])
+            (found,) = (await service.failures(P1, day(FAR), day(FAR))).failures  # not hidden
+            assert found.resolution.status is FixStatus.UNRESOLVED
+            assert str(recurrence.event_id) in (found.resolution.reason or "")
+            # before the recurrence happened, the fix stands
+            before = await service.failures(P1, T0 + timedelta(seconds=10), day(FAR), True)
+            assert before.failures[0].resolution.status is FixStatus.RESOLVED
+
+    with_service(body)
+
+
+def test_a_version_cap_never_answers_from_part_of_a_decisions_recordings(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    async def body(store: Neo4jStore, service: TemporalService) -> None:
+        await deliver(store, [decision(1, "dec_a"), decision(2, "dec_a", status="rejected")])
+        assert await active(service, P1, 5) == []
+        monkeypatch.setattr(temporal, "MAX_VERSIONS", 1)
+        cut = await service.decisions(P1, day(5), day(FAR), include_history=True)
+        assert cut.truncated and cut.decisions == ()  # not "accepted" from its first recording
 
     with_service(body)

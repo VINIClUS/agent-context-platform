@@ -18,6 +18,8 @@ from pydantic import (
 )
 from pydantic_settings import BaseSettings, SettingsConfigDict
 
+from agent_context_platform.operations.faults import FaultLabel
+
 # Where the indexer image mounts the checkout being indexed (containers/indexer/Dockerfile).
 DEFAULT_CHECKOUT_ROOTS = ("/work",)
 Environment = Literal["development", "test", "production"]
@@ -54,10 +56,12 @@ class PostgreSQLSettings(BaseModel):
     # Least-privilege login roles for the operator CLI (members of `agent_context_projector` and
     # `agent_context_api`); each falls back to `dsn` when unset. `admin_dsn` is the operator
     # connection that provisions `operations.registered_producers` and `operations.mcp_tokens`
-    # (the API and projector roles may not write them).
+    # (the API and projector roles may not write them). `migration_dsn` is the schema owner that
+    # `agent-context db upgrade` runs Alembic as (the platform-migrate role, never the API).
     projector_dsn: Secret[PostgresDsn] | None = Field(default=None, repr=False)
     api_dsn: Secret[PostgresDsn] | None = Field(default=None, repr=False)
     admin_dsn: Secret[PostgresDsn] | None = Field(default=None, repr=False)
+    migration_dsn: Secret[PostgresDsn] | None = Field(default=None, repr=False)
 
     @property
     def effective_projector_dsn(self) -> Secret[PostgresDsn] | None:
@@ -71,7 +75,11 @@ class PostgreSQLSettings(BaseModel):
     def effective_admin_dsn(self) -> Secret[PostgresDsn] | None:
         return self.admin_dsn or self.dsn
 
-    @field_validator("dsn", "projector_dsn", "api_dsn", "admin_dsn")
+    @property
+    def effective_migration_dsn(self) -> Secret[PostgresDsn] | None:
+        return self.migration_dsn or self.dsn
+
+    @field_validator("dsn", "projector_dsn", "api_dsn", "admin_dsn", "migration_dsn")
     @classmethod
     def require_async_psycopg_database(
         cls, dsn: Secret[PostgresDsn] | None
@@ -199,7 +207,9 @@ class SearchSettings(BaseModel):
 
     The service never downloads the model: `agent-context models fetch --dest <dir>` does, and
     the service loads `model_dir`, failing closed on any digest mismatch. With no `model_dir`
-    the search projector cannot embed and refuses to index (it never silently skips).
+    the search projector cannot embed: the worker refuses to start unless it runs lexical-only
+    (`projection run --lexical-only`: rows without embeddings, counted), and replays refuse unless
+    `--without-search` skips the projector.
     """
 
     model_config = _SECTION_CONFIG
@@ -207,6 +217,59 @@ class SearchSettings(BaseModel):
     model_dir: Path | None = Field(default=None, strict=False)
     embedding_batch_size: int = Field(default=16, ge=1, le=256)
     embedding_threads: int = Field(default=1, ge=1, le=16)
+
+
+class FaultInjectionSettings(BaseModel):
+    """Crash-test fault points (docs/operations/fault-injection.md); inert by default.
+
+    Armed only when ``enabled`` is true and ``crash_at`` names a label; ``after`` fires on
+    that label's n-th hit. ``Settings`` refuses ``enabled`` in production.
+    """
+
+    model_config = _SECTION_CONFIG
+
+    enabled: bool = False
+    crash_at: FaultLabel | None = None
+    after: int = Field(default=1, ge=1)
+
+
+# --- observability (PLATFORM-050) ---------------------------------------------------------------
+class ObservabilitySettings(BaseModel):
+    """OpenTelemetry export (docs/operations/telemetry.md); disabled while no endpoint is set.
+
+    ``otlp_endpoint`` is the OTLP/HTTP base URL; when unset the standard
+    ``OTEL_EXPORTER_OTLP_*ENDPOINT`` variables apply. Export headers (for example access tokens)
+    come only from the standard ``OTEL_EXPORTER_OTLP_*HEADERS`` variables, never from settings.
+    """
+
+    model_config = _SECTION_CONFIG
+
+    enabled: bool = True
+    otlp_endpoint: AnyHttpUrl | None = None
+    service_instance_id: str | None = Field(default=None, min_length=1, max_length=128)
+    export_timeout_seconds: float = Field(default=5.0, gt=0, le=60, allow_inf_nan=False)
+    max_queue_size: int = Field(default=2048, gt=0, le=65_536)
+    max_export_batch_size: int = Field(default=512, gt=0, le=65_536)
+    schedule_delay_seconds: float = Field(default=5.0, gt=0, le=300, allow_inf_nan=False)
+    metric_export_interval_seconds: float = Field(default=30.0, ge=1, le=3600, allow_inf_nan=False)
+    shutdown_timeout_seconds: float = Field(default=5.0, gt=0, le=60, allow_inf_nan=False)
+    projection_sample_seconds: float = Field(default=15.0, ge=1, le=3600, allow_inf_nan=False)
+
+    @field_validator("otlp_endpoint")
+    @classmethod
+    def reject_embedded_credentials(cls, url: AnyHttpUrl | None) -> AnyHttpUrl | None:
+        if url is not None and (url.username is not None or url.password is not None):
+            raise ValueError("OTLP endpoint must not contain credentials")
+        return url
+
+    @model_validator(mode="after")
+    def require_batch_within_queue(self) -> Self:
+        if self.max_export_batch_size > self.max_queue_size:
+            raise ValueError("max_export_batch_size must not exceed max_queue_size")
+        return self
+
+
+# --- end observability ---------------------------------------------------------------------------
 
 
 class Settings(BaseSettings):
@@ -229,6 +292,8 @@ class Settings(BaseSettings):
     mcp: MCPSettings = Field(default_factory=MCPSettings)
     ingestion: IngestionSettings = Field(default_factory=IngestionSettings)
     search: SearchSettings = Field(default_factory=SearchSettings)
+    fault_injection: FaultInjectionSettings = Field(default_factory=FaultInjectionSettings)
+    observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
     # Structural indexer (PLATFORM-032b). Adapters are confined with Landlock and the runner
     # refuses to run them when the kernel cannot enforce it; this is the dev-only escape hatch
     # (AGENT_CONTEXT_INDEXER_ALLOW_UNCONFINED_ADAPTERS). Never enable it in production.
@@ -243,6 +308,8 @@ class Settings(BaseSettings):
     def require_complete_production_settings(self) -> Self:
         if self.environment != "production":
             return self
+        if self.fault_injection.enabled:
+            raise ValueError("fault injection must not be enabled in production")
 
         neo4j_password = (
             None if self.neo4j.password is None else self.neo4j.password.get_secret_value()

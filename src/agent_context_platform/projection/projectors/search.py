@@ -24,8 +24,19 @@ cannot resurrect purged content; a `content.purged` that is projected before the
 PostgreSQL row, so a node a concurrent index-and-purge race leaves behind is never returned and the
 next rebuild removes it.
 
+Identity: content IDs are chosen by producers, so a content ID is bound to the scope, digest and
+media type of the bytes first indexed under it. A later event naming it with another scope or other
+bytes is refused (`SearchScopeConflictError`, `SearchContentConflictError`: retried, then
+dead-lettered), in PostgreSQL for live delivery and on the `ContentEmbedding` node for a replay
+that never writes PostgreSQL, so the result never depends on delivery order.
+
 Only events scoped to both a project and a repository are indexed: retrieval is always scoped,
-so an unscoped document could never be returned.
+so an unscoped document could never be returned. A worker with no model runs the projector
+lexical-only (`SearchBackend.embeddings=None`): the PostgreSQL rows are written with every check
+above, only the `ContentEmbedding` nodes are left for a rebuild with the model.
+
+An in-place rebuild first reads every document it will replay (`check_replay`), so content that is
+gone without a `content.purged` stops it before anything is reset or wiped.
 
 `embedding` is excluded from the P039 graph digest (`VOLATILE_PROPERTIES`); the model identity and
 revision stay in it.
@@ -34,6 +45,7 @@ revision stay in it.
 from __future__ import annotations
 
 import json
+import logging
 from collections.abc import Iterable, Sequence
 from dataclasses import dataclass
 from typing import Any, Final, LiteralString
@@ -43,7 +55,8 @@ from agent_context_sdk.content import ContentDisposition
 from sqlalchemy import text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from agent_context_platform.content.service import ContentService
+from agent_context_platform.content.service import ContentService, ContentUnavailableError
+from agent_context_platform.ledger.repository import LedgerRepository
 from agent_context_platform.projection.neo4j import Neo4jTransaction
 from agent_context_platform.projection.projectors import (
     assert_link,
@@ -51,8 +64,10 @@ from agent_context_platform.projection.projectors import (
     lock_event_nodes,
     relationship_statement,
 )
-from agent_context_platform.retrieval.embeddings import EmbeddingProvider
+from agent_context_platform.retrieval.embeddings import EmbeddedText, EmbeddingProvider
 from agent_context_platform.retrieval.models import TEXT_SEARCH_CONFIG
+
+_LOG = logging.getLogger(__name__)
 
 CONTENT_PURGED_TYPE: Final = "content.purged"
 # Dimensions of the cosine vector index (`projection.schema`); a provider must match.
@@ -89,32 +104,50 @@ class SearchScopeConflictError(RuntimeError):
     """A content ID is already indexed under a different project or repository."""
 
 
+class SearchContentConflictError(RuntimeError):
+    """A content ID is already indexed, in the same scope, for different sanitized bytes.
+
+    Content IDs are chosen by producers. Merging would make the indexed text and vector depend on
+    delivery order (live workers) versus ledger order (a replay), so the later event is refused
+    (retried, then dead-lettered) exactly like a cross-scope collision. The message never carries
+    content, digests or IDs.
+    """
+
+
 class EmbeddingDimensionError(RuntimeError):
     """The embedding provider's vectors do not match the vector index."""
 
 
+class SearchReplayIntegrityError(RuntimeError):
+    """Content a replay would index cannot be read, or one content ID names different content.
+
+    Raised by `SearchProjector.check_replay` BEFORE an in-place rebuild touches anything, with
+    counts only. Purged content is not an error (the ledger's `content.purged` covers it): bytes
+    that are gone without a purge event must be restored, or purged through the ledger.
+    """
+
+
 @dataclass(frozen=True, slots=True)
 class SearchBackend:
-    """What indexing needs: the projector-role PostgreSQL, content access and an embedder."""
+    """What indexing needs: the projector-role PostgreSQL, content access and an embedder.
+
+    `embeddings=None` is the worker's lexical-only mode (no model provisioned): the PostgreSQL
+    rows are written with every check a full index runs (tombstones, scope and content identity,
+    readable bytes), so a conflict dead-letters live exactly as it would with a model, and only
+    the `ContentEmbedding` nodes are left for a later rebuild with the model to fill in.
+    """
 
     sessions: async_sessionmaker[AsyncSession]
     content: ContentService
-    embeddings: EmbeddingProvider
+    embeddings: EmbeddingProvider | None
     # False for a replay into a scratch or standby graph (`verify --replay-check`, a standby
     # rebuild): content is still read, tombstones checked and vectors written to the target graph,
     # but the live PostgreSQL rows and tombstones are never written or deleted.
     write_documents: bool = True
 
-
-@dataclass(frozen=True, slots=True)
-class PurgeAccess:
-    """What purging needs, and nothing more: PostgreSQL (no embedder, no content reader).
-
-    Purges must work on a deployment with no model, otherwise purged content would stay searchable.
-    """
-
-    sessions: async_sessionmaker[AsyncSession]
-    write_documents: bool = True
+    def __post_init__(self) -> None:
+        if self.embeddings is None and not self.write_documents:
+            raise ValueError("a replay into a graph needs an embedding provider")
 
 
 @dataclass(frozen=True, slots=True)
@@ -133,17 +166,24 @@ _LEDGER_PURGES: Final[str] = (
     "jsonb_array_elements(e.payload -> 'purged_contents') AS item "
     "WHERE e.event_type = 'content.purged'"
 )
+# Empties the documents and reseeds the tombstones from the ledger (migration 20261002_0001).
+_RESET_PROJECTION: Final[str] = "SELECT retrieval.reset_search_projection()"
+_CHECK_PAGE_SIZE: Final = 500
+_DELIVERED_PAGE: Final[str] = (
+    "SELECT outbox_id, event_id FROM projection.outbox "
+    "WHERE status = 'delivered' AND outbox_id > :after ORDER BY outbox_id LIMIT :limit"
+)
 _TOMBSTONED: Final[str] = (
     "SELECT 1 FROM retrieval.content_tombstones WHERE content_id = :content_id"
 )
 _UPSERT_DOCUMENT: Final[str] = f"""
 INSERT INTO retrieval.search_documents AS d
     (content_id, event_id, source_event_ids, event_type, project_id, repository_id,
-     session_id, occurred_at, redaction, tsv)
+     session_id, occurred_at, redaction, content_sha256, media_type, tsv)
 VALUES
     (:content_id, CAST(:event_id AS uuid), ARRAY[CAST(:event_id AS uuid)], :event_type,
-     :project_id, :repository_id, :session_id, :occurred_at, :redaction,
-     to_tsvector('{TEXT_SEARCH_CONFIG}', CAST(:body AS text)))
+     :project_id, :repository_id, :session_id, :occurred_at, :redaction, :content_sha256,
+     :media_type, to_tsvector('{TEXT_SEARCH_CONFIG}', CAST(:body AS text)))
 ON CONFLICT (content_id) DO UPDATE SET
     event_id = CASE WHEN (excluded.occurred_at, excluded.event_id) < (d.occurred_at, d.event_id)
         THEN excluded.event_id ELSE d.event_id END,
@@ -161,8 +201,12 @@ ON CONFLICT (content_id) DO UPDATE SET
     tsv = excluded.tsv,
     indexed_at = now()
 WHERE d.project_id = excluded.project_id AND d.repository_id = excluded.repository_id
+  AND d.content_sha256 = excluded.content_sha256 AND d.media_type = excluded.media_type
 RETURNING content_id
 """
+_EXISTING_SCOPE: Final[str] = (
+    "SELECT project_id, repository_id FROM retrieval.search_documents WHERE content_id = :content_id"
+)
 _INSERT_TOMBSTONE: Final[str] = (
     "INSERT INTO retrieval.content_tombstones (content_id, purged_event_id, purged_at) "
     "VALUES (:content_id, CAST(:event_id AS uuid), :purged_at) ON CONFLICT (content_id) DO NOTHING"
@@ -175,7 +219,7 @@ _DELETE_DOCUMENTS: Final[str] = (
 _UPSERT_EMBEDDING: Final[LiteralString] = (
     "MERGE (n:ContentEmbedding {content_id: $content_id}) "
     "SET n.model_id = $model_id, n.model_revision = $model_revision, "
-    "n.content_sha256 = $content_sha256, n.truncated = $truncated, "
+    "n.content_sha256 = $content_sha256, n.media_type = $media_type, n.truncated = $truncated, "
     "n.project_id = coalesce(n.project_id, $project_id), "
     "n.repository_id = coalesce(n.repository_id, $repository_id) "
     "WITH n "
@@ -184,6 +228,13 @@ _UPSERT_EMBEDDING: Final[LiteralString] = (
     "WITH n, collect(source_event_id) AS source_event_ids "
     "SET n.source_event_ids = source_event_ids "
     "WITH n CALL db.create.setNodeVectorProperty(n, 'embedding', $vector)"
+)
+# The graph twin of the PostgreSQL identity check. A replay into a scratch or standby graph never
+# writes PostgreSQL, so without it the vector of a reused content ID would follow replay order.
+_EMBEDDING_IDENTITY: Final[LiteralString] = (
+    "MATCH (n:ContentEmbedding {content_id: $content_id}) "
+    "RETURN n.project_id = $project_id AND n.repository_id = $repository_id AS same_scope, "
+    "n.content_sha256 = $content_sha256 AND n.media_type = $media_type AS same_content"
 )
 _DELETE_EMBEDDINGS: Final[LiteralString] = (
     "MATCH (n:ContentEmbedding) WHERE n.content_id IN $content_ids DETACH DELETE n"
@@ -247,14 +298,15 @@ class SearchProjector:
 
     name = "search"
     version = "1"
+    # Never named in the history marker (`schema.history_projectors`): temporal reads do not need
+    # search history, and whether embeddings are complete is reported by `projection status` from
+    # the rows versus the nodes (a lexical-only worker leaves them out), not by the marker.
+    records_history = False
 
-    def __init__(
-        self, backend: SearchBackend | None = None, purge: PurgeAccess | None = None
-    ) -> None:
+    def __init__(self, backend: SearchBackend | None = None) -> None:
         self._backend = backend
-        self._purge_access = (
-            PurgeAccess(backend.sessions, backend.write_documents) if backend else purge
-        )
+        # Events whose rows were written without an embedding (lexical-only mode); counts only.
+        self.unembedded_events = 0
         # Purges seen by THIS instance while it replays into a graph-only target
         # (`write_documents=False`): the live tombstone table is never written then, so a purge
         # that precedes its original event in the replay is remembered here instead.
@@ -263,22 +315,17 @@ class SearchProjector:
     def with_backend(self, backend: SearchBackend) -> SearchProjector:
         return SearchProjector(backend)
 
-    def with_purge(self, purge: PurgeAccess) -> SearchProjector:
-        return SearchProjector(purge=purge)
-
     def handles(self, event_type: str) -> bool:
         return event_type in _HANDLED
 
     async def seed_purges(self, sessions: async_sessionmaker[AsyncSession]) -> int:
         """Remember every `content.purged` ID in the ledger, before a replay.
 
-        An in-place rebuild empties the tombstone table, and the purged bytes are already gone, so
-        an original event replayed before its later purge would fail to read them. The ledger is
-        authoritative: content it records as purged is never read or embedded by this instance.
+        The purged bytes are already gone, so an original event replayed before its later purge
+        would fail to read them. The ledger is authoritative: content it records as purged is never
+        read or embedded by this instance, whatever the purge event's outbox status.
         """
-        async with sessions() as session:
-            rows = await session.execute(text(_LEDGER_PURGES))
-            self._replayed_purges.update(str(content_id) for content_id in rows.scalars())
+        self._replayed_purges |= await _ledger_purges(sessions)
         return len(self._replayed_purges)
 
     async def project(self, tx: Neo4jTransaction, event: StoredEventV1) -> None:
@@ -294,16 +341,24 @@ class SearchProjector:
         indexed = await self._index_documents(backend, event, refs, project_id, repository_id)
         if not indexed:
             return
+        embeddings = backend.embeddings
+        if embeddings is None:
+            self.unembedded_events += 1
+            if self.unembedded_events == 1:
+                _LOG.warning("search rows written without embeddings: lexical-only mode")
+            return
         await lock_event_nodes(tx, event)
         owner = _owner(event)
         for document, vector, truncated in indexed:
+            await _check_embedding_identity(tx, document.ref, project_id, repository_id)
             await tx.run(
                 _UPSERT_EMBEDDING,
                 parameters={
                     "content_id": document.ref.content_id,
-                    "model_id": backend.embeddings.model_id,
-                    "model_revision": backend.embeddings.model_revision,
+                    "model_id": embeddings.model_id,
+                    "model_revision": embeddings.model_revision,
                     "content_sha256": document.ref.content_sha256,
+                    "media_type": document.ref.media_type,
                     "truncated": truncated,
                     "project_id": project_id,
                     "repository_id": repository_id,
@@ -323,10 +378,56 @@ class SearchProjector:
             )
         return self._backend
 
-    def _require_purge_access(self) -> PurgeAccess:
-        if self._purge_access is None:
-            raise SearchBackendNotConfiguredError("purging needs a PostgreSQL connection")
-        return self._purge_access
+    async def check_replay(self, sessions: async_sessionmaker[AsyncSession]) -> int:
+        """Read every document an in-place replay will index, BEFORE anything is reset or wiped.
+
+        Walks the delivered events in outbox order with the projector's own scope and media rules,
+        skips content the ledger records as purged, and reads each remaining content object
+        through the content service (digest-verified, bytes discarded), checking that a content
+        ID always names the same scope, digest and media type. Raises
+        `SearchReplayIntegrityError` with counts only; returns the number of documents checked.
+        Costs one extra read of all indexed content: the price of never wiping the live graph for
+        a replay that would fail.
+        """
+        backend = self._require_backend()
+        purged = await _ledger_purges(sessions)
+        identities: dict[str, tuple[str, str, str, str]] = {}
+        checked = unreadable = conflicting = 0
+        after = 0
+        while True:
+            async with sessions() as session:
+                page = (
+                    await session.execute(
+                        text(_DELIVERED_PAGE), {"after": after, "limit": _CHECK_PAGE_SIZE}
+                    )
+                ).all()
+                if not page:
+                    break
+                for outbox_id, event_id in page:
+                    after = outbox_id
+                    event = await LedgerRepository.get_event(session, event_id)
+                    scope = None if event is None else _scope(event)
+                    if event is None or scope is None:
+                        continue
+                    for ref in event.content_refs:
+                        if not _indexable(ref) or ref.content_id in purged:
+                            continue
+                        identity = (*scope, ref.content_sha256, ref.media_type)
+                        if identities.setdefault(ref.content_id, identity) != identity:
+                            conflicting += 1
+                            continue
+                        checked += 1
+                        try:
+                            await backend.content.read(session, ref)
+                        except ContentUnavailableError:
+                            unreadable += 1
+        if unreadable or conflicting:
+            raise SearchReplayIntegrityError(
+                f"the replay would fail: {unreadable} unreadable content object(s) and "
+                f"{conflicting} conflicting content ID reuse(s) among delivered events; restore "
+                "or purge (content.purged) the content before rebuilding"
+            )
+        return checked
 
     async def _index_documents(
         self,
@@ -336,7 +437,10 @@ class SearchProjector:
         project_id: str,
         repository_id: str,
     ) -> list[tuple[_Document, tuple[float, ...], bool]]:
-        """Read, embed and upsert the PostgreSQL rows; return what to write to the graph."""
+        """Read, embed and upsert the PostgreSQL rows; return what to write to the graph.
+
+        Lexical-only (no embedder): the rows are written exactly as with one, every vector empty.
+        """
         documents: list[_Document] = []
         async with backend.sessions() as session:
             tombstoned = await _tombstoned(session, [ref.content_id for ref in refs])
@@ -350,11 +454,14 @@ class SearchProjector:
                     documents.append(_Document(ref, body))
         if not documents:
             return []
-        embedded = await backend.embeddings.embed([document.text for document in documents])
-        if len(embedded) != len(documents) or any(
-            len(item.vector) != EMBEDDING_DIMENSIONS for item in embedded
-        ):
-            raise EmbeddingDimensionError("embedding provider output does not match the index")
+        if backend.embeddings is None:
+            embedded = [EmbeddedText((), truncated=False) for _ in documents]
+        else:
+            embedded = await backend.embeddings.embed([document.text for document in documents])
+            if len(embedded) != len(documents) or any(
+                len(item.vector) != EMBEDDING_DIMENSIONS for item in embedded
+            ):
+                raise EmbeddingDimensionError("embedding provider output does not match the index")
         written: list[tuple[_Document, tuple[float, ...], bool]] = []
         if not backend.write_documents:
             return [
@@ -379,12 +486,14 @@ class SearchProjector:
                         "session_id": event.context.session_id,
                         "occurred_at": event.occurred_at,
                         "redaction": document.ref.disposition.value,
+                        "content_sha256": document.ref.content_sha256,
+                        "media_type": document.ref.media_type,
                         "body": document.text,
                     },
                 )
                 if row.first() is None:
-                    raise SearchScopeConflictError(
-                        "content is already indexed under another project or repository"
+                    await _raise_conflict(
+                        session, document.ref.content_id, project_id, repository_id
                     )
                 written.append((document, item.vector, item.truncated))
         return written
@@ -392,7 +501,7 @@ class SearchProjector:
     async def _purge(self, tx: Neo4jTransaction, event: StoredEventV1) -> None:
         purged = ContentPurgedV1.model_validate(dict(event.payload))
         content_ids = sorted(item.content_id for item in purged.purged_contents)
-        access = self._require_purge_access()
+        access = self._require_backend()
         if not access.write_documents:
             self._replayed_purges.update(content_ids)
         else:
@@ -410,6 +519,63 @@ class SearchProjector:
                 await session.execute(text(_DELETE_DOCUMENTS), {"content_ids": content_ids})
         await lock_event_nodes(tx, event)
         await tx.run(_DELETE_EMBEDDINGS, parameters={"content_ids": content_ids})
+
+
+async def reset_search_tables(session: AsyncSession) -> int:
+    """Empty the search documents and reseed the tombstones from the ledger; returns tombstones.
+
+    For an in-place rebuild, through `retrieval.reset_search_projection()` (SECURITY DEFINER: the
+    projector role can neither truncate nor delete tombstones itself). A delivered-only replay
+    skips a dead-lettered `content.purged` whose PostgreSQL delete may already have committed, so
+    every purge the ledger records is tombstoned here instead of being forgotten (a later event
+    could otherwise re-index purged content once the rebuild is over), and the replay's own
+    tombstone checks then cover purged originals without any in-memory set.
+    """
+    return int(await session.scalar(text(_RESET_PROJECTION)) or 0)
+
+
+async def _ledger_purges(sessions: async_sessionmaker[AsyncSession]) -> set[str]:
+    """Every content ID a `content.purged` in the ledger names (IDs only, whatever the status)."""
+    async with sessions() as session:
+        rows = await session.execute(text(_LEDGER_PURGES))
+        return {str(content_id) for content_id in rows.scalars()}
+
+
+async def _raise_conflict(
+    session: AsyncSession, content_id: str, project_id: str, repository_id: str
+) -> None:
+    """Name the collision the identity-checked upsert refused; content-free messages only."""
+    existing = (await session.execute(text(_EXISTING_SCOPE), {"content_id": content_id})).first()
+    if existing is None or (existing.project_id, existing.repository_id) != (
+        project_id,
+        repository_id,
+    ):
+        raise SearchScopeConflictError(
+            "content is already indexed under another project or repository"
+        )
+    raise SearchContentConflictError("content ID is already indexed for different content")
+
+
+async def _check_embedding_identity(
+    tx: Neo4jTransaction, ref: ContentRefV1, project_id: str, repository_id: str
+) -> None:
+    result = await tx.run(
+        _EMBEDDING_IDENTITY,
+        parameters={
+            "content_id": ref.content_id,
+            "project_id": project_id,
+            "repository_id": repository_id,
+            "content_sha256": ref.content_sha256,
+            "media_type": ref.media_type,
+        },
+    )
+    for record in result.records:
+        if not record["same_scope"]:
+            raise SearchScopeConflictError(
+                "content is already embedded under another project or repository"
+            )
+        if not record["same_content"]:
+            raise SearchContentConflictError("content ID is already embedded for different content")
 
 
 def _content_id(ref: ContentRefV1) -> str:

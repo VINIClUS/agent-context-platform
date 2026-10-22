@@ -73,18 +73,18 @@ def test_models_fetch_requires_a_destination() -> None:
     assert result.exit_code == 2
 
 
-def test_without_a_model_directory_search_can_still_purge_but_not_index() -> None:
-    sessions = object()
-    runtime = SimpleNamespace(sessions=sessions)
+def test_binding_search_without_a_model_directory_is_refused() -> None:
+    # Every caller refuses earlier with a clearer message; this is the last line of defence.
+    with pytest.raises(cli.CliUsageError, match="AGENT_CONTEXT_SEARCH__MODEL_DIR"):
+        asyncio.run(
+            cli._search_projectors(
+                Settings(), SimpleNamespace(sessions=object()), write_documents=True
+            )  # type: ignore[arg-type]
+        )
 
-    projectors = asyncio.run(
-        cli._search_projectors(Settings(), runtime, write_documents=True)  # type: ignore[arg-type]
-    )
 
-    assert [item.name for item in projectors] == [item.name for item in registered_projectors()]
-    search = projectors[-1]
-    assert search._backend is None  # type: ignore[attr-defined]
-    assert search._purge_access.sessions is sessions  # type: ignore[attr-defined]
+async def _no_seed(*_args: Any) -> None:
+    return None
 
 
 def test_with_a_model_directory_the_search_projector_gets_a_verified_provider_and_content(
@@ -99,6 +99,7 @@ def test_with_a_model_directory_the_search_projector_gets_a_verified_provider_an
 
     monkeypatch.setattr(cli.LocalMiniLMProvider, "load", staticmethod(fake_load))
     monkeypatch.setattr(cli.S3BlobStore, "from_settings", staticmethod(lambda _settings: object()))
+    monkeypatch.setattr(cli, "_seed_search_purges", _no_seed)
     settings = Settings(search={"model_dir": tmp_path, "embedding_batch_size": 4})
     sessions = object()
     runtime = cli.Runtime(sessions=sessions, recording_sessions=None, store=object())  # type: ignore[arg-type]
@@ -283,7 +284,8 @@ def test_without_search_skips_the_projector_and_the_search_table_reset(
     projectors = asyncio.run(
         cli._search_projectors(Settings(), object(), write_documents=True, without_search=True)  # type: ignore[arg-type]
     )
-    assert "search" not in [item.name for item in projectors] and len(projectors) == 4
+    assert "search" not in [item.name for item in projectors]
+    assert len(projectors) == len(registered_projectors()) - 1
 
 
 def test_an_in_place_rebuild_with_search_resets_the_search_tables_a_standby_one_does_not(
@@ -338,3 +340,75 @@ def test_a_standby_rebuild_without_search_is_allowed_even_with_embeddings(
     _invoke("projection", "rebuild", *_TARGET, "--target-username", "op", "--without-search")
 
     assert seen["calls"] == ["runtime", "preflight", "rebuild"]
+
+
+@pytest.mark.parametrize("write_documents", [False, True])
+def test_only_a_replay_that_never_writes_tombstones_seeds_purges_from_the_ledger(
+    monkeypatch: pytest.MonkeyPatch, tmp_path: Path, write_documents: bool
+) -> None:
+    from agent_context_platform.projection.projectors.search import SearchProjector
+
+    seeded: list[object] = []
+
+    async def seed(_self: Any, sessions: Any) -> int:
+        seeded.append(sessions)
+        return 0
+
+    monkeypatch.setattr(cli.LocalMiniLMProvider, "load", staticmethod(lambda *_a, **_k: object()))
+    monkeypatch.setattr(cli.S3BlobStore, "from_settings", staticmethod(lambda _s: object()))
+    monkeypatch.setattr(SearchProjector, "seed_purges", seed)
+    sessions = object()
+    runtime = cli.Runtime(sessions=sessions, recording_sessions=None, store=object())  # type: ignore[arg-type]
+
+    projectors = asyncio.run(
+        cli._search_projectors(
+            Settings(search={"model_dir": tmp_path}), runtime, write_documents=write_documents
+        )
+    )
+
+    assert projectors[-1].name == "search"
+    assert seeded == ([] if write_documents else [sessions])
+
+
+def test_only_an_in_place_rebuild_checks_the_replay_and_does_so_before_the_rebuild(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    seen = _env(monkeypatch, model=True)
+
+    async def projectors(*_args: Any, **_kwargs: Any) -> tuple[Any, ...]:
+        return ()
+
+    async def check(*_args: Any) -> None:
+        seen["calls"].append("check")
+
+    monkeypatch.setattr(cli, "_search_projectors", projectors)
+    monkeypatch.setattr(cli, "_check_search_replay", check)
+
+    _invoke("projection", "rebuild", "--in-place", "--confirm", "neo4j")
+    assert seen["calls"] == ["runtime", "preflight", "check", "rebuild"]
+    seen["calls"].clear()
+    _invoke("projection", "rebuild", *_TARGET, "--target-username", "op")
+    assert seen["calls"] == ["runtime", "preflight", "rebuild"]
+
+
+def test_a_failed_replay_check_stops_the_rebuild_with_a_content_free_error(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent_context_platform.projection.projectors.search import SearchReplayIntegrityError
+
+    seen = _env(monkeypatch, model=True)
+
+    async def projectors(*_args: Any, **_kwargs: Any) -> tuple[Any, ...]:
+        return ()
+
+    async def check(*_args: Any) -> None:
+        raise SearchReplayIntegrityError("the replay would fail: 1 unreadable content object(s)")
+
+    monkeypatch.setattr(cli, "_search_projectors", projectors)
+    monkeypatch.setattr(cli, "_check_search_replay", check)
+
+    result = _invoke("projection", "rebuild", "--in-place", "--confirm", "neo4j")
+
+    assert result.exit_code == 1 and "SearchReplayIntegrityError" in result.stderr
+    assert "1 unreadable content object(s)" in result.stderr
+    assert "rebuild" not in seen["calls"]

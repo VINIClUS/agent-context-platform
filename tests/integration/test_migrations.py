@@ -229,6 +229,8 @@ EXPECTED_COLUMNS = {
         "session_id",
         "occurred_at",
         "redaction",
+        "content_sha256",
+        "media_type",
         "tsv",
         "indexed_at",
     },
@@ -389,7 +391,7 @@ async def _exercise_search_step(dsn: str) -> None:
                         ("agent_context_api", "INSERT", False),
                         ("agent_context_api", "DELETE", False),
                         ("agent_context_projector", "DELETE", True),
-                        ("agent_context_projector", "TRUNCATE", True),
+                        ("agent_context_projector", "TRUNCATE", False),
                     ):
                         assert (
                             await connection.scalar(
@@ -405,6 +407,27 @@ async def _exercise_search_step(dsn: str) -> None:
                         text(
                             "SELECT has_table_privilege('agent_context_projector', "
                             "'retrieval.content_tombstones', 'DELETE')"
+                        )
+                    )
+                    # The reset is a SECURITY DEFINER function only the projector may execute.
+                    for role, allowed in (
+                        ("agent_context_projector", True),
+                        ("agent_context_api", False),
+                    ):
+                        assert (
+                            await connection.scalar(
+                                text(
+                                    "SELECT has_function_privilege(:role, "
+                                    "'retrieval.reset_search_projection()', 'EXECUTE')"
+                                ),
+                                {"role": role},
+                            )
+                            is allowed
+                        )
+                    assert await connection.scalar(
+                        text(
+                            "SELECT prosecdef FROM pg_proc "
+                            "WHERE oid = 'retrieval.reset_search_projection()'::regprocedure"
                         )
                     )
                     await _run_alembic(connection, command.downgrade, _MCP_TOKENS_REVISION)
@@ -956,6 +979,7 @@ EXPECTED_CONSTRAINT_NAMES = {
     "pk_search_documents",
     "ck_search_documents_source_event_ids_not_empty",
     "ck_search_documents_event_id_in_sources",
+    "ck_search_documents_content_sha256_hex",
     "pk_content_tombstones",
     "pk_mcp_tokens",
     "uq_mcp_tokens_token_prefix",
@@ -1034,12 +1058,12 @@ EXPECTED_TABLE_GRANTS = (
     | _table_grants(
         "agent_context_projector",
         {"retrieval.search_documents"},
-        {"SELECT", "INSERT", "DELETE", "TRUNCATE"},
+        {"SELECT", "INSERT", "DELETE"},
     )
     | _table_grants(
         "agent_context_projector",
         {"retrieval.content_tombstones"},
-        {"SELECT", "INSERT", "TRUNCATE"},
+        {"SELECT", "INSERT"},
     )
     | _table_grants("agent_context_projector", {"projection.outbox"}, {"SELECT"})
     | _table_grants(

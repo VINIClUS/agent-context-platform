@@ -15,6 +15,10 @@ from agent_context_sdk.events.system import ProjectionOutcome
 from typer.testing import CliRunner
 
 from agent_context_platform import cli
+from agent_context_platform.operations import migrate
+from agent_context_platform.projection.neo4j import Neo4jStore
+from agent_context_platform.projection.registry import registered_projectors
+from agent_context_platform.projection.schema import ProjectionHistory
 from agent_context_platform.projection.verify import (
     GraphDigest,
     MissingGrantError,
@@ -60,6 +64,7 @@ class Calls:
         self.preflight: list[tuple[bool, bool]] = []
         self.preflight_error: Exception | None = None
         self.extra_grants: list[tuple[Any, ...]] = []
+        self.history: ProjectionHistory | None = None
 
 
 @pytest.fixture
@@ -87,10 +92,23 @@ def calls(monkeypatch: pytest.MonkeyPatch) -> Calls:
     async def no_search_projectors(*_args: Any, **_kwargs: Any) -> tuple[Any, ...]:
         return ()  # the model is never loaded here; the search wiring has its own tests
 
+    async def fake_history(store: Any) -> ProjectionHistory | None:
+        assert store is seen.runtime_store  # the live graph, never a scratch or standby target
+        return seen.history
+
     monkeypatch.setattr(cli, "_runtime", runtime)
     monkeypatch.setattr(cli, "preflight", fake_preflight)
     monkeypatch.setattr(cli, "_search_projectors", no_search_projectors)
+    monkeypatch.setattr(cli, "projection_history", fake_history)
     return seen
+
+
+REGISTERED = sorted(f"{item.name}:{item.version}" for item in registered_projectors())
+# The marker never names the search projector (`records_history = False`).
+RECORDED = [item for item in REGISTERED if item != "search:1"]
+REQUIRED = ["knowledge:2", "quality:2"]
+OTHERS = [item for item in RECORDED if item not in REQUIRED]
+MISSING = {"state": "missing", "missing": REQUIRED, "others_missing": OTHERS}
 
 
 def projector(*issues: str) -> ProjectorVerification:
@@ -218,6 +236,7 @@ def test_verify_reports_a_match_as_json_and_exit_zero(
     assert result.exit_code == 0
     payload = json.loads(result.output)
     assert payload["ok"] and payload["graph"]["digest"] == "d" * 64
+    assert payload["history"] == MISSING
     options = calls.verify[0]
     assert options["require_caught_up"] is False and options["replay_target"] is None
     assert options["recorder"] is not None and options["batch_size"] == 1000
@@ -232,6 +251,22 @@ def test_verify_human_output_and_no_record(monkeypatch: pytest.MonkeyPatch, call
     assert "graph digest " + "d" * 64 in result.output and "verified" in result.output
     assert "replay digest" in result.output and "recorded 1 new" in result.output
     assert calls.verify[0]["recorder"] is None and calls.verify[0]["batch_size"] == 5
+    lines = result.output.splitlines()
+    assert lines[-2].startswith("history: missing, rebuild required before temporal reads")
+    assert "knowledge:2" in lines[-2] and lines[-1] == "verified"
+    calls.history = ProjectionHistory(frozenset(RECORDED))
+    complete = run("projection", "verify", "--no-record")
+    assert "history: complete for temporal reads\n" in complete.output
+    # the same set the temporal reads check: other projectors are only listed
+    calls.history = ProjectionHistory(frozenset(REQUIRED))
+    required_only = run("projection", "verify", "--no-record")
+    assert "history: complete for temporal reads; other projectors not replayed from the" in (
+        required_only.output
+    )
+    # the marker is reported, never a verification failure of its own
+    calls.history = ProjectionHistory(frozenset({"knowledge:1"}))
+    outdated = run("projection", "verify", "--no-record")
+    assert outdated.exit_code == 0 and "history: outdated, rebuild required" in outdated.output
 
 
 def test_verify_exits_one_on_a_mismatch(monkeypatch: pytest.MonkeyPatch, calls: Calls) -> None:
@@ -443,14 +478,40 @@ def test_status_lists_each_projector_read_only(
         return statuses
 
     monkeypatch.setattr(cli, "projection_status", fake)
+    monkeypatch.setattr(cli, "_search_status", _search_counts(documents=5, embeddings=3))
 
     human = run("projection", "status")
     assert human.exit_code == 0
     assert "git 1: state active, checkpoint 4/6, lag 2, last error RuntimeError" in human.output
     assert "code 1: state none" in human.output and "last run never" in human.output
+    assert "search: 5 documents, 3 embeddings (2 without embeddings: run" in human.output
+
+    assert "history: missing, rebuild required before temporal reads" in human.output
 
     machine = json.loads(run("projection", "status", "--json").output)
     assert [item["name"] for item in machine["projectors"]] == ["git", "code"]
+    assert machine["history"] == MISSING
+    calls.history = ProjectionHistory(frozenset(RECORDED))
+    machine = json.loads(run("projection", "status", "--json").output)
+    assert machine["history"] == {"state": "complete", "missing": [], "others_missing": []}
+    assert machine["search"] == {
+        "documents": 5,
+        "embeddings": 3,
+        "documents_without_embeddings": 2,
+    }
+    monkeypatch.setattr(cli, "_search_status", _search_counts(documents=3, embeddings=3))
+    assert "search: 3 documents, 3 embeddings\n" in run("projection", "status").output
+
+
+def _search_counts(*, documents: int, embeddings: int) -> Any:
+    async def counts(_runtime: Any) -> dict[str, int]:
+        return {
+            "documents": documents,
+            "embeddings": embeddings,
+            "documents_without_embeddings": max(documents - embeddings, 0),
+        }
+
+    return counts
 
 
 def test_a_missing_or_invalid_configuration_is_a_usage_error(
@@ -564,11 +625,20 @@ def test_the_real_runtime_opens_lazily_and_closes(monkeypatch: pytest.MonkeyPatc
         assert sessions is not None
         return []
 
+    async def history(store: Any) -> None:
+        assert isinstance(store, Neo4jStore)
+
     monkeypatch.setattr(cli, "projection_status", fake)
+    monkeypatch.setattr(cli, "projection_history", history)
+    monkeypatch.setattr(cli, "_search_status", _search_counts(documents=0, embeddings=0))
 
     result = run("projection", "status", "--json")
 
-    assert result.exit_code == 0 and json.loads(result.output) == {"projectors": []}
+    assert result.exit_code == 0 and json.loads(result.output) == {
+        "projectors": [],
+        "history": MISSING,
+        "search": {"documents": 0, "embeddings": 0, "documents_without_embeddings": 0},
+    }
 
 
 def test_server_keys_normalize_local_hosts_and_default_ports() -> None:
@@ -614,3 +684,201 @@ def test_the_runner_quiet_period_is_an_option_and_dead_letters_are_reported(
     assert skipped["count"] == 11 and skipped["event_ids"][0] == str(poison)
     assert "skipped 11 dead-lettered events" in custom.output and "..." in custom.output
     assert "MUST be stopped" in run("projection", "rebuild", "--help").output.replace("\n", " ")
+
+
+# --- `agent-context db` (PLATFORM-049) ------------------------------------------------------------
+
+
+class MigrateCalls:
+    def __init__(self) -> None:
+        self.upgrade: list[dict[str, Any]] = []
+        self.current = 0
+        self.disposed = 0
+
+
+@pytest.fixture
+def migrations(monkeypatch: pytest.MonkeyPatch) -> MigrateCalls:
+    calls = MigrateCalls()
+    monkeypatch.delenv("AGENT_CONTEXT_POSTGRESQL__MIGRATION_DSN", raising=False)
+    monkeypatch.delenv(migrate.ALEMBIC_CONFIG_ENV, raising=False)
+
+    class Engine:
+        def __init__(self, url: str) -> None:
+            self.url = url
+
+        async def dispose(self) -> None:
+            calls.disposed += 1
+
+    def fake_engine(url: str, **_kwargs: Any) -> Engine:
+        calls.upgrade.append({"url": url})
+        return Engine(url)
+
+    monkeypatch.setattr(cli, "create_async_engine", fake_engine)
+    return calls
+
+
+def _migration_report(*, applied: bool) -> migrate.MigrationReport:
+    return migrate.MigrationReport(
+        "20260823_0001" if applied else "20260929_0001", "20260929_0001", "20260929_0001", applied
+    )
+
+
+def test_db_upgrade_uses_the_migration_dsn_and_reports_without_secrets(
+    monkeypatch: pytest.MonkeyPatch, migrations: MigrateCalls
+) -> None:
+    migration_password = "migration-only-secret"
+    monkeypatch.setenv(
+        "AGENT_CONTEXT_POSTGRESQL__MIGRATION_DSN",
+        f"postgresql+psycopg://migrator:{migration_password}@db.example.test/agent",
+    )
+    seen: dict[str, Any] = {}
+
+    async def fake_upgrade(engine: Any, config: Any, **options: Any) -> migrate.MigrationReport:
+        seen.update(options, url=engine.url, config=config.config_file_name)
+        return _migration_report(applied=True)
+
+    monkeypatch.setattr(migrate, "upgrade", fake_upgrade)
+
+    result = CliRunner().invoke(
+        cli.app, ["db", "upgrade", "--expect-head", "20260929_0001", "--lock-timeout", "5"]
+    )
+
+    assert result.exit_code == cli.EXIT_OK, result.stderr
+    assert result.stdout.strip() == "schema upgraded from 20260823_0001 to 20260929_0001"
+    assert seen["url"].startswith("postgresql+psycopg://migrator:")
+    assert seen["expect_head"] == "20260929_0001"
+    assert seen["lock_timeout_seconds"] == 5
+    assert seen["config"] == "alembic.ini"
+    assert migrations.disposed == 1
+    assert migration_password not in result.output and PASSWORD not in result.output
+
+
+def test_db_upgrade_falls_back_to_the_shared_dsn_and_reports_a_no_op_as_json(
+    monkeypatch: pytest.MonkeyPatch, migrations: MigrateCalls
+) -> None:
+    async def fake_upgrade(engine: Any, config: Any, **options: Any) -> migrate.MigrationReport:
+        assert engine.url == DSN
+        return _migration_report(applied=False)
+
+    monkeypatch.setattr(migrate, "upgrade", fake_upgrade)
+
+    result = CliRunner().invoke(cli.app, ["db", "upgrade", "--json"])
+
+    assert result.exit_code == cli.EXIT_OK
+    assert json.loads(result.stdout) == {
+        "before": "20260929_0001",
+        "after": "20260929_0001",
+        "head": "20260929_0001",
+        "applied": False,
+    }
+    result = CliRunner().invoke(cli.app, ["db", "upgrade"])
+    assert result.stdout.strip() == "schema already at head 20260929_0001"
+
+
+@pytest.mark.parametrize(
+    ("error", "exit_code"),
+    [
+        (migrate.MigrationError("unknown_revision", "refusing to downgrade"), cli.EXIT_USAGE),
+        (migrate.MigrationError("alembic_config_missing", "not found"), cli.EXIT_USAGE),
+        (migrate.MigrationError("interrupted", "stopped by a signal"), cli.EXIT_FAILED),
+        (migrate.MigrationError("head_mismatch", "not at head"), cli.EXIT_FAILED),
+        (migrate.MigrationError("lock_timeout", "held too long"), cli.EXIT_FAILED),
+        (RuntimeError(f"connection to {DSN} failed"), cli.EXIT_FAILED),
+    ],
+)
+def test_db_upgrade_failures_map_to_exit_codes_without_secrets(
+    monkeypatch: pytest.MonkeyPatch,
+    migrations: MigrateCalls,
+    error: Exception,
+    exit_code: int,
+) -> None:
+    async def fake_upgrade(*_args: Any, **_options: Any) -> migrate.MigrationReport:
+        raise error
+
+    monkeypatch.setattr(migrate, "upgrade", fake_upgrade)
+
+    result = CliRunner().invoke(cli.app, ["db", "upgrade"])
+
+    assert result.exit_code == exit_code
+    assert result.stdout == ""
+    assert PASSWORD not in result.output and "db.example.test" not in result.output
+    assert migrations.disposed == 1
+    if isinstance(error, migrate.MigrationError):
+        assert result.stderr.strip() == f"error: {error.code}: {error}"
+
+
+def test_db_commands_need_a_dsn_and_the_alembic_scripts(
+    monkeypatch: pytest.MonkeyPatch, migrations: MigrateCalls, tmp_path: Any
+) -> None:
+    monkeypatch.delenv("AGENT_CONTEXT_POSTGRESQL__DSN")
+    result = CliRunner().invoke(cli.app, ["db", "upgrade"])
+    assert result.exit_code == cli.EXIT_USAGE
+    assert "AGENT_CONTEXT_POSTGRESQL__MIGRATION_DSN (or __DSN) is required" in result.stderr
+
+    missing = str(tmp_path / "missing.ini")
+    result = CliRunner().invoke(cli.app, ["db", "current", "--alembic-config", missing])
+    assert result.exit_code == cli.EXIT_USAGE
+    assert result.stderr.startswith("error: alembic_config_missing: ")
+    assert migrations.upgrade == []
+
+
+@pytest.mark.parametrize(
+    ("state", "exit_code"),
+    [("at_head", cli.EXIT_OK), ("behind", cli.EXIT_FAILED), ("empty", cli.EXIT_FAILED)],
+)
+def test_db_current_reports_the_state(
+    monkeypatch: pytest.MonkeyPatch, migrations: MigrateCalls, state: str, exit_code: int
+) -> None:
+    revision = None if state == "empty" else "20260929_0001"
+    report = migrate.CurrentReport(revision, "20260929_0001", state)  # type: ignore[arg-type]
+
+    async def fake_current(*_args: Any) -> migrate.CurrentReport:
+        return report
+
+    monkeypatch.setattr(migrate, "current", fake_current)
+
+    result = CliRunner().invoke(cli.app, ["db", "current"])
+    as_json = CliRunner().invoke(cli.app, ["db", "current", "--json"])
+
+    assert result.exit_code == exit_code
+    assert result.stdout.strip() == f"revision {revision or 'none'} head 20260929_0001: {state}"
+    assert json.loads(as_json.stdout) == {
+        "revision": revision,
+        "head": "20260929_0001",
+        "state": state,
+    }
+    assert migrations.disposed == 2
+
+
+@pytest.mark.parametrize("value", ["nan", "inf", "-inf", "0", "-1", "1e12", "2147484"])
+def test_db_upgrade_rejects_a_lock_timeout_postgresql_cannot_hold(
+    monkeypatch: pytest.MonkeyPatch, migrations: MigrateCalls, value: str
+) -> None:
+    async def fake_upgrade(*_args: Any, **_options: Any) -> migrate.MigrationReport:
+        raise AssertionError("must not upgrade")
+
+    monkeypatch.setattr(migrate, "upgrade", fake_upgrade)
+
+    result = CliRunner().invoke(cli.app, ["db", "upgrade", "--lock-timeout", value])
+
+    assert result.exit_code == cli.EXIT_USAGE
+    assert migrations.upgrade == []
+
+
+def test_db_upgrade_accepts_the_largest_lock_timeout(
+    monkeypatch: pytest.MonkeyPatch, migrations: MigrateCalls
+) -> None:
+    seen: dict[str, Any] = {}
+
+    async def fake_upgrade(engine: Any, config: Any, **options: Any) -> migrate.MigrationReport:
+        seen.update(options)
+        return _migration_report(applied=False)
+
+    monkeypatch.setattr(migrate, "upgrade", fake_upgrade)
+
+    result = CliRunner().invoke(
+        cli.app, ["db", "upgrade", "--lock-timeout", str(migrate.MAX_LOCK_TIMEOUT_SECONDS)]
+    )
+
+    assert result.exit_code == cli.EXIT_OK, result.stderr
+    assert seen["lock_timeout_seconds"] == migrate.MAX_LOCK_TIMEOUT_SECONDS

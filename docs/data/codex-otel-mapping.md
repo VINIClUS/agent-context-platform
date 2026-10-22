@@ -36,7 +36,9 @@ sandbox export.
   `otel_init.rs`) must be in the explicit allowlist `codex_cli_rs` (`DEFAULT_ORIGINATOR`,
   `default_client.rs`) or `codex_exec` (`set_default_originator`, `exec/src/lib.rs`). Names that
   identify the platform (`agent-context`, `agent-context-*`, `agent_context*`, case-insensitive)
-  are rejected with `platform_origin`; every other or missing name is rejected with
+  are rejected with `platform_origin`, and so is any record whose resource carries the platform
+  telemetry marker `agent_context.origin` (any value, whatever the service name; see
+  `docs/operations/telemetry.md`); every other or missing name is rejected with
   `unknown_service` / `missing_service`. Other Codex surfaces (TUI, IDE, SDK) or overridden names
   (`CODEX_INTERNAL_ORIGINATOR_OVERRIDE`, `service_name_override`) are rejected until added to the
   allowlist deliberately. The check runs before the event name is inspected, so it also covers
