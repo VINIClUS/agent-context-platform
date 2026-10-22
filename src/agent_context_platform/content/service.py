@@ -710,12 +710,17 @@ class ContentService:
                 raise ContentUnavailableError("content ref has no object key")
             try:
                 data = await self._blob_store.get_verified(ref.object_key, ref.content_sha256)
+            except BlobIntegrityError:
+                _integrity_failure("digest_mismatch", "read", ref.content_sha256)
+                raise ContentUnavailableError("object content could not be read") from None
             except BlobStoreError:
+                # Gone or unreachable: a purge removes bytes on purpose, so this raises no alarm.
                 raise ContentUnavailableError("object content could not be read") from None
         if (
             len(data) != ref.uncompressed_bytes
             or hashlib.sha256(data).hexdigest() != ref.content_sha256
         ):
+            _integrity_failure("digest_mismatch", "read", ref.content_sha256)
             raise ContentUnavailableError("stored content does not match its ref")
         return data
 
