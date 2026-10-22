@@ -8,6 +8,7 @@ import pytest
 from botocore.exceptions import ClientError
 
 from agent_context_platform.content.blob_store import (
+    BlobInputLimitError,
     BlobIntegrityError,
     BlobNotFoundError,
     BlobStoreError,
@@ -357,3 +358,12 @@ def test_from_settings_creates_one_path_style_client_with_timeouts_and_retries(
     assert session.client_kwargs["config"].read_timeout == 2.5
     assert session.client_kwargs["config"].retries == {"total_max_attempts": 4, "mode": "standard"}
     assert session.client_kwargs["config"].s3 == {"addressing_style": "path"}
+
+
+def test_content_over_the_upload_limits_is_an_input_error_not_a_stored_object_failure() -> None:
+    client = FakeS3Client()
+    with pytest.raises(BlobInputLimitError, match="uncompressed"):
+        _run(_store(client, max_uncompressed_bytes=1).put_verified(b"ab", "text/plain"))
+    with pytest.raises(BlobInputLimitError, match="compressed"):
+        _run(_store(client, max_compressed_bytes=1).put_verified(b"ab", "text/plain"))
+    assert issubclass(BlobInputLimitError, BlobIntegrityError)  # existing callers unchanged

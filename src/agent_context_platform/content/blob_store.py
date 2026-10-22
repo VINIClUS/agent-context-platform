@@ -59,6 +59,10 @@ class BlobIntegrityError(BlobStoreError):
     """Stored data or metadata violates the verified blob protocol."""
 
 
+class BlobInputLimitError(BlobIntegrityError):
+    """Content to upload exceeds a configured size limit (nothing stored was checked)."""
+
+
 @dataclass(frozen=True)
 class _ObjectMetadata:
     """Verified metadata shared by the HEAD and GET sides of one S3 object."""
@@ -108,7 +112,7 @@ class S3BlobStore:
     async def put_verified(self, content: bytes, media_type: str) -> StoredBlob:
         """Store content and verify server-visible metadata before returning it."""
         if len(content) > self._settings.max_uncompressed_bytes:
-            raise BlobIntegrityError("uncompressed payload exceeds configured limit")
+            raise BlobInputLimitError("uncompressed payload exceeds configured limit")
 
         digest = hashlib.sha256(content).hexdigest()
         object_key = _object_key(digest)
@@ -116,7 +120,7 @@ class S3BlobStore:
             level=3, write_content_size=True, write_checksum=True
         ).compress(content)
         if len(compressed) > self._settings.max_compressed_bytes:
-            raise BlobIntegrityError("compressed payload exceeds configured limit")
+            raise BlobInputLimitError("compressed payload exceeds configured limit")
 
         expected_metadata = _ObjectMetadata(
             sha256=digest,
