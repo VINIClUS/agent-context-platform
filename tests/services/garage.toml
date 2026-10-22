@@ -13,9 +13,9 @@ metadata_dir = "/var/lib/garage/metadata"
 data_dir = "/var/lib/garage/data"
 db_engine = "sqlite"
 
-rpc_bind_addr = "0.0.0.0:3901"
+rpc_bind_addr = "[::]:3901"
 rpc_secret = "db63019b3092cd267f8b70078ae4103dd91a236a0e147818e2106dbd7ba8559e"
 
 [s3_api]
 s3_region = "garage"
-api_bind_addr = "0.0.0.0:3900"
+api_bind_addr = "[::]:3900"
