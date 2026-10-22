@@ -751,3 +751,40 @@ def test_driver_errors_become_typed_errors_without_the_statement_or_its_paramete
     message = str(raised.value)
     assert "SELECT" not in message and "private" not in message and "secret" not in message
     assert raised.value.__cause__ is None and raised.value.__suppress_context__
+
+
+def test_each_tool_call_is_one_retrieval_sample_with_a_closed_outcome(telemetry: Any) -> None:
+    from agent_context_sdk.contracts.mcp import DecisionHistoryInputV1
+
+    from agent_context_platform.observability import contract
+    from agent_context_platform.retrieval.cursor import CursorInvalid
+    from agent_context_platform.retrieval.freshness import Freshness
+
+    class StaticFreshness:
+        async def read(self, *_: object) -> Freshness:
+            return Freshness(str(EVENT), 1, T, None, "pc1-x", 0, ())
+
+    fake: Any = object()
+    composer_ = ContextComposer(
+        graph=fake,
+        graph_reader=fake,
+        temporal=fake,
+        search=fake,
+        ledger=fake,
+        freshness=StaticFreshness(),  # type: ignore[arg-type]
+        cursor=CursorCodec.ephemeral(),
+    )
+    request = DecisionHistoryInputV1.model_validate(
+        {
+            "scope": {"kind": "project", "project_id": "p"},
+            "query": "q",
+            "valid_at": T.isoformat(),
+            "budget": {"max_items": 1, "max_bytes": 1000, "max_tokens": 1000},
+            "cursor": "ctx1.forged.cursor",
+        }
+    )
+    with pytest.raises(CursorInvalid):
+        asyncio.run(composer_.decision_history(request, RequestContext("p")))
+    name = contract.RETRIEVAL_DURATION
+    assert telemetry.value(name, operation="decision_history", outcome="client_error") == 1
+    assert telemetry.span("agent_context.retrieval.decision_history")

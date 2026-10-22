@@ -92,6 +92,7 @@ import json
 import math
 import re
 from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
+from contextlib import AbstractContextManager
 from dataclasses import dataclass, field, replace
 from datetime import UTC, datetime, timedelta
 from typing import Final
@@ -118,8 +119,9 @@ from agent_context_sdk.ids import new_uuid7
 from pydantic import BaseModel
 from sqlalchemy.exc import DBAPIError
 
+from agent_context_platform.observability import retrieval_span
 from agent_context_platform.projection.neo4j import Neo4jReadFacade
-from agent_context_platform.retrieval.cursor import CursorCodec, query_digest
+from agent_context_platform.retrieval.cursor import CursorCodec, CursorError, query_digest
 from agent_context_platform.retrieval.evidence import (
     Citation,
     EvidenceLedger,
@@ -153,6 +155,7 @@ from agent_context_platform.retrieval.search import (
     SearchRequestError,
     SearchScope,
     SearchService,
+    SearchTimeoutError,
 )
 from agent_context_platform.retrieval.temporal import (
     DecisionRecord,
@@ -163,7 +166,9 @@ from agent_context_platform.retrieval.temporal import (
     HistoricalReason,
     ObservedRun,
     RunKind,
+    TemporalDecisionNotFound,
     TemporalProjectionOutdated,
+    TemporalRequestError,
     TemporalScope,
     TemporalService,
 )
@@ -239,6 +244,12 @@ class AmbiguousSymbol(ContextRequestError):
 
 class ContextBudgetTooSmall(ContextRequestError):
     """The budget cannot hold even the first ranked item."""
+
+
+# Telemetry (docs/operations/telemetry.md): a typed request error is the client's, the deadline is
+# the deadline, anything else (a backend failure, `ContextUnavailable`) is a server error.
+CLIENT_ERRORS: Final = (ContextRequestError, ScopeNotFound, CursorError)
+DEADLINE_ERRORS: Final = (RetrievalDeadlineExceeded,)
 
 
 @dataclass(frozen=True, slots=True)
@@ -529,6 +540,22 @@ class ContextComposer:
         evidence_scope: EvidenceScope,
         gather: Callable[[Freshness], Awaitable[_Gathered]],
     ) -> ContextPackageV1:
+        """One `operation=<tool>` retrieval sample and span around the whole request."""
+        with retrieval_span(tool, client_errors=CLIENT_ERRORS, deadline_errors=DEADLINE_ERRORS):
+            return await self._answer(
+                tool, request, context, scope, revision, evidence_scope, gather
+            )
+
+    async def _answer(
+        self,
+        tool: str,
+        request: BaseModel,
+        context: RequestContext,
+        scope: ProjectScopeV1 | RepositoryScopeV1,
+        revision: CommitRevisionV1 | WorkspaceSnapshotRevisionV1 | None,
+        evidence_scope: EvidenceScope,
+        gather: Callable[[Freshness], Awaitable[_Gathered]],
+    ) -> ContextPackageV1:
         deadline = min(context.deadline_seconds or self._deadline, self._deadline)
         budget: QueryBudgetV1 = getattr(request, "budget")  # noqa: B009 (every tool input has one)
         cursor: str | None = getattr(request, "cursor")  # noqa: B009
@@ -784,9 +811,11 @@ class ContextComposer:
             search_scope = SearchScope(project, repository_id)
             if tokens:
                 query = " or ".join(tokens)
-                lexical += await self._search.lexical(query, search_scope, MAX_SEARCH_HITS)
+                with _search_span():
+                    lexical += await self._search.lexical(query, search_scope, MAX_SEARCH_HITS)
             try:
-                vector += await self._search.vector(task, search_scope, MAX_SEARCH_HITS)
+                with _search_span():
+                    vector += await self._search.vector(task, search_scope, MAX_SEARCH_HITS)
             except SearchRequestError:
                 gathered.warnings.add("vector_search_unavailable")
         citable = await self._ledger.events(
@@ -908,7 +937,8 @@ class ContextComposer:
         gathered = _Gathered()
         # Known as of the projection snapshot, not the wall clock: the same snapshot, the same answer.
         known = _known(freshness)
-        result = await self._temporal.decisions(temporal, request.valid_at, known, True)
+        with _temporal_span():
+            result = await self._temporal.decisions(temporal, request.valid_at, known, True)
         if result.truncated:
             gathered.warnings.add("decisions_capped")
         records = list(result.decisions)
@@ -959,7 +989,8 @@ class ContextComposer:
         )
         temporal = TemporalScope(repository_id=request.repository_id)
         at = request.valid_to - _ONE_MICROSECOND
-        result = await self._temporal.failures(temporal, at, _known(freshness), True)
+        with _temporal_span():
+            result = await self._temporal.failures(temporal, at, _known(freshness), True)
         if result.truncated:
             gathered.warnings.add("failures_capped")
         failures = [f for f in result.failures if _in_window(f, request.valid_from, at)]
@@ -1001,7 +1032,8 @@ class ContextComposer:
         gathered: _Gathered,
     ) -> list[DecisionRecord]:
         try:
-            result = await self._temporal.decisions(scope, valid_at, recorded_at, history)
+            with _temporal_span():
+                result = await self._temporal.decisions(scope, valid_at, recorded_at, history)
         except TemporalProjectionOutdated:
             gathered.warnings.add("temporal_projection_outdated")
             return []
@@ -1013,7 +1045,8 @@ class ContextComposer:
         self, scope: TemporalScope, valid_at: datetime, recorded_at: datetime, gathered: _Gathered
     ) -> list[FailureRecord]:
         try:
-            result = await self._temporal.failures(scope, valid_at, recorded_at, True)
+            with _temporal_span():
+                result = await self._temporal.failures(scope, valid_at, recorded_at, True)
         except TemporalProjectionOutdated:
             gathered.warnings.add("temporal_projection_outdated")
             return []
@@ -1677,6 +1710,22 @@ def _failure_words(failure: FailureRecord) -> tuple[str, ...]:
 # --------------------------------------------------------------------------------------------
 # Ranking, budgets and helpers
 # --------------------------------------------------------------------------------------------
+
+
+def _search_span() -> AbstractContextManager[object]:
+    """One `operation=search` sample per lexical or vector call (`retrieval/search.py` has none)."""
+    return retrieval_span(
+        "search", client_errors=(SearchRequestError,), deadline_errors=(SearchTimeoutError,)
+    )
+
+
+def _temporal_span() -> AbstractContextManager[object]:
+    """One `operation=temporal` sample per temporal read (`retrieval/temporal.py` has none)."""
+    return retrieval_span(
+        "temporal",
+        client_errors=(TemporalRequestError, TemporalDecisionNotFound),
+        deadline_errors=DEADLINE_ERRORS,
+    )
 
 
 def _known(freshness: Freshness, ceiling: datetime | None = None) -> datetime:
