@@ -48,6 +48,7 @@ from sqlalchemy.ext.asyncio import AsyncEngine
 from agent_context_platform.ledger.repository import LedgerRepository
 from agent_context_platform.projection.neo4j import Neo4jStore
 from agent_context_platform.projection.registry import projectors_with_search
+from agent_context_platform.projection.schema import history_projectors, record_projection_history
 from agent_context_platform.projection.verify import replay_ledger, wipe_graph
 from agent_context_platform.retrieval.composer import ContextComposer, RequestContext
 from agent_context_platform.retrieval.evidence import EVENT_METADATA_MEDIA_TYPE
@@ -377,12 +378,10 @@ def test_answers_are_byte_identical_on_a_second_run_and_after_an_empty_graph_rep
 
     async def replayed(world: EvalWorld) -> dict[str, str]:
         assert await wipe_graph(world.store) > 0
-        await replay_ledger(
-            world.projector,
-            world.store,
-            projectors_with_search(world.backend()),
-            delivered_only=True,
-        )
+        projectors = projectors_with_search(world.backend())
+        await replay_ledger(world.projector, world.store, projectors, delivered_only=True)
+        # As a verified rebuild does: the replayed graph holds the whole ledger's history.
+        await record_projection_history(world.store, history_projectors(projectors))
         answers = await _answer_all(world, seeded)
         return {qid: answer.fingerprint() for qid, answer in answers.items()}
 

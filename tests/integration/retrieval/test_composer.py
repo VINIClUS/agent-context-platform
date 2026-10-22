@@ -30,6 +30,8 @@ from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from agent_context_platform.content.service import ContentService
 from agent_context_platform.projection.neo4j import Neo4jStore, Neo4jTransaction
+from agent_context_platform.projection.registry import projectors_with_search
+from agent_context_platform.projection.schema import history_projectors, record_projection_history
 from agent_context_platform.retrieval.composer import (
     ContextBudgetTooSmall,
     ContextRequestError,
@@ -419,17 +421,14 @@ def test_an_outdated_temporal_projection_is_a_warning_or_an_error_never_silent(
     seeded: Seeded, postgres_dsn: str, projection_engine: AsyncEngine
 ) -> None:
     async def body(world: EvalWorld) -> ContextPackageV1:
+        # A graph without the history marker (never rebuilt, or wiped by an unfinished rebuild)
+        # cannot prove the temporal history complete.
         async def stale(tx: Neo4jTransaction) -> None:
-            await tx.run(
-                "CREATE (:Decision {decision_id: 'dec_unversioned', state_order: 1})",
-                parameters={},
-            )
+            await tx.run("MATCH (m:ProjectionHistory) DETACH DELETE m", parameters={})
 
-        async def heal(tx: Neo4jTransaction) -> None:
-            await tx.run(
-                "MATCH (d:Decision {decision_id: 'dec_unversioned'}) DETACH DELETE d",
-                parameters={},
-            )
+        async def heal() -> None:
+            projectors = projectors_with_search(world.backend())
+            await record_projection_history(world.store, history_projectors(projectors))
 
         await world.store.execute_write(stale)
         try:
@@ -449,7 +448,7 @@ def test_an_outdated_temporal_projection_is_a_warning_or_an_error_never_silent(
                 task(commit(seeded.revisions.c1)), PRINCIPAL
             )
         finally:
-            await world.store.execute_write(heal)
+            await heal()
 
     page = run_in_world(seeded, postgres_dsn, projection_engine, body)
     assert "temporal_projection_outdated" in page.warnings

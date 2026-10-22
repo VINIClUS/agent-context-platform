@@ -83,6 +83,7 @@ from agent_context_platform.projection.neo4j import Neo4jStore
 from agent_context_platform.projection.projectors.search import SearchBackend
 from agent_context_platform.projection.registry import projectors_with_search
 from agent_context_platform.projection.runtime import ProjectionRunner, ProjectionRunReport
+from agent_context_platform.projection.verify import record_history_if_fresh
 from agent_context_platform.retrieval.composer import ContextComposer
 from agent_context_platform.retrieval.cursor import CursorCodec
 from agent_context_platform.retrieval.evidence import EvidenceLedger
@@ -804,10 +805,14 @@ class EvalWorld:
     # --- projection ---
 
     async def project(self) -> ProjectionRunReport:
+        projectors = projectors_with_search(self.backend())
+        # As the projection worker does at start-up: an empty graph with nothing delivered yet is
+        # projected from the ledger's start, so the history marker the temporal reads need holds.
+        await record_history_if_fresh(self.projector, self.store, projectors)
         runner = ProjectionRunner(
             self.projector,
             self.store,
-            projectors_with_search(self.backend()),
+            projectors,
             worker_id="evaluation-world",
             max_attempts=1,
         )
