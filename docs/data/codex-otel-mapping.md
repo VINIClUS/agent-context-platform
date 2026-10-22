@@ -93,25 +93,42 @@ feeds every Codex event record through this mapper. It is not part of the frozen
   | `MAX_TOTAL_ATTRIBUTES`, every attribute at every level, nested values included | 65536 | `too_many_attributes` |
   | `MAX_ATTRIBUTES` per resource or scope | 128 | `too_many_attributes` |
   | nested attribute values deeper than 4 | | `too_many_attributes` |
+  | `MAX_FIELDS`, every field occurrence the scan visits | 300000 | `too_many_fields` |
+  | `MAX_OBJECTS`, every repeated element (message or scalar) at every level | 200000 | `too_many_objects` |
   | distinct mapped events per request (one ingestion batch) | 500 | `too_many_drafts` |
 
-  These are checked on the **wire bytes before parsing** (`ledger/otlp_wire.py`): the scan descends
-  only into containers and attributes, skips everything else by length and stops at the first
-  exceeded limit, so its work is bounded by the limits and the parser only sees a message whose
-  object count is within them. Per-span limits reject that span only (partial success):
+  These are checked on the **wire bytes before parsing** (`ledger/otlp_wire.py`). The scan uses the
+  generated descriptors as its only schema: it visits every field occurrence of every message
+  reachable from the request (counted against `MAX_FIELDS`, so its cost is bounded by the limits,
+  not the bytes), counts every repeated element against `MAX_OBJECTS` (so parsing never allocates
+  more than the limits allow), and stops at the first exceeded limit. It answers 400 with a fixed
+  code for what the receiver never needs and cannot bound otherwise: an unknown field
+  (`unsupported_field`, at any level), `Resource.entity_refs` (`unsupported_field`), a singular
+  message field that occurs twice (`repeated_singular_field`: the parser would merge both into one
+  container), and a wire type that does not match the field (`malformed_request`, groups included,
+  which the parser itself would accept). Per-span limits reject that span only (partial success):
   `MAX_EVENTS_PER_SPAN` (64, `too_many_events`) and `MAX_ATTRIBUTES` per span or span event (128,
   `too_many_attributes`); their events still count toward `MAX_RECORDS`, so a flood is a
   request-level 413. A string value over 16 KiB rejects its record (`attribute_value_too_long`).
+  Record-level rejections (times, over-long values, the mapper) reject the span while sibling
+  records of the same span still land.
+
   Inflation, the scan, parsing and mapping run on a worker thread behind an admission gate: two
-  decodes at once per process and four waiting; beyond that the request is refused at once with
-  503 and `Retry-After`, and a queued request whose client has gone is not decoded. Measured on the
-  development container at the limits: the collector's largest batch (15 spans x 64 events x 44
-  attributes of 64 characters, 3.73 MiB, 25 KiB gzip) takes about 0.12 s and 11 MiB of extra peak
-  memory; the densest message the limits allow (65,536 attributes over 1000 records) about 0.13 s
-  and 7 MiB; a flood of resources or links is refused within milliseconds. `MAX_DECOMPRESSED_BYTES`
-  is that largest batch plus about 60%. The ingestion append that follows is async database work on
-  the event loop, one statement round per event. A per-producer token bucket of 5/s, burst 20
-  (`RATE_LIMIT_PER_SECOND`, `RATE_LIMIT_BURST`) answers 429 with `Retry-After`.
+  decodes at once per process and four waiting, at most one running and one waiting per producer (so
+  one producer within its own rate limit cannot starve the others); beyond that the request is
+  refused at once with 503 and `Retry-After`. A queued request whose client has gone is not decoded.
+  A cancelled request keeps its place until its worker thread finishes, so at most two threads ever
+  decode per process; with N worker processes or replicas the bound is 2N. Measured on the
+  development container: the collector's largest batch (15 spans x 64 events x 44 attributes of 64
+  characters, 3.73 MiB, 25 KiB gzip) takes about 0.09 s and 11 MiB of extra peak memory; the densest
+  message the limits allow (65,536 attributes over 1000 records) about 0.13 s and 7 MiB; a flood of
+  the smallest fields stops at the field budget in about 0.17 s whatever its size; an `entity_refs`
+  flood is refused in well under a millisecond. `MAX_DECOMPRESSED_BYTES` stays 6 MiB (the largest
+  batch plus about 60%): with the field and object budgets the scan and parse costs no longer grow
+  with bytes, and the bytes themselves cost at most 6 MiB plus the 4 MiB body per running decode.
+  The ingestion append that follows is async database work on the event loop, one statement round
+  per event. A per-producer token bucket of 5/s, burst 20 (`RATE_LIMIT_PER_SECOND`,
+  `RATE_LIMIT_BURST`) answers 429 with `Retry-After`.
 - **Idempotency key.** `IDEMPOTENCY_HMAC_KEY` (at least 32 characters, at least 8 distinct) keys the
   mapper's digest. Until it is set (and ingestion is configured) the route answers 503 with
   `Retry-After`; the collector retries for at most an hour and then drops the batch.
@@ -133,16 +150,18 @@ feeds every Codex event record through this mapper. It is not part of the frozen
   (300) in the future is rejected (`future_timestamp`). `observed_at` is the later of `occurred_at`
   and the OTLP time: deterministic, so a collector retry of the same export maps to identical drafts
   and is answered `existing`.
-- **Streams and batches.** Drafts go to the stream `codex-otel:<producer_id>:<session_id>`, one per
-  producer and Codex session, both components percent-encoded (a `:` becomes `%3A`), so no
-  producer/session pair can name another pair's stream. A stream-level failure (a quarantined
-  stream after a failed integrity verification) stays within one session. All drafts of one
-  request are appended as one atomic batch. When the batch is refused, the events it is attributable
-  to (an `idempotency_conflict`, a `stream_quarantined` stream) are rejected and the others are
-  resubmitted, until a batch is accepted, the ledger names no offender, or 8 batches were tried (the
-  ledger names one conflict per batch; what is left then is rejected as `batch_rejected`). Events
-  already stored are `existing`, never rejected. One conflicting record therefore never discards the
-  rest of its export.
+- **Streams and batches.** Drafts go to the stream `codex-otel:` plus 40 hex characters of a SHA-256
+  over the length-prefixed producer id and session id: one stream per producer and Codex session, of
+  a fixed length whatever the ids (the ledger's stream id is at most 512 characters) and
+  collision-safe; the readable ids stay in the event (producer, payload, context). A stream-level
+  failure (a quarantined stream after a failed integrity verification) stays within one session. All
+  drafts of one request are appended as one atomic batch. When the batch is refused, the events it
+  is attributable to (an `idempotency_conflict`, a `stream_quarantined` stream) are rejected and the
+  others resubmitted, until a batch is accepted, the ledger names no offender, or 8 batches were
+  tried (the ledger names one conflict per batch; what is left then is rejected as
+  `batch_rejected`). Worst case: 8 transactions of up to 500 events for one export. Events already
+  stored are `existing`, never rejected. One conflicting record therefore never discards the rest of
+  its export.
 - **Response.** 200 with an `ExportTraceServiceResponse`; when spans were rejected,
   `partial_success.rejected_spans` and the fixed `error_message` `spans rejected: <reason codes>`
   (sorted fixed codes such as `platform_origin`, `future_timestamp` or `idempotency_conflict`, never
@@ -154,8 +173,7 @@ feeds every Codex event record through this mapper. It is not part of the frozen
   (these batches do not go through the ingestion route, so `agent_context.ingestion.*` and its span
   never count them; see `docs/operations/telemetry.md`).
 - **Threat note.** Any `events:ingest` producer can append `agent.session.started` for any
-  `conversation.id` it chooses, but only into its own streams (`codex-otel:<its producer_id>:...`,
-  unambiguous because both components are percent-encoded)
+  `conversation.id` it chooses, but only into its own streams (derived from its own producer id)
   and under its own producer id: projections can tell the sources apart, and revoking the producer
   stops it. Only the collector should hold the receiver's producer token.
 - **For the collector (INFRA-050).** The `otlphttp` exporter targets
