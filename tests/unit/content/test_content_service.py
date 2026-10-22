@@ -208,6 +208,11 @@ class FakeAsyncSession:
         else:
             self._call_log.append(f"insert_inline:{compiled_params['inline_id']}")
 
+    async def scalar(self, clause: Any) -> None:
+        # attach() asks whether a missing object was referenced; nothing is in this fake catalog.
+        self._call_log.append("referenced?")
+        return None
+
 
 # ---------------------------------------------------------------------------
 # content_digest_lock_key

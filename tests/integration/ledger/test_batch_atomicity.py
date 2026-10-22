@@ -549,3 +549,160 @@ def test_the_full_ingestion_path_is_traced_and_counted_without_content(
                 assert forbidden not in records
 
     _run(exercise())
+
+
+def _raw_s3(settings: S3Settings) -> Any:
+    """A plain boto3 client: the test plays a disk or an operator editing the bucket directly."""
+    import boto3
+    from botocore.config import Config as BotoConfig
+
+    return boto3.client(
+        "s3",
+        endpoint_url=str(settings.endpoint_url),
+        region_name=settings.region_name,
+        aws_access_key_id=settings.access_key_id.get_secret_value()  # type: ignore[union-attr]
+        if settings.access_key_id
+        else None,
+        aws_secret_access_key=settings.secret_access_key.get_secret_value()  # type: ignore[union-attr]
+        if settings.secret_access_key
+        else None,
+        config=BotoConfig(s3={"addressing_style": settings.addressing_style}),
+    )
+
+
+def test_a_corrupted_stored_object_raises_the_alarm_and_is_left_untouched(
+    stack: Stack, s3_settings: S3Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    """E2E-004: one flipped byte in a referenced object, every header (zstd encoding) intact."""
+    from unit.observability._capture import capture_telemetry
+
+    from agent_context_platform.observability import contract
+
+    caplog.set_level(logging.DEBUG)
+    run = uuid4().hex
+    data, claim, item = _content(INLINE_MAX_BYTES + 1_000)
+    key = (
+        f"sha256/{claim.content_sha256[:2]}/{claim.content_sha256[2:4]}/{claim.content_sha256}.zst"
+    )
+    s3 = _raw_s3(s3_settings)
+    bucket = s3_settings.bucket_name
+
+    async def exercise() -> None:
+        first = _batch((_draft(f"c1-{run}", stream_id=f"s-{run}", claims=(claim,)),), (item,))
+        assert (await stack.post(first)).status_code == 200
+
+        stored = s3.get_object(Bucket=bucket, Key=key)
+        body = bytearray(stored["Body"].read())
+        body[len(body) // 2] ^= 0x01  # inside the frame: only its checksum can tell
+        s3.put_object(
+            Bucket=bucket,
+            Key=key,
+            Body=bytes(body),
+            Metadata=stored["Metadata"],
+            ContentType=stored["ContentType"],
+            ContentEncoding=stored["ContentEncoding"],
+        )
+        before = s3.head_object(Bucket=bucket, Key=key)
+        assert before["ContentEncoding"] == "zstd" and before["Metadata"] == stored["Metadata"]
+
+        # A new event that reuses the same content: preparing it re-verifies the stored object.
+        draft = _draft(f"c2-{run}", stream_id=f"s-{run}", claims=(claim,))
+        with capture_telemetry() as telemetry:
+            response = await stack.post(_batch((draft,), (item,)))
+
+            assert telemetry.points(contract.LEDGER_INTEGRITY_FAILURES) == {
+                (("check", "digest_mismatch"),): 1
+            }
+        assert response.status_code == 503
+        assert response.headers["retry-after"] == "60"
+        rejected = IngestBatchResponseV1.model_validate(response.json()).rejected
+        assert [(r.error_code, r.retryable) for r in rejected] == [("service_unavailable", True)]
+        assert await stack.count("ledger.events", "stream_id = :s", s=f"s-{run}") == 1
+
+        alarms = [r for r in caplog.records if r.getMessage().startswith("content_integrity")]
+        assert [(r.check, r.stage, r.content_sha256, r.object_key) for r in alarms] == [  # type: ignore[attr-defined]
+            ("digest_mismatch", "prepare", claim.content_sha256, key)
+        ]
+        records = "\n".join(str(record.__dict__) for record in caplog.records)
+        assert data.decode()[:64] not in records and TOKEN not in records
+
+        # Never repaired, overwritten or deleted: the corrupt bytes and headers stay for an operator.
+        after = s3.get_object(Bucket=bucket, Key=key)
+        assert after["Body"].read() == bytes(body)
+        assert after["ETag"] == before["ETag"] and after["Metadata"] == before["Metadata"]
+        assert after["ContentEncoding"] == "zstd"
+
+    _run(exercise())
+
+
+def test_an_intact_object_compressed_by_another_writer_is_reused_without_an_alarm(
+    stack: Stack, s3_settings: S3Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An object at another zstd level (another version or tool) is valid: reuse, never page."""
+    import zstandard as zstd
+    from unit.observability._capture import capture_telemetry
+
+    from agent_context_platform.observability import contract
+
+    caplog.set_level(logging.DEBUG)
+    run = uuid4().hex
+    # Letters, not hex (the redaction re-check may treat hex as a secret); low enough redundancy
+    # that compression levels give different sizes.
+    words = [
+        "".join(chr(97 + int(c, 16)) for c in hashlib.sha256(f"{run}-{n}".encode()).hexdigest())[
+            : n % 7 + 3
+        ]
+        for n in range(12_000)
+    ]
+    data = " ".join(words).encode()
+    assert len(data) > INLINE_MAX_BYTES
+    claim = ContentClaimV1(
+        content_id=f"content-{run}",
+        content_sha256=hashlib.sha256(data).hexdigest(),
+        media_type="text/plain",
+        uncompressed_bytes=len(data),
+    )
+    item = SanitizedContentItemV1(
+        claim=claim,
+        sanitized_bytes_base64=base64.b64encode(data).decode("ascii"),
+        redaction_report=RedactionReportV1(
+            policy_version="1.0.0", disposition=ContentDisposition.SANITIZED
+        ),
+    )
+    digest = claim.content_sha256
+    key = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}.zst"
+    body = zstd.ZstdCompressor(level=19, write_content_size=True, write_checksum=True).compress(
+        data
+    )
+    ours = zstd.ZstdCompressor(level=3, write_content_size=True, write_checksum=True)
+    assert len(body) != len(ours.compress(data))
+    s3 = _raw_s3(s3_settings)
+    s3.put_object(
+        Bucket=s3_settings.bucket_name,
+        Key=key,
+        Body=body,
+        Metadata={"sha256": digest, "uncompressed-bytes": str(len(data))},
+        ContentType="application/octet-stream",
+        ContentEncoding="zstd",
+    )
+    before = s3.head_object(Bucket=s3_settings.bucket_name, Key=key)["ETag"]
+
+    async def exercise() -> None:
+        batch = _batch((_draft(f"z-{run}", stream_id=f"s-{run}", claims=(claim,)),), (item,))
+        with capture_telemetry() as telemetry:
+            response = await stack.post(batch)
+            assert telemetry.points(contract.LEDGER_INTEGRITY_FAILURES) == {}
+        assert response.status_code == 200, response.text
+        assert (
+            await stack.count(
+                "catalog.content_objects",
+                "content_sha256 = :d AND compressed_bytes = :n",
+                d=digest,
+                n=len(body),
+            )
+            == 1
+        )
+
+    _run(exercise())
+    assert not [r for r in caplog.records if r.getMessage().startswith("content_integrity")]
+    assert s3.head_object(Bucket=s3_settings.bucket_name, Key=key)["ETag"] == before

@@ -62,6 +62,8 @@ class SweepReport:
     deleted: int
     retained: int
     skipped_recent: int
+    would_delete: int = 0  # a dry run's `deleted`
+    dry_run: bool = False
 
 
 class OrphanSweeper:
@@ -82,7 +84,7 @@ class OrphanSweeper:
         self._session_factory = session_factory
         self._min_age = min_age
 
-    async def run(self, cutoff: datetime) -> SweepReport:
+    async def run(self, cutoff: datetime, *, dry_run: bool = False) -> SweepReport:
         """Delete unreferenced content-addressed objects older than `cutoff`.
 
         The effective cutoff is never more recent than ``min_age`` before
@@ -106,10 +108,15 @@ class OrphanSweeper:
         A single candidate's failure aborts the run. Deleting an object is
         idempotent and the DB re-check is repeated fresh each time, so the
         caller may simply retry the whole sweep.
+
+        ``dry_run`` runs the same listing and the same locked reference check
+        but deletes nothing; what a real sweep would delete is counted in
+        ``would_delete``.
         """
         effective_cutoff = min(cutoff, datetime.now(UTC) - self._min_age)
         examined = 0
         deleted = 0
+        would_delete = 0
         retained = 0
         skipped_recent = 0
         async for object_key, last_modified in self._list_candidates():
@@ -120,19 +127,23 @@ class OrphanSweeper:
             if last_modified >= effective_cutoff:
                 skipped_recent += 1
                 continue
-            if await self._sweep_one(digest, object_key):
-                deleted += 1
-            else:
+            if not await self._sweep_one(digest, object_key, dry_run=dry_run):
                 retained += 1
+            elif dry_run:
+                would_delete += 1
+            else:
+                deleted += 1
         return SweepReport(
             examined=examined,
             deleted=deleted,
             retained=retained,
             skipped_recent=skipped_recent,
+            would_delete=would_delete,
+            dry_run=dry_run,
         )
 
-    async def _sweep_one(self, digest: str, object_key: str) -> bool:
-        """Return True if the object was deleted, False if it was retained."""
+    async def _sweep_one(self, digest: str, object_key: str, *, dry_run: bool = False) -> bool:
+        """Return True if the object was (or, in a dry run, would be) deleted, False if retained."""
         async with self._session_factory() as session, session.begin():
             namespace, digest_key = content_digest_lock_key(digest)
             await session.execute(
@@ -144,6 +155,8 @@ class OrphanSweeper:
             )
             if exists is not None:
                 return False
+            if dry_run:
+                return True
             await _run_delete_to_completion(
                 self._client.delete_object, Bucket=self._bucket_name, Key=object_key
             )

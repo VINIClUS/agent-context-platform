@@ -59,6 +59,10 @@ class BlobIntegrityError(BlobStoreError):
     """Stored data or metadata violates the verified blob protocol."""
 
 
+class BlobInputLimitError(BlobIntegrityError):
+    """Content to upload exceeds a configured size limit (nothing stored was checked)."""
+
+
 @dataclass(frozen=True)
 class _ObjectMetadata:
     """Verified metadata shared by the HEAD and GET sides of one S3 object."""
@@ -79,36 +83,12 @@ class S3BlobStore:
     @classmethod
     def from_settings(cls, settings: S3Settings) -> S3BlobStore:
         """Build the single, explicitly configured S3 client for this store."""
-        access_key_id = (
-            None if settings.access_key_id is None else settings.access_key_id.get_secret_value()
-        )
-        secret_access_key = (
-            None
-            if settings.secret_access_key is None
-            else settings.secret_access_key.get_secret_value()
-        )
-        session = boto3.session.Session(
-            aws_access_key_id=access_key_id,
-            aws_secret_access_key=secret_access_key,
-            region_name=settings.region_name,
-        )
-        client = session.client(
-            "s3",
-            endpoint_url=None if settings.endpoint_url is None else str(settings.endpoint_url),
-            region_name=settings.region_name,
-            config=Config(
-                connect_timeout=settings.connect_timeout_seconds,
-                read_timeout=settings.read_timeout_seconds,
-                retries={"total_max_attempts": settings.max_attempts, "mode": "standard"},
-                s3={"addressing_style": settings.addressing_style},
-            ),
-        )
-        return cls(settings, client=client)
+        return cls(settings, client=build_s3_client(settings))
 
     async def put_verified(self, content: bytes, media_type: str) -> StoredBlob:
         """Store content and verify server-visible metadata before returning it."""
         if len(content) > self._settings.max_uncompressed_bytes:
-            raise BlobIntegrityError("uncompressed payload exceeds configured limit")
+            raise BlobInputLimitError("uncompressed payload exceeds configured limit")
 
         digest = hashlib.sha256(content).hexdigest()
         object_key = _object_key(digest)
@@ -116,7 +96,7 @@ class S3BlobStore:
             level=3, write_content_size=True, write_checksum=True
         ).compress(content)
         if len(compressed) > self._settings.max_compressed_bytes:
-            raise BlobIntegrityError("compressed payload exceeds configured limit")
+            raise BlobInputLimitError("compressed payload exceeds configured limit")
 
         expected_metadata = _ObjectMetadata(
             sha256=digest,
@@ -124,10 +104,10 @@ class S3BlobStore:
             uncompressed_bytes=len(content),
             media_type=media_type,
         )
-        if self._settings.write_mode == "content_addressed" and await self._reuse_existing(
-            object_key, content, expected_metadata
-        ):
-            return self._stored_blob(object_key, expected_metadata)
+        if self._settings.write_mode == "content_addressed":
+            existing = await self._reuse_existing(object_key, content, expected_metadata)
+            if existing is not None:
+                return self._stored_blob(object_key, existing)
 
         request: dict[str, Any] = {
             "Bucket": self._settings.bucket_name,
@@ -144,9 +124,22 @@ class S3BlobStore:
             self._verify_expected_metadata(
                 self._validate_response(head, expected_sha256=digest), expected_metadata
             )
-        else:
-            await self._verify_existing(object_key, content, expected_metadata)
-        return self._stored_blob(object_key, expected_metadata)
+            return self._stored_blob(object_key, expected_metadata)
+        try:
+            existing = await self._verify_existing(object_key, content, expected_metadata)
+        except BlobNotFoundError:
+            # The object existed at the conditional PUT and was deleted before it could be
+            # verified: only the orphan sweep deletes objects, and only unreferenced ones. Upload
+            # it once more (a second disappearance is reported as it is).
+            if not await self._put(request):
+                existing = await self._verify_existing(object_key, content, expected_metadata)
+                return self._stored_blob(object_key, existing)
+            head = await self._head(object_key)
+            self._verify_expected_metadata(
+                self._validate_response(head, expected_sha256=digest), expected_metadata
+            )
+            return self._stored_blob(object_key, expected_metadata)
+        return self._stored_blob(object_key, existing)
 
     @staticmethod
     def _stored_blob(object_key: str, metadata: _ObjectMetadata) -> StoredBlob:
@@ -160,24 +153,33 @@ class S3BlobStore:
 
     async def _reuse_existing(
         self, object_key: str, content: bytes, expected_metadata: _ObjectMetadata
-    ) -> bool:
+    ) -> _ObjectMetadata | None:
         try:
-            await self._verify_existing(object_key, content, expected_metadata)
+            return await self._verify_existing(object_key, content, expected_metadata)
         except BlobNotFoundError:
-            return False
-        return True
+            return None
 
     async def _verify_existing(
         self, object_key: str, content: bytes, expected_metadata: _ObjectMetadata
-    ) -> None:
+    ) -> _ObjectMetadata:
+        """Prove an object someone already stored under this digest; return its own metadata.
+
+        Its compressed size is NOT compared with what this process would write: another zstd
+        version, level or tool compresses the same bytes differently and is still intact. What
+        proves it is `get_verified` (the object's own declared lengths, the Zstandard frame
+        checksum and the SHA-256 of the decompressed bytes), plus the declared uncompressed
+        length and the media type this protocol fixes.
+        """
         head = await self._head(object_key)
-        self._verify_expected_metadata(
-            self._validate_response(head, expected_sha256=expected_metadata.sha256),
-            expected_metadata,
-        )
+        actual = self._validate_response(head, expected_sha256=expected_metadata.sha256)
+        if actual.uncompressed_bytes != expected_metadata.uncompressed_bytes:
+            raise BlobIntegrityError("object uncompressed byte count does not match")
+        if actual.media_type != expected_metadata.media_type:
+            raise BlobIntegrityError("object media type does not match")
         existing_content = await self.get_verified(object_key, expected_metadata.sha256)
         if existing_content != content:
             raise BlobIntegrityError("stored content does not match the requested content")
+        return actual
 
     async def get_verified(self, object_key: str, expected_sha256: str) -> bytes:
         """Download only a canonical object and prove its compressed and raw identities."""
@@ -329,6 +331,34 @@ class S3BlobStore:
             raise BlobIntegrityError("object uncompressed byte count does not match")
         if actual.media_type != expected.media_type:
             raise BlobIntegrityError("object media type does not match")
+
+
+def build_s3_client(settings: S3Settings) -> Any:
+    """The one way to build a boto3 S3 client from settings (the store and the orphan sweeper)."""
+    access_key_id = (
+        None if settings.access_key_id is None else settings.access_key_id.get_secret_value()
+    )
+    secret_access_key = (
+        None
+        if settings.secret_access_key is None
+        else settings.secret_access_key.get_secret_value()
+    )
+    session = boto3.session.Session(
+        aws_access_key_id=access_key_id,
+        aws_secret_access_key=secret_access_key,
+        region_name=settings.region_name,
+    )
+    return session.client(
+        "s3",
+        endpoint_url=None if settings.endpoint_url is None else str(settings.endpoint_url),
+        region_name=settings.region_name,
+        config=Config(
+            connect_timeout=settings.connect_timeout_seconds,
+            read_timeout=settings.read_timeout_seconds,
+            retries={"total_max_attempts": settings.max_attempts, "mode": "standard"},
+            s3={"addressing_style": settings.addressing_style},
+        ),
+    )
 
 
 def _object_key(digest: str) -> str:

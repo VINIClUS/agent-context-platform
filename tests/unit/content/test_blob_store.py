@@ -8,6 +8,7 @@ import pytest
 from botocore.exceptions import ClientError
 
 from agent_context_platform.content.blob_store import (
+    BlobInputLimitError,
     BlobIntegrityError,
     BlobNotFoundError,
     BlobStoreError,
@@ -357,3 +358,91 @@ def test_from_settings_creates_one_path_style_client_with_timeouts_and_retries(
     assert session.client_kwargs["config"].read_timeout == 2.5
     assert session.client_kwargs["config"].retries == {"total_max_attempts": 4, "mode": "standard"}
     assert session.client_kwargs["config"].s3 == {"addressing_style": "path"}
+
+
+def test_content_over_the_upload_limits_is_an_input_error_not_a_stored_object_failure() -> None:
+    client = FakeS3Client()
+    with pytest.raises(BlobInputLimitError, match="uncompressed"):
+        _run(_store(client, max_uncompressed_bytes=1).put_verified(b"ab", "text/plain"))
+    with pytest.raises(BlobInputLimitError, match="compressed"):
+        _run(_store(client, max_compressed_bytes=1).put_verified(b"ab", "text/plain"))
+    assert issubclass(BlobInputLimitError, BlobIntegrityError)  # existing callers unchanged
+
+
+@pytest.mark.parametrize("write_mode", ["content_addressed", "if_none_match"])
+@pytest.mark.parametrize("level", [1, 19])
+def test_an_object_compressed_differently_but_intact_is_reused_as_is(
+    write_mode: str, level: int
+) -> None:
+    # Another zstd version, level or tool: the frame checksum, the declared lengths and the
+    # SHA-256 of the decompressed bytes prove the object, not its compressed size.
+    import zstandard as zstd
+
+    content = b" ".join(
+        hashlib.sha256(str(n).encode()).hexdigest()[: n % 7 + 3].encode() for n in range(400)
+    )
+    digest = hashlib.sha256(content).hexdigest()
+    key = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}.zst"
+    other = zstd.ZstdCompressor(level=level, write_content_size=True, write_checksum=True)
+    body = other.compress(content)
+    ours = zstd.ZstdCompressor(level=3, write_content_size=True, write_checksum=True)
+    assert len(body) != len(ours.compress(content))  # the case this test is about
+    client = FakeS3Client()
+    client.objects[key] = {
+        "Body": body,
+        "ContentLength": len(body),
+        "Metadata": {"sha256": digest, "uncompressed-bytes": str(len(content))},
+        "ContentType": "text/plain",
+        "ContentEncoding": "zstd",
+    }
+    attempts = client.put_attempts
+
+    stored = _run(_store(client, write_mode=write_mode).put_verified(content, "text/plain"))
+
+    assert stored.object_key == key and stored.compressed_bytes == len(body)
+    assert stored.uncompressed_bytes == len(content)
+    assert client.objects[key]["Body"] == body  # never rewritten
+    if write_mode == "content_addressed":
+        assert client.put_attempts == attempts
+
+
+def test_a_reused_object_still_fails_on_a_wrong_declared_length_or_media_type() -> None:
+    content = b"reusable content " * 64
+    client = FakeS3Client()
+    stored = _run(_store(client).put_verified(content, "text/plain"))
+    original = dict(client.objects[stored.object_key])
+
+    client.objects[stored.object_key]["Metadata"] = {
+        "sha256": stored.sha256,
+        "uncompressed-bytes": str(len(content) + 1),
+    }
+    with pytest.raises(BlobIntegrityError, match="uncompressed"):
+        _run(_store(client).put_verified(content, "text/plain"))
+    client.objects[stored.object_key] = {**original, "ContentType": "application/json"}
+    with pytest.raises(BlobIntegrityError, match="media type"):
+        _run(_store(client).put_verified(content, "text/plain"))
+
+
+def test_a_conditional_put_retries_once_when_the_existing_object_was_swept_meanwhile() -> None:
+    # if_none_match: the PUT is refused because the object exists, then the orphan sweep deletes
+    # it before it is verified. The upload is retried once, never reported as a missing object.
+    content = b"swept between the put and the head"
+    client = FakeS3Client()
+    store = _store(client, write_mode="if_none_match")
+    _run(store.put_verified(content, "text/plain"))
+    put = client.put_object
+    keys: list[str] = []
+
+    def put_then_sweep_once(**request: Any) -> dict[str, Any]:
+        keys.append(request["Key"])
+        try:
+            return put(**request)
+        finally:
+            if len(keys) == 1:
+                client.objects.pop(request["Key"], None)  # the sweep, right after the 412
+
+    client.put_object = put_then_sweep_once  # type: ignore[method-assign]
+    stored = _run(store.put_verified(content, "text/plain"))
+
+    assert keys == [stored.object_key, stored.object_key]
+    assert stored.object_key in client.objects
