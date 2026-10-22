@@ -85,7 +85,7 @@ from agent_context_sdk import (
     canonical_json_bytes,
     redact_json,
 )
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
@@ -638,7 +638,21 @@ class ContentService:
             try:
                 await self._blob_store.get_verified(stored_blob.object_key, digest)
             except BlobNotFoundError:
-                _integrity_failure("missing_object", "attach", digest)
+                # Under the digest lock: a catalog row means a referenced object is gone (the
+                # sweep never deletes those), which is an integrity failure. Without one, the
+                # orphan sweep deleted an old unreferenced object this batch was reusing: nothing
+                # is lost and the retried batch uploads it again, so it raises no alarm.
+                referenced = await session.scalar(
+                    select(ContentObjectRow.id).where(ContentObjectRow.content_sha256 == digest)
+                )
+                if referenced is not None:
+                    _integrity_failure("missing_object", "attach", digest)
+                else:
+                    logger.info(
+                        "content_object_swept_before_attach content_sha256=%s",
+                        digest,
+                        extra={"content_sha256": digest},
+                    )
                 raise
             except BlobIntegrityError:
                 _integrity_failure("digest_mismatch", "attach", digest)

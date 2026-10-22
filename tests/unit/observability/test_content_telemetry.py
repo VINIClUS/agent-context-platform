@@ -59,8 +59,14 @@ class MemoryBlobStore:
 
 
 class RecordingSession:
+    def __init__(self, *, referenced: bool = True) -> None:
+        self.referenced = referenced  # whether catalog.content_objects already has the digest
+
     async def execute(self, *_args: Any, **_kwargs: Any) -> None:
         return None
+
+    async def scalar(self, *_args: Any, **_kwargs: Any) -> int | None:
+        return 1 if self.referenced else None
 
 
 def _item(content_id: str, data: bytes, media_type: str = "text/plain") -> SanitizedContentItemV1:
@@ -221,3 +227,31 @@ def test_content_over_the_storage_limit_raises_no_integrity_alarm(
 
     assert telemetry.points(contract.LEDGER_INTEGRITY_FAILURES) == {}
     assert _integrity_logs(caplog) == []
+
+
+def test_an_unreferenced_object_swept_before_attach_is_no_integrity_failure(
+    telemetry: Capture, canaries: Canaries, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The orphan sweep may delete an old unreferenced object a batch is reusing: nothing referenced
+    # it, so nothing is lost. The batch is retried (and re-uploads); no alarm is raised.
+    caplog.set_level(logging.INFO, logger="agent_context_platform.content.service")
+    store = MemoryBlobStore()
+    service = _service(store)
+    data = (canaries.content * 8).encode()
+    prepared = asyncio.run(service.prepare([_item("o", data)]))
+    store.failure = BlobNotFoundError("gone")
+
+    with pytest.raises(BlobNotFoundError):
+        asyncio.run(service.attach(RecordingSession(referenced=False), prepared))  # type: ignore[arg-type]
+
+    assert telemetry.points(contract.LEDGER_INTEGRITY_FAILURES) == {}
+    assert _integrity_logs(caplog) == []
+    [record] = [r for r in caplog.records if r.getMessage().startswith("content_object_swept")]
+    assert record.content_sha256 == hashlib.sha256(data).hexdigest()
+    # Corrupt bytes are a failure whether or not anything references them yet.
+    store.failure = BlobIntegrityError("digest differs")
+    with pytest.raises(BlobIntegrityError):
+        asyncio.run(service.attach(RecordingSession(referenced=False), prepared))  # type: ignore[arg-type]
+    assert telemetry.points(contract.LEDGER_INTEGRITY_FAILURES) == {
+        (("check", "digest_mismatch"),): 1
+    }

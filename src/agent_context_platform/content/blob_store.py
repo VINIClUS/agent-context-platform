@@ -125,7 +125,20 @@ class S3BlobStore:
                 self._validate_response(head, expected_sha256=digest), expected_metadata
             )
             return self._stored_blob(object_key, expected_metadata)
-        existing = await self._verify_existing(object_key, content, expected_metadata)
+        try:
+            existing = await self._verify_existing(object_key, content, expected_metadata)
+        except BlobNotFoundError:
+            # The object existed at the conditional PUT and was deleted before it could be
+            # verified: only the orphan sweep deletes objects, and only unreferenced ones. Upload
+            # it once more (a second disappearance is reported as it is).
+            if not await self._put(request):
+                existing = await self._verify_existing(object_key, content, expected_metadata)
+                return self._stored_blob(object_key, existing)
+            head = await self._head(object_key)
+            self._verify_expected_metadata(
+                self._validate_response(head, expected_sha256=digest), expected_metadata
+            )
+            return self._stored_blob(object_key, expected_metadata)
         return self._stored_blob(object_key, existing)
 
     @staticmethod

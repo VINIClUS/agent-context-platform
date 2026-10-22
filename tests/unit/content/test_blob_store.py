@@ -421,3 +421,28 @@ def test_a_reused_object_still_fails_on_a_wrong_declared_length_or_media_type() 
     client.objects[stored.object_key] = {**original, "ContentType": "application/json"}
     with pytest.raises(BlobIntegrityError, match="media type"):
         _run(_store(client).put_verified(content, "text/plain"))
+
+
+def test_a_conditional_put_retries_once_when_the_existing_object_was_swept_meanwhile() -> None:
+    # if_none_match: the PUT is refused because the object exists, then the orphan sweep deletes
+    # it before it is verified. The upload is retried once, never reported as a missing object.
+    content = b"swept between the put and the head"
+    client = FakeS3Client()
+    store = _store(client, write_mode="if_none_match")
+    _run(store.put_verified(content, "text/plain"))
+    put = client.put_object
+    keys: list[str] = []
+
+    def put_then_sweep_once(**request: Any) -> dict[str, Any]:
+        keys.append(request["Key"])
+        try:
+            return put(**request)
+        finally:
+            if len(keys) == 1:
+                client.objects.pop(request["Key"], None)  # the sweep, right after the 412
+
+    client.put_object = put_then_sweep_once  # type: ignore[method-assign]
+    stored = _run(store.put_verified(content, "text/plain"))
+
+    assert keys == [stored.object_key, stored.object_key]
+    assert stored.object_key in client.objects
