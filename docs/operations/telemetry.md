@@ -71,7 +71,7 @@ counters).
 | `agent_context.mcp.requests` | counter | `{request}` | `method` = server/discover / tools/list / tools/call / other; `tool` = context_for_task / repository_overview / symbol_context / decision_history / failure_history / none; `outcome` = ok / client_error / auth_error / rate_limited / server_error | `agent_context_mcp_requests_total` |
 | `agent_context.mcp.duration` | histogram | `s` | `method`, `tool` | `agent_context_mcp_duration_seconds_*` |
 | `http.server.request.duration` | histogram | `s` | `http.request.method` (standard methods or `_OTHER`), `http.route` (the matched route template under `/v1/`, `/health/`, `/mcp`, `/openapi.json`, `/docs` or `/redoc`, else `other`), `http.response.status_code` | `http_server_request_duration_seconds_*` |
-| `agent_context.otel.requests` | counter | `{request}` | `outcome` = accepted / rejected / error; `reason` = none / auth / rate_limited / unsupported_media_type / too_large / malformed / abandoned / internal | `agent_context_otel_requests_total` |
+| `agent_context.otel.requests` | counter | `{request}` | `outcome` = accepted / rejected / error; `reason` = none / auth / rate_limited / unsupported_media_type / too_large / malformed / unsupported / abandoned / internal | `agent_context_otel_requests_total` |
 | `agent_context.otel.spans` | counter | `{span}` | `result` = mapped / unmapped / rejected | `agent_context_otel_spans_total` |
 
 Duration histograms use the explicit bucket boundaries
@@ -121,7 +121,9 @@ Duration histograms use the explicit bucket boundaries
 - **Codex OTLP receiver** (`POST /v1/otel/traces`, PLATFORM-053). One `requests` sample per export:
   `accepted` for every 200 (rejected spans included), `rejected` for a 4xx (`auth` 401/403,
   `rate_limited` 429, `unsupported_media_type` 415, `too_large` 413 for any request-level limit,
-  `malformed` 400, `abandoned` when the client went away while queued), `error` with `internal` for
+  `malformed` 400 for undecodable or malformed wire data, `unsupported` 400 for well-formed data the
+  receiver refuses structurally (a singular message field sent twice), `abandoned` when the client
+  went away while queued), `error` with `internal` for
   5xx (including a full admission gate). `spans` counts each span once: `mapped` (it produced a
   stored or already-stored event), `unmapped` (no Codex event the mapper models) or `rejected`
   (refused by the mapper, its resource or scope, the platform-origin marker, its times, or the

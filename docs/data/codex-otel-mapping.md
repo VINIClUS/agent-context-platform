@@ -94,19 +94,24 @@ feeds every Codex event record through this mapper. It is not part of the frozen
   | `MAX_ATTRIBUTES` per resource or scope | 128 | `too_many_attributes` |
   | nested attribute values deeper than 4 | | `too_many_attributes` |
   | `MAX_FIELDS`, every field occurrence the scan visits | 300000 | `too_many_fields` |
-  | `MAX_OBJECTS`, every repeated element (message or scalar) at every level | 200000 | `too_many_objects` |
+  | `MAX_OBJECTS`, every repeated element (message, string or bytes) at every level | 200000 | `too_many_objects` |
   | distinct mapped events per request (one ingestion batch) | 500 | `too_many_drafts` |
 
   These are checked on the **wire bytes before parsing** (`ledger/otlp_wire.py`). The scan uses the
   generated descriptors as its only schema: it visits every field occurrence of every message
   reachable from the request (counted against `MAX_FIELDS`, so its cost is bounded by the limits,
   not the bytes), counts every repeated element against `MAX_OBJECTS` (so parsing never allocates
-  more than the limits allow), and stops at the first exceeded limit. It answers 400 with a fixed
-  code for what the receiver never needs and cannot bound otherwise: an unknown field
-  (`unsupported_field`, at any level), `Resource.entity_refs` (`unsupported_field`), a singular
-  message field that occurs twice (`repeated_singular_field`: the parser would merge both into one
-  container), and a wire type that does not match the field (`malformed_request`, groups included,
-  which the parser itself would accept). Per-span limits reject that span only (partial success):
+  more than the limits allow), and stops at the first exceeded limit. **Unknown fields** (a newer
+  OTLP schema), at any level, are accepted: each occurrence counts against `MAX_FIELDS`, the scan
+  skips it by its wire type and never descends into it, and the parser keeps it as raw bytes,
+  bounded by `MAX_DECOMPRESSED_BYTES`; the mapper never reads them. `Resource.entity_refs` is
+  scanned like any field (each `EntityRef` and each of its repeated strings counts against
+  `MAX_OBJECTS`). The scan answers 400 with a fixed code only for what it cannot bound otherwise: a
+  singular message field that occurs twice (`repeated_singular_field`: the parser would merge both
+  into one container; telemetry reason `unsupported`), and malformed wire data
+  (`malformed_request`, reason `malformed`): a wire type that does not match a known field, groups
+  and reserved wire types 6 and 7 at any field (the parser itself would accept groups), truncated
+  data, or a varint over ten bytes. Per-span limits reject that span only (partial success):
   `MAX_EVENTS_PER_SPAN` (64, `too_many_events`) and `MAX_ATTRIBUTES` per span or span event (128,
   `too_many_attributes`); their events still count toward `MAX_RECORDS`, so a flood is a
   request-level 413. A string value over 16 KiB rejects its record (`attribute_value_too_long`).
@@ -114,16 +119,20 @@ feeds every Codex event record through this mapper. It is not part of the frozen
   records of the same span still land.
 
   Inflation, the scan, parsing and mapping run on a worker thread behind an admission gate: two
-  decodes at once per process and four waiting, at most one running and one waiting per producer (so
-  one producer within its own rate limit cannot starve the others); beyond that the request is
+  decodes at once per process and four waiting; one producer holds at most two of those places and
+  runs at most one decode at a time (its second place waits for its own turn before it competes for
+  a worker), so one producer within its own rate limit never holds both workers and cannot starve
+  the others; beyond that the request is
   refused at once with 503 and `Retry-After`. A queued request whose client has gone is not decoded.
   A cancelled request keeps its place until its worker thread finishes, so at most two threads ever
   decode per process; with N worker processes or replicas the bound is 2N. Measured on the
   development container: the collector's largest batch (15 spans x 64 events x 44 attributes of 64
   characters, 3.73 MiB, 25 KiB gzip) takes about 0.09 s and 11 MiB of extra peak memory; the densest
   message the limits allow (65,536 attributes over 1000 records) about 0.13 s and 7 MiB; a flood of
-  the smallest fields stops at the field budget in about 0.17 s whatever its size; an `entity_refs`
-  flood is refused in well under a millisecond. `MAX_DECOMPRESSED_BYTES` stays 6 MiB (the largest
+  the smallest fields stops at the field budget in about 0.17 s whatever its size. The worst case
+  the scan accepts is a body of about 300,000 fields that each carry a ten-byte (overlong) varint,
+  3.3 to 3.6 MiB: about 0.4 to 0.5 s here and about 0.6 s on the review machine, per accepted
+  request and running decode (unknown fields cost the same as known ones). `MAX_DECOMPRESSED_BYTES` stays 6 MiB (the largest
   batch plus about 60%): with the field and object budgets the scan and parse costs no longer grow
   with bytes, and the bytes themselves cost at most 6 MiB plus the 4 MiB body per running decode.
   The ingestion append that follows is async database work on the event loop, one statement round
