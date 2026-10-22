@@ -305,7 +305,7 @@ async def _snapshot(owner: AsyncEngine) -> dict[str, tuple[int, str | None]]:
                 text(
                     "SELECT table_schema || '.' || table_name FROM information_schema.tables "
                     "WHERE table_type = 'BASE TABLE' AND table_schema IN "
-                    "('operations', 'ledger', 'projection', 'catalog') ORDER BY 1"
+                    "('operations', 'ledger', 'projection', 'catalog', 'retrieval') ORDER BY 1"
                 )
             )
         ).scalars()
@@ -321,6 +321,7 @@ async def _snapshot(owner: AsyncEngine) -> dict[str, tuple[int, str | None]]:
             ).one()
             snapshot[table] = (int(row[0]), row[1])
     assert "operations.registered_producers" in snapshot and "operations.mcp_tokens" in snapshot
+    assert any(table.startswith("retrieval.") for table in snapshot)
     return snapshot
 
 

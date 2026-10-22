@@ -73,7 +73,8 @@ class Probe:
         )
         mcp = McpAuthRuntime(authenticator=self.mcp, limiter=self.limiter)  # type: ignore[arg-type]
         self.client = TestClient(
-            create_app(Settings(environment="test"), ingestion=ingestion, mcp_auth=mcp)
+            create_app(Settings(environment="test"), ingestion=ingestion, mcp_auth=mcp),
+            base_url="http://127.0.0.1:8000",  # an allowed MCP Host
         )
 
     def get(self, *authorizations: str) -> Any:
@@ -163,7 +164,7 @@ def test_an_mcp_token_needs_the_read_scope_and_spends_the_rate_limit(probe: Prob
 
 
 def test_an_unconfigured_plane_fails_closed() -> None:
-    client = TestClient(create_app(Settings(environment="test")))
+    client = TestClient(create_app(Settings(environment="test")), base_url="http://localhost:8080")
     for token in (PRODUCER_TOKEN, MCP_TOKEN):
         response = client.get(WHOAMI_PATH, headers={"authorization": f"Bearer {token}"})
         assert response.status_code == 503
@@ -174,3 +175,50 @@ def test_the_probe_is_not_in_the_published_schema_and_only_answers_get(probe: Pr
     assert WHOAMI_PATH not in probe.client.app.openapi()["paths"]  # type: ignore[attr-defined]
     response = probe.client.post(WHOAMI_PATH, headers={"authorization": f"Bearer {MCP_TOKEN}"})
     assert response.status_code == 405 and probe.mcp.calls == []
+
+
+@pytest.mark.parametrize(
+    ("extra", "status", "code"),
+    [
+        ([("host", "rebind.example")], 421, "invalid_host"),
+        ([("host", "127.0.0.1:8000"), ("host", "127.0.0.1:8000")], 421, "invalid_host"),
+        ([("origin", "https://rebind.example")], 403, "invalid_origin"),
+        (
+            [("origin", "http://127.0.0.1:1"), ("origin", "http://127.0.0.1:1")],
+            403,
+            "invalid_origin",
+        ),
+    ],
+)
+def test_an_mcp_token_meets_the_mcp_host_and_origin_allowlist_before_any_lookup(
+    probe: Probe, extra: list[tuple[str, str]], status: int, code: str
+) -> None:
+    # A DNS-rebinding page must not reach the MCP Argon2 gate through the probe.
+    headers = [("authorization", f"Bearer {MCP_TOKEN}"), *extra]
+    if not any(name == "host" for name, _ in extra):
+        headers.append(("host", "127.0.0.1:8000"))
+
+    response = probe.client.get(WHOAMI_PATH, headers=headers)
+
+    assert response.status_code == status and response.json()["error"]["code"] == code
+    assert probe.mcp.calls == [] and probe.limiter.acquired == []
+
+
+def test_a_browser_origin_is_refused_for_producer_tokens_too(probe: Probe) -> None:
+    response = probe.client.get(
+        WHOAMI_PATH,
+        headers={"authorization": f"Bearer {PRODUCER_TOKEN}", "origin": "https://rebind.example"},
+    )
+    assert response.status_code == 403 and response.json()["error"]["code"] == "invalid_origin"
+    assert probe.producer.calls == []
+    # An allowed Origin is fine; the producer plane keeps the ingestion route's Host rules.
+    allowed = probe.client.get(
+        WHOAMI_PATH,
+        headers={"authorization": f"Bearer {PRODUCER_TOKEN}", "origin": "http://localhost:3000"},
+    )
+    assert allowed.status_code == 204
+    elsewhere = probe.client.get(
+        WHOAMI_PATH,
+        headers={"authorization": f"Bearer {PRODUCER_TOKEN}", "host": "ingest.example"},
+    )
+    assert elsewhere.status_code == 204 and elsewhere.headers[TOKEN_KIND_HEADER] == "producer"

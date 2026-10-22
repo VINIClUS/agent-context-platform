@@ -6,6 +6,14 @@ answers ``204`` with ``X-Agent-Context-Token-Kind: producer|mcp`` and no body; a
 fixed, content-free error body (the ingestion envelope: ``error.code``, ``error.message``,
 ``request_id``).
 
+Before any lookup the probe applies the MCP transport's browser defences (`mcp.allowed_hosts` and
+`mcp.allowed_origins`, the same matching as `/mcp`'s protocol guard): an ``Origin`` header, when
+present, must be allowed for every token (the probe is for command-line clients), and an ``mcp_``
+token additionally needs an allowed, single ``Host``. So a DNS-rebinding page cannot spend the MCP
+Argon2 gate through the probe (421 ``invalid_host``, 403 ``invalid_origin``, no database work). A
+producer token keeps the ingestion route's rules (no Host allowlist there): the probe costs it no
+more than ``POST /v1/ingestion/batches`` already does.
+
 It is deliberately outside the frozen ingestion OpenAPI (``include_in_schema=False``; the
 snapshot covers ``/v1/ingestion/*`` only) and it writes nothing: both authenticators only read
 their registration row (neither keeps a last-used time or an audit row in the database), so a
@@ -30,6 +38,7 @@ from agent_context_platform.mcp.auth import (
     McpAuthHolder,
     RateLimitedError,
 )
+from agent_context_platform.mcp.protocol_guard import _matches as allowlisted
 from agent_context_platform.security.bearer import (
     AuthError,
     AuthOverloadedError,
@@ -38,6 +47,7 @@ from agent_context_platform.security.bearer import (
     MissingCredentialError,
     parse_bearer,
 )
+from agent_context_platform.settings import MCPSettings, Settings
 
 logger = logging.getLogger("agent_context_platform.ledger.whoami")
 
@@ -54,6 +64,8 @@ _MESSAGES: Final = {
     "auth_unavailable": "Authentication is not available.",
     "rate_limited": "Too many requests; retry later.",
     "internal_error": "The request could not be processed.",
+    "invalid_host": "The Host is not allowed.",
+    "invalid_origin": "The Origin is not allowed.",
 }
 
 router = APIRouter()
@@ -64,6 +76,8 @@ async def whoami(request: Request) -> Response:
     """204 and the token kind for a valid producer or MCP token; a fixed error otherwise."""
     try:
         kind = await _authenticate(request)
+    except _Refused as error:
+        return _error(request, error.status, error.code)
     except AuthOverloadedError as error:
         return _error(request, error.status_code, error.code, _OVERLOAD_RETRY_AFTER_SECONDS)
     except AuthError as error:
@@ -86,7 +100,36 @@ class _Unavailable(Exception):
     """The plane the token belongs to is not configured in this process."""
 
 
+class _Refused(Exception):
+    """The request fails a transport check (Host, Origin) before any authentication."""
+
+    def __init__(self, status: int, code: str) -> None:
+        super().__init__(code)
+        self.status = status
+        self.code = code
+
+
+def _single(request: Request, name: str) -> tuple[int, str | None]:
+    values = request.headers.getlist(name)
+    return len(values), (values[0] if values else None)
+
+
+def _check_origin(request: Request, settings: MCPSettings) -> None:
+    """A present Origin must be allowed (a missing one is a non-browser client); never repeated."""
+    count, origin = _single(request, "origin")
+    if count > 1 or (origin is not None and not allowlisted(origin, settings.allowed_origins)):
+        raise _Refused(403, "invalid_origin")
+
+
+def _check_host(request: Request, settings: MCPSettings) -> None:
+    count, host = _single(request, "host")
+    if count != 1 or host is None or not allowlisted(host, settings.allowed_hosts):
+        raise _Refused(421, "invalid_host")
+
+
 async def _authenticate(request: Request) -> str:
+    settings: Settings = request.app.state.settings
+    _check_origin(request, settings.mcp)
     authorizations = request.headers.getlist("authorization")
     if not authorizations:
         raise MissingCredentialError
@@ -98,6 +141,7 @@ async def _authenticate(request: Request) -> str:
     if bearer is None:
         raise InvalidCredentialError
     if bearer.prefix.startswith(MCP_TOKEN_PREFIX):
+        _check_host(request, settings.mcp)
         holder: McpAuthHolder | None = getattr(request.app.state, "mcp_auth", None)
         runtime = None if holder is None else holder.runtime
         if runtime is None:
