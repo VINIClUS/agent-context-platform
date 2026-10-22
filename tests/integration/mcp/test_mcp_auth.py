@@ -295,3 +295,67 @@ def test_minted_token_round_trips_through_the_real_app(
     assert principal == "minted-reader"
     assert token.partition(".")[2] not in verifier
     assert verifier.startswith("$argon2id$")
+
+
+async def _snapshot(owner: AsyncEngine) -> dict[str, tuple[int, str | None]]:
+    """Row count and a digest of every row of every platform table (any write changes one)."""
+    async with owner.connect() as connection:
+        tables = (
+            await connection.execute(
+                text(
+                    "SELECT table_schema || '.' || table_name FROM information_schema.tables "
+                    "WHERE table_type = 'BASE TABLE' AND table_schema IN "
+                    "('operations', 'ledger', 'projection', 'catalog') ORDER BY 1"
+                )
+            )
+        ).scalars()
+        snapshot: dict[str, tuple[int, str | None]] = {}
+        for table in tables:
+            row = (
+                await connection.execute(
+                    text(
+                        f"SELECT count(*), md5(string_agg(t::text, ',' ORDER BY t::text)) "
+                        f"FROM {table} t"
+                    )
+                )
+            ).one()
+            snapshot[table] = (int(row[0]), row[1])
+    assert "operations.registered_producers" in snapshot and "operations.mcp_tokens" in snapshot
+    return snapshot
+
+
+def test_whoami_answers_for_both_planes_and_writes_nothing(
+    owner_engine: AsyncEngine, api_engine: AsyncEngine
+) -> None:
+    """PLATFORM-054: the token probe the Codex doctor uses changes no row, not even a timestamp."""
+    from agent_context_platform.ledger.whoami import TOKEN_KIND_HEADER, WHOAMI_PATH
+
+    async def exercise() -> None:
+        async with owner_engine.begin() as connection:  # one registration per producer id
+            await connection.execute(
+                text("DELETE FROM operations.registered_producers WHERE producer_id = :p"),
+                {"p": "auth-producer"},
+            )
+        producer = await _insert_producer(owner_engine, "whoami01")
+        reader = await _insert_token(owner_engine, "mcp_whoami01")
+        revoked = await _insert_token(owner_engine, "mcp_whoami02", revoked=True)
+        before = await _snapshot(owner_engine)
+        app = _application(api_engine)
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=app), base_url="http://127.0.0.1:8000"
+        ) as client:
+
+            async def probe(token: str) -> httpx2.Response:
+                return await client.get(WHOAMI_PATH, headers={"authorization": f"Bearer {token}"})
+
+            ok_producer, ok_mcp = await probe(producer), await probe(reader)
+            assert (ok_producer.status_code, ok_producer.headers[TOKEN_KIND_HEADER]) == (
+                204,
+                "producer",
+            )
+            assert (ok_mcp.status_code, ok_mcp.headers[TOKEN_KIND_HEADER]) == (204, "mcp")
+            for bad in (revoked, f"whoami01.{'x' * 43}", f"mcp_whoami01.{'x' * 43}"):
+                assert (await probe(bad)).status_code == 401
+        assert await _snapshot(owner_engine) == before
+
+    asyncio.run(exercise())

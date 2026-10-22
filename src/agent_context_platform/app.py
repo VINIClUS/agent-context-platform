@@ -27,6 +27,7 @@ from agent_context_platform.ledger.auth import (
     SqlProducerLookup,
 )
 from agent_context_platform.ledger.service import IngestionService
+from agent_context_platform.ledger.whoami import router as whoami_router
 from agent_context_platform.mcp.auth import (
     MEMORY_READ_SCOPE,
     McpAuthenticator,
@@ -213,7 +214,9 @@ def create_app(
     application.openapi = openapi  # type: ignore[method-assign]
     application.state.ingestion = ingestion
     application.state.readiness = readiness
+    application.state.mcp_auth = mcp_holder  # read by the token probe (`ledger.whoami`)
     application.include_router(router)
+    application.include_router(whoami_router)  # outside the frozen ingestion OpenAPI
     # Inside the request-context middleware: the server span is a child of the caller's trace.
     application.add_middleware(HttpTelemetryMiddleware)
     application.add_middleware(RequestContextMiddleware)
