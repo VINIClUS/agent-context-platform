@@ -1,0 +1,33 @@
+{
+  "schema": 1,
+  "model_id": "sentence-transformers/paraphrase-multilingual-MiniLM-L12-v2",
+  "revision": "e8f8c211226b894fcb81acc59f3b34ba3efd5f42",
+  "source": "https://huggingface.co",
+  "runtime": "onnxruntime",
+  "dimensions": 384,
+  "max_sequence_length": 128,
+  "pooling": "mean",
+  "normalize": "l2",
+  "files": [
+    {
+      "path": "1_Pooling/config.json",
+      "size": 190,
+      "sha256": "4be450dde3b0273bb9787637cfbd28fe04a7ba6ab9d36ac48e92b11e350ffc23"
+    },
+    {
+      "path": "onnx/model.onnx",
+      "size": 470301610,
+      "sha256": "10f7a088420252b26caf819236ca2c9d2987afd0fc06fec7553b542a5655a05a"
+    },
+    {
+      "path": "sentence_bert_config.json",
+      "size": 53,
+      "sha256": "70f4448f31320443fe3557cacea5abf2dcc4915dda8c80646bec9f3bb0aa5a1f"
+    },
+    {
+      "path": "tokenizer.json",
+      "size": 9081518,
+      "sha256": "2c3387be76557bd40970cec13153b3bbf80407865484b209e655e5e4729076b8"
+    }
+  ]
+}

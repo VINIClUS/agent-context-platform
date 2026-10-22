@@ -334,7 +334,7 @@ default command is exec-form.
 ```bash
 docker build -f containers/platform/Dockerfile \
   --build-arg REVISION="$(git rev-parse HEAD)" --build-arg VERSION=0.1.0 \
-  --build-arg SDK_VERSION=0.6.0 --build-arg ALEMBIC_HEAD=20260929_0001 \
+  --build-arg SDK_VERSION=0.6.0 --build-arg ALEMBIC_HEAD=20261002_0001 \
   -t agent-context-platform:dev .
 ```
 
@@ -348,7 +348,7 @@ does). Unset, they read `unknown`/`dev` (local builds).
 | --- | --- | --- |
 | `platform-migrate` (one-shot, before the API) | `agent-context db upgrade --expect-head <io.agent-context.alembic.head>` | `AGENT_CONTEXT_POSTGRESQL__MIGRATION_DSN` |
 | `platform-api` (2 replicas) | default: `uvicorn agent_context_platform.app:create_app --factory --host 0.0.0.0 --port 8000 --no-access-log --no-server-header` | `AGENT_CONTEXT_ENVIRONMENT=production`, `__POSTGRESQL__DSN` (API login), `__NEO4J__*`, `__S3__*`, `__MCP__TOKEN_HMAC_KEY`, `__MCP__ALLOWED_HOSTS`/`__ALLOWED_ORIGINS` |
-| `platform-projector` | `agent-context projection run` | `__POSTGRESQL__PROJECTOR_DSN`, `__NEO4J__*` |
+| `platform-projector` | `agent-context projection run` | `__POSTGRESQL__PROJECTOR_DSN`, `__NEO4J__*`, `__S3__*`, and `__SEARCH__MODEL_DIR` (model volume) or `AGENT_CONTEXT_PROJECTION_LEXICAL_ONLY=1` (see Search and embeddings) |
 | `platform-indexer` | `agent-context index --repository-id <id> --checkout /work` | `__POSTGRESQL__API_DSN`; run with `user: "10001:10001"` |
 
 The migrate role needs only its DSN: it does not set `AGENT_CONTEXT_ENVIRONMENT=production`,
@@ -382,6 +382,89 @@ with the labels, runs the same container tests, pushes `ghcr.io/viniclus/agent-c
 prints the digest; infra pins that digest (`image: ghcr.io/viniclus/agent-context-platform@sha256:...`)
 in its `versions.lock`, never the tag, and passes the `io.agent-context.alembic.head` label to
 `--expect-head`.
+
+## Search and embeddings
+
+Retrieval over sanitized content has two projections, both rebuildable from the ledger and never a
+source of truth: PostgreSQL full-text rows (`retrieval.search_documents`, a `simple`-configuration
+`tsvector` with a GIN index; the text itself is not stored twice) and 384-dimension vectors on
+Neo4j `ContentEmbedding` nodes behind a cosine vector index. The `search` projector writes both for
+every event that references sanitized content and removes both on `content.purged`. Search is
+always scoped to a project and a repository, bounded to 100 results and runs under a deadline
+(`retrieval/search.py`).
+
+Embeddings come from the multilingual MiniLM model run on `onnxruntime` (no torch). The model is
+pinned by revision and file digests in `src/agent_context_platform/retrieval/models.lock.json`.
+The service and the tests never download it; fetch it once and point the service at it:
+
+```bash
+agent-context models fetch --dest /var/lib/agent-context/models/minilm   # about 470 MB, sha256-checked
+export AGENT_CONTEXT_SEARCH__MODEL_DIR=/var/lib/agent-context/models/minilm
+```
+
+Loading re-checks every digest and fails closed on a mismatch. `AGENT_CONTEXT_SEARCH__EMBEDDING_BATCH_SIZE`
+and `..._EMBEDDING_THREADS` bound the inference work.
+
+What needs the model:
+
+* `projection run` (the worker) refuses to start without `MODEL_DIR` (exit `2`, before any
+  connection) unless it runs **lexical-only**: `--lexical-only` or
+  `AGENT_CONTEXT_PROJECTION_LEXICAL_ONLY=1` (refused while `MODEL_DIR` is set). Lexical-only reads
+  the content (S3 settings needed) and writes the search rows with every check a full index runs:
+  tombstones, scope and content identity, readable bytes. A conflict or unreadable content is
+  therefore dead-lettered live exactly as with a model, and lexical search and purges work at
+  once. Only the `ContentEmbedding` nodes are missing; the worker counts them (`search_unembedded`
+  in the summary, a `projection_worker search_unembedded N` log line), and `projection status`
+  reports them durably (`search: N documents, M embeddings (K without embeddings ...)`; the search
+  checkpoint itself shows no lag, since those events were delivered).
+* Backfilling embeddings after lexical-only: run a rebuild with `MODEL_DIR` set. Either
+  `projection rebuild --in-place` (stop the worker first: it resets the search tables and the live
+  graph and replays the delivered events), or a standby rebuild into another Neo4j instance and
+  cutover (the rows already exist in PostgreSQL; the standby graph gets the embeddings). Then run
+  the worker with the model.
+* `projection rebuild` and `projection verify --replay-check` refuse to run without `MODEL_DIR`
+  unless `--without-search` (or `AGENT_CONTEXT_PROJECTION_WITHOUT_SEARCH=1`, which the worker
+  ignores) skips the search projector. `--without-search` is itself refused (in place, or for a
+  replay check) while the live graph holds `ContentEmbedding` nodes: they would be wiped, or
+  reported as drift. Plain `projection verify` never loads the model; `status` never does either.
+* `projection rebuild --in-place` first reads every document the replay will index, read-only and
+  before it takes the rebuild lock, touches a checkpoint, resets a table or wipes the graph. It
+  skips content the ledger records as purged and fails with `SearchReplayIntegrityError` (counts
+  only) if any other content cannot be read or one content ID names different content. This costs
+  one extra read of all indexed content. Then `retrieval.reset_search_projection()` (a SECURITY
+  DEFINER function; the projector role holds no TRUNCATE and cannot delete tombstones) empties
+  the documents and reseeds the tombstones from every purge in the ledger, whatever its outbox
+  status. Purged content therefore stays purged across rebuilds, even when its purge event was
+  dead-lettered. The reset locks in the worker's order under a 10 s lock timeout.
+* Recovery: if an in-place rebuild still fails after the wipe (a transient Neo4j, PostgreSQL or
+  S3 error), the checkpoints stay `rebuilding` and the worker must stay stopped; fix the cause
+  and run the same `projection rebuild --in-place` again. It starts from zero.
+
+Consistency: a search row is returned only once one of its source events is `delivered`, and a
+hit's provenance (event, session, time, source event IDs) comes from delivered events only: the
+earliest one, as a rebuild records it. A row left behind by a dead-lettered or not-yet-delivered
+event stays hidden. Indexing and purging of one content ID serialize on a PostgreSQL advisory
+lock. A producer-chosen `content_id` reused for different sanitized bytes (or in another scope) is
+refused (`SearchContentConflictError`, `SearchScopeConflictError`: retried, then dead-lettered),
+never merged.
+
+Retention contract (design section 16): every removal of stored content must go through the
+ledger as a `content.purged` event; replays treat content that is gone without one as an integrity
+failure. Retention expiry (180 days for session content) is not implemented yet. When it is, it
+must emit `content.purged` for what it deletes, or the next in-place rebuild stops at its check
+(follow-up).
+
+Containers (service image): the worker container sets `AGENT_CONTEXT_SEARCH__MODEL_DIR` to a
+read-only volume the model was provisioned into once with `agent-context models fetch --dest`
+(about 470 MB; never at image build or start-up). Without a provisioned model it runs
+lexical-only with `AGENT_CONTEXT_PROJECTION_LEXICAL_ONLY=1` (and no `MODEL_DIR`). Either way it
+needs the S3 settings, because indexing reads the content. The image needs the `onnxruntime`,
+`tokenizers` and `numpy` wheels (no torch). A process serving vector search
+(`SearchService.vector`, wired by PLATFORM-043) embeds the query, so it needs the same volume;
+lexical search needs only PostgreSQL. Rebuild and replay-check jobs need the volume too, or
+`--without-search` as above. `tests/unit/retrieval/test_model_parity.py`
+compares the ONNX output with sentence-transformers and runs only when
+`AGENT_CONTEXT_TEST_MODEL_PARITY=1`.
 
 ## Ingestion API contract
 

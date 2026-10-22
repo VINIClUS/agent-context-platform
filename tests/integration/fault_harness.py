@@ -58,6 +58,8 @@ def process_env(
     env["AGENT_CONTEXT_INGESTION__ARGON2_TIME_COST"] = "1"
     env["AGENT_CONTEXT_INGESTION__ARGON2_MEMORY_COST_KIB"] = "8"
     env["AGENT_CONTEXT_INGESTION__ARGON2_PARALLELISM"] = "1"
+    # No embedding model in these tests: the worker indexes search rows lexical-only.
+    env["AGENT_CONTEXT_PROJECTION_LEXICAL_ONLY"] = "1"
     if crash_at is not None:
         env["AGENT_CONTEXT_FAULT_INJECTION__ENABLED"] = "true"
         env["AGENT_CONTEXT_FAULT_INJECTION__CRASH_AT"] = crash_at

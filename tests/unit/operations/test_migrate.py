@@ -15,7 +15,7 @@ pytestmark = pytest.mark.unit
 
 PROJECT_ROOT = Path(__file__).parents[3]
 ALEMBIC_INI = PROJECT_ROOT / "alembic.ini"
-SHIPPED = frozenset({"20260823_0001", "20260928_0001", "20260929_0001"})
+SHIPPED = frozenset({"20260823_0001", "20260928_0001", "20260929_0001", "20261002_0001"})
 
 
 def test_the_config_comes_from_the_argument_then_the_environment(
