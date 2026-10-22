@@ -430,6 +430,16 @@ async def _exercise_search_step(dsn: str) -> None:
                             "WHERE oid = 'retrieval.reset_search_projection()'::regprocedure"
                         )
                     )
+                    # Pinned search path (no schema of the caller can shadow a name) and the
+                    # lock timeout that bounds the reset's table locks.
+                    assert sorted(
+                        await connection.scalar(
+                            text(
+                                "SELECT proconfig FROM pg_proc "
+                                "WHERE oid = 'retrieval.reset_search_projection()'::regprocedure"
+                            )
+                        )
+                    ) == ["lock_timeout=10s", "search_path=pg_catalog, pg_temp"]
                     await _run_alembic(connection, command.downgrade, _MCP_TOKENS_REVISION)
                     await connection.commit()
                     assert (

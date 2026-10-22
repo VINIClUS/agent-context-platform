@@ -396,8 +396,8 @@ def _validate_vector_config(record: Record, statement: SchemaStatement) -> None:
 # projection, not a projection of an event, so the graph digest leaves it out (`verify.py`).
 # Readers that depend on complete history (`retrieval/temporal.py`) refuse to serve without it,
 # and `REQUIRED_HISTORY` is the one list of what they need (`projection status`/`verify` report
-# against it too). A projector whose `records_history` attribute is False (one that projects no
-# history, such as a purge-only one) is never named in the marker (`history_projectors`). The
+# against it too). A projector whose `records_history` attribute is False (one whose history no
+# reader needs, such as the search projector) is never named in the marker (`history_projectors`). The
 # worker narrows the marker at start-up to the versions it runs (`narrow_projection_history`), so
 # rolling a projector back and forward again cannot leave a stale claim; restoring a Neo4j dump
 # restores the marker the dump holds, which is only true when the dump and the ledger agree, so
