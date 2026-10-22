@@ -445,7 +445,19 @@ What needs the model:
   dead-lettered. The reset locks in the worker's order under a 10 s lock timeout.
 * Recovery: if an in-place rebuild still fails after the wipe (a transient Neo4j, PostgreSQL or
   S3 error), the checkpoints stay `rebuilding` and the worker must stay stopped; fix the cause
-  and run the same `projection rebuild --in-place` again. It starts from zero.
+  and run the same `projection rebuild --in-place` again. It starts from zero. Not transient:
+  content bytes that vanish without a `content.purged` between the check and the replay (storage
+  loss during the rebuild) fail the replay after the wipe, and the rerun is then refused by its
+  check. Restore the bytes, or purge the content through the ledger, then rerun; until then live
+  search (and the graph) stays partial. The check holds one PostgreSQL transaction per page of
+  500 delivered events while it reads their content serially.
+* `projection status` reports `documents_without_embeddings` as rows minus nodes: an
+  approximation (hidden rows of undelivered events and stale nodes left by a purge race count
+  too), enough to show that a backfill is due, not an exact list.
+* Ownership: `retrieval.reset_search_projection()` runs with its owner's rights, the role that
+  ran the migrations. It is safe as written (fixed statements, pinned `search_path`, EXECUTE for
+  the projector role only), but infra should still run migrations as a dedicated non-superuser
+  schema owner (`AGENT_CONTEXT_POSTGRESQL__MIGRATION_DSN`), never a superuser.
 
 Consistency: a search row is returned only once one of its source events is `delivered`, and a
 hit's provenance (event, session, time, source event IDs) comes from delivered events only: the
