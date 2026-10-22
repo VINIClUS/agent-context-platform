@@ -540,6 +540,43 @@ after an empty-graph replay:
 uv run pytest -q tests/evaluation
 ```
 
+## MCP memory tools
+
+`POST /mcp` (MCP `2026-07-28`, stateless: no `initialize`, no `Mcp-Session-Id`, no cookie; a
+direct `tools/call` needs no prior `server/discover`) serves exactly five read-only tools, each
+bound to the `ContextComposer` method of the same name (`mcp/tools.py`): `context_for_task`,
+`repository_overview`, `symbol_context`, `decision_history` and `failure_history`. Their
+`inputSchema`/`outputSchema` are the SDK's published `mcp.<tool>.{input,output}.v1.json` schemas;
+`tools/list` is the same on every replica (sorted, `ttlMs` 60000, `cacheScope: private`). Every
+tool is annotated `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true`,
+`openWorldHint: false`, and says why in its description. No input takes SQL, Cypher, a path or a
+URL, and paging is the explicit, signed `cursor` (see Context packages).
+
+* **Auth.** A bearer `mcp_...` token with the `memory:read` scope (401 without, 403 with another
+  scope, 429 over the per-principal rate). The composer is called with the token's principal only.
+* **Results.** `structuredContent` is the `ContextPackageV1`, valid against the output schema, and
+  `resultType` is `complete`. The text block is a short summary that names items only by a
+  bounded, JSON-quoted title; item titles and content are untrusted evidence.
+* **Errors.** An unknown tool is a JSON-RPC `-32602`. Everything else is a tool error
+  (`isError: true`) whose text is `{"error": {"code", "message", "retryable"}}`, with a fixed
+  message and one of these codes: `invalid_arguments` (field names only, never values),
+  `invalid_request`, `scope_not_found`, `revision_not_found`, `symbol_not_found`,
+  `ambiguous_symbol`, `budget_too_small`, `cursor_invalid`, `cursor_expired`, `cursor_mismatch`,
+  `cursor_stale` (start again from the first page), `temporal_projection_outdated`,
+  `projection_not_ready`, `deadline_exceeded`, `context_unavailable`, `unauthenticated` and
+  `internal_error`. `retryable` is true only for `projection_not_ready`, `deadline_exceeded` and
+  `context_unavailable`.
+* **No resources.** `resources/*` and prompts are not served and no resource links are emitted.
+  The `resource_uri` of an evidence reference is a stable name, not a capability
+  (`docs/data/context-evidence.md`): dereferencing it would need a reader that re-checks scope,
+  delivery and purge and serves content beyond the bounded excerpts, which does not exist yet.
+* **Wiring.** At start-up the API builds the composer from `AGENT_CONTEXT_POSTGRESQL__API_DSN`
+  (falling back to `__DSN`; the API role, never the projector role), `__NEO4J__*`, `__S3__*`,
+  `__MCP__CURSOR_HMAC_KEY` (required in production) and, for vector search,
+  `__SEARCH__MODEL_DIR` (without it the tools search lexically and warn
+  `vector_search_unavailable`). Until all of PostgreSQL, Neo4j and S3 are configured every call
+  answers `context_unavailable`.
+
 ## Ingestion API contract
 
 `openapi/agent-context-v1.json` freezes the ingestion v1 HTTP surface (`/v1/ingestion/*` and the
