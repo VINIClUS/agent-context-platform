@@ -695,6 +695,8 @@ async def _search_status(runtime: Runtime) -> dict[str, int]:
 
     The search checkpoint advances over events a lexical-only worker indexed without embeddings,
     so lag alone cannot show them; more rows than nodes means a rebuild with the model is due.
+    `documents_without_embeddings` is rows minus nodes, an approximation (hidden rows of
+    undelivered events and stale nodes count too): exact would need every ID from both stores.
     Counts only.
     """
     async with runtime.sessions() as session:
@@ -718,7 +720,7 @@ def _search_status_line(search: dict[str, int]) -> str:
     line = f"search: {search['documents']} documents, {search['embeddings']} embeddings"
     if search["documents_without_embeddings"]:
         line += (
-            f" ({search['documents_without_embeddings']} without embeddings: run "
+            f" (about {search['documents_without_embeddings']} without embeddings: run "
             "`projection rebuild` with AGENT_CONTEXT_SEARCH__MODEL_DIR to add them)"
         )
     return line

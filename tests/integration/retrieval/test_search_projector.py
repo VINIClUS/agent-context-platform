@@ -566,9 +566,6 @@ def test_purges_work_on_a_lexical_only_deployment_with_no_embedding_model(
 def test_an_in_place_rebuild_survives_content_whose_bytes_were_really_purged(
     postgres_dsn: str, projection_engine: AsyncEngine
 ) -> None:
-    from agent_context_platform import cli
-    from agent_context_platform.projection.verify import rebuild_projections
-
     async def body(world: SearchWorld) -> None:
         await world.ingest("kept text", "c-kept")
         await world.ingest("bytes will vanish", "c-gone")
@@ -581,17 +578,8 @@ def test_an_in_place_rebuild_survives_content_whose_bytes_were_really_purged(
                 text("DELETE FROM catalog.inline_contents WHERE content_sha256 = :d"),
                 {"d": gone_digest},
             )
-        projectors = projectors_with_search(world.backend())
-
-        report = await rebuild_projections(
-            world.projector_sessions,
-            world.store,
-            projectors,
-            target_description="live",
-            in_place=True,
-            runner_quiet_seconds=0,
-            before_replay=lambda: cli._prepare_search_replay(projectors, world.projector_sessions),
-        )
+        # Through the CLI's path: the replay check must skip purged content, not refuse it.
+        report = await _rebuild_in_place(world, projectors_with_search(world.backend()))
 
         assert report.ok  # the original event was replayed before its purge, without reading bytes
         assert await world.documents() == ["c-kept"]
@@ -1022,5 +1010,58 @@ def test_a_hit_reports_the_earliest_delivered_event_never_a_dead_lettered_one(
         assert (hit.event_id, hit.session_id) == (str(later), "session-c")
         assert hit.occurred_at == BASE_TIME.replace(hour=12)
         assert hit.source_event_ids == (str(later),)
+
+    with_world(body, dsn=postgres_dsn, owner=projection_engine)
+
+
+@pytest.mark.parametrize(
+    ("empty", "media_type"),
+    [("   \n\t ", "text/plain"), ('{"exit_code": 0}', "application/json")],
+)
+def test_content_first_seen_without_text_never_blocks_a_rebuild(
+    postgres_dsn: str, projection_engine: AsyncEngine, empty: str, media_type: str
+) -> None:
+    async def body(world: SearchWorld) -> None:
+        await world.ingest(empty, "c-late-text", media_type=media_type)
+        await world.ingest("now with real text", "c-late-text", turn="turn-2")
+        assert (await world.project()).dead_lettered == 0  # no row for the empty one: no conflict
+        assert await world.documents() == ["c-late-text"]
+
+        report = await _rebuild_in_place(world, projectors_with_search(world.backend()))
+
+        assert report.ok, json.dumps(report.to_dict(), default=str)
+        assert await world.documents() == ["c-late-text"]
+        assert await world.embedding_ids() == ["c-late-text"]
+
+    with_world(body, dsn=postgres_dsn, owner=projection_engine)
+
+
+def test_a_hit_reports_the_earliest_of_several_delivered_events(
+    postgres_dsn: str, projection_engine: AsyncEngine
+) -> None:
+    from .search_harness import BASE_TIME
+
+    async def body(world: SearchWorld) -> None:
+        late = await world.ingest(
+            "twice delivered body",
+            "c-twice",
+            session="session-late",
+            turn="turn-2",
+            at=BASE_TIME.replace(hour=15),
+        )
+        early = await world.ingest(
+            "twice delivered body",
+            "c-twice",
+            session="session-early",
+            turn="turn-3",
+            at=BASE_TIME.replace(hour=10),
+        )
+        assert (await world.project()).dead_lettered == 0
+
+        (hit,) = await _service(world).lexical("twice", SCOPE, 5)
+
+        assert (hit.event_id, hit.session_id) == (str(early), "session-early")
+        assert hit.occurred_at == BASE_TIME.replace(hour=10)
+        assert hit.source_event_ids == tuple(sorted((str(early), str(late))))
 
     with_world(body, dsn=postgres_dsn, owner=projection_engine)
