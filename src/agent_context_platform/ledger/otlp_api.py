@@ -27,14 +27,14 @@ rate limited, 503 not configured or a retryable outage (``Retry-After``). Error 
 from __future__ import annotations
 
 import asyncio
+import functools
+import hashlib
 import logging
 import zlib
-from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
-from contextlib import asynccontextmanager
+from collections.abc import Callable, Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
-from typing import Any, Final
-from urllib.parse import quote
+from typing import Any, Final, TypeVar
 from uuid import UUID
 
 from agent_context_sdk import (  # type: ignore[import-untyped, unused-ignore]
@@ -65,15 +65,30 @@ from agent_context_platform.mcp.auth import RateLimitedError, TokenBucketLimiter
 from agent_context_platform.observability import record_otel_request, record_otel_spans
 
 logger = logging.getLogger("agent_context_platform.ledger.otlp_api")
+_T = TypeVar("_T")
 
 TRACES_PATH: Final = "/v1/otel/traces"
 PROTOBUF_MEDIA_TYPE: Final = "application/x-protobuf"
 PRODUCER_NAME: Final = "codex-otel-receiver"
 # Part of every mapped draft: a change makes re-exported records conflict, so it stays fixed.
 PRODUCER_VERSION: Final = "1.0.0"
-# One stream per producer and Codex session (``codex-otel:<producer>:<session>``, both
-# percent-encoded): a stream-level failure stays within one session.
+# One stream per producer and Codex session: ``codex-otel:`` plus 40 hex characters of a SHA-256
+# over the length-prefixed producer id and session id. Fixed length (fits the ledger's 512) and
+# collision-safe; the readable ids stay in the event (producer, payload and context).
 STREAM_PREFIX: Final = "codex-otel:"
+
+
+def stream_id(producer_id: str, session_id: str | None) -> str:
+    """The stream of one producer and Codex session (``session_id`` ``None``: no session)."""
+    digest = hashlib.sha256()
+    for part in (producer_id, session_id):
+        encoded = b"" if part is None else part.encode()
+        # Length-prefixed (and None distinct from ""): no two pairs share an encoding.
+        digest.update(b"-" if part is None else len(encoded).to_bytes(4, "big"))
+        digest.update(encoded)
+    return STREAM_PREFIX + digest.hexdigest()[:40]
+
+
 # One ingestion batch holds at most 500 events.
 MAX_DRAFTS: Final = 500
 # Any string attribute value longer than this rejects its record before mapping.
@@ -131,6 +146,19 @@ _MESSAGES: Final[Mapping[str, tuple[int, str]]] = {
         "too_many_drafts: more than 500 distinct events in one export.",
     ),
     "malformed_request": (Code.INVALID_ARGUMENT, "The request is not a valid OTLP export."),
+    "unsupported_field": (
+        Code.INVALID_ARGUMENT,
+        "unsupported_field: a field the receiver does not accept (unknown or refused).",
+    ),
+    "repeated_singular_field": (
+        Code.INVALID_ARGUMENT,
+        "repeated_singular_field: a singular message field occurs more than once.",
+    ),
+    "too_many_fields": (Code.RESOURCE_EXHAUSTED, "too_many_fields: field limit exceeded."),
+    "too_many_objects": (
+        Code.RESOURCE_EXHAUSTED,
+        "too_many_objects: repeated element limit exceeded.",
+    ),
     "internal_error": (Code.INTERNAL, "The request could not be processed."),
 }
 _TOO_LARGE: Final = frozenset(
@@ -144,6 +172,8 @@ _TOO_LARGE: Final = frozenset(
         "too_many_resources",
         "too_many_scopes",
         "too_many_links",
+        "too_many_fields",
+        "too_many_objects",
     }
 )
 # Error code -> telemetry (outcome, reason).
@@ -157,6 +187,8 @@ _TELEMETRY: Final[Mapping[str, tuple[str, str]]] = {
     "rate_limited": ("rejected", "rate_limited"),
     "unsupported_media_type": ("rejected", "unsupported_media_type"),
     "malformed_request": ("rejected", "malformed"),
+    "unsupported_field": ("rejected", "malformed"),
+    "repeated_singular_field": ("rejected", "malformed"),
     "internal_error": ("error", "internal"),
     "decode_busy": ("error", "internal"),
     "client_disconnected": ("rejected", "abandoned"),
@@ -183,6 +215,8 @@ class OtlpReceiverRuntime:
     max_scopes: int = 64
     max_links: int = 1_000
     max_total_attributes: int = 65_536
+    max_fields: int = 300_000
+    max_objects: int = 200_000
     decode_gate: DecodeGate = field(
         default_factory=lambda: DecodeGate(DECODE_WORKERS, DECODE_QUEUE_DEPTH),
         repr=False,
@@ -198,30 +232,73 @@ class OtlpReceiverRuntime:
             max_links=self.max_links,
             max_total_attributes=self.max_total_attributes,
             max_container_attributes=self.max_attributes,
+            max_fields=self.max_fields,
+            max_objects=self.max_objects,
         )
 
 
 class DecodeGate:
-    """At most ``workers`` decodes at once and ``queue_depth`` more waiting; the rest get 503.
+    """Admission for blocking decodes: bounded concurrency, queue and per-producer share.
 
-    Waiting is bounded so a burst cannot pile up CPU work for clients that already gave up.
+    At most ``workers`` decodes run at once and ``queue_depth`` more wait; one producer holds at
+    most ``per_producer`` of those places (one running plus one waiting by default), so a producer
+    within its own rate limit cannot starve the others. Anything beyond answers 503 at once. A
+    place is given back when the worker thread finishes, not when the request is cancelled: a
+    cancelled request's decode keeps its slot until the thread is done, so no more than
+    ``workers`` threads ever decode.
     """
 
-    def __init__(self, workers: int, queue_depth: int) -> None:
+    def __init__(self, workers: int, queue_depth: int, per_producer: int = 2) -> None:
         self._slots = asyncio.Semaphore(workers)
         self._capacity = workers + queue_depth
+        self._per_producer = per_producer
         self._admitted = 0
+        self._by_producer: dict[str, int] = {}
 
-    @asynccontextmanager
-    async def admit(self) -> AsyncIterator[None]:
-        if self._admitted >= self._capacity:
+    async def run(self, producer: str, request: Request, work: Callable[[], _T]) -> _T:
+        """Run ``work`` on a worker thread once admitted; skip it if the client has left."""
+        if (
+            self._admitted >= self._capacity
+            or self._by_producer.get(producer, 0) >= self._per_producer
+        ):
             raise _RequestError(503, "decode_busy")
-        self._admitted += 1
+        self._admit(producer)
+        holds_slot = False
+        handed_over = False
         try:
-            async with self._slots:
-                yield
+            await self._slots.acquire()
+            holds_slot = True
+            if await request.is_disconnected():
+                raise _RequestError(499, "client_disconnected")
+            future = asyncio.get_running_loop().run_in_executor(None, work)
+            try:
+                return await asyncio.shield(future)
+            except asyncio.CancelledError:
+                # The thread cannot be stopped: its place is released when it finishes.
+                handed_over = True
+                future.add_done_callback(lambda _: self._release(producer, holds_slot=True))
+                raise
         finally:
-            self._admitted -= 1
+            if not handed_over:
+                self._release(producer, holds_slot=holds_slot)
+
+    def _admit(self, producer: str) -> None:
+        self._admitted += 1
+        self._by_producer[producer] = self._by_producer.get(producer, 0) + 1
+
+    def _release(self, producer: str, *, holds_slot: bool) -> None:
+        if holds_slot:
+            self._slots.release()
+        self._admitted -= 1
+        remaining = self._by_producer[producer] - 1
+        if remaining:
+            self._by_producer[producer] = remaining
+        else:
+            del self._by_producer[producer]
+
+    @property
+    def admitted(self) -> int:
+        return self._admitted
 
 
 class _RequestError(Exception):
@@ -283,15 +360,14 @@ async def _handle(request: Request, runtime: OtlpReceiverRuntime) -> Response:
         producer=ProducerV1(
             producer_id=principal.producer_id, name=PRODUCER_NAME, version=PRODUCER_VERSION
         ),
-        # Percent-encoded components: no producer/session pair can name another's stream.
-        stream_id=STREAM_PREFIX + quote(principal.producer_id, safe=""),
+        stream_id=stream_id(principal.producer_id, None),
     )
     now = datetime.now(UTC)
-    async with runtime.decode_gate.admit():
-        # A client that gave up while queued is not worth the decode.
-        if await request.is_disconnected():
-            raise _RequestError(499, "client_disconnected")
-        mapping = await asyncio.to_thread(decode_and_map, body, gzipped, runtime, config, now)
+    mapping = await runtime.decode_gate.run(
+        principal.producer_id,
+        request,
+        functools.partial(decode_and_map, body, gzipped, runtime, config, now),
+    )
 
     if mapping.drafts:
         await _ingest(runtime, mapping)
@@ -398,8 +474,8 @@ def decode_and_map(
         otlp_wire.scan(data, runtime.wire_limits())
     except otlp_wire.WireLimitExceeded as error:
         raise _RequestError(413, error.code) from None
-    except otlp_wire.WireMalformed:
-        raise _RequestError(400, "malformed_request") from None
+    except otlp_wire.WireRefused as error:
+        raise _RequestError(400, error.code) from None
     export = _parse(data)
     mapping = map_export(
         config,
@@ -555,7 +631,7 @@ def _map_record(
     # Per-session stream; observed_at no earlier than occurred_at. Deterministic, so a retry
     # yields the identical draft.
     session = draft.context.session_id if draft.context is not None else None
-    stream = f"{config.stream_id}:{quote(session, safe='')}" if session else config.stream_id
+    stream = stream_id(config.producer.producer_id, session or None)
     return draft.model_copy(
         update={"stream_id": stream, "observed_at": max(draft.occurred_at, otlp_time)}
     )

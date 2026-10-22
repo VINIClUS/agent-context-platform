@@ -1,24 +1,31 @@
 """Bounded structural scan of an OTLP ``ExportTraceServiceRequest`` before it is parsed.
 
-Parsing allocates one object per message, so a few kilobytes of gzip can inflate into millions of
-tiny links, attributes or nested array values whose parsing alone costs hundreds of MiB. This
-scanner walks the protobuf wire format instead: it descends only into the container fields
-(resource spans, scopes, spans, span events, links, attributes and nested attribute values),
-skips every other field by its length, and stops at the first exceeded limit. Its work is
-therefore bounded by the limits themselves, whatever the input, and the parser only ever sees a
-message whose object count is within them.
+Parsing allocates per message and per repeated element, so a few kilobytes of gzip can inflate
+into millions of objects. This scanner walks the protobuf wire format with the generated
+descriptors as its only schema, and is sound for every field the schema has:
 
-Field numbers come from the generated descriptors, never from hand-written constants.
+- it visits EVERY field occurrence of every message reachable from the request descriptor and
+  counts it against a field budget, so its own cost is bounded by the limits, not by the bytes;
+- it counts EVERY repeated element (message or scalar, packed or not) against an object budget,
+  so the parser never allocates more than the limits allow;
+- it refuses what the receiver never needs and cannot bound otherwise: unknown fields, fields
+  listed in ``REFUSED_FIELDS``, a second occurrence of a singular message field (the parser would
+  merge it into one container), and a wire type that does not match the field's type;
+- on top, domain hooks bound resources, scopes, spans, records (spans plus events), links,
+  attributes (every level, nested values included), attributes per resource or scope, and the
+  nesting depth of attribute values.
+
+It stops at the first exceeded limit. ``WireLimitExceeded`` carries a fixed 413 code,
+``WireRefused`` a fixed 400 code.
 """
 
 from __future__ import annotations
 
-from collections.abc import Callable, Mapping
+from collections.abc import Mapping
 from dataclasses import dataclass
-from functools import partial
 from typing import Final
 
-from google.protobuf.descriptor import Descriptor
+from google.protobuf.descriptor import Descriptor, FieldDescriptor
 from opentelemetry.proto.collector.trace.v1.trace_service_pb2 import ExportTraceServiceRequest
 from opentelemetry.proto.common.v1.common_pb2 import (
     AnyValue,
@@ -30,40 +37,97 @@ from opentelemetry.proto.common.v1.common_pb2 import (
 from opentelemetry.proto.resource.v1.resource_pb2 import Resource
 from opentelemetry.proto.trace.v1.trace_pb2 import ResourceSpans, ScopeSpans, Span
 
-
-def _number(descriptor: Descriptor, name: str) -> int:
-    return int(descriptor.fields_by_name[name].number)
-
-
-_REQUEST_RESOURCE_SPANS: Final = _number(ExportTraceServiceRequest.DESCRIPTOR, "resource_spans")
-_RESOURCE_SPANS_RESOURCE: Final = _number(ResourceSpans.DESCRIPTOR, "resource")
-_RESOURCE_SPANS_SCOPE_SPANS: Final = _number(ResourceSpans.DESCRIPTOR, "scope_spans")
-_RESOURCE_ATTRIBUTES: Final = _number(Resource.DESCRIPTOR, "attributes")
-_SCOPE_SPANS_SCOPE: Final = _number(ScopeSpans.DESCRIPTOR, "scope")
-_SCOPE_SPANS_SPANS: Final = _number(ScopeSpans.DESCRIPTOR, "spans")
-_SCOPE_ATTRIBUTES: Final = _number(InstrumentationScope.DESCRIPTOR, "attributes")
-_SPAN_ATTRIBUTES: Final = _number(Span.DESCRIPTOR, "attributes")
-_SPAN_EVENTS: Final = _number(Span.DESCRIPTOR, "events")
-_SPAN_LINKS: Final = _number(Span.DESCRIPTOR, "links")
-_EVENT_ATTRIBUTES: Final = _number(Span.Event.DESCRIPTOR, "attributes")
-_LINK_ATTRIBUTES: Final = _number(Span.Link.DESCRIPTOR, "attributes")
-_KEY_VALUE_VALUE: Final = _number(KeyValue.DESCRIPTOR, "value")
-_ANY_ARRAY: Final = _number(AnyValue.DESCRIPTOR, "array_value")
-_ANY_KVLIST: Final = _number(AnyValue.DESCRIPTOR, "kvlist_value")
-# The one-byte tag of a length-delimited `string_value` field.
-_ANY_STRING_TAG: Final = (_number(AnyValue.DESCRIPTOR, "string_value") << 3) | 2
-_ARRAY_VALUES: Final = _number(ArrayValue.DESCRIPTOR, "values")
-_KVLIST_VALUES: Final = _number(KeyValueList.DESCRIPTOR, "values")
-
-# Visits one length-delimited field: (start, end) offsets of its payload.
-Handler = Callable[[int, int], None]
-
 _VARINT: Final = 0
 _FIXED64: Final = 1
 _LENGTH_DELIMITED: Final = 2
 _FIXED32: Final = 5
+
 # Nested attribute values (arrays, key-value lists) deeper than this are refused.
 MAX_VALUE_DEPTH: Final = 4
+# Fields the receiver never needs and refuses outright (Codex does not send them).
+REFUSED_FIELDS: Final = frozenset({(Resource.DESCRIPTOR.full_name, "entity_refs")})
+
+_WIRE_TYPE_BY_FIELD_TYPE: Final[Mapping[int, int]] = {
+    FieldDescriptor.TYPE_DOUBLE: _FIXED64,
+    FieldDescriptor.TYPE_FIXED64: _FIXED64,
+    FieldDescriptor.TYPE_SFIXED64: _FIXED64,
+    FieldDescriptor.TYPE_FLOAT: _FIXED32,
+    FieldDescriptor.TYPE_FIXED32: _FIXED32,
+    FieldDescriptor.TYPE_SFIXED32: _FIXED32,
+    FieldDescriptor.TYPE_INT32: _VARINT,
+    FieldDescriptor.TYPE_INT64: _VARINT,
+    FieldDescriptor.TYPE_UINT32: _VARINT,
+    FieldDescriptor.TYPE_UINT64: _VARINT,
+    FieldDescriptor.TYPE_SINT32: _VARINT,
+    FieldDescriptor.TYPE_SINT64: _VARINT,
+    FieldDescriptor.TYPE_BOOL: _VARINT,
+    FieldDescriptor.TYPE_ENUM: _VARINT,
+    FieldDescriptor.TYPE_STRING: _LENGTH_DELIMITED,
+    FieldDescriptor.TYPE_BYTES: _LENGTH_DELIMITED,
+    FieldDescriptor.TYPE_MESSAGE: _LENGTH_DELIMITED,
+}
+
+
+@dataclass(frozen=True, slots=True)
+class _Field:
+    number: int
+    wire_type: int
+    repeated: bool
+    message: Descriptor | None
+    refused: bool
+
+
+def _table(descriptor: Descriptor) -> dict[int, _Field]:
+    return {
+        item.number: _Field(
+            number=item.number,
+            wire_type=_WIRE_TYPE_BY_FIELD_TYPE[item.type],
+            repeated=item.is_repeated,
+            message=item.message_type,
+            refused=(descriptor.full_name, item.name) in REFUSED_FIELDS,
+        )
+        for item in descriptor.fields
+    }
+
+
+def _tables(root: Descriptor) -> dict[str, dict[int, _Field]]:
+    tables: dict[str, dict[int, _Field]] = {}
+    pending = [root]
+    while pending:
+        descriptor = pending.pop()
+        if descriptor.full_name in tables:
+            continue
+        tables[descriptor.full_name] = _table(descriptor)
+        pending.extend(item.message_type for item in descriptor.fields if item.message_type)
+    return tables
+
+
+_TABLES: Final = _tables(ExportTraceServiceRequest.DESCRIPTOR)
+_REQUEST: Final = ExportTraceServiceRequest.DESCRIPTOR.full_name
+_RESOURCE_SPANS: Final = ResourceSpans.DESCRIPTOR.full_name
+_SCOPE_SPANS: Final = ScopeSpans.DESCRIPTOR.full_name
+_SPAN: Final = Span.DESCRIPTOR.full_name
+_EVENT: Final = Span.Event.DESCRIPTOR.full_name
+_LINK: Final = Span.Link.DESCRIPTOR.full_name
+_KEY_VALUE: Final = KeyValue.DESCRIPTOR.full_name
+_ARRAY_VALUE: Final = ArrayValue.DESCRIPTOR.full_name
+_NESTING: Final = frozenset({_ARRAY_VALUE, KeyValueList.DESCRIPTOR.full_name})
+# Containers whose own attributes are bounded by `max_container_attributes`.
+_CONTAINERS: Final = frozenset(
+    {Resource.DESCRIPTOR.full_name, InstrumentationScope.DESCRIPTOR.full_name}
+)
+_CONTAINER_ATTRIBUTES: Final = frozenset(
+    {
+        Resource.DESCRIPTOR.fields_by_name["attributes"].number,
+        InstrumentationScope.DESCRIPTOR.fields_by_name["attributes"].number,
+    }
+)
+# The common attribute shape, read inline: KeyValue{1: key, 2: AnyValue{1: string}}.
+_KEY_TAG: Final = (KeyValue.DESCRIPTOR.fields_by_name["key"].number << 3) | _LENGTH_DELIMITED
+_VALUE_TAG: Final = (KeyValue.DESCRIPTOR.fields_by_name["value"].number << 3) | _LENGTH_DELIMITED
+_STRING_TAG: Final = (
+    AnyValue.DESCRIPTOR.fields_by_name["string_value"].number << 3
+) | _LENGTH_DELIMITED
 
 
 @dataclass(frozen=True, slots=True)
@@ -77,6 +141,10 @@ class WireLimits:
     max_links: int
     max_total_attributes: int
     max_container_attributes: int
+    # Every field occurrence visited (bounds the scan's own cost).
+    max_fields: int = 300_000
+    # Every repeated element, message or scalar (bounds what the parser allocates).
+    max_objects: int = 200_000
 
 
 class WireLimitExceeded(Exception):
@@ -87,25 +155,38 @@ class WireLimitExceeded(Exception):
         self.code = code
 
 
-class WireMalformed(Exception):
-    """The bytes are not a well-formed protobuf message."""
+class WireRefused(Exception):
+    """Well-formed or not, the bytes hold something the receiver refuses; ``code`` is for 400."""
+
+    def __init__(self, code: str) -> None:
+        super().__init__(code)
+        self.code = code
+
+
+# The previous name of the malformed-input error; every refusal is a 400.
+WireMalformed = WireRefused
 
 
 @dataclass(slots=True)
-class _Counts:
+class Counts:
     resources: int = 0
     scopes: int = 0
     spans: int = 0
     records: int = 0
     links: int = 0
     attributes: int = 0
+    fields: int = 0
+    objects: int = 0
 
 
 class _Scanner:
     def __init__(self, data: bytes, limits: WireLimits) -> None:
         self._data = data
         self._limits = limits
-        self.counts = _Counts()
+        self.counts = Counts()
+
+    def request(self) -> None:
+        self._message(0, len(self._data), _REQUEST, 0)
 
     # --- primitives ---------------------------------------------------------------------------
 
@@ -114,7 +195,7 @@ class _Scanner:
         result = shift = 0
         while True:
             if position >= end or shift > 63:
-                raise WireMalformed
+                raise WireRefused("malformed_request")
             byte = data[position]
             position += 1
             result |= (byte & 0x7F) << shift
@@ -122,206 +203,183 @@ class _Scanner:
                 return result, position
             shift += 7
 
-    def _walk(self, start: int, end: int, visit: Mapping[int, Handler]) -> None:
-        """Walk one message region; length-delimited fields in ``visit`` are handed over."""
+    def _field_visited(self) -> None:
+        counts = self.counts
+        counts.fields += 1
+        if counts.fields > self._limits.max_fields:
+            raise WireLimitExceeded("too_many_fields")
+
+    def _objects(self, number: int) -> None:
+        counts = self.counts
+        counts.objects += number
+        if counts.objects > self._limits.max_objects:
+            raise WireLimitExceeded("too_many_objects")
+
+    # --- the generic walk ---------------------------------------------------------------------
+
+    def _message(self, start: int, end: int, kind: str, depth: int) -> None:
+        """Walk one message of type ``kind``: every field checked, counted and, if a message,
+        descended into. ``depth`` is the nesting depth of attribute values."""
+        self._enter(kind, depth)
+        table = _TABLES[kind]
         data = self._data
+        singular_messages: set[int] = set()
+        container_attributes = 0
         position = start
         while position < end:
+            self._field_visited()
             tag = data[position]
-            if tag < 0x80:  # one-byte tag: every field this scanner visits
+            if tag < 0x80:
                 position += 1
             else:
                 tag, position = self._varint(position, end)
             number, wire_type = tag >> 3, tag & 0x7
-            if number == 0:
-                raise WireMalformed
-            if wire_type != _LENGTH_DELIMITED:
+            spec = table.get(number)
+            if spec is None or spec.refused:
+                raise WireRefused("unsupported_field")
+            if wire_type == _LENGTH_DELIMITED:
+                if position < end and data[position] < 0x80:
+                    length = data[position]
+                    position += 1
+                else:
+                    length, position = self._varint(position, end)
+                field_end = position + length
+                if field_end > end:
+                    raise WireRefused("malformed_request")
+                if spec.wire_type == _LENGTH_DELIMITED:
+                    if spec.message is not None:
+                        if spec.repeated:
+                            self._objects(1)
+                        elif number in singular_messages:
+                            # The parser would merge both into one container: refuse instead.
+                            raise WireRefused("repeated_singular_field")
+                        else:
+                            singular_messages.add(number)
+                        if kind in _CONTAINERS and number in _CONTAINER_ATTRIBUTES:
+                            container_attributes += 1
+                            if container_attributes > self._limits.max_container_attributes:
+                                raise WireLimitExceeded("too_many_attributes")
+                        child = spec.message.full_name
+                        child_depth = depth + 1 if child in _NESTING else depth
+                        if kind == _ARRAY_VALUE:
+                            self._attribute(depth)  # an array element is an attribute value
+                        if not (
+                            child == _KEY_VALUE
+                            and self._plain_attribute(position, field_end, child_depth)
+                        ):
+                            self._message(position, field_end, child, child_depth)
+                    elif spec.repeated:
+                        self._objects(1)  # a repeated string or bytes element
+                elif spec.repeated:
+                    # A packed repeated scalar: every element is an object.
+                    self._objects(self._packed_count(position, field_end, spec.wire_type))
+                else:
+                    raise WireRefused("malformed_request")  # wire type mismatch
+                position = field_end
+            elif wire_type == spec.wire_type:
+                if spec.repeated:
+                    self._objects(1)
                 position = self._skip(position, end, wire_type)
-                continue
-            if position < end and data[position] < 0x80:
-                length = data[position]
-                position += 1
             else:
-                length, position = self._varint(position, end)
-            field_end = position + length
-            if field_end > end:
-                raise WireMalformed
-            handler = visit.get(number)
-            if handler is not None:
-                handler(position, field_end)
-            position = field_end
+                raise WireRefused("malformed_request")  # wire type mismatch, groups, reserved
 
-    # --- limits -------------------------------------------------------------------------------
+    def _enter(self, kind: str, depth: int) -> None:
+        counts = self.counts
+        limits = self._limits
+        if kind == _KEY_VALUE:
+            self._attribute(depth)
+        elif kind == _SPAN:
+            counts.spans += 1
+            if counts.spans > limits.max_spans:
+                raise WireLimitExceeded("too_many_spans")
+            self._record()
+        elif kind == _EVENT:
+            self._record()
+        elif kind == _LINK:
+            counts.links += 1
+            if counts.links > limits.max_links:
+                raise WireLimitExceeded("too_many_links")
+        elif kind == _SCOPE_SPANS:
+            counts.scopes += 1
+            if counts.scopes > limits.max_scopes:
+                raise WireLimitExceeded("too_many_scopes")
+        elif kind == _RESOURCE_SPANS:
+            counts.resources += 1
+            if counts.resources > limits.max_resources:
+                raise WireLimitExceeded("too_many_resources")
+        elif kind in _NESTING and depth > MAX_VALUE_DEPTH:
+            raise WireLimitExceeded("too_many_attributes")
 
     def _attribute(self, depth: int) -> None:
-        self.counts.attributes += 1
-        if self.counts.attributes > self._limits.max_total_attributes:
-            raise WireLimitExceeded("too_many_attributes")
-        if depth > MAX_VALUE_DEPTH:
-            raise WireLimitExceeded("too_many_attributes")
-
-    # --- messages -----------------------------------------------------------------------------
-
-    def request(self) -> None:
-        self._walk(0, len(self._data), {_REQUEST_RESOURCE_SPANS: self._resource_spans})
-
-    def _resource_spans(self, start: int, end: int) -> None:
-        self.counts.resources += 1
-        if self.counts.resources > self._limits.max_resources:
-            raise WireLimitExceeded("too_many_resources")
-        self._walk(
-            start,
-            end,
-            {
-                _RESOURCE_SPANS_RESOURCE: self._resource,
-                _RESOURCE_SPANS_SCOPE_SPANS: self._scope_spans,
-            },
-        )
-
-    def _resource(self, start: int, end: int) -> None:
-        self._container(start, end, _RESOURCE_ATTRIBUTES)
-
-    def _scope_spans(self, start: int, end: int) -> None:
-        self.counts.scopes += 1
-        if self.counts.scopes > self._limits.max_scopes:
-            raise WireLimitExceeded("too_many_scopes")
-        self._walk(start, end, {_SCOPE_SPANS_SCOPE: self._scope, _SCOPE_SPANS_SPANS: self._span})
-
-    def _scope(self, start: int, end: int) -> None:
-        self._container(start, end, _SCOPE_ATTRIBUTES)
-
-    def _container(self, start: int, end: int, field_number: int) -> None:
-        """A resource or scope: its own attribute count is bounded request-wide."""
-        before = self.counts.attributes
-        self._walk(start, end, {field_number: self._key_value_at(0)})
-        if self.counts.attributes - before > self._limits.max_container_attributes:
-            raise WireLimitExceeded("too_many_attributes")
-
-    def _span(self, start: int, end: int) -> None:
-        self.counts.spans += 1
-        if self.counts.spans > self._limits.max_spans:
-            raise WireLimitExceeded("too_many_spans")
-        self._record()
-        self._walk(
-            start,
-            end,
-            {
-                _SPAN_ATTRIBUTES: self._key_value_at(0),
-                _SPAN_EVENTS: self._event,
-                _SPAN_LINKS: self._link,
-            },
-        )
-
-    def _record(self) -> None:
-        self.counts.records += 1
-        if self.counts.records > self._limits.max_records:
-            raise WireLimitExceeded("too_many_records")
-
-    def _event(self, start: int, end: int) -> None:
-        self._record()
-        self._walk(start, end, {_EVENT_ATTRIBUTES: self._key_value_at(0)})
-
-    def _link(self, start: int, end: int) -> None:
-        self.counts.links += 1
-        if self.counts.links > self._limits.max_links:
-            raise WireLimitExceeded("too_many_links")
-        self._walk(start, end, {_LINK_ATTRIBUTES: self._key_value_at(0)})
-
-    def _key_value_at(self, depth: int) -> Handler:
-        return partial(self._key_value, depth=depth)
-
-    def _key_value(self, start: int, end: int, depth: int) -> None:
-        """One attribute: counted, and its value inspected only when it may nest values.
-
-        The hot path of the scan (every attribute of every record passes here): one-byte tags and
-        lengths are read inline, and a value that is exactly one scalar field is skipped whole.
-        """
         counts = self.counts
         counts.attributes += 1
         if counts.attributes > self._limits.max_total_attributes or depth > MAX_VALUE_DEPTH:
             raise WireLimitExceeded("too_many_attributes")
-        data = self._data
-        position = start
-        while position < end:
-            tag = data[position]
-            if tag >= 0x80 or tag & 0x7 != _LENGTH_DELIMITED:
-                # Unusual shape: let the general walker finish this message.
-                self._walk(position, end, {_KEY_VALUE_VALUE: self._any_value_at(depth)})
-                return
-            position += 1
-            if position < end and data[position] < 0x80:
-                length = data[position]
-                position += 1
-            else:
-                length, position = self._varint(position, end)
-            field_end = position + length
-            if field_end > end:
-                raise WireMalformed
-            if (
-                tag >> 3 == _KEY_VALUE_VALUE
-                and position < field_end
-                and not self._single_scalar(position, field_end)
-            ):
-                self._any_value(position, field_end, depth)
-            position = field_end
 
-    def _single_scalar(self, start: int, end: int) -> bool:
-        """Whether an AnyValue payload is exactly one string field (the common case)."""
+    def _record(self) -> None:
+        counts = self.counts
+        counts.records += 1
+        if counts.records > self._limits.max_records:
+            raise WireLimitExceeded("too_many_records")
+
+    def _plain_attribute(self, start: int, end: int, depth: int) -> bool:
+        """The common attribute, read inline: exactly a key and a single string value.
+
+        Returns ``False`` (nothing counted) for any other shape, which then takes the generic
+        walk. Counts the same fields and checks as the generic walk would.
+        """
         data = self._data
-        if data[start] != _ANY_STRING_TAG:
+        if end - start < 4 or data[start] != _KEY_TAG or data[start + 1] >= 0x80:
             return False
-        position = start + 1
-        if position < end and data[position] < 0x80:
-            return position + 1 + data[position] == end
-        length, position = self._varint(position, end)
-        return position + length == end
+        value_tag_at = start + 2 + data[start + 1]
+        if value_tag_at + 3 > end or data[value_tag_at] != _VALUE_TAG:
+            return False
+        value_length = data[value_tag_at + 1]
+        value_start = value_tag_at + 2
+        if value_length >= 0x80 or value_start + value_length != end:
+            return False
+        if data[value_start] != _STRING_TAG or value_start + 1 >= end:
+            return False
+        string_length = data[value_start + 1]
+        if string_length >= 0x80 or value_start + 2 + string_length != end:
+            return False
+        self._attribute(depth)
+        for _ in range(3):  # key, value, string_value
+            self._field_visited()
+        return True
 
-    def _any_value(self, start: int, end: int, depth: int) -> None:
-        """A scalar is skipped by length; an array or key-value list is descended into."""
-        data = self._data
-        position = start
-        while position < end:
-            tag, position = self._varint(position, end)
-            number, wire_type = tag >> 3, tag & 0x7
-            if wire_type != _LENGTH_DELIMITED:
-                position = self._skip(position, end, wire_type)
-                continue
-            length, position = self._varint(position, end)
-            field_end = position + length
-            if field_end > end:
-                raise WireMalformed
-            if number == _ANY_ARRAY:
-                self._walk(position, field_end, {_ARRAY_VALUES: self._element_at(depth + 1)})
-            elif number == _ANY_KVLIST:
-                self._walk(position, field_end, {_KVLIST_VALUES: self._key_value_at(depth + 1)})
-            position = field_end
-        del data
-
-    def _any_value_at(self, depth: int) -> Handler:
-        return lambda start, end: self._any_value(start, end, depth)
-
-    def _element_at(self, depth: int) -> Handler:
-        def element(start: int, end: int) -> None:
-            self._attribute(depth)
-            self._any_value(start, end, depth)
-
-        return element
+    def _packed_count(self, start: int, end: int, wire_type: int) -> int:
+        if wire_type == _FIXED64:
+            size = 8
+        elif wire_type == _FIXED32:
+            size = 4
+        else:
+            count = 0
+            position = start
+            while position < end:
+                _, position = self._varint(position, end)
+                count += 1
+                if count > self._limits.max_objects:
+                    raise WireLimitExceeded("too_many_objects")
+            return count
+        if (end - start) % size:
+            raise WireRefused("malformed_request")
+        return (end - start) // size
 
     def _skip(self, position: int, end: int, wire_type: int) -> int:
-        """Skip a non-length-delimited field's payload; groups and unknown types are malformed."""
         if wire_type == _VARINT:
             _, position = self._varint(position, end)
         elif wire_type == _FIXED64:
             position += 8
-        elif wire_type == _FIXED32:
-            position += 4
         else:
-            raise WireMalformed
+            position += 4
         if position > end:
-            raise WireMalformed
+            raise WireRefused("malformed_request")
         return position
 
 
-def scan(data: bytes, limits: WireLimits) -> None:
-    """Raise ``WireLimitExceeded`` or ``WireMalformed`` unless ``data`` is within ``limits``."""
-    _Scanner(data, limits).request()
+def scan(data: bytes, limits: WireLimits) -> Counts:
+    """Raise ``WireLimitExceeded`` or ``WireRefused`` unless ``data`` is within ``limits``."""
+    scanner = _Scanner(data, limits)
+    scanner.request()
+    return scanner.counts

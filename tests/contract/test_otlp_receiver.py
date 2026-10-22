@@ -46,6 +46,7 @@ from agent_context_platform.ledger.otlp_api import (
     STREAM_PREFIX,
     TRACES_PATH,
     OtlpReceiverRuntime,
+    stream_id,
 )
 from agent_context_platform.ledger.service import IngestOutcome
 from agent_context_platform.mcp.auth import TokenBucketLimiter
@@ -246,7 +247,8 @@ async def test_a_codex_event_becomes_one_canonical_draft_in_one_batch() -> None:
     assert draft.producer.name == PRODUCER_NAME
     session_id = _fixture()["attributes"]["conversation.id"]
     # One stream per producer and Codex session.
-    assert draft.stream_id == f"{STREAM_PREFIX}{PRODUCER_ID}:{session_id}"
+    assert draft.stream_id == stream_id(PRODUCER_ID, session_id)
+    assert draft.stream_id.startswith(STREAM_PREFIX)
     assert draft.payload["session_id"] == _fixture()["attributes"]["conversation.id"]
     assert draft.trace is not None and draft.trace.trace_id == "4bf92f3577b34da6a3ce929d0e0e4736"
     # The record's own OTLP time, not the arrival time: a retry maps to the identical draft.

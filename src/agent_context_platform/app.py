@@ -109,6 +109,8 @@ def _build_otlp_receiver(
         max_scopes=receiver.max_scopes,
         max_links=receiver.max_links,
         max_total_attributes=receiver.max_total_attributes,
+        max_fields=receiver.max_fields,
+        max_objects=receiver.max_objects,
     )
 
 

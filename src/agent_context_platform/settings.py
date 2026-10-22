@@ -298,6 +298,10 @@ class OtelReceiverSettings(BaseModel):
     max_scopes: int = Field(default=64, gt=0, le=1_000)
     max_links: int = Field(default=1_000, gt=0, le=100_000)
     max_total_attributes: int = Field(default=65_536, gt=0, le=1_048_576)
+    # Every field occurrence the scan visits (bounds its cost by limits, not bytes) and every
+    # repeated element (bounds what parsing allocates).
+    max_fields: int = Field(default=300_000, gt=0, le=4_194_304)
+    max_objects: int = Field(default=200_000, gt=0, le=4_194_304)
     # How far in the future (by Codex's clock) a record's times may be.
     max_clock_skew_seconds: float = Field(default=300.0, ge=0, le=86_400, allow_inf_nan=False)
     # Per-producer, per-replica token bucket.

@@ -411,53 +411,113 @@ async def test_resource_attributes_never_leak_into_the_record() -> None:
 # --- round 3: admission gate, multi-conflict loop, stream names, remaining mutants -----------------
 
 
-async def test_decodes_run_off_the_loop_two_at_a_time_and_a_full_queue_is_refused(
-    monkeypatch: pytest.MonkeyPatch,
-) -> None:
+class _Connected:
+    async def is_disconnected(self) -> bool:
+        return False
+
+
+async def test_the_gate_runs_two_decodes_at_a_time_and_caps_its_queue() -> None:
     import asyncio
     import threading
 
-    import httpx2
-
-    running = 0
-    peak = 0
+    gate = otlp_api.DecodeGate(workers=2, queue_depth=4)
+    running = peak = 0
     lock = threading.Lock()
-    real = otlp_api.decode_and_map
 
-    def slow(*args: Any) -> Any:
+    def work() -> str:
         nonlocal running, peak
         with lock:
             running += 1
             peak = max(peak, running)
-        time.sleep(0.3)  # blocking work: it must not run on the event loop
+        time.sleep(0.2)
         with lock:
             running -= 1
+        return "done"
+
+    async def one(producer: str) -> Any:
+        try:
+            return await gate.run(producer, _Connected(), work)  # type: ignore[arg-type]
+        except otlp_api._RequestError as error:
+            return error.status
+
+    started = time.perf_counter()
+    tasks = [asyncio.create_task(one(f"producer-{i}")) for i in range(8)]
+    await asyncio.sleep(0.05)
+    loop_latency = time.perf_counter()
+    await asyncio.sleep(0)
+    loop_latency = time.perf_counter() - loop_latency
+    results = await asyncio.gather(*tasks)
+
+    assert peak == 2
+    assert results.count("done") == 6
+    assert results.count(503) == 2
+    assert loop_latency < 0.05  # decodes ran on threads
+    assert time.perf_counter() - started < 2.0
+    assert gate.admitted == 0
+
+
+async def test_one_producer_holds_at_most_one_running_and_one_waiting_place(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+
+    import httpx2
+
+    real = otlp_api.decode_and_map
+
+    def slow(*args: Any) -> Any:
+        time.sleep(0.3)
         return real(*args)
 
     monkeypatch.setattr(otlp_api, "decode_and_map", slow)
     harness = Harness(burst=100)
     body = _export(_span({"x": 1})).SerializeToString()
 
-    async def health() -> float:
-        async with httpx2.AsyncClient(
-            transport=httpx2.ASGITransport(app=harness.app), base_url="http://127.0.0.1:8000"
-        ) as client:
-            started = time.perf_counter()
-            assert (await client.get("/health/live")).status_code == 200
-            return time.perf_counter() - started
-
-    exports = [
-        asyncio.create_task(harness.post(body))
-        for _ in range(otlp_api.DECODE_WORKERS + otlp_api.DECODE_QUEUE_DEPTH + 2)
-    ]
+    exports = [asyncio.create_task(harness.post(body)) for _ in range(4)]
     await asyncio.sleep(0.1)
-    health_seconds = await health()
+    async with httpx2.AsyncClient(
+        transport=httpx2.ASGITransport(app=harness.app), base_url="http://127.0.0.1:8000"
+    ) as client:
+        started = time.perf_counter()
+        assert (await client.get("/health/live")).status_code == 200
+        health_seconds = time.perf_counter() - started
     statuses = sorted(response.status_code for response in await asyncio.gather(*exports))
 
-    assert peak == otlp_api.DECODE_WORKERS
-    assert health_seconds < 0.25  # the loop stayed responsive while decodes ran
-    assert statuses.count(503) >= 2  # beyond two running and four waiting: refused at once
-    assert statuses.count(200) == otlp_api.DECODE_WORKERS + otlp_api.DECODE_QUEUE_DEPTH
+    assert statuses == [200, 200, 503, 503]
+    assert health_seconds < 0.25  # the event loop stayed responsive while decodes ran
+
+
+async def test_places_are_given_back_so_sequential_requests_never_run_out() -> None:
+    harness = Harness(burst=100)
+    body = _export(_span({"x": 1})).SerializeToString()
+    for _ in range(otlp_api.DECODE_WORKERS + otlp_api.DECODE_QUEUE_DEPTH + 4):
+        assert (await harness.post(body)).status_code == 200
+    assert harness.runtime.decode_gate.admitted == 0
+
+
+async def test_a_cancelled_request_keeps_its_slot_until_the_thread_finishes() -> None:
+    import asyncio
+    import threading
+
+    gate = otlp_api.DecodeGate(workers=1, queue_depth=0, per_producer=1)
+    release = threading.Event()
+    task = asyncio.create_task(gate.run("p", _Connected(), lambda: release.wait(5)))  # type: ignore[arg-type]
+    await asyncio.sleep(0.05)
+    task.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await task
+
+    # The thread still runs: its place is still taken.
+    assert gate.admitted == 1
+    with pytest.raises(otlp_api._RequestError):
+        await gate.run("q", _Connected(), lambda: None)  # type: ignore[arg-type]
+    release.set()
+    for _ in range(50):
+        if gate.admitted == 0:
+            break
+        await asyncio.sleep(0.02)
+    assert gate.admitted == 0
+    assert await gate.run("q", _Connected(), lambda: "ok") == "ok"  # type: ignore[arg-type]
 
 
 async def test_a_queued_request_whose_client_left_is_not_decoded(
@@ -563,7 +623,23 @@ async def test_stream_names_encode_their_components_unambiguously() -> None:
     _response(await harness.post(export.SerializeToString()))
 
     (draft,) = harness.service.batches[0].events
-    assert draft.stream_id == "codex-otel:codex-otel-producer:x%3Ay"
+    assert draft.stream_id == otlp_api.stream_id("codex-otel-producer", session)
+    # Length-prefixed parts: the pairs ("p", "x:y") and ("p:x", "y") never share a stream.
+    assert otlp_api.stream_id("p", "x:y") != otlp_api.stream_id("p:x", "y")
+    assert otlp_api.stream_id("p", "") != otlp_api.stream_id("p", None)
+    assert otlp_api.stream_id("p", "s") != otlp_api.stream_id("q", "s")
+
+
+@pytest.mark.parametrize(
+    ("producer", "session"),
+    [("p" * 255, "a:" * 64), ("é" * 255, "0198a4b1-98c0-7c28-ae3f-000000000001"), ("ü", None)],
+)
+def test_stream_ids_have_a_fixed_length_whatever_the_ids(
+    producer: str, session: str | None
+) -> None:
+    value = otlp_api.stream_id(producer, session)
+    assert len(value) == len(otlp_api.STREAM_PREFIX) + 40
+    assert value.isascii()
 
 
 async def test_the_span_marker_rejects_a_span_whose_child_event_is_a_codex_event() -> None:
@@ -653,3 +729,75 @@ def test_the_wire_scan_counts_what_the_parser_parses(seed: int) -> None:
     assert scanner.counts.records == len(spans_parsed) + sum(len(sp.events) for sp in spans_parsed)
     assert scanner.counts.links == sum(len(sp.links) for sp in spans_parsed)
     assert scanner.counts.attributes == expected_attributes
+
+
+async def test_span_less_resources_are_never_converted_or_judged(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    converted: list[int] = []
+    real = otlp_api._attributes
+
+    def counting(pairs: Any) -> Any:
+        converted.append(1)
+        return real(pairs)
+
+    monkeypatch.setattr(otlp_api, "_attributes", counting)
+    harness = Harness()
+    export = _export(_span(events=[_codex_event()]))
+    # A span-less resource that would be refused (platform origin) if it were judged.
+    export.resource_spans.add().resource.attributes.extend(
+        _pairs({"service.name": "agent-context-platform", "agent_context.origin": "platform"})
+    )
+
+    response = _response(await harness.post(export.SerializeToString()))
+
+    assert not response.HasField("partial_success")
+    assert len(harness.service.batches[0].events) == 1
+    # One resource and one event converted; the span-less resource never.
+    assert len(converted) == 2
+
+
+async def test_a_refusal_naming_no_offender_is_not_resubmitted() -> None:
+    harness = Harness()
+    service = ConflictEach([])
+    calls: list[int] = []
+
+    async def refuse_all(batch: IngestBatchRequestV1) -> IngestOutcome:
+        calls.append(len(batch.events))
+        rejected = tuple(
+            RejectedEventV1(event_id=e.event_id, error_code="batch_rejected", retryable=False)
+            for e in batch.events
+        )
+        return IngestOutcome(409, IngestBatchResponseV1(batch_id=batch.batch_id, rejected=rejected))
+
+    object.__setattr__(service, "ingest", refuse_all)
+    object.__setattr__(harness.runtime, "service", service)
+    export = _export(
+        *(_span(events=[_codex_event(**{"conversation.id": _session(i)})]) for i in (1, 2))
+    )
+
+    response = _response(await harness.post(export.SerializeToString()))
+
+    assert calls == [2]  # one batch, never resubmitted
+    assert response.partial_success.rejected_spans == 2
+
+
+async def test_a_differing_event_model_wins_and_the_resource_value_never_appears() -> None:
+    harness = Harness()
+    resource = {**_fixture()["resource"], "model": "resource-model-canary"}
+    span = _span(events=[_codex_event(model="event-model")])
+
+    _response(await harness.post(_export(span, resource=resource).SerializeToString()))
+
+    (draft,) = harness.service.batches[0].events
+    assert draft.payload["model"] == "event-model"
+    assert "resource-model-canary" not in draft.model_dump_json()
+
+
+@pytest.mark.parametrize(("events", "rejected"), [(2, 0), (3, 1)])
+async def test_events_per_span_admits_exactly_its_value(events: int, rejected: int) -> None:
+    harness = Harness(max_events_per_span=2)
+    response = _response(
+        await harness.post(_export(_span(events=[{"x": 1}] * events)).SerializeToString())
+    )
+    assert response.partial_success.rejected_spans == rejected

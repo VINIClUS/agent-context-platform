@@ -39,7 +39,7 @@ from agent_context_platform.ledger.auth import (
     ProducerAuthenticator,
     SqlProducerLookup,
 )
-from agent_context_platform.ledger.otlp_api import TRACES_PATH, OtlpReceiverRuntime
+from agent_context_platform.ledger.otlp_api import TRACES_PATH, OtlpReceiverRuntime, stream_id
 from agent_context_platform.ledger.service import IngestionService
 from agent_context_platform.mcp.auth import TokenBucketLimiter
 from agent_context_platform.projection.verify import NoContentBlobStore
@@ -212,7 +212,7 @@ def test_a_codex_export_becomes_one_canonical_event_idempotently(
 
         (event,) = await receiver.events(session_id)
         assert event["event_type"] == "agent.session.started"
-        assert event["stream_id"] == f"codex-otel:{PRODUCER_ID}:{session_id}"
+        assert event["stream_id"] == stream_id(PRODUCER_ID, session_id)
         payload = json.loads(event["payload"])
         assert payload["session_id"] == session_id
         assert payload["source"] == "codex_otel"
@@ -300,5 +300,62 @@ def test_one_conflicting_record_never_drops_the_rest_of_its_export(receiver: Rec
         )
         for name in ("x", "q", "y"):
             assert len(await receiver.events(ids[name])) == 1, name
+
+    asyncio.run(exercise())
+
+
+def test_maximal_and_non_ascii_ids_still_fit_the_ledger(receiver: Receiver) -> None:
+    """Review S3'': a 255-character non-ASCII producer id and a 128-character `a:` session."""
+    producer_id = "é" * 255
+    prefix = "otelint2"
+    token = f"{prefix}.{secrets.token_urlsafe(32)}"
+    session_id = "a:" * 64
+    now = datetime.now(UTC)
+
+    async def exercise() -> None:
+        async with receiver.owner.begin() as connection:
+            await connection.execute(
+                text(
+                    "DELETE FROM operations.registered_producers "
+                    "WHERE producer_id = :id OR token_prefix = :prefix"
+                ),
+                {"id": producer_id, "prefix": prefix},
+            )
+            await connection.execute(
+                text(
+                    "INSERT INTO operations.registered_producers (producer_id, token_prefix, "
+                    "token_verifier, scope, expires_at, created_at, updated_at) VALUES "
+                    "(:id, :prefix, :verifier, 'events:ingest', :expires, :now, :now)"
+                ),
+                {
+                    "id": producer_id,
+                    "prefix": prefix,
+                    "verifier": PasswordHasher(time_cost=1, memory_cost=8, parallelism=1).hash(
+                        token
+                    ),
+                    "expires": now + timedelta(days=1),
+                    "now": now,
+                },
+            )
+        other = Receiver(receiver.owner, receiver.app, token)
+        body = _export(
+            _fixture()["resource"], {**_fixture()["attributes"], "conversation.id": session_id}
+        )
+        response = await other.post(body)
+        assert response.status_code == 200
+        assert not ExportTraceServiceResponse.FromString(response.content).HasField(
+            "partial_success"
+        )
+        async with receiver.owner.connect() as connection:
+            stored = (
+                await connection.execute(
+                    text(
+                        "SELECT stream_id FROM ledger.events WHERE producer_id = :producer "
+                        "AND payload->>'session_id' = :session"
+                    ),
+                    {"producer": producer_id, "session": session_id},
+                )
+            ).all()
+        assert [row.stream_id for row in stored] == [stream_id(producer_id, session_id)]
 
     asyncio.run(exercise())
