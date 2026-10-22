@@ -666,7 +666,7 @@ def login_roles(postgres_dsn: str, ledger_engine: AsyncEngine) -> Iterator[dict[
     """LOGIN roles that are members of the real migration roles; dropped before the downgrade.
 
     `projector` and `api` are the roles the CLI needs. `readonly` (projector membership only) has
-    no INSERT on the ledger and `apionly` (API membership only) cannot read checkpoints: each is
+    no INSERT on the ledger and `apionly` (API membership only) cannot write checkpoints: each is
     the connection that is missing a grant in the preflight tests.
     """
     suffix = uuid.uuid4().hex[:8]
@@ -1036,10 +1036,14 @@ def test_a_missing_grant_fails_before_any_target_is_wiped_or_checkpoint_reset(wo
         ["projection", "rebuild", "--in-place", "--confirm", "neo4j"], world.env(api="readonly")
     )
     assert in_place.exit_code == 1 and "api connection lacks" in in_place.stderr
-    # The projector connection cannot read checkpoints.
-    blind = invoke(["projection", "verify"], world.env(projector="apionly"))
+    # The projector connection may read checkpoints (the API role does, for readiness and
+    # freshness) but not rewrite them: an in-place rebuild fails before anything is reset.
+    blind = invoke(
+        ["projection", "rebuild", "--in-place", "--confirm", "neo4j"],
+        world.env(projector="apionly"),
+    )
     assert blind.exit_code == 1 and "projector connection lacks" in blind.stderr
-    assert "SELECT on projection.projection_checkpoints" in blind.stderr
+    assert "INSERT on projection.projection_checkpoints" in blind.stderr
 
     assert asyncio.run(graph_facts()) == world.facts  # nothing was wiped
     assert (
