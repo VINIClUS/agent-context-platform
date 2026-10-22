@@ -48,6 +48,7 @@ def environment(monkeypatch: pytest.MonkeyPatch) -> None:
         "AGENT_CONTEXT_NEO4J__USERNAME": "neo4j",
         "AGENT_CONTEXT_NEO4J__PASSWORD": PASSWORD,
         cli.TARGET_PASSWORD_ENV: PASSWORD,
+        "AGENT_CONTEXT_SEARCH__MODEL_DIR": "/models/minilm",
     }.items():
         monkeypatch.setenv(name, value)
     monkeypatch.delenv(cli.TARGET_USERNAME_ENV, raising=False)
@@ -62,6 +63,7 @@ class Calls:
         self.recording: list[bool] = []
         self.preflight: list[tuple[bool, bool]] = []
         self.preflight_error: Exception | None = None
+        self.extra_grants: list[tuple[Any, ...]] = []
         self.history: ProjectionHistory | None = None
 
 
@@ -79,10 +81,16 @@ def calls(monkeypatch: pytest.MonkeyPatch) -> Calls:
             store=seen.runtime_store,
         )
 
-    async def fake_preflight(_projector: Any, recorder: Any, *, write_checkpoints: bool) -> None:
+    async def fake_preflight(
+        _projector: Any, recorder: Any, *, write_checkpoints: bool, extra_grants: Any = ()
+    ) -> None:
         seen.preflight.append((recorder is not None, write_checkpoints))
+        seen.extra_grants.append(tuple(extra_grants))
         if seen.preflight_error is not None:
             raise seen.preflight_error
+
+    async def no_search_projectors(*_args: Any, **_kwargs: Any) -> tuple[Any, ...]:
+        return ()  # the model is never loaded here; the search wiring has its own tests
 
     async def fake_history(store: Any) -> ProjectionHistory | None:
         assert store is seen.runtime_store  # the live graph, never a scratch or standby target
@@ -90,13 +98,16 @@ def calls(monkeypatch: pytest.MonkeyPatch) -> Calls:
 
     monkeypatch.setattr(cli, "_runtime", runtime)
     monkeypatch.setattr(cli, "preflight", fake_preflight)
+    monkeypatch.setattr(cli, "_search_projectors", no_search_projectors)
     monkeypatch.setattr(cli, "projection_history", fake_history)
     return seen
 
 
 REGISTERED = sorted(f"{item.name}:{item.version}" for item in registered_projectors())
+# The marker never names the search projector (`records_history = False`).
+RECORDED = [item for item in REGISTERED if item != "search:1"]
 REQUIRED = ["knowledge:2", "quality:2"]
-OTHERS = [item for item in REGISTERED if item not in REQUIRED]
+OTHERS = [item for item in RECORDED if item not in REQUIRED]
 MISSING = {"state": "missing", "missing": REQUIRED, "others_missing": OTHERS}
 
 
@@ -186,6 +197,35 @@ def test_the_cli_has_help_for_every_projection_command() -> None:
     assert "projection" in run("--help").output
 
 
+@pytest.mark.parametrize(
+    ("args", "expected"),
+    [
+        (["verify"], None),  # plain verify never builds (loads) a search provider
+        (["verify", "--replay-check", *TARGET, *USER], False),
+        (["rebuild", *TARGET, *USER], False),  # standby: live PostgreSQL stays untouched
+        (["rebuild", "--in-place", "--confirm", "neo4j"], True),
+    ],
+)
+def test_only_projecting_commands_bind_search_and_only_in_place_writes_documents(
+    monkeypatch: pytest.MonkeyPatch, calls: Calls, args: list[str], expected: bool | None
+) -> None:
+    patch_verify(monkeypatch, calls, verification(replay="d" * 64))
+    patch_rebuild(monkeypatch, calls, ProjectionOutcome.COMPLETED)
+    built: list[bool] = []
+
+    async def fake_search_projectors(
+        _settings: Any, _runtime: Any, *, write_documents: bool, without_search: bool
+    ) -> tuple[Any, ...]:
+        built.append(write_documents)
+        return ()
+
+    monkeypatch.setattr(cli, "_search_projectors", fake_search_projectors)
+
+    run("projection", *args)
+
+    assert built == ([] if expected is None else [expected])
+
+
 def test_verify_reports_a_match_as_json_and_exit_zero(
     monkeypatch: pytest.MonkeyPatch, calls: Calls
 ) -> None:
@@ -214,7 +254,7 @@ def test_verify_human_output_and_no_record(monkeypatch: pytest.MonkeyPatch, call
     lines = result.output.splitlines()
     assert lines[-2].startswith("history: missing, rebuild required before temporal reads")
     assert "knowledge:2" in lines[-2] and lines[-1] == "verified"
-    calls.history = ProjectionHistory(frozenset(REGISTERED))
+    calls.history = ProjectionHistory(frozenset(RECORDED))
     complete = run("projection", "verify", "--no-record")
     assert "history: complete for temporal reads\n" in complete.output
     # the same set the temporal reads check: other projectors are only listed
@@ -438,20 +478,40 @@ def test_status_lists_each_projector_read_only(
         return statuses
 
     monkeypatch.setattr(cli, "projection_status", fake)
+    monkeypatch.setattr(cli, "_search_status", _search_counts(documents=5, embeddings=3))
 
     human = run("projection", "status")
     assert human.exit_code == 0
     assert "git 1: state active, checkpoint 4/6, lag 2, last error RuntimeError" in human.output
     assert "code 1: state none" in human.output and "last run never" in human.output
+    assert "search: 5 documents, 3 embeddings (about 2 without embeddings: run" in human.output
 
     assert "history: missing, rebuild required before temporal reads" in human.output
 
     machine = json.loads(run("projection", "status", "--json").output)
     assert [item["name"] for item in machine["projectors"]] == ["git", "code"]
     assert machine["history"] == MISSING
-    calls.history = ProjectionHistory(frozenset(REGISTERED))
+    calls.history = ProjectionHistory(frozenset(RECORDED))
     machine = json.loads(run("projection", "status", "--json").output)
     assert machine["history"] == {"state": "complete", "missing": [], "others_missing": []}
+    assert machine["search"] == {
+        "documents": 5,
+        "embeddings": 3,
+        "documents_without_embeddings": 2,
+    }
+    monkeypatch.setattr(cli, "_search_status", _search_counts(documents=3, embeddings=3))
+    assert "search: 3 documents, 3 embeddings\n" in run("projection", "status").output
+
+
+def _search_counts(*, documents: int, embeddings: int) -> Any:
+    async def counts(_runtime: Any) -> dict[str, int]:
+        return {
+            "documents": documents,
+            "embeddings": embeddings,
+            "documents_without_embeddings": max(documents - embeddings, 0),
+        }
+
+    return counts
 
 
 def test_a_missing_or_invalid_configuration_is_a_usage_error(
@@ -570,12 +630,14 @@ def test_the_real_runtime_opens_lazily_and_closes(monkeypatch: pytest.MonkeyPatc
 
     monkeypatch.setattr(cli, "projection_status", fake)
     monkeypatch.setattr(cli, "projection_history", history)
+    monkeypatch.setattr(cli, "_search_status", _search_counts(documents=0, embeddings=0))
 
     result = run("projection", "status", "--json")
 
     assert result.exit_code == 0 and json.loads(result.output) == {
         "projectors": [],
         "history": MISSING,
+        "search": {"documents": 0, "embeddings": 0, "documents_without_embeddings": 0},
     }
 
 

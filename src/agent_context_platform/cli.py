@@ -46,6 +46,7 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from agent_context_platform.content.blob_store import S3BlobStore
 from agent_context_platform.content.service import ContentService
 from agent_context_platform.db import session_factory
 from agent_context_platform.indexing.emitter import IndexingConfig, IndexingService
@@ -55,8 +56,17 @@ from agent_context_platform.ledger.service import IngestionService
 from agent_context_platform.observability import setup as telemetry_setup
 from agent_context_platform.observability.projection import ProjectionSampler
 from agent_context_platform.operations import faults, migrate, provisioning
-from agent_context_platform.projection.neo4j import Neo4jStore
-from agent_context_platform.projection.registry import registered_projectors
+from agent_context_platform.projection.neo4j import Neo4jStore, Neo4jTransaction
+from agent_context_platform.projection.projectors.search import (
+    SearchBackend,
+    SearchProjector,
+    SearchReplayIntegrityError,
+    reset_search_tables,
+)
+from agent_context_platform.projection.registry import (
+    projectors_with_search,
+    registered_projectors,
+)
 from agent_context_platform.projection.runtime import (
     OutboxBacklog,
     ProjectionRunner,
@@ -76,6 +86,7 @@ from agent_context_platform.projection.verify import (
     DEFAULT_BATCH_SIZE,
     DEFAULT_RUNNER_QUIET_SECONDS,
     REBUILD_LOCK_KEY,
+    GrantRequirement,
     MissingGrantError,
     NoContentBlobStore,
     ProjectionEventRecorder,
@@ -90,6 +101,12 @@ from agent_context_platform.projection.verify import (
     rebuild_projections,
     record_history_if_fresh,
     verify_projections,
+)
+from agent_context_platform.retrieval.embeddings import (
+    LocalMiniLMProvider,
+    fetch_model,
+    load_manifest,
+    verify_model_dir,
 )
 from agent_context_platform.settings import Neo4jSettings, Settings
 
@@ -152,6 +169,16 @@ _TARGET_USERNAME = Annotated[
 _WIPE_TARGET = Annotated[
     bool,
     typer.Option("--wipe-target", help="Delete the target's graph data first (needs --confirm)."),
+]
+_WITHOUT_SEARCH = Annotated[
+    bool,
+    typer.Option(
+        "--without-search",
+        envvar="AGENT_CONTEXT_PROJECTION_WITHOUT_SEARCH",
+        help="Skip the search projector: no ContentEmbedding nodes are rebuilt or compared, and "
+        "an in-place rebuild leaves the search tables and the search checkpoint untouched. "
+        "Without this flag a replay needs AGENT_CONTEXT_SEARCH__MODEL_DIR.",
+    ),
 ]
 _CONFIRM = Annotated[
     str | None,
@@ -360,6 +387,9 @@ def _run(main: Callable[[], Coroutine[Any, Any, int]]) -> None:
     except RunnerActiveError as error:
         typer.echo(f"error: {error}", err=True)
         code = EXIT_FAILED
+    except SearchReplayIntegrityError as error:  # counts only, never content or IDs
+        typer.echo(f"error: {public_error_class(error)}: {error}", err=True)
+        code = EXIT_FAILED
     except Exception as error:
         typer.echo(f"error: {public_error_class(error)}", err=True)
         code = EXIT_FAILED
@@ -423,11 +453,14 @@ def verify_command(
     confirm: _CONFIRM = None,
     json_output: _JSON = False,
     batch_size: _BATCH = DEFAULT_BATCH_SIZE,
+    without_search: _WITHOUT_SEARCH = False,
 ) -> None:
     """Check checkpoints, coverage, source IDs and stream heads against the ledger."""
 
     async def main() -> int:
         settings = _load_settings()
+        if replay_check:
+            _require_search_model(settings, without_search=without_search)
         scratch: Neo4jStore | None = None
         if replay_check:
             target = _target_settings(settings.neo4j, target_uri, target_database, target_username)
@@ -439,13 +472,25 @@ def verify_command(
             _forbid_target_options(target_uri, target_database, wipe_target, confirm)
         try:
             async with _runtime(settings, record=record) as runtime:
+                if replay_check and without_search:
+                    await _require_no_embeddings(runtime.store, what="a replay check with")
                 await preflight(
-                    runtime.sessions, runtime.recording_sessions, write_checkpoints=False
+                    runtime.sessions,
+                    runtime.recording_sessions,
+                    write_checkpoints=False,
+                    extra_grants=_search_grants(settings, write_documents=False)
+                    if replay_check and not without_search
+                    else (),
                 )
                 report = await verify_projections(
                     runtime.sessions,
                     runtime.store,
-                    registered_projectors(),
+                    # Only a replay projects; plain verify must not load or hash the model.
+                    await _search_projectors(
+                        settings, runtime, write_documents=False, without_search=without_search
+                    )
+                    if replay_check
+                    else registered_projectors(),
                     require_caught_up=require_caught_up,
                     replay_target=scratch,
                     wipe_replay_target=wipe_target,
@@ -545,11 +590,13 @@ def rebuild_command(
     ] = DEFAULT_RUNNER_QUIET_SECONDS,
     json_output: _JSON = False,
     batch_size: _BATCH = DEFAULT_BATCH_SIZE,
+    without_search: _WITHOUT_SEARCH = False,
 ) -> None:
     """Replay the ledger into a standby target (default) or the live graph (--in-place)."""
 
     async def main() -> int:
         settings = _load_settings()
+        _require_search_model(settings, without_search=without_search)
         if in_place:
             _forbid_target_options(target_uri, target_database, wipe_target)
             _confirmed(confirm, settings.neo4j.database, "--in-place")
@@ -562,22 +609,41 @@ def rebuild_command(
             if wipe_target:
                 _confirmed(confirm, target_settings.database, "--wipe-target")
         async with _runtime(settings, record=record) as runtime:
+            if in_place and without_search:
+                await _require_no_embeddings(runtime.store, what="an in-place rebuild with")
             # Before anything is mutated: a missing grant must not surface after a target is wiped.
             await preflight(
-                runtime.sessions, runtime.recording_sessions, write_checkpoints=in_place
+                runtime.sessions,
+                runtime.recording_sessions,
+                write_checkpoints=in_place,
+                extra_grants=()
+                if without_search
+                else _search_grants(settings, write_documents=in_place),
             )
             target = runtime.store if in_place else Neo4jStore(target_settings)
             try:
+                projectors = await _search_projectors(
+                    settings, runtime, write_documents=in_place, without_search=without_search
+                )
+                if in_place:
+                    # Read-only, before the rebuild lock, the checkpoints, the reset and the wipe:
+                    # a replay that would fail on content must never start on the live graph.
+                    await _check_search_replay(projectors, runtime.sessions)
                 report = await rebuild_projections(
                     runtime.sessions,
                     target,
-                    registered_projectors(),
+                    projectors,
                     target_description=_describe(target_settings),
                     in_place=in_place,
                     wipe_target=wipe_target,
                     recorder=_recorder(runtime),
                     batch_size=batch_size,
                     runner_quiet_seconds=runner_quiet_seconds,
+                    before_replay=(
+                        (lambda: _prepare_search_replay(projectors, runtime.sessions))
+                        if in_place and not without_search
+                        else None
+                    ),
                 )
             finally:
                 if not in_place:
@@ -600,6 +666,7 @@ def status_command(json_output: _JSON = False) -> None:
         settings = _load_settings()
         async with _runtime(settings) as runtime:
             statuses = await projection_status(runtime.sessions, registered_projectors())
+            search = await _search_status(runtime)
             history = await _history(runtime.store, registered_projectors())
         lines = [
             f"{item.name} {item.version}: state {item.state or 'none'}, "
@@ -608,14 +675,55 @@ def status_command(json_output: _JSON = False) -> None:
             f"last run {item.last_run_at.isoformat() if item.last_run_at else 'never'}"
             for item in statuses
         ]
+        lines.append(_search_status_line(search))
         _emit(
-            {"projectors": [item.to_dict() for item in statuses], "history": history},
+            {
+                "projectors": [item.to_dict() for item in statuses],
+                "history": history,
+                "search": search,
+            },
             as_json=json_output,
             lines=[*lines, _history_line(history)],
         )
         return EXIT_OK
 
     _run(main)
+
+
+async def _search_status(runtime: Runtime) -> dict[str, int]:
+    """Search rows versus embedding nodes: the durable trace of a lexical-only worker.
+
+    The search checkpoint advances over events a lexical-only worker indexed without embeddings,
+    so lag alone cannot show them; more rows than nodes means a rebuild with the model is due.
+    `documents_without_embeddings` is rows minus nodes, an approximation (hidden rows of
+    undelivered events and stale nodes count too): exact would need every ID from both stores.
+    Counts only.
+    """
+    async with runtime.sessions() as session:
+        documents = int(
+            await session.scalar(text("SELECT count(*) FROM retrieval.search_documents")) or 0
+        )
+
+    async def count(tx: Neo4jTransaction) -> int:
+        result = await tx.run("MATCH (n:ContentEmbedding) RETURN count(n) AS n", parameters={})
+        return int(result.records[0]["n"])
+
+    embeddings = await runtime.store.execute_read(count)
+    return {
+        "documents": documents,
+        "embeddings": embeddings,
+        "documents_without_embeddings": max(documents - embeddings, 0),
+    }
+
+
+def _search_status_line(search: dict[str, int]) -> str:
+    line = f"search: {search['documents']} documents, {search['embeddings']} embeddings"
+    if search["documents_without_embeddings"]:
+        line += (
+            f" (about {search['documents_without_embeddings']} without embeddings: run "
+            "`projection rebuild` with AGENT_CONTEXT_SEARCH__MODEL_DIR to add them)"
+        )
+    return line
 
 
 # --- projection worker (PLATFORM-039D) ---------------------------------------------------------
@@ -643,6 +751,7 @@ class WorkerTotals:
     lost_leases: int = 0
     iterations: int = 0
     paused_for_rebuild: int = 0
+    search_unembedded: int = 0  # lexical-only mode: content events indexed without embeddings
     outcome: str = "stopped"  # drained | timeout | stopped | interrupted
 
     def add(self, report: ProjectionRunReport) -> None:
@@ -653,16 +762,48 @@ class WorkerTotals:
         self.lost_leases += report.lost_leases
 
 
-def build_projectors(settings: Settings) -> tuple[Projector, ...]:
+LEXICAL_ONLY_ENV = "AGENT_CONTEXT_PROJECTION_LEXICAL_ONLY"
+
+
+async def build_projectors(
+    settings: Settings, runtime: Runtime, *, lexical_only: bool = False
+) -> tuple[Projector, ...]:
     """The projector set the worker runs: the ONE place a projector needing configuration binds.
 
-    Today that is the registry as is. A projector that needs a backend built from `settings` (the
-    search projector's embedding provider and PostgreSQL writer, PLATFORM-042) is added here, so
-    the worker never assembles projectors anywhere else. It must fail closed with a clear error
-    when its configuration is missing.
+    The search projector is bound exactly as `projection rebuild --in-place` binds it, in a writing
+    mode (`_search_projectors`, `write_documents=True`); with `AGENT_CONTEXT_SEARCH__MODEL_DIR` it
+    indexes (loading verifies every model digest and fails closed). `lexical_only` is the explicit
+    mode for a worker with no model: it reads content and writes the PostgreSQL rows with every
+    check a full index runs, so conflicts and unreadable content dead-letter live exactly as with a
+    model (a later replay skips them), and leaves only the `ContentEmbedding` nodes to a rebuild
+    with the model. Without a model and without that mode the worker refuses to start.
     """
-    del settings  # no registered projector needs configuration yet
-    return registered_projectors()
+    _check_worker_search_mode(settings, lexical_only=lexical_only)
+    if lexical_only:
+        content = ContentService(S3BlobStore.from_settings(settings.s3), RedactionPolicyV1())
+        return projectors_with_search(SearchBackend(runtime.sessions, content, None))
+    return await _search_projectors(settings, runtime, write_documents=True)
+
+
+def _check_worker_search_mode(settings: Settings, *, lexical_only: bool) -> None:
+    if lexical_only and settings.search.model_dir is not None:
+        raise CliUsageError(
+            "--lexical-only is refused while AGENT_CONTEXT_SEARCH__MODEL_DIR is set: a worker with "
+            "a model indexes embeddings too; unset one of them"
+        )
+    if not lexical_only and settings.search.model_dir is None:
+        raise CliUsageError(
+            "the projection worker needs AGENT_CONTEXT_SEARCH__MODEL_DIR (see `models fetch`); "
+            "pass --lexical-only to index search rows without embeddings"
+        )
+
+
+def _search_unembedded(projectors: Sequence[Projector]) -> int:
+    return sum(
+        projector.unembedded_events
+        for projector in projectors
+        if isinstance(projector, SearchProjector)
+    )
 
 
 def _worker_exit_code(totals: WorkerTotals, *, once: bool) -> int:
@@ -807,6 +948,11 @@ def _worker_lines(totals: WorkerTotals, statuses: Sequence[ProjectorStatus]) -> 
         f"retried {totals.retried}, dead-lettered {totals.dead_lettered}, "
         f"lost leases {totals.lost_leases}"
     ]
+    if totals.search_unembedded:
+        lines.append(
+            f"search: {totals.search_unembedded} content events indexed without embeddings "
+            "(lexical-only; a rebuild with the model adds them)"
+        )
     lines.extend(
         f"{item.name} {item.version}: checkpoint {item.checkpoint_outbox_id}/"
         f"{item.ledger_head_outbox_id}, lag {item.lag}"
@@ -847,6 +993,16 @@ def run_command(
         typer.Option("--log-seconds", min=0.1, help="At most one progress line per N seconds."),
     ] = 30.0,
     json_output: _JSON = False,
+    lexical_only: Annotated[
+        bool,
+        typer.Option(
+            "--lexical-only",
+            envvar=LEXICAL_ONLY_ENV,
+            help="No embedding model: write the search rows (lexical search, purges, every "
+            "conflict check) without embeddings. Refused while AGENT_CONTEXT_SEARCH__MODEL_DIR is "
+            "set; without it the worker needs that model.",
+        ),
+    ] = False,
 ) -> None:
     """Run the projection worker: claim outbox rows and project them into the graph.
 
@@ -855,13 +1011,15 @@ def run_command(
     drains the outbox and exits 0, or 1 when an event was dead-lettered during the run, or on
     `--max-seconds` expiring (`timeout`), or when SIGTERM/SIGINT cuts it short (`interrupted`). Pauses (`paused_for_rebuild`) while a rebuild holds the
     rebuild lock. Uses the projector role. Progress and the summary are counts only; never a DSN
-    or event content.
+    or event content. Needs AGENT_CONTEXT_SEARCH__MODEL_DIR unless `--lexical-only` indexes the
+    search rows without embeddings.
     """
 
     async def main() -> int:
         if health_file is not None and not health_file.parent.is_dir():
             raise CliUsageError("--health-file must be in an existing directory")
         settings = _load_settings()
+        _check_worker_search_mode(settings, lexical_only=lexical_only)  # before any connection
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         handled: list[signal.Signals] = []
@@ -883,7 +1041,7 @@ def run_command(
         sampler: asyncio.Task[None] | None = None
         try:
             async with _runtime(settings) as runtime:
-                projectors = build_projectors(settings)
+                projectors = await build_projectors(settings, runtime, lexical_only=lexical_only)
                 runner = ProjectionRunner(
                     runtime.sessions, runtime.store, projectors, worker_id=worker_id
                 )
@@ -928,6 +1086,9 @@ def run_command(
                     if sampler is not None:
                         sampler.cancel()
                         await asyncio.gather(sampler, return_exceptions=True)
+                totals.search_unembedded = _search_unembedded(projectors)
+                if totals.search_unembedded:
+                    log(f"search_unembedded {totals.search_unembedded}")
                 statuses = await projection_status(runtime.sessions, projectors)
         finally:
             if sampler is not None and not sampler.done():
@@ -1530,6 +1691,194 @@ def db_current_command(alembic_config: _ALEMBIC_CONFIG = None, json_output: _JSO
 
 
 # --- end of `agent-context db` ------------------------------------------------------------------
+
+
+# --- PLATFORM-042: `models fetch` and the search projector's configured backend ----------------
+# Kept in one block, apart from the other commands, to ease rebases.
+models_app = typer.Typer(
+    help="Fetch and check the pinned local embedding model.",
+    no_args_is_help=True,
+    add_completion=False,
+    pretty_exceptions_enable=False,
+)
+app.add_typer(models_app, name="models")
+
+
+@models_app.command("fetch")
+def models_fetch_command(
+    dest: Annotated[
+        Path,
+        typer.Option(
+            "--dest",
+            file_okay=False,
+            help="Directory to download the model into (set AGENT_CONTEXT_SEARCH__MODEL_DIR to it).",
+        ),
+    ],
+    json_output: _JSON = False,
+) -> None:
+    """Download the pinned embedding model by revision and verify every sha256.
+
+    This is the only command that downloads the model; the service and the tests never do.
+    """
+
+    async def main() -> int:
+        manifest = load_manifest()
+        downloaded = await asyncio.to_thread(fetch_model, manifest, dest)
+        await asyncio.to_thread(verify_model_dir, manifest, dest)
+        _emit(
+            {
+                "model_id": manifest.model_id,
+                "revision": manifest.revision,
+                "dest": str(dest),
+                "downloaded": downloaded,
+                "verified": [item.path for item in manifest.files],
+            },
+            as_json=json_output,
+            lines=[
+                f"{manifest.model_id}@{manifest.revision}: {len(downloaded)} file(s) downloaded, "
+                f"{len(manifest.files)} verified in {dest}"
+            ],
+        )
+        return EXIT_OK
+
+    _run(main)
+
+
+_SEARCH_UPDATE_COLUMNS = (
+    "event_id",
+    "source_event_ids",
+    "event_type",
+    "session_id",
+    "occurred_at",
+    "redaction",
+    "tsv",
+    "indexed_at",
+)
+
+
+def _search_grants(settings: Settings, *, write_documents: bool) -> tuple[GrantRequirement, ...]:
+    """Projector-role privileges the bound search projector needs; none when it is unbound.
+
+    Content and tombstones are read whenever search is bound; the search rows and tombstones are
+    written only in a writing mode (`write_documents`). Checked by `preflight`, before any wipe.
+    """
+    if settings.search.model_dir is None:
+        return ()
+    needed = [
+        GrantRequirement("table", "catalog.inline_contents", "SELECT"),
+        GrantRequirement("table", "retrieval.content_tombstones", "SELECT"),
+    ]
+    if write_documents:
+        needed += [
+            GrantRequirement("table", "retrieval.content_tombstones", "INSERT"),
+            *(
+                GrantRequirement("table", "retrieval.search_documents", privilege)
+                for privilege in ("SELECT", "INSERT", "DELETE")
+            ),
+            GrantRequirement("function", "retrieval.reset_search_projection()", "EXECUTE"),
+            *(
+                GrantRequirement("column", "retrieval.search_documents", "UPDATE", column)
+                for column in _SEARCH_UPDATE_COLUMNS
+            ),
+        ]
+    return tuple(needed)
+
+
+def _require_search_model(settings: Settings, *, without_search: bool) -> None:
+    """Refuse a replay that would bind the search projector without a model, before any mutation.
+
+    A destructive rebuild without the model would wipe the graph and then fail (or silently drop)
+    every `ContentEmbedding`; `--without-search` is the explicit way to skip the projector.
+    """
+    if not without_search and settings.search.model_dir is None:
+        raise CliUsageError(
+            "the search projector needs AGENT_CONTEXT_SEARCH__MODEL_DIR (see `models fetch`); "
+            "pass --without-search to skip it"
+        )
+
+
+async def _require_no_embeddings(store: Neo4jStore, *, what: str) -> None:
+    """Refuse `--without-search` against a live graph that holds `ContentEmbedding` nodes.
+
+    The replay would wipe (in place) or fail to reproduce (replay-check) the embeddings the search
+    projector owns, and nothing would bring them back. Raised before any mutation.
+    """
+
+    async def count(tx: Neo4jTransaction) -> int:
+        result = await tx.run("MATCH (n:ContentEmbedding) RETURN count(n) AS n", parameters={})
+        return int(result.records[0]["n"])
+
+    if await store.execute_read(count):
+        raise CliUsageError(
+            f"{what} --without-search is refused: the live graph holds ContentEmbedding nodes "
+            "that would be lost or reported as a mismatch; configure "
+            "AGENT_CONTEXT_SEARCH__MODEL_DIR and drop --without-search"
+        )
+
+
+async def _prepare_search_replay(
+    projectors: Sequence[Projector], sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """Before an in-place replay: empty the search documents and reseed the tombstones.
+
+    `reset_search_tables` tombstones every purge the ledger records, so purge knowledge survives
+    the rebuild even for a dead-lettered `content.purged` the delivered-only replay skips, and the
+    replayed originals of purged content find their tombstone instead of reading gone bytes.
+    """
+    if any(isinstance(projector, SearchProjector) for projector in projectors):
+        async with sessions() as session, session.begin():
+            await reset_search_tables(session)
+
+
+async def _check_search_replay(
+    projectors: Sequence[Projector], sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    for projector in projectors:
+        if isinstance(projector, SearchProjector):
+            await projector.check_replay(sessions)
+
+
+async def _seed_search_purges(
+    projectors: Sequence[Projector], sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    for projector in projectors:
+        if isinstance(projector, SearchProjector):
+            await projector.seed_purges(sessions)
+
+
+async def _search_projectors(
+    settings: Settings, runtime: Runtime, *, write_documents: bool, without_search: bool = False
+) -> tuple[Projector, ...]:
+    """The registered projectors; with a model directory the search projector can embed.
+
+    Without `AGENT_CONTEXT_SEARCH__MODEL_DIR` the default (unconfigured) search projector is used:
+    it fails closed on any event it would have to index. Loading verifies every model digest.
+    `write_documents` is False for a replay into a scratch or standby graph: the search rows and
+    tombstones live in the live PostgreSQL, which such a replay must never write.
+    """
+    if without_search:
+        return tuple(item for item in registered_projectors() if item.name != "search")
+    model_dir = settings.search.model_dir
+    if model_dir is None:  # every caller refuses this first (`_require_search_model`)
+        raise CliUsageError("the search projector needs AGENT_CONTEXT_SEARCH__MODEL_DIR")
+    provider = await asyncio.to_thread(
+        LocalMiniLMProvider.load,
+        model_dir,
+        batch_size=settings.search.embedding_batch_size,
+        threads=settings.search.embedding_threads,
+    )
+    content = ContentService(S3BlobStore.from_settings(settings.s3), RedactionPolicyV1())
+    projectors = projectors_with_search(
+        SearchBackend(runtime.sessions, content, provider, write_documents)
+    )
+    if not write_documents:
+        # A scratch or standby replay never writes tombstones, and its originals precede their
+        # purges: remember every purge the ledger records so purged bytes are never read.
+        await _seed_search_purges(projectors, runtime.sessions)
+    return projectors
+
+
+# --- end PLATFORM-042 ---------------------------------------------------------------------------
 
 
 if __name__ == "__main__":
