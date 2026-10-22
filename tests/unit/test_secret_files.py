@@ -7,6 +7,7 @@ from pathlib import Path
 
 import pytest
 
+from agent_context_platform import settings as settings_module
 from agent_context_platform.settings import (
     SECRET_FILE_NAMES,
     SECRETS_DIR_ENV,
@@ -70,16 +71,23 @@ def test_nested_secrets_are_read_from_files_named_after_their_variables(
     assert "file-secret" not in repr(settings)
 
 
-def test_the_environment_takes_precedence_over_a_file(
-    secrets_dir: Path, monkeypatch: pytest.MonkeyPatch
+@pytest.mark.parametrize("env_value", [ENV_DSN, ""])  # an empty value is set, too
+@pytest.mark.parametrize(
+    "env_name", ["AGENT_CONTEXT_POSTGRESQL__API_DSN", "agent_context_postgresql__api_dsn"]
+)
+def test_a_variable_set_both_in_the_environment_and_as_a_file_is_refused(
+    secrets_dir: Path, monkeypatch: pytest.MonkeyPatch, env_value: str, env_name: str
 ) -> None:
+    # A stale variable left after a rotation would silently keep the old key (and keep it in
+    # /proc/<pid>/environ): refuse to start instead, naming the variable but never a value.
     _write(secrets_dir, "AGENT_CONTEXT_POSTGRESQL__API_DSN", API_DSN)
-    monkeypatch.setenv("AGENT_CONTEXT_POSTGRESQL__API_DSN", ENV_DSN)
+    monkeypatch.setenv(env_name, env_value)
 
-    settings = Settings()
+    with pytest.raises(SecretFileError, match="AGENT_CONTEXT_POSTGRESQL__API_DSN") as error:
+        Settings()
 
-    assert settings.postgresql.api_dsn is not None
-    assert settings.postgresql.api_dsn.get_secret_value().unicode_string() == ENV_DSN
+    assert "both" in str(error.value)
+    assert "file-secret" not in str(error.value) and "env-secret" not in str(error.value)
 
 
 @pytest.mark.parametrize("mode", [0o440, 0o404, 0o600 | 0o020, 0o402])
@@ -154,7 +162,7 @@ def test_a_directory_others_can_write_or_a_symlinked_directory_is_refused(
     link = tmp_path / "linked"
     link.symlink_to(secrets_dir)
     monkeypatch.setenv(SECRETS_DIR_ENV, str(link))
-    with pytest.raises(SecretFileError, match="directory"):
+    with pytest.raises(SecretFileError, match="symlink"):
         Settings()
 
 
@@ -189,4 +197,65 @@ def test_a_non_regular_or_non_utf8_secret_file_is_refused(secrets_dir: Path) -> 
     path.write_bytes(b"\xff\xfe")
     path.chmod(0o400)
     with pytest.raises(SecretFileError, match="UTF-8"):
+        Settings()
+
+
+def test_owners_other_than_the_process_user_or_root_are_refused_as_any_user(
+    secrets_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Runs as any uid: the accepted owners are made to exclude whoever owns the test files.
+    _write(secrets_dir, "AGENT_CONTEXT_NEO4J__PASSWORD", "neo4j-file-secret")
+    owner = secrets_dir.stat().st_uid
+    monkeypatch.setattr(settings_module, "_accepted_owners", lambda: frozenset({owner + 1}))
+    with pytest.raises(SecretFileError, match="directory owner"):
+        Settings()
+
+    calls = iter([frozenset({owner}), frozenset({owner + 1})])  # directory ok, file not
+    monkeypatch.setattr(settings_module, "_accepted_owners", lambda: next(calls))
+    with pytest.raises(SecretFileError, match="AGENT_CONTEXT_NEO4J__PASSWORD: the file owner"):
+        Settings()
+
+
+def test_the_accepted_owners_are_the_process_user_and_root() -> None:
+    assert settings_module._accepted_owners() == frozenset({os.geteuid(), 0})
+
+
+@pytest.mark.parametrize(
+    "content",
+    [
+        "\ufeffvalue",  # a byte-order mark
+        " value",
+        "value ",
+        "val\u2028ue",
+        "val\vue",
+        "val\fue",
+        "val\x1bue",
+        "value\n\n",
+    ],
+)
+def test_a_value_with_a_bom_control_characters_or_surrounding_space_is_refused(
+    secrets_dir: Path, content: str
+) -> None:
+    _write(secrets_dir, "AGENT_CONTEXT_MCP__TOKEN_HMAC_KEY", content)
+    with pytest.raises(SecretFileError, match="AGENT_CONTEXT_MCP__TOKEN_HMAC_KEY"):
+        Settings()
+
+
+@pytest.mark.parametrize("ending", ["\n", "\r\n", ""])
+def test_only_one_final_line_ending_is_dropped(secrets_dir: Path, ending: str) -> None:
+    _write(secrets_dir, "AGENT_CONTEXT_NEO4J__PASSWORD", "inner value" + ending)
+    password = Settings().neo4j.password
+    assert password is not None and password.get_secret_value() == "inner value"
+
+
+def test_a_directory_reached_through_a_symlinked_parent_is_refused(
+    secrets_dir: Path, monkeypatch: pytest.MonkeyPatch, tmp_path: Path
+) -> None:
+    alias = tmp_path / "alias"
+    alias.symlink_to(tmp_path)
+    monkeypatch.setenv(SECRETS_DIR_ENV, str(alias / "secrets"))
+    with pytest.raises(SecretFileError, match="symlink"):
+        Settings()
+    monkeypatch.setenv(SECRETS_DIR_ENV, str(secrets_dir / ".." / "secrets"))
+    with pytest.raises(SecretFileError, match="canonical"):
         Settings()
