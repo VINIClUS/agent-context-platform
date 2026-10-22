@@ -1,5 +1,6 @@
+import asyncio
 import secrets
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from datetime import UTC, datetime, timedelta
 from typing import Any, Literal
@@ -7,7 +8,12 @@ from typing import Any, Literal
 from agent_context_sdk import RedactionPolicyV1  # type: ignore[import-untyped, unused-ignore]
 from fastapi import FastAPI
 from fastapi.responses import JSONResponse
-from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
 from starlette.routing import Route
 
 from agent_context_platform.content.blob_store import S3BlobStore
@@ -39,6 +45,7 @@ from agent_context_platform.mcp.auth import (
     require_scope,
 )
 from agent_context_platform.mcp.server import MCP_PATH, build_mcp_mount, create_mcp_server
+from agent_context_platform.mcp.tools import ComposerHolder, MemoryComposer
 from agent_context_platform.observability import setup as telemetry_setup
 from agent_context_platform.observability.http import HttpTelemetryMiddleware
 from agent_context_platform.operations import faults, migrate
@@ -50,6 +57,14 @@ from agent_context_platform.operations.readiness import (
     readiness_engine,
 )
 from agent_context_platform.projection.neo4j import Neo4jStore
+from agent_context_platform.retrieval.composer import ContextComposer
+from agent_context_platform.retrieval.cursor import CursorCodec
+from agent_context_platform.retrieval.embeddings import EmbeddingProvider, LocalMiniLMProvider
+from agent_context_platform.retrieval.evidence import EvidenceLedger
+from agent_context_platform.retrieval.freshness import FreshnessReader
+from agent_context_platform.retrieval.graph import GraphTraversalService
+from agent_context_platform.retrieval.search import SearchService
+from agent_context_platform.retrieval.temporal import TemporalService
 from agent_context_platform.settings import Settings
 
 
@@ -116,6 +131,65 @@ def _build_mcp_auth(
     )
 
 
+def _composer_configured(settings: Settings) -> bool:
+    """The memory tools need PostgreSQL, a complete Neo4j login and S3 (object content)."""
+    neo4j = settings.neo4j
+    return (
+        settings.postgresql.effective_api_dsn is not None
+        and neo4j.uri is not None
+        and bool(neo4j.username and neo4j.username.strip())
+        and neo4j.password is not None
+        and bool(neo4j.password.get_secret_value().strip())
+        and settings.s3.endpoint_url is not None
+    )
+
+
+async def _build_composer(
+    settings: Settings, sessions: async_sessionmaker[AsyncSession], store: Neo4jStore
+) -> tuple[ContextComposer, list[Callable[[], Awaitable[None]]]]:
+    """Wire the five memory tools' composer (PLATFORM-043) to the API role, never the projector.
+
+    ``sessions`` must be the API-role factory (``postgresql.api_dsn``, falling back to ``dsn``):
+    PLATFORM-055 grants that role every read the readers need. Without a model directory the
+    search has no embedder (lexical-only): the composer reports ``vector_search_unavailable``.
+    Loading a configured model verifies its digests and fails start-up closed on a mismatch.
+    """
+    embeddings: EmbeddingProvider | None = None
+    model_dir = settings.search.model_dir
+    if model_dir is not None:
+        embeddings = await asyncio.to_thread(
+            LocalMiniLMProvider.load,
+            model_dir,
+            batch_size=settings.search.embedding_batch_size,
+            threads=settings.search.embedding_threads,
+        )
+    graph = GraphTraversalService.from_settings(settings.neo4j)
+    temporal = TemporalService.from_settings(settings.neo4j)
+    reader = store.read_only()
+    content = ContentService(S3BlobStore.from_settings(settings.s3), RedactionPolicyV1())
+    composer = ContextComposer(
+        graph=graph,
+        graph_reader=reader,
+        temporal=temporal,
+        search=SearchService(sessions, reader, embeddings),
+        ledger=EvidenceLedger(sessions, content),
+        freshness=FreshnessReader(sessions),
+        # Settings require the key in production; elsewhere cursors die with the process.
+        cursor=CursorCodec.from_key(settings.mcp.cursor_hmac_key),
+    )
+    return composer, [graph.close, temporal.close]
+
+
+def _api_engine(settings: Settings, engine: AsyncEngine | None) -> AsyncEngine | None:
+    """The API-role engine: a separate one only when ``api_dsn`` differs from ``dsn``."""
+    postgresql = settings.postgresql
+    if postgresql.api_dsn is None:
+        return engine
+    return create_async_engine(
+        postgresql.api_dsn.get_secret_value().unicode_string(), pool_pre_ping=True
+    )
+
+
 def _utc_now() -> datetime:
     return datetime.now(UTC)
 
@@ -134,20 +208,24 @@ def create_app(
     ingestion: IngestionRuntime | None = None,
     mcp_auth: McpAuthRuntime | None = None,
     readiness: ReadinessProbe | None = None,
+    composer: MemoryComposer | None = None,
 ) -> FastAPI:
     """Create an isolated platform application with no external resources.
 
     ``ingestion`` and ``mcp_auth`` inject ready runtimes (tests); otherwise they are built
     from settings when the application starts. Until MCP authentication is bound, ``/mcp``
     answers 401 without a token and 503 with one: it fails closed. ``readiness`` injects the
-    ``/health/ready`` probe; until one is bound the route answers 503.
+    ``/health/ready`` probe; until one is bound the route answers 503. ``composer`` injects the
+    memory tools' composer; otherwise it is built at start-up when PostgreSQL, Neo4j and S3 are
+    configured, and until then every tool call answers ``context_unavailable``.
     """
     resolved_settings = Settings() if settings is None else settings
     faults.configure(resolved_settings.fault_injection)
     mcp_holder = McpAuthHolder(mcp_auth)
+    composer_holder = ComposerHolder(composer)
     # One server per application: the SDK app can only be started once.
     mcp_mount = build_mcp_mount(
-        create_mcp_server(),
+        create_mcp_server(composer=composer_holder),
         resolved_settings.mcp,
         access_gate=require_scope(MEMORY_READ_SCOPE, mcp_holder),
     )
@@ -171,11 +249,12 @@ def create_app(
             application.state.ingestion = _build_ingestion(resolved_settings, sessions)
         if mcp_auth is None and sessions is not None:
             mcp_holder.runtime = _build_mcp_auth(resolved_settings, sessions)
-        store = None
+        neo4j = resolved_settings.neo4j
+        store = None if neo4j.uri is None else Neo4jStore(neo4j)
+        api_engine = _api_engine(resolved_settings, engine)
+        closers: list[Callable[[], Awaitable[None]]] = []
         readiness_db = None
         if readiness is None:
-            neo4j = resolved_settings.neo4j
-            store = None if neo4j.uri is None else Neo4jStore(neo4j)
             readiness_db = None if dsn is None else readiness_engine(dsn, DEFAULT_TIMEOUT_SECONDS)
             application.state.readiness = build_probe(
                 resolved_settings,
@@ -184,10 +263,24 @@ def create_app(
                 None if readiness_db is None else _shipped_head(),
             )
         try:
+            if (
+                composer is None
+                and store is not None
+                and api_engine is not None
+                and _composer_configured(resolved_settings)
+            ):
+                composer_holder.composer, closers = await _build_composer(
+                    resolved_settings, session_factory(api_engine), store
+                )
             async with mcp_mount.lifespan():
                 yield
         finally:
             application.state.readiness = readiness
+            composer_holder.composer = composer
+            for close in closers:
+                await close()
+            if api_engine is not None and api_engine is not engine:
+                await api_engine.dispose()
             if store is not None:
                 await store.close()
             if readiness_db is not None:
