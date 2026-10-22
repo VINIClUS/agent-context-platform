@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import json
 import os
 import stat
 import unicodedata
@@ -143,6 +144,8 @@ class S3Settings(BaseModel):
     access_key_id: SecretStr | None = Field(default=None, repr=False)
     secret_access_key: SecretStr | None = Field(default=None, repr=False)
     addressing_style: Literal["path"] = "path"
+    # Deploy `content_addressed`. `if_none_match` needs a backend that refuses a conditional PUT
+    # over an existing key (412); Garage v2.3.0 ignores If-None-Match and would overwrite.
     write_mode: Literal["content_addressed", "if_none_match"] = "content_addressed"
     max_compressed_bytes: int = 67_108_864
     max_uncompressed_bytes: int = 268_435_456
@@ -433,6 +436,9 @@ def read_secret_files(directory: str) -> dict[str, dict[str, str]]:
         raise SecretFileError(f"{SECRETS_DIR_ENV} must be an absolute path")
     if os.path.normpath(directory) != directory.rstrip("/") or ".." in path.parts:
         raise SecretFileError(f"{SECRETS_DIR_ENV} must be a canonical path (no `.`, `..`, `//`)")
+    # realpath() checks every ancestor; the open below refuses a symlink in the last component
+    # (O_NOFOLLOW). An ancestor swapped for a symlink between the two needs write access to that
+    # ancestor, which already means control over what the process reads: accepted.
     if os.path.realpath(directory) != os.path.normpath(directory):
         raise SecretFileError(f"{SECRETS_DIR_ENV} must not go through a symlink")
     try:
@@ -485,7 +491,7 @@ def _read_secret_file(directory_fd: int, name: str) -> str:
         text = data.decode("utf-8")
     except UnicodeDecodeError:
         raise SecretFileError(f"{name}: not UTF-8 text") from None
-    value = text.removesuffix("\n").removesuffix("\r")
+    value = text[:-2] if text.endswith("\r\n") else text.removesuffix("\n")
     if not value or any(
         unicodedata.category(character)[0] in "CZ" and character != " " for character in value
     ):
@@ -495,6 +501,23 @@ def _read_secret_file(directory_fd: int, name: str) -> str:
     if value != value.strip():
         raise SecretFileError(f"{name}: the value must not start or end with whitespace")
     return value
+
+
+def _section_sets(exported: dict[str, str], section: str, field: str) -> bool:
+    """Whether the whole-section variable `AGENT_CONTEXT_<SECTION>` (JSON) may set `field`.
+
+    Fail closed: a value that is not a JSON object might hold the secret, so it counts as set.
+    """
+    raw = exported.get(f"{_SECRET_FILE_PREFIX}{section.upper()}")
+    if raw is None:
+        return False
+    try:
+        parsed = json.loads(raw)
+    except ValueError:
+        return True
+    if not isinstance(parsed, dict):
+        return True
+    return any(isinstance(key, str) and key.lower() == field for key in parsed)
 
 
 class _SecretFilesSource(PydanticBaseSettingsSource):
@@ -508,11 +531,12 @@ class _SecretFilesSource(PydanticBaseSettingsSource):
         if directory is None:
             return {}
         values = read_secret_files(directory)
-        exported = {name.upper() for name in os.environ}
+        exported = {name.upper(): value for name, value in os.environ.items()}
         both = sorted(
             name
             for name, (section, field) in SECRET_FILE_NAMES.items()
-            if field in values.get(section, {}) and name in exported
+            if field in values.get(section, {})
+            and (name in exported or _section_sets(exported, section, field))
         )
         if both:
             raise SecretFileError(

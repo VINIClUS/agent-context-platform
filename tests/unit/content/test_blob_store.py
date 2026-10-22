@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+from dataclasses import replace
 from typing import Any
 
 import pytest
@@ -121,7 +122,7 @@ def test_two_identical_content_addressed_puts_reuse_the_verified_object() -> Non
     first = _run(store.put_verified(b"same", "application/octet-stream"))
     second = _run(store.put_verified(b"same", "application/octet-stream"))
 
-    assert second == first
+    assert second == replace(first, created=False) and first.created
     assert client.put_attempts == 1
 
 
@@ -144,7 +145,7 @@ def test_conditional_put_accepts_existing_object_after_precondition_failure() ->
 
     second = _run(store.put_verified(b"same", "text/plain"))
 
-    assert second == first
+    assert second == replace(first, created=False) and first.created
     assert client.put_attempts == 2
 
 
@@ -416,7 +417,7 @@ def test_a_reused_object_still_fails_on_a_wrong_declared_length_or_media_type() 
         "sha256": stored.sha256,
         "uncompressed-bytes": str(len(content) + 1),
     }
-    with pytest.raises(BlobIntegrityError, match="uncompressed"):
+    with pytest.raises(BlobIntegrityError, match=r"uncompressed|content size"):
         _run(_store(client).put_verified(content, "text/plain"))
     client.objects[stored.object_key] = {**original, "ContentType": "application/json"}
     with pytest.raises(BlobIntegrityError, match="media type"):
@@ -446,3 +447,133 @@ def test_a_conditional_put_retries_once_when_the_existing_object_was_swept_meanw
 
     assert keys == [stored.object_key, stored.object_key]
     assert stored.object_key in client.objects
+
+
+def _level19_object(content: bytes) -> dict[str, Any]:
+    import zstandard as zstd
+
+    digest = hashlib.sha256(content).hexdigest()
+    body = zstd.ZstdCompressor(level=19, write_content_size=True, write_checksum=True).compress(
+        content
+    )
+    return {
+        "Body": body,
+        "ContentLength": len(body),
+        "Metadata": {"sha256": digest, "uncompressed-bytes": str(len(content))},
+        "ContentType": "text/plain",
+        "ContentEncoding": "zstd",
+    }
+
+
+_VARIED = b" ".join(
+    hashlib.sha256(str(n).encode()).hexdigest()[: n % 7 + 3].encode() for n in range(400)
+)
+
+
+def test_a_second_refusal_after_a_sweep_verifies_what_the_other_writer_stored() -> None:
+    # 412, the sweep deletes it, the retried PUT is refused again because another writer stored
+    # it meanwhile: that object is verified and reused, never overwritten.
+    client = FakeS3Client()
+    store = _store(client, write_mode="if_none_match")
+    first = _run(store.put_verified(_VARIED, "text/plain"))
+    put = client.put_object
+    calls: list[int] = []
+
+    def refuse_sweep_then_refuse(**request: Any) -> dict[str, Any]:
+        calls.append(1)
+        try:
+            return put(**request)
+        finally:
+            if len(calls) == 1:  # the sweep, then another writer at another level
+                client.objects[request["Key"]] = _level19_object(_VARIED)
+
+    client.put_object = refuse_sweep_then_refuse  # type: ignore[method-assign]
+    client.objects.pop(first.object_key)
+    client.objects[first.object_key] = _level19_object(_VARIED)
+    stored = _run(store.put_verified(_VARIED, "text/plain"))
+
+    assert len(calls) == 1  # a 412 straight away: verified and reused
+    assert stored.compressed_bytes == client.objects[stored.object_key]["ContentLength"]
+
+    calls.clear()
+    sweep_then_writer: list[str] = []
+
+    def refuse_then_sweep(**request: Any) -> dict[str, Any]:
+        calls.append(1)
+        try:
+            return put(**request)
+        finally:
+            if len(calls) == 1:
+                client.objects.pop(request["Key"])  # swept after the 412
+                sweep_then_writer.append("swept")
+
+    original_head = client.head_object
+
+    def head_then_rewrite(**kwargs: Any) -> dict[str, Any]:
+        try:
+            return original_head(**kwargs)
+        finally:
+            if sweep_then_writer == ["swept"]:  # the 404 head; another writer stores it now
+                client.objects[kwargs["Key"]] = _level19_object(_VARIED)
+                sweep_then_writer.append("rewritten")
+
+    client.put_object = refuse_then_sweep  # type: ignore[method-assign]
+    client.head_object = head_then_rewrite  # type: ignore[method-assign]
+    again = _run(store.put_verified(_VARIED, "text/plain"))
+    assert len(calls) == 2 and sweep_then_writer == ["swept", "rewritten"]
+    assert not again.created and again.compressed_bytes == len(_level19_object(_VARIED)["Body"])
+
+
+def test_put_verified_says_whether_this_call_created_the_object() -> None:
+    client = FakeS3Client()
+    assert _run(_store(client).put_verified(_VARIED, "text/plain")).created is True
+    assert _run(_store(client).put_verified(_VARIED, "text/plain")).created is False
+
+
+def test_an_object_replaced_by_another_writer_right_after_our_put_is_verified_not_alarmed() -> None:
+    # Rolling upgrade: another replica rewrites the same digest (another level) between our PUT
+    # and our HEAD. Intact bytes are accepted, with the stored object's own size.
+    client = FakeS3Client()
+    put = client.put_object
+
+    def put_then_replace(**request: Any) -> dict[str, Any]:
+        result = put(**request)
+        client.objects[request["Key"]] = _level19_object(_VARIED)
+        return result
+
+    client.put_object = put_then_replace  # type: ignore[method-assign]
+    stored = _run(_store(client).put_verified(_VARIED, "text/plain"))
+
+    assert stored.created is True
+    assert stored.compressed_bytes == len(_level19_object(_VARIED)["Body"])
+    corrupt = dict(_level19_object(_VARIED))
+    corrupt["Body"] = corrupt["Body"][:-1] + bytes([corrupt["Body"][-1] ^ 1])
+
+    def put_then_corrupt(**request: Any) -> dict[str, Any]:
+        result = put(**request)
+        client.objects[request["Key"]] = corrupt
+        return result
+
+    client.put_object = put_then_corrupt  # type: ignore[method-assign]
+    client.objects.clear()
+    with pytest.raises(BlobIntegrityError):
+        _run(_store(client).put_verified(_VARIED, "text/plain"))
+
+
+def test_a_reused_object_records_the_size_from_the_head_get_verified_read() -> None:
+    client = FakeS3Client()
+    key = _run(_store(client).put_verified(_VARIED, "text/plain")).object_key
+    client.objects[key] = _level19_object(_VARIED)
+    heads: list[str] = []
+    store = _store(client)
+    original_head = store._head
+
+    async def counting_head(object_key: str) -> dict[str, Any]:
+        heads.append(object_key)
+        return await original_head(object_key)
+
+    store._head = counting_head  # type: ignore[method-assign]
+    stored = _run(store.put_verified(_VARIED, "text/plain"))
+
+    assert heads == [key]  # one HEAD: the one get_verified checks the GET against
+    assert stored.compressed_bytes == client.objects[key]["ContentLength"]

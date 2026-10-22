@@ -639,13 +639,14 @@ class ContentService:
                 await self._blob_store.get_verified(stored_blob.object_key, digest)
             except BlobNotFoundError:
                 # Under the digest lock: a catalog row means a referenced object is gone (the
-                # sweep never deletes those), which is an integrity failure. Without one, the
-                # orphan sweep deleted an old unreferenced object this batch was reusing: nothing
-                # is lost and the retried batch uploads it again, so it raises no alarm.
+                # sweep never deletes those), and an object this request wrote seconds ago is
+                # no old orphan either: both are integrity failures. Otherwise the orphan sweep
+                # deleted an old unreferenced object this batch was reusing: nothing is lost and
+                # the retried batch uploads it again, so it raises no alarm.
                 referenced = await session.scalar(
                     select(ContentObjectRow.id).where(ContentObjectRow.content_sha256 == digest)
                 )
-                if referenced is not None:
+                if referenced is not None or stored_blob.created:
                     _integrity_failure("missing_object", "attach", digest)
                 else:
                     logger.info(
@@ -703,6 +704,8 @@ class ContentService:
         if ref.storage is ContentStorage.INLINE:
             row = await session.get(InlineContentRow, ref.inline_id)
             if row is None:
+                # Nothing deletes inline rows and callers skip purged content first: a loss.
+                _integrity_failure("missing_object", "read", ref.content_sha256)
                 raise ContentUnavailableError("inline content is not stored")
             data = row.data
         else:
@@ -713,8 +716,13 @@ class ContentService:
             except BlobIntegrityError:
                 _integrity_failure("digest_mismatch", "read", ref.content_sha256)
                 raise ContentUnavailableError("object content could not be read") from None
+            except BlobNotFoundError:
+                # No platform code deletes referenced bytes (the sweep takes only unreferenced
+                # objects) and callers skip purged content before reading: a loss.
+                _integrity_failure("missing_object", "read", ref.content_sha256)
+                raise ContentUnavailableError("object content could not be read") from None
             except BlobStoreError:
-                # Gone or unreachable: a purge removes bytes on purpose, so this raises no alarm.
+                # Unreachable, not wrong: an outage, no integrity alarm.
                 raise ContentUnavailableError("object content could not be read") from None
         if (
             len(data) != ref.uncompressed_bytes

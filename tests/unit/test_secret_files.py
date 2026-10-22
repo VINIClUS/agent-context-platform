@@ -260,3 +260,57 @@ def test_a_directory_reached_through_a_symlinked_parent_is_refused(
     monkeypatch.setenv(SECRETS_DIR_ENV, str(secrets_dir / ".." / "secrets"))
     with pytest.raises(SecretFileError, match="canonical"):
         Settings()
+
+
+@pytest.mark.parametrize("section_name", ["AGENT_CONTEXT_S3", "agent_context_s3"])
+@pytest.mark.parametrize(
+    "value",
+    [
+        '{"secret_access_key": "stale-env"}',
+        '{"SECRET_ACCESS_KEY": "stale-env"}',
+        '{"secret_access_key": ""}',
+    ],
+)
+def test_a_section_variable_holding_a_mounted_secret_is_refused(
+    secrets_dir: Path, monkeypatch: pytest.MonkeyPatch, section_name: str, value: str
+) -> None:
+    _write(secrets_dir, "AGENT_CONTEXT_S3__SECRET_ACCESS_KEY", "s3-file-secret")
+    monkeypatch.setenv(section_name, value)
+
+    with pytest.raises(SecretFileError, match="AGENT_CONTEXT_S3") as error:
+        Settings()
+
+    assert "stale-env" not in str(error.value) and "s3-file-secret" not in str(error.value)
+
+
+def test_a_section_variable_without_the_mounted_secret_merges_with_the_file(
+    secrets_dir: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    _write(secrets_dir, "AGENT_CONTEXT_S3__SECRET_ACCESS_KEY", "s3-file-secret")
+    monkeypatch.setenv("AGENT_CONTEXT_S3", '{"bucket_name": "from-env"}')
+
+    settings = Settings()
+
+    assert settings.s3.bucket_name == "from-env"
+    assert settings.s3.secret_access_key is not None
+    assert settings.s3.secret_access_key.get_secret_value() == "s3-file-secret"
+
+
+def test_an_unreadable_section_variable_counts_as_setting_the_secret() -> None:
+    # Settings itself refuses such a value earlier; the helper fails closed on its own too.
+    exported = {"AGENT_CONTEXT_S3": "not json at all"}
+    assert settings_module._section_sets(exported, "s3", "secret_access_key")
+    assert settings_module._section_sets({"AGENT_CONTEXT_S3": "[1]"}, "s3", "secret_access_key")
+    assert not settings_module._section_sets(
+        {"AGENT_CONTEXT_S3": '{"bucket_name": "b"}'}, "s3", "secret_access_key"
+    )
+    assert not settings_module._section_sets({}, "s3", "secret_access_key")
+
+
+@pytest.mark.parametrize("content", ["val\N{NO-BREAK SPACE}ue", "value\r", "value\r\r\n"])
+def test_a_no_break_space_or_a_bare_carriage_return_is_refused(
+    secrets_dir: Path, content: str
+) -> None:
+    _write(secrets_dir, "AGENT_CONTEXT_MCP__TOKEN_HMAC_KEY", content)
+    with pytest.raises(SecretFileError, match="AGENT_CONTEXT_MCP__TOKEN_HMAC_KEY"):
+        Settings()
