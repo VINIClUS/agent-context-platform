@@ -310,9 +310,10 @@ agent-context mcp-token revoke mcp_AbCd1234xyz            # prefix from `mcp-tok
 objects no catalog row references once older than the 24-hour floor (counts only).
 `GET /v1/auth/whoami` answers `204` and `X-Agent-Context-Token-Kind: producer|mcp` for a valid
 token and writes nothing. `AGENT_CONTEXT_SECRETS_DIR` reads secret settings from `0400` files named
-after their variables (the environment wins over a file). A stored object that fails verification
-raises the `content_integrity_failure` log line and the `integrity_failures` metric and answers a
-retryable `503` with `Retry-After: 60`; it is never repaired automatically. See
+after their variables (a variable both exported and mounted refuses to start). A stored object
+that fails verification raises the `content_integrity_failure` log line and the
+`integrity_failures` metric and answers a retryable `503` (`Retry-After: 60`); it is never repaired
+automatically. See
 [docs/operations/content-integrity.md](docs/operations/content-integrity.md).
 
 ### Migrating the schema
