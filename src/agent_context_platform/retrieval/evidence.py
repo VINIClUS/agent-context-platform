@@ -1,7 +1,7 @@
 """Ledger-backed evidence for context items (PLATFORM-043): references, snippets, ranking.
 
 Every `EvidenceRefV1` a context package cites is built here from a REAL stored event, loaded through
-`LedgerRepository.get_event` (the ledger's single reconstruction path) and integrity-checked with
+`_row_to_stored_event` (the reconstruction `LedgerRepository.get_event` uses), in batches, and integrity-checked with
 the SDK's `verify_event`; an event that is missing, not yet delivered by the projection runner
 (pending or dead-lettered), fails verification, has a non-UUIDv7 ID or lies outside the request
 scope is never cited.
@@ -57,12 +57,13 @@ from agent_context_sdk import (
 from agent_context_sdk.canonical import canonical_json_bytes
 from agent_context_sdk.contracts.query import EvidenceRefV1
 from pydantic import ValidationError
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_context_platform.content.models import INLINE_MAX_BYTES
 from agent_context_platform.content.service import ContentService, ContentServiceError
-from agent_context_platform.ledger.repository import LedgerRepository
+from agent_context_platform.ledger.models import EventContentRefRow, EventRow
+from agent_context_platform.ledger.repository import _row_to_stored_event
 from agent_context_platform.projection.projectors.search import extract_text
 from agent_context_platform.retrieval.models import TEXT_SEARCH_CONFIG
 
@@ -72,6 +73,8 @@ MAX_READ_BYTES: Final = INLINE_MAX_BYTES
 MAX_SNIPPET_CHARS: Final = 480
 MAX_EVENTS_PER_LOAD: Final = 1000
 DEFAULT_STATEMENT_TIMEOUT_SECONDS: Final = 5.0
+EXECUTION_EVENT_PREFIX: Final = "quality."
+FAILURE_OBSERVED_TYPE: Final = "knowledge.failure.observed"
 _READABLE_MEDIA_TYPES: Final = frozenset({"text/plain", "application/json"})
 
 _PURGED: Final[str] = (
@@ -106,9 +109,15 @@ class EvidenceScope:
     - `before` (exclusive) bounds its `occurred_at`, `recorded_before` its `observed_at`: a
       revision's window end bounds both (a fact first recorded after the window is later
       knowledge, whenever it says it happened); `failure_history` bounds valid time only.
-    - In a revision query (`revision_mode`), an event whose payload names a workspace snapshot
-      (`snapshot_id`) is dirty evidence unless it is the requested snapshot (`snapshot_id`;
-      `None` for a commit): CI or test output of a dirty workspace never backs a commit answer.
+    - In a revision query (`revision_mode`), an EXECUTION event (`quality.*`: CI and test runs,
+      findings) whose payload names a workspace snapshot is dirty evidence unless it is the
+      requested snapshot (`snapshot_id`; `None` for a commit): output of a dirty workspace never
+      backs a commit answer. Code events are NOT filtered this way: a code claim names the run
+      that first observed it, so an unchanged symbol committed after being indexed in a dirty
+      snapshot is a replayed claim whose only event names that snapshot. Whether a code fact
+      belongs to the revision is decided by the revision's membership (`revision.py`).
+    - `excluded_runs` are the CI and test runs the answer dropped (dirty runs): a failure
+      observation (`knowledge.failure.observed`) made in one of them is not cited either.
     - `max_outbox_id` bounds its outbox position to the package's `as_of_event_id`, so an event
       delivered after the snapshot (while an earlier one was still pending) is never cited.
     """
@@ -119,6 +128,7 @@ class EvidenceScope:
     recorded_before: datetime | None = None
     revision_mode: bool = False
     snapshot_id: str | None = None
+    excluded_runs: frozenset[str] = frozenset()
     max_outbox_id: int | None = None
 
     def __post_init__(self) -> None:
@@ -135,9 +145,14 @@ class EvidenceScope:
             return False
         if self.recorded_before is not None and event.observed_at >= self.recorded_before:
             return False
-        if self.revision_mode:
-            named = event.payload.get("snapshot_id")
+        payload = event.payload
+        if self.revision_mode and event.event_type.startswith(EXECUTION_EVENT_PREFIX):
+            named = payload.get("snapshot_id")
             if named is not None and str(named) != self.snapshot_id:
+                return False
+        if self.excluded_runs and event.event_type == FAILURE_OBSERVED_TYPE:
+            runs = {str(payload[k]) for k in ("ci_run_id", "test_run_id") if payload.get(k)}
+            if runs & self.excluded_runs:
                 return False
         return True
 
@@ -243,6 +258,17 @@ def clean_text(value: str, limit: int) -> str:
     return collapsed[: limit - 1].rstrip() + "…"
 
 
+class LoadedEvents(dict[str, "LedgerEvent"]):
+    """Loaded events by ID; `capped` says the request named more than `MAX_EVENTS_PER_LOAD`."""
+
+    capped: bool = False
+
+
+async def _purged(session: AsyncSession, content_ids: Sequence[str]) -> set[str]:
+    rows = await session.execute(text(_PURGED), {"content_ids": list(content_ids)})
+    return {str(row.content_id) for row in rows}
+
+
 def _uuid(value: str) -> UUID | None:
     try:
         return UUID(value)
@@ -270,38 +296,51 @@ class EvidenceLedger:
         """Bound every statement of the session's transaction (the request deadline bounds all)."""
         await session.execute(text(_TIMEOUT), {"millis": self._timeout})
 
-    async def events(
-        self, event_ids: Iterable[str], scope: EvidenceScope
-    ) -> dict[str, LedgerEvent]:
-        """The verified, in-scope events among `event_ids` (others are silently not citable)."""
+    async def events(self, event_ids: Iterable[str], scope: EvidenceScope) -> LoadedEvents:
+        """The verified, in-scope events among `event_ids` (others are silently not citable).
+
+        At most `MAX_EVENTS_PER_LOAD` are loaded: the NEWEST (UUIDv7 order), with `capped` set
+        so the caller reports it. One transaction, a fixed number of statements: delivery, the
+        event rows, their content references (reconstructed by the ledger's own
+        `_row_to_stored_event`) and the purge check.
+        """
         wanted = sorted({uid for uid in (_uuid(e) for e in event_ids) if uid is not None})
+        loaded = LoadedEvents()
         if len(wanted) > MAX_EVENTS_PER_LOAD:
-            wanted = wanted[:MAX_EVENTS_PER_LOAD]
-        loaded: dict[str, LedgerEvent] = {}
+            wanted = wanted[-MAX_EVENTS_PER_LOAD:]
+            loaded.capped = True
+        if not wanted:
+            return loaded
         async with self._sessions() as session:
-            events: list[StoredEventV1] = []
-            delivered = set()
-            if wanted:
-                await self._bound(session)
-                rows = await session.execute(
-                    text(_DELIVERED),
-                    {"ids": [str(e) for e in wanted], "max": scope.max_outbox_id},
+            await self._bound(session)
+            rows = await session.execute(
+                text(_DELIVERED), {"ids": [str(e) for e in wanted], "max": scope.max_outbox_id}
+            )
+            delivered = sorted(UUID(str(row.event_id)) for row in rows)
+            if not delivered:
+                return loaded
+            event_rows = (
+                await session.scalars(select(EventRow).where(EventRow.event_id.in_(delivered)))
+            ).all()
+            ref_rows = (
+                await session.scalars(
+                    select(EventContentRefRow).where(EventContentRefRow.event_id.in_(delivered))
                 )
-                delivered = {UUID(str(row.event_id)) for row in rows}
-            for event_id in wanted:
-                if event_id not in delivered:
+            ).all()
+            refs: dict[UUID, list[EventContentRefRow]] = {}
+            for ref in ref_rows:
+                refs.setdefault(ref.event_id, []).append(ref)
+            events: list[StoredEventV1] = []
+            for row in sorted(event_rows, key=lambda r: r.event_id):
+                event = _row_to_stored_event(row, refs.get(row.event_id, []))
+                if event.event_id.version != 7 or not verify_event(event):
                     continue
-                event = await LedgerRepository.get_event(session, event_id)
-                if event is None or event.event_id.version != 7 or not verify_event(event):
-                    continue
-                if not scope.admits(event):
-                    continue
-                events.append(event)
+                if scope.admits(event):
+                    events.append(event)
             content_ids = sorted({ref.content_id for e in events for ref in e.content_refs})
             purged: set[str] = set()
             if content_ids:
-                rows = await session.execute(text(_PURGED), {"content_ids": content_ids})
-                purged = {str(row.content_id) for row in rows}
+                purged = await _purged(session, content_ids)
         for event in events:
             preimage = canonical_json_bytes(
                 event.model_dump(mode="json", exclude={"integrity": {"event_sha256"}})
@@ -315,24 +354,40 @@ class EvidenceLedger:
 
     async def snippet(self, item: LedgerEvent, content_id: str | None) -> str | None:
         """A bounded excerpt of gated content, or `None` when any gate refuses (see module)."""
-        ref = item.citable_content(content_id)
-        if ref is None:
-            return None
-        media = ref.media_type.split(";", 1)[0].strip().lower()
-        if media not in _READABLE_MEDIA_TYPES or ref.uncompressed_bytes > MAX_READ_BYTES:
-            return None
+        return (await self.snippets([(item, content_id)])).get((item.event_id, content_id))
+
+    async def snippets(
+        self, requests: Sequence[tuple[LedgerEvent, str | None]]
+    ) -> dict[tuple[str, str | None], str | None]:
+        """Excerpts for several (event, content ID) pairs, read in ONE transaction whose purge
+        re-check (a purge recorded since `events` loaded the event must still win) covers them all.
+        """
+        readable: dict[tuple[str, str | None], ContentRefV1] = {}
+        found: dict[tuple[str, str | None], str | None] = {}
+        for item, content_id in requests:
+            key = (item.event_id, content_id)
+            found[key] = None
+            ref = item.citable_content(content_id)
+            if ref is None:
+                continue
+            media = ref.media_type.split(";", 1)[0].strip().lower()
+            if media in _READABLE_MEDIA_TYPES and ref.uncompressed_bytes <= MAX_READ_BYTES:
+                readable[key] = ref
+        if not readable:
+            return found
         async with self._sessions() as session:
             await self._bound(session)
-            # Re-checked in the read's own transaction: a purge recorded since `events` loaded
-            # the event must still win.
-            if (await session.execute(text(_PURGED), {"content_ids": [ref.content_id]})).first():
-                return None
-            try:
-                data = await self._content.read(session, ref)
-            except ContentServiceError:
-                return None
-        excerpt = clean_text(extract_text(media, data), MAX_SNIPPET_CHARS)
-        return excerpt or None
+            purged = await _purged(session, sorted({r.content_id for r in readable.values()}))
+            for key, ref in sorted(readable.items(), key=lambda kv: (kv[0][0], kv[0][1] or "")):
+                if ref.content_id in purged:
+                    continue
+                try:
+                    data = await self._content.read(session, ref)
+                except ContentServiceError:
+                    continue
+                media = ref.media_type.split(";", 1)[0].strip().lower()
+                found[key] = clean_text(extract_text(media, data), MAX_SNIPPET_CHARS) or None
+        return found
 
     async def rank_documents(
         self, event_ids: Sequence[str], query: str, *, limit: int

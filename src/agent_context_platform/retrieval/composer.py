@@ -11,12 +11,16 @@ exist in the graph, a revision must have been indexed for it (`revision.py`), a 
 exist. Code is read AS INDEXED AT the revision, from the per-run facts (`RevisionView`), never from
 the current pointers, so a commit query cannot see a later or dirty snapshot's code, and a
 snapshot query sees its uncommitted revisions. The revision's window `[run start, next run)`
-bounds everything else: decisions and failures are read at `valid_at = recorded_at =` the end of
-the window (when the window is open: the instant the ledger recorded the package's
-`as_of_event_id`, never the wall clock), and every cited event, session content included, must
-have occurred AND been observed inside the window. CI, test and other output of a workspace
-snapshot other than the requested one (dirty state, for a commit: any snapshot) is never evidence:
-such events are not citable and such runs are dropped from failures (`EvidenceScope`).
+bounds everything else: decisions and failures are read at `valid_at` just before the end of the
+window (an open window: the snapshot's `valid_instant`, never the wall clock) and at a record time
+that never passes the snapshot (`Freshness.known_until`: a supersession, fix or decision delivered
+beyond `as_of_event_id` is not known yet), and every cited event, session content included, must
+have occurred AND been observed inside the window. CI and test output of a workspace snapshot
+other than the requested one (dirty state, for a commit: any snapshot) is never evidence: such
+execution events are not citable, such runs are dropped from failures together with the
+observations made in them, and a resolution that rested on them becomes
+`unknown (dirty_runs_excluded)`. Code facts are not filtered this way: a commit that adopts code
+first indexed in a dirty snapshot cites that replayed claim; revision membership decides.
 
 Candidates. Graph proximity comes from PLATFORM-040 (`neighborhood`, depth 2, around the code the
 task names) and from the revision's own relations; every node 040 returns is admitted only if the
@@ -74,8 +78,10 @@ Freshness. `as_of_event_id`, `projection_checkpoint` and `staleness_ms` come fro
 Bounds and safety. Inputs are data: no SQL, Cypher, path or URL is ever taken from them (all
 statements are static and parameterized, all graph reads go through the read-only facades). The
 whole request runs under one deadline (`RetrievalDeadlineExceeded`); a request may shorten the
-composer's deadline, never extend it, and every PostgreSQL statement has its own timeout. Nothing
-is logged here.
+composer's deadline, never extend it, and every PostgreSQL statement has its own timeout. A
+cancelled statement is the deadline and any other driver error is `ContextUnavailable`, both
+raised `from None` and content-free (a driver error carries the statement and its parameters, the
+user's query words among them). Nothing is logged here.
 """
 
 from __future__ import annotations
@@ -110,6 +116,7 @@ from agent_context_sdk.contracts.mcp import (
 )
 from agent_context_sdk.ids import new_uuid7
 from pydantic import BaseModel
+from sqlalchemy.exc import DBAPIError
 
 from agent_context_platform.projection.neo4j import Neo4jReadFacade
 from agent_context_platform.retrieval.cursor import CursorCodec, query_digest
@@ -151,6 +158,7 @@ from agent_context_platform.retrieval.temporal import (
     DecisionRecord,
     DecisionStanding,
     FailureRecord,
+    FixResolution,
     FixStatus,
     HistoricalReason,
     ObservedRun,
@@ -209,10 +217,16 @@ _STOPWORD_TEXT: Final = (
 )
 _STOPWORDS: Final = frozenset(_STOPWORD_TEXT.split())
 _ONE_MICROSECOND: Final = timedelta(microseconds=1)
+QUERY_CANCELED: Final = "57014"  # PostgreSQL SQLSTATE of a statement cancelled by its timeout
+FAR_FUTURE: Final = datetime(9999, 12, 31, tzinfo=UTC)  # "every recorded fact" for temporal reads
 
 
 class ContextRequestError(RetrievalError, ValueError):
     """The request is malformed or cannot be answered as asked."""
+
+
+class ContextUnavailable(RetrievalError):
+    """A backing store failed; the message never carries a statement or its parameters."""
 
 
 class SymbolNotFound(ScopeNotFound):
@@ -265,6 +279,7 @@ class _Gathered:
     candidates: dict[str, _Candidate] = field(default_factory=dict)
     warnings: set[str] = field(default_factory=set)
     evidence: EvidenceScope | None = None  # the scope cited events must satisfy, if narrower
+    loaded: dict[str, LedgerEvent] = field(default_factory=dict)  # events already loaded
 
     def add(self, candidate: _Candidate) -> None:
         held = self.candidates.get(candidate.item_id)
@@ -285,32 +300,56 @@ class _Gathered:
 
 @dataclass(frozen=True, slots=True)
 class _Window:
-    """A revision's time window and its reading instant."""
+    """A revision's time window and the instants temporal facts are read at."""
 
     start: datetime
     end: datetime | None
-    at: datetime
+    at: datetime  # valid time
+    known: datetime  # record time: what the platform knew, never beyond the snapshot
 
 
 class _Renderer:
-    """Renders ranked candidates for one page, loading cited events a window at a time."""
+    """Renders ranked candidates for one page, loading cited events and excerpts a window at a
+    time (events already loaded for this request, e.g. by the search filter, are reused after
+    the page's scope admits them again)."""
 
     def __init__(
-        self, composer: ContextComposer, ranked: Sequence[_Candidate], scope: EvidenceScope
+        self,
+        composer: ContextComposer,
+        ranked: Sequence[_Candidate],
+        scope: EvidenceScope,
+        loaded: Mapping[str, LedgerEvent],
+        warnings: set[str],
     ) -> None:
         self._composer = composer
         self._ranked = ranked
         self._scope = scope
-        self._events: dict[str, LedgerEvent] = {}
+        self._events = {k: v for k, v in loaded.items() if scope.admits(v.event)}
+        self._seen = set(loaded)  # loaded before: not citable when the scope refused it
+        self._snippets: dict[tuple[str, str | None], str | None] = {}
+        self._warnings = warnings
         self._loaded_to = 0
 
     async def _load(self, position: int) -> None:
         if position < self._loaded_to:
             return
         window = self._ranked[position : position + LOAD_WINDOW]
-        wanted = {c.event_id for cand in window for c in cand.citations} - set(self._events)
+        wanted = {c.event_id for cand in window for c in cand.citations} - self._seen
         if wanted:
-            self._events.update(await self._composer._ledger.events(wanted, self._scope))
+            found = await self._composer._ledger.events(wanted, self._scope)
+            if found.capped:
+                self._warnings.add("evidence_capped")
+            self._events.update(found)
+            self._seen |= wanted
+        requests = {
+            (owner.event_id, cand.excerpt[1]): (owner, cand.excerpt[1])
+            for cand in window
+            if cand.excerpt is not None
+            and (owner := _excerpt_owner(cand, self._events)) is not None
+            and (owner.event_id, cand.excerpt[1]) not in self._snippets
+        }
+        if requests:
+            self._snippets.update(await self._composer._ledger.snippets(list(requests.values())))
         self._loaded_to = position + len(window)
 
     async def citable(self, position: int) -> bool:
@@ -322,7 +361,53 @@ class _Renderer:
 
     async def render(self, position: int, *, quote: bool) -> ContextItemV1 | None:
         await self._load(position)
-        return await self._composer._render(self._ranked[position], self._events, quote=quote)
+        candidate = self._ranked[position]
+        excerpt = None
+        if quote and candidate.excerpt is not None:
+            owner = _excerpt_owner(candidate, self._events)
+            if owner is not None:
+                excerpt = self._snippets.get((owner.event_id, candidate.excerpt[1]))
+        return _render(candidate, self._events, excerpt)
+
+
+def _excerpt_owner(candidate: _Candidate, events: Mapping[str, LedgerEvent]) -> LedgerEvent | None:
+    """The citable event whose content an item quotes: the named one, else a cited event that
+    carries the same content (or, with no content ID, any cited event)."""
+    if candidate.excerpt is None:
+        return None
+    event_id, content_id = candidate.excerpt
+    if event_id in events:
+        return events[event_id]
+    for citation in candidate.citations:
+        if citation.event_id in events and (
+            content_id is None or citation.content_id == content_id
+        ):
+            return events[citation.event_id]
+    return None
+
+
+def _render(
+    candidate: _Candidate, events: Mapping[str, LedgerEvent], excerpt: str | None
+) -> ContextItemV1 | None:
+    refs: dict[str, EvidenceRefV1] = {}
+    for citation in candidate.citations:
+        found = events.get(citation.event_id)
+        ref = None if found is None else evidence_ref(found, citation)
+        if ref is not None:
+            refs.setdefault(ref.model_dump_json(), ref)
+    if not refs:
+        return None
+    evidence = tuple(refs[key] for key in sorted(refs)[:MAX_EVIDENCE_PER_ITEM])
+    content = candidate.body
+    if excerpt is not None:
+        content += f"\n{EXCERPT_LABEL}: " + json.dumps(excerpt, ensure_ascii=False)
+    return ContextItemV1(
+        item_id=candidate.item_id,
+        kind=candidate.kind,
+        title=clean_text(candidate.title, MAX_TITLE_CHARS) or candidate.kind,
+        content=content,
+        evidence=evidence,
+    )
 
 
 class ContextComposer:
@@ -469,9 +554,17 @@ class ContextComposer:
                 cited = replace(
                     gathered.evidence or evidence_scope, max_outbox_id=freshness.as_of_outbox_id
                 )
-                items, next_position, dropped = await self._page(ranked, start, budget, cited)
+                items, next_position, dropped = await self._page(
+                    ranked, start, budget, cited, gathered.loaded, gathered.warnings
+                )
         except TimeoutError:
             raise RetrievalDeadlineExceeded("context request exceeded its deadline") from None
+        except DBAPIError as error:
+            # A driver error carries the statement and its parameters (the user's query words
+            # among them): never let it travel. A cancelled statement is the deadline.
+            if getattr(error.orig, "sqlstate", None) == QUERY_CANCELED:
+                raise RetrievalDeadlineExceeded("context request exceeded its deadline") from None
+            raise ContextUnavailable("the ledger could not be read") from None
         if dropped:
             gathered.warnings.add("items_without_evidence")
         next_cursor = None
@@ -493,6 +586,8 @@ class ContextComposer:
         start: int,
         budget: QueryBudgetV1,
         scope: EvidenceScope,
+        loaded: Mapping[str, LedgerEvent] | None = None,
+        warnings: set[str] | None = None,
     ) -> tuple[list[ContextItemV1], int, int]:
         """Items from `start` in rank order, and the position after the last one taken.
 
@@ -504,7 +599,9 @@ class ContextComposer:
         """
         max_items = min(budget.max_items, MAX_PAGE_ITEMS)
         max_bytes = min(budget.max_bytes, budget.max_tokens * BYTES_PER_TOKEN)
-        renderer = _Renderer(self, ranked, scope)
+        renderer = _Renderer(
+            self, ranked, scope, loaded or {}, set() if warnings is None else warnings
+        )
         items: list[ContextItemV1] = []
         used = 2  # the array's brackets
         dropped = 0
@@ -532,42 +629,6 @@ class ContextComposer:
             position += 1
         return items, position, dropped
 
-    async def _render(
-        self, candidate: _Candidate, events: Mapping[str, LedgerEvent], *, quote: bool
-    ) -> ContextItemV1 | None:
-        refs: dict[str, EvidenceRefV1] = {}
-        for citation in candidate.citations:
-            found = events.get(citation.event_id)
-            ref = None if found is None else evidence_ref(found, citation)
-            if ref is not None:
-                refs.setdefault(ref.model_dump_json(), ref)
-        if not refs:
-            return None
-        evidence = tuple(refs[key] for key in sorted(refs)[:MAX_EVIDENCE_PER_ITEM])
-        content = candidate.body
-        if quote and candidate.excerpt is not None:
-            event_id, content_id = candidate.excerpt
-            owner = events.get(event_id) or next(
-                (
-                    events[c.event_id]
-                    for c in candidate.citations
-                    if c.content_id is not None
-                    and c.content_id == content_id
-                    and c.event_id in events
-                ),
-                None,
-            )
-            excerpt = None if owner is None else await self._ledger.snippet(owner, content_id)
-            if excerpt is not None:
-                content += f"\n{EXCERPT_LABEL}: " + json.dumps(excerpt, ensure_ascii=False)
-        return ContextItemV1(
-            item_id=candidate.item_id,
-            kind=candidate.kind,
-            title=clean_text(candidate.title, MAX_TITLE_CHARS) or candidate.kind,
-            content=content,
-            evidence=evidence,
-        )
-
     # --- scope resolution ---
 
     async def _view(
@@ -578,12 +639,13 @@ class ContextComposer:
         return await self._revisions.view(repository_id, revision)
 
     def _window(self, view: RevisionView, freshness: Freshness) -> _Window:
-        """The revision's window; an open one is read at the projection snapshot's instant."""
+        """The revision's window: a closed one is read just before its end; an open one at the
+        snapshot's `valid_instant`. Record time is never beyond the snapshot (`_known`)."""
         start = window_bound(view.run.occurred_at)
         end = window_bound(view.window_end)
         assert start is not None
-        at = freshness.as_of_recorded_at if end is None else end - _ONE_MICROSECOND
-        return _Window(start, end, max(start, at))
+        at = max(start, freshness.valid_instant if end is None else end - _ONE_MICROSECOND)
+        return _Window(start, end, at, _known(freshness, at))
 
     @staticmethod
     def _revision_scope(
@@ -637,8 +699,10 @@ class ContextComposer:
                 gathered.add(code.relation(relation, distance=min(near)))
 
         temporal = TemporalScope(repository_id=repository_id)
-        decisions = await self._decisions(temporal, window.at, window.at, False, gathered)
-        failures = await self._failures(temporal, window.at, window.at, gathered)
+        decisions = await self._decisions(temporal, window.at, window.known, False, gathered)
+        failures = await self._failures(temporal, window.at, window.known, gathered)
+        scope = replace(scope, excluded_runs=_dirty_runs(failures, snapshot))
+        gathered.evidence = scope
         failures = [clean for f in failures if (clean := _without_dirty(f, snapshot)) is not None]
         hits = await self._search_hits(repository_id, request.task, tokens, scope, gathered)
         hit_match = {event: score for hit, score in hits for event in hit.source_event_ids}
@@ -666,7 +730,7 @@ class ContextComposer:
                 continue  # the decision or failure item already carries this content
             if hit.event_type.startswith(("knowledge.decision", "knowledge.failure")):
                 continue  # not active or not visible at the revision: never a leak
-            gathered.add(_content_candidate(hit, score))
+            gathered.add(_content_candidate(hit, score, gathered.loaded))
         return gathered
 
     async def _current_proximity(
@@ -729,6 +793,9 @@ class ContextComposer:
             {e for hit in (*lexical, *vector) for e in (hit.event_id, *hit.source_event_ids)},
             scope,
         )
+        gathered.loaded.update(citable)
+        if citable.capped:
+            gathered.warnings.add("evidence_capped")
 
         def admitted(hit: SearchHit) -> SearchHit | None:
             events = tuple(sorted(e for e in {hit.event_id, *hit.source_event_ids} if e in citable))
@@ -773,9 +840,14 @@ class ContextComposer:
             for candidate in code.changes(view.previous, before):
                 gathered.add(candidate)
         temporal = TemporalScope(repository_id=repository_id)
-        for record in await self._decisions(temporal, window.at, window.at, False, gathered):
+        for record in await self._decisions(temporal, window.at, window.known, False, gathered):
             gathered.add(_decision_candidate(record, window.at, priority=3))
-        for failure in await self._failures(temporal, window.at, window.at, gathered):
+        failures = await self._failures(temporal, window.at, window.known, gathered)
+        if gathered.evidence is not None:
+            gathered.evidence = replace(
+                gathered.evidence, excluded_runs=_dirty_runs(failures, None)
+            )
+        for failure in failures:
             clean = _without_dirty(failure, None)
             if clean is None or clean.resolution.status is FixStatus.RESOLVED:
                 continue
@@ -815,7 +887,7 @@ class ContextComposer:
             code.module_of(symbol.file_id),
         }
         temporal = TemporalScope(repository_id=request.repository_id)
-        for record in await self._decisions(temporal, window.at, window.at, True, gathered):
+        for record in await self._decisions(temporal, window.at, window.known, True, gathered):
             if names.intersection(record.subjects):
                 gathered.add(_decision_candidate(record, window.at, priority=3, match=1.0))
         return gathered
@@ -835,7 +907,7 @@ class ContextComposer:
             raise ScopeNotFound("the project or repository is unknown")
         gathered = _Gathered()
         # Known as of the projection snapshot, not the wall clock: the same snapshot, the same answer.
-        known = freshness.as_of_recorded_at
+        known = _known(freshness)
         result = await self._temporal.decisions(temporal, request.valid_at, known, True)
         if result.truncated:
             gathered.warnings.add("decisions_capped")
@@ -887,7 +959,7 @@ class ContextComposer:
         )
         temporal = TemporalScope(repository_id=request.repository_id)
         at = request.valid_to - _ONE_MICROSECOND
-        result = await self._temporal.failures(temporal, at, freshness.as_of_recorded_at, True)
+        result = await self._temporal.failures(temporal, at, _known(freshness), True)
         if result.truncated:
             gathered.warnings.add("failures_capped")
         failures = [f for f in result.failures if _in_window(f, request.valid_from, at)]
@@ -1458,11 +1530,14 @@ def _failure_candidates(
     return found
 
 
-def _content_candidate(hit: SearchHit, score: float) -> _Candidate:
+def _content_candidate(
+    hit: SearchHit, score: float, events: Mapping[str, LedgerEvent] | None = None
+) -> _Candidate:
     kind = _CONTENT_KINDS.get(hit.event_type, "session_content")
     where = f"session {hit.session_id}" if hit.session_id else "the repository"
     body = (
-        f"{kind.replace('_', ' ')} from {where} ({hit.event_type}) at {_iso(hit.occurred_at)}\n"
+        f"{kind.replace('_', ' ')} from {where} ({hit.event_type}) at {_iso(hit.occurred_at)}"
+        f"{_ran_on(hit, events or {})}\n"
         f"content: sanitized ({hit.redaction}); match score {score}"
     )
     digest = hashlib.sha256(hit.content_id.encode()).hexdigest()[:32]
@@ -1510,6 +1585,31 @@ _CONTENT_KINDS: Final = {
 }
 
 
+def _ran_on(hit: SearchHit, events: Mapping[str, LedgerEvent]) -> str:
+    """Which revision executed output ran on, from its citable run event (a CI or test run of
+    another commit is in the window but is not the requested revision's)."""
+    for event_id in hit.source_event_ids:
+        found = events.get(event_id)
+        if found is None or not found.event.event_type.startswith("quality."):
+            continue
+        payload = found.event.payload
+        if payload.get("commit_id"):
+            return f", run on commit {payload['commit_id']}"
+        if payload.get("snapshot_id"):
+            return f", run on workspace snapshot {payload['snapshot_id']}"
+    return ""
+
+
+def _dirty_runs(failures: Iterable[FailureRecord], snapshot: str | None) -> frozenset[str]:
+    """The CI and test runs a revision answer drops: those of another workspace snapshot."""
+    return frozenset(
+        run.run_id
+        for failure in failures
+        for run in failure.observed_in
+        if run.kind is not RunKind.SESSION and run.snapshot_id not in (None, snapshot)
+    )
+
+
 def _run_line(run: ObservedRun) -> str:
     parts = [f"- {run.kind.value} {run.run_id}"]
     if run.status:
@@ -1527,17 +1627,27 @@ def _run_line(run: ObservedRun) -> str:
 
 def _without_dirty(failure: FailureRecord, snapshot: str | None) -> FailureRecord | None:
     """A failure as seen from a revision: runs on any other workspace snapshot are dirty, not
-    evidence (`snapshot` is the requested one, `None` for a commit)."""
-    runs = tuple(run for run in failure.observed_in if run.snapshot_id in (None, snapshot))
-    if failure.observed_in and not runs:
+    evidence (`snapshot` is the requested one, `None` for a commit).
+
+    The resolution was derived over every run, dirty ones included, so it is kept only when it
+    rests on the remaining runs alone: a fix path between two kept runs that validated an allowed
+    revision. Anything else is `unknown` with the reason `dirty_runs_excluded` (never a reason
+    text that names a dirty run).
+    """
+    kept = tuple(run for run in failure.observed_in if run.snapshot_id in (None, snapshot))
+    if failure.observed_in and not kept:
         return None
+    ids = {run.run_id for run in kept}
+    path = failure.resolution.path
+    path_kept = path is None or (
+        path.failing_run_id in ids and path.validated_snapshot_id in (None, snapshot)
+    )
+    if len(kept) == len(failure.observed_in) and path_kept:
+        return failure
     resolution = failure.resolution
-    if resolution.path is not None and resolution.path.validated_snapshot_id not in (
-        None,
-        snapshot,
-    ):
-        resolution = replace(resolution, status=FixStatus.UNRESOLVED, reason="dirty_fix", path=None)
-    return replace(failure, observed_in=runs, resolution=resolution)
+    if path is None or not path_kept:
+        resolution = FixResolution(FixStatus.UNKNOWN, "dirty_runs_excluded")
+    return replace(failure, observed_in=kept, resolution=resolution)
 
 
 def _in_window(failure: FailureRecord, start: datetime, end: datetime) -> bool:
@@ -1567,6 +1677,13 @@ def _failure_words(failure: FailureRecord) -> tuple[str, ...]:
 # --------------------------------------------------------------------------------------------
 # Ranking, budgets and helpers
 # --------------------------------------------------------------------------------------------
+
+
+def _known(freshness: Freshness, ceiling: datetime | None = None) -> datetime:
+    """The record time temporal facts are read at: everything the snapshot knows and nothing
+    beyond it (`Freshness.known_until`), at most `ceiling` (a closed revision window)."""
+    bounds = [b for b in (freshness.known_until, ceiling) if b is not None]
+    return min(bounds) if bounds else FAR_FUTURE
 
 
 def _snapshot_token(freshness: Freshness) -> str:

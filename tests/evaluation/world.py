@@ -274,9 +274,17 @@ class EvalWorld:
         repo.write("pkg/draft.py", DRAFT)
         lineage = self._lineage(repo, lineage, extra=("pkg/draft.py",))
         await self._index(repo, lineage, at(5), "snapshot")
+        self._repo, self._repo_lineage = repo, lineage
 
         await self._after_snapshot()
         await self._other_repository(tmp)
+
+    async def commit_worktree(self, hours: float, name: str) -> str:
+        """Commit the dirty working tree indexed as the snapshot, unchanged, and index it: the
+        usual flow (index a dirty workspace, then commit). Returns the new commit."""
+        oid = self._repo.commit(at(hours), "commit the snapshot")
+        await self._index(self._repo, self._repo_lineage, at(hours), name)
+        return oid
 
     def _scope(self) -> tuple[str, str, str]:
         if self._other:

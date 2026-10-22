@@ -24,8 +24,8 @@ from agent_context_sdk.contracts.mcp import (
     RepositoryOverviewInputV1,
     SymbolContextInputV1,
 )
-from evaluation.world import NOW, PROJECT, REPOSITORY, EvalWorld, Revisions, at
-from sqlalchemy import text
+from evaluation.world import NOW, PROJECT, REPOSITORY, EvalWorld, Revisions, _content, at
+from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from agent_context_platform.content.service import ContentService
@@ -53,6 +53,7 @@ from .conftest import wipe
 pytestmark = pytest.mark.integration
 
 PRINCIPAL = RequestContext("contract-principal")
+STATEMENT_CEILING = 40  # PostgreSQL statements of one context_for_task page (API role)
 WIDE = {"max_items": 30, "max_bytes": 60_000, "max_tokens": 15_000}
 
 
@@ -495,6 +496,8 @@ def test_dirty_ci_output_and_late_knowledge_back_only_the_snapshot_answer(
         clean = await composer.context_for_task(task(commit(seeded.revisions.c2), ask), PRINCIPAL)
         return dirty, clean
 
+    # The dirty output never even becomes a candidate (it would be dropped as uncitable).
+
     dirty, clean = run_in_world(seeded, postgres_dsn, projection_engine, body)
 
     def cited(page: ContextPackageV1) -> set[str]:
@@ -506,6 +509,7 @@ def test_dirty_ci_output_and_late_knowledge_back_only_the_snapshot_answer(
     assert any(item.kind == "ci_output" for item in dirty.items)
     # ... but at C2 (window [3:00, 5:00)) one is dirty and the other later knowledge.
     assert not probes & cited(clean)
+    assert "items_without_evidence" not in clean.warnings
     text_ = "\n".join(item.content for item in clean.items)
     assert "dirty workspace test output" not in text_ and "late observed note" not in text_
 
@@ -529,7 +533,9 @@ def test_a_delivery_past_a_still_pending_row_stales_the_cursor_and_is_never_cite
         first = await composer.decision_history(history(), PRINCIPAL)
         assert first.next_cursor is not None
         await world._decision(97, "dec_pending", 8.5, "A rounding decision held back.")
-        await world._decision(98, "dec_rounding_v3", 8.6, "Round half even in add.")
+        await world._decision(
+            98, "dec_rounding_v3", 8.6, "Round half even in add.", supersedes="dec_rounding_v2"
+        )
         pending = seeded_event = world.keys["decision:dec_pending"]
         async with world.owner.begin() as connection:  # postpone the earlier row
             await connection.execute(
@@ -554,6 +560,20 @@ def test_a_delivery_past_a_still_pending_row_stales_the_cursor_and_is_never_cite
             )
             cited = {str(r.source_event_id) for i in everything.items for r in i.evidence}
             assert world.keys["decision:dec_rounding_v3"] not in cited  # delivered after as_of
+            # Nothing v3 changed is known at the snapshot: v2 is still active, not superseded.
+            by_id = {item.item_id: item for item in everything.items}
+            assert "decision:dec_rounding_v3" not in by_id
+            v2 = by_id["decision:dec_rounding_v2"].content
+            assert "ACTIVE" in v2 and "dec_rounding_v3" not in v2
+            snapshot = await composer.context_for_task(
+                task(
+                    {"kind": "workspace_snapshot", "snapshot_id": seeded.revisions.snapshot},
+                    "rounding decision for add",
+                ),
+                PRINCIPAL,
+            )
+            active = [i for i in snapshot.items if i.item_id == "decision:dec_rounding_v2"]
+            assert active and "ACTIVE" in active[0].content
         finally:
             async with world.owner.begin() as connection:
                 await connection.execute(
@@ -563,3 +583,88 @@ def test_a_delivery_past_a_still_pending_row_stales_the_cursor_and_is_never_cite
             await world.project()
 
     run_in_world(seeded, postgres_dsn, projection_engine, body)
+
+
+def test_answers_follow_the_snapshot_not_the_wall_clock_nor_a_producer_clock(
+    seeded: Seeded, postgres_dsn: str, projection_engine: AsyncEngine
+) -> None:
+    """A decision whose producer clock runs ahead is known as soon as it is delivered; one that
+    starts in two hours is not active in the open snapshot window, whatever the reader's clock."""
+
+    async def body(world: EvalWorld) -> None:
+        real = datetime.now(UTC)
+
+        async def decision(
+            number: int, decision_id: str, observed: datetime, start: datetime
+        ) -> None:
+            item, claim = _content(f"content_{decision_id}", f"{decision_id} about rounding in add")
+            await world._event(
+                number,
+                "knowledge.decision.recorded",
+                observed,
+                {
+                    "decision_id": decision_id,
+                    "status": "accepted",
+                    "subjects": ["pkg.calc.add"],
+                    "content_id": claim.content_id,
+                    "valid_from": start.isoformat(),
+                    "recorded_at": observed.isoformat(),
+                },
+                claims=(claim,),
+                items=(item,),
+            )
+
+        await decision(95, "dec_skewed", real + timedelta(seconds=3), real + timedelta(seconds=3))
+        await decision(96, "dec_scheduled", real, real + timedelta(hours=2))
+        assert (await world.project()).delivered == 2
+        now, tomorrow = (
+            world.composer(clock=lambda: real),
+            world.composer(clock=lambda: real + timedelta(days=1)),
+        )
+        ask = DecisionHistoryInputV1.model_validate(
+            {
+                "scope": {"kind": "project", "project_id": PROJECT},
+                "query": "skewed",
+                "valid_at": (real + timedelta(minutes=1)).isoformat(),
+                "budget": WIDE,
+            }
+        )
+        found = await now.decision_history(ask, PRINCIPAL)
+        assert "decision:dec_skewed" in {item.item_id for item in found.items}
+        snapshot = task(
+            {"kind": "workspace_snapshot", "snapshot_id": seeded.revisions.snapshot},
+            "scheduled decision for add",
+        )
+        today = await now.context_for_task(snapshot, PRINCIPAL)
+        later = await tomorrow.context_for_task(snapshot, PRINCIPAL)
+        assert "decision:dec_scheduled" not in {item.item_id for item in later.items}
+        volatile = {"query_id", "generated_at", "staleness_ms", "next_cursor"}
+        assert today.model_dump(exclude=volatile) == later.model_dump(exclude=volatile)
+
+    run_in_world(seeded, postgres_dsn, projection_engine, body)
+
+
+def test_a_task_answer_needs_a_bounded_number_of_statements(
+    seeded: Seeded, postgres_dsn: str, projection_engine: AsyncEngine
+) -> None:
+    statements: list[str] = []
+
+    async def body(world: EvalWorld) -> ContextPackageV1:
+        engine = world._engines[0].sync_engine  # the API role
+
+        def count(*_: Any) -> None:
+            statements.append("x")
+
+        event.listen(engine, "before_cursor_execute", count)
+        try:
+            return await world.composer().context_for_task(
+                task(commit(seeded.revisions.c2), "rounding drift in add for report totals"),
+                PRINCIPAL,
+            )
+        finally:
+            event.remove(engine, "before_cursor_execute", count)
+
+    page = run_in_world(seeded, postgres_dsn, projection_engine, body)
+    assert page.items
+    print("api statements", len(statements))
+    assert len(statements) <= STATEMENT_CEILING

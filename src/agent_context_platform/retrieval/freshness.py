@@ -12,6 +12,15 @@
   (which never writes checkpoints) leaves it unchanged.
 - `staleness_ms` is the age, at `now`, of the oldest outbox row still waiting; 0 when none waits,
   and never negative.
+- Two instants let the answer depend on the snapshot only, never on the wall clock, and compare
+  like with like (both are producer `observed_at` values, the clock temporal reads use):
+  `known_until` is just before the earliest `observed_at` of any knowledge or quality event
+  BEYOND the watermark (a later outbox row, delivered out of order or still waiting), or `None`
+  when there is none. Reading temporal facts recorded up to it hides every such event (a
+  supersession, a fix, a new decision is not known yet) while a producer whose clock runs ahead
+  is still seen as soon as its event is delivered. `valid_instant` is the latest `observed_at`
+  among the newest `RECENT_EVENTS` delivered events at or below the watermark: the "now" of an
+  open revision window.
 - Warnings, never silent: `projection_dead_letters:<projector>` for open dead letters of a
   projector the answer depends on, `projection_<state>:<projector>` for a paused or rebuilding one,
   and `projection_not_started:<projector>` when it has no checkpoint at all.
@@ -28,7 +37,7 @@ import hashlib
 import json
 from collections.abc import Sequence
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import datetime, timedelta
 from typing import Final
 
 from sqlalchemy import text
@@ -45,7 +54,19 @@ _WATERMARK: Final[str] = (
     "AND (CAST(:low AS bigint) IS NULL OR outbox_id < CAST(:low AS bigint)) "
     "ORDER BY outbox_id DESC LIMIT 1"
 )
-_RECORDED: Final[str] = "SELECT recorded_at FROM ledger.events WHERE event_id = :event_id"
+# Bounded by the outbox rows after the watermark (the backlog), never the whole ledger.
+_BEYOND: Final[str] = (
+    "SELECT min(e.observed_at) FROM projection.outbox o "
+    "JOIN ledger.events e ON e.event_id = o.event_id "
+    "WHERE o.outbox_id > :as_of AND (e.event_type LIKE 'knowledge.%' "
+    "OR e.event_type LIKE 'quality.%')"
+)
+_RECENT: Final[str] = (
+    "SELECT max(e.observed_at) FROM (SELECT event_id FROM projection.outbox "
+    "WHERE outbox_id <= :as_of AND status = 'delivered' ORDER BY outbox_id DESC "
+    "LIMIT :recent) o JOIN ledger.events e ON e.event_id = o.event_id"
+)
+RECENT_EVENTS: Final = 1000
 _TIMEOUT: Final[str] = "SELECT set_config('statement_timeout', :millis, true)"
 _CHECKPOINTS: Final[str] = (
     "SELECT projector_name, projector_version, last_outbox_id, state "
@@ -65,9 +86,8 @@ class ProjectionNotReady(RetrievalError):
 class Freshness:
     as_of_event_id: str
     as_of_outbox_id: int
-    # When the ledger recorded the as-of event: the instant an open revision window is read at,
-    # so an answer depends on the projection snapshot and not on the wall clock.
-    as_of_recorded_at: datetime
+    valid_instant: datetime  # the "now" of an open window (see the module docstring)
+    known_until: datetime | None  # temporal facts recorded after it are beyond the snapshot
     projection_checkpoint: str
     staleness_ms: int
     warnings: tuple[str, ...]
@@ -91,11 +111,11 @@ class FreshnessReader:
             await session.execute(text(_TIMEOUT), {"millis": self._timeout})
             waiting = (await session.execute(text(_WAITING))).one()
             mark = (await session.execute(text(_WATERMARK), {"low": waiting.low})).first()
-            recorded = None
+            recent = beyond = None
             if mark is not None:
-                recorded = (
-                    await session.execute(text(_RECORDED), {"event_id": mark.event_id})
-                ).scalar_one()
+                bound = {"as_of": mark.outbox_id, "recent": RECENT_EVENTS}
+                recent = (await session.execute(text(_RECENT), bound)).scalar_one()
+                beyond = (await session.execute(text(_BEYOND), bound)).scalar_one()
             checkpoints = {
                 (str(row.projector_name), str(row.projector_version)): row
                 for row in await session.execute(text(_CHECKPOINTS))
@@ -104,7 +124,7 @@ class FreshnessReader:
                 (str(row.projector_name), str(row.projector_version)): int(row.open)
                 for row in await session.execute(text(_DEAD_LETTERS))
             }
-        if mark is None or recorded is None:
+        if mark is None or recent is None:
             raise ProjectionNotReady("no event has been projected yet")
         material: list[list[object]] = []
         warnings: list[str] = []
@@ -129,7 +149,8 @@ class FreshnessReader:
         return Freshness(
             as_of_event_id=str(mark.event_id),
             as_of_outbox_id=int(mark.outbox_id),
-            as_of_recorded_at=recorded,
+            valid_instant=recent,
+            known_until=None if beyond is None else beyond - timedelta(microseconds=1),
             projection_checkpoint=f"pc1-{digest[:40]}",
             staleness_ms=staleness,
             warnings=tuple(dict.fromkeys(warnings)),

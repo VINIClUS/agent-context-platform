@@ -45,6 +45,7 @@ from agent_context_platform.retrieval.evidence import (
     Citation,
     EvidenceScope,
     LedgerEvent,
+    LoadedEvents,
     clean_text,
     evidence_ref,
     metadata_ref,
@@ -125,12 +126,16 @@ class FakeLedger:
         self._snippet = snippet
         self.loads: list[set[str]] = []
 
-    async def events(self, event_ids: Any, scope: EvidenceScope) -> dict[str, LedgerEvent]:
+    async def events(self, event_ids: Any, scope: EvidenceScope) -> LoadedEvents:
         self.loads.append(set(event_ids))
-        return {e: self._events[e] for e in event_ids if e in self._events}
+        found = LoadedEvents({e: self._events[e] for e in event_ids if e in self._events})
+        found.capped = len(set(event_ids)) > 3
+        return found
 
-    async def snippet(self, item: LedgerEvent, content_id: str | None) -> str | None:
-        return self._snippet
+    async def snippets(
+        self, requests: list[tuple[LedgerEvent, str | None]]
+    ) -> dict[tuple[str, str | None], str | None]:
+        return {(item.event_id, content_id): self._snippet for item, content_id in requests}
 
 
 def composer(ledger: FakeLedger) -> ContextComposer:
@@ -403,7 +408,16 @@ def test_a_commit_query_drops_runs_and_fixes_of_dirty_snapshots() -> None:
     )
     kept = _without_dirty(mixed, None)
     assert kept is not None and [r.run_id for r in kept.observed_in] == ["ci-1"]
-    assert kept.resolution.status is FixStatus.UNRESOLVED and kept.resolution.path is None
+    assert kept.resolution.status is FixStatus.UNKNOWN and kept.resolution.path is None
+    assert kept.resolution.reason == "dirty_runs_excluded"
+    # A fix path between kept runs that validated a commit survives a dropped dirty run ...
+    clean_fix = replace(mixed, resolution=clean.resolution)
+    survived = _without_dirty(clean_fix, None)
+    assert survived is not None and survived.resolution == clean.resolution
+    # ... but one that validated a dirty snapshot does not, even when every run is clean.
+    dirty_fix = replace(clean, resolution=_failure(True, snapshot="s").resolution)
+    unknown = _without_dirty(dirty_fix, None)
+    assert unknown is not None and unknown.resolution.status is FixStatus.UNKNOWN
 
 
 def test_failure_windows_count_the_first_observation_or_any_run_completion() -> None:
@@ -497,7 +511,7 @@ class _Outbox:
             _Rows([]),  # statement timeout
             _Rows([waiting]),
             _Rows([mark] if mark else []),
-            *([_Recorded()] if mark else []),
+            *([_Scalar(T), _Scalar(None)] if mark else []),
             _Rows(checkpoints),
             _Rows(dead),
         ]
@@ -518,9 +532,12 @@ class _Outbox:
         return self._answers.pop(0)
 
 
-class _Recorded:
-    def scalar_one(self) -> datetime:
-        return T
+class _Scalar:
+    def __init__(self, value: datetime | None) -> None:
+        self.value = value
+
+    def scalar_one(self) -> datetime | None:
+        return self.value
 
 
 def _row(**fields: Any) -> Any:
@@ -542,7 +559,7 @@ def test_freshness_needs_a_projected_event_and_reports_missing_checkpoints() -> 
     )
     assert fresh.staleness_ms == 0  # a clock behind the outbox never yields a negative lag
     assert fresh.as_of_event_id == str(EVENT)
-    assert (fresh.as_of_outbox_id, fresh.as_of_recorded_at) == (4, T)
+    assert (fresh.as_of_outbox_id, fresh.valid_instant, fresh.known_until) == (4, T, None)
     with pytest.raises(ValueError):
         FreshnessReader(empty, statement_timeout_seconds=0)  # type: ignore[arg-type]
     assert fresh.warnings == ("projection_dead_letters:code", "projection_not_started:search")
@@ -587,3 +604,150 @@ def test_a_request_can_shorten_the_deadline_but_never_extend_it() -> None:
     )
     with pytest.raises(RetrievalDeadlineExceeded):
         asyncio.run(slow.decision_history(request, RequestContext("p", deadline_seconds=60)))
+
+
+def test_only_execution_events_of_another_snapshot_are_dirty_and_dropped_runs_take_their_observations() -> (
+    None
+):
+    def event_of(event_type: str, payload: dict[str, Any]) -> Any:
+        return stored().model_copy(update={"event_type": event_type, "payload": payload})
+
+    commit_scope = EvidenceScope(repository_id="repo-1", revision_mode=True)
+    # A code claim names the run that first observed it: committed unchanged, it stays citable.
+    replayed = event_of("code.symbol.indexed", {"snapshot_id": "snap-1", "symbol_id": "s"})
+    assert commit_scope.admits(replayed)
+    dirty_run = event_of("quality.ci_run.completed", {"snapshot_id": "snap-1"})
+    assert not commit_scope.admits(dirty_run)
+    observation = event_of("knowledge.failure.observed", {"ci_run_id": "ci-dirty"})
+    assert commit_scope.admits(observation)
+    assert not replace(commit_scope, excluded_runs=frozenset({"ci-dirty"})).admits(observation)
+    clean = event_of("knowledge.failure.observed", {"ci_run_id": "ci-clean"})
+    assert replace(commit_scope, excluded_runs=frozenset({"ci-dirty"})).admits(clean)
+
+
+def test_dirty_runs_are_the_runs_of_another_snapshot() -> None:
+    from agent_context_platform.retrieval.composer import _dirty_runs
+
+    mixed = replace(
+        _failure(True),
+        observed_in=(
+            _run("ci-clean", status="failure"),
+            _run("ci-own", status="failure", snapshot="snap-1"),
+            _run("ci-other", status="failure", snapshot="snap-2"),
+        ),
+    )
+    assert _dirty_runs([mixed], None) == {"ci-own", "ci-other"}
+    assert _dirty_runs([mixed], "snap-1") == {"ci-other"}
+
+
+def test_record_time_never_passes_the_snapshot() -> None:
+    from agent_context_platform.retrieval.composer import FAR_FUTURE, _known
+    from agent_context_platform.retrieval.freshness import Freshness
+
+    def fresh(known: datetime | None) -> Freshness:
+        return Freshness("e", 1, T, known, "pc1-x", 0, ())
+
+    assert _known(fresh(None)) == FAR_FUTURE
+    assert _known(fresh(T)) == T
+    assert _known(fresh(T), T - timedelta(hours=1)) == T - timedelta(hours=1)
+    assert _known(fresh(None), T) == T
+
+
+def test_executed_output_names_the_revision_it_ran_on() -> None:
+    hit = SearchHit(
+        "c-1",
+        1.0,
+        "p",
+        "repo-1",
+        None,
+        str(EVENT),
+        "quality.ci_run.completed",
+        T,
+        (str(EVENT),),
+        "sanitized",
+    )
+    body = _content_candidate(hit, 1.0, {str(EVENT): ledger_event()}).body
+    assert "run on commit " + "a" * 40 in body
+    snap = ledger_event().event.model_copy(
+        update={
+            "payload": {**ledger_event().event.payload, "commit_id": None, "snapshot_id": "s-1"}
+        }
+    )
+    body = _content_candidate(hit, 1.0, {str(EVENT): LedgerEvent(snap, 1, frozenset())}).body
+    assert "run on workspace snapshot s-1" in body
+    assert "run on" not in _content_candidate(hit, 1.0, {}).body
+
+
+def test_too_many_cited_events_are_reported_as_capped() -> None:
+    ledger = FakeLedger({str(EVENT): ledger_event()})
+    many = candidate(
+        "m",
+        citations=(
+            *(Citation(f"e{n}", "git", 1.0) for n in range(4)),
+            Citation(str(EVENT), "git", 1.0),
+        ),
+    )
+    warnings: set[str] = set()
+    scope = EvidenceScope(repository_id="repo-1")
+    asyncio.run(
+        composer(ledger)._page(
+            [many],
+            0,
+            QueryBudgetV1(max_items=1, max_bytes=10**6, max_tokens=10**6),
+            scope,
+            {},
+            warnings,
+        )
+    )
+    assert warnings == {"evidence_capped"}
+
+
+@pytest.mark.parametrize(
+    ("sqlstate", "expected"), [("57014", "deadline"), ("08006", "unavailable")]
+)
+def test_driver_errors_become_typed_errors_without_the_statement_or_its_parameters(
+    sqlstate: str, expected: str
+) -> None:
+    from agent_context_sdk.contracts.mcp import DecisionHistoryInputV1
+    from sqlalchemy.exc import OperationalError
+
+    from agent_context_platform.retrieval.composer import ContextUnavailable
+    from agent_context_platform.retrieval.graph import RetrievalDeadlineExceeded
+
+    class Driver(Exception):
+        def __init__(self) -> None:
+            super().__init__("canceling statement due to statement timeout")
+            self.sqlstate = sqlstate
+
+    class FailingFreshness:
+        async def read(self, *_: object) -> Any:
+            raise OperationalError(
+                "SELECT secret_column FROM ledger.events WHERE q = %(query)s",
+                {"query": "private task words"},
+                Driver(),
+            )
+
+    fake: Any = object()
+    failing = ContextComposer(
+        graph=fake,
+        graph_reader=fake,
+        temporal=fake,
+        search=fake,
+        ledger=fake,
+        freshness=FailingFreshness(),  # type: ignore[arg-type]
+        cursor=CursorCodec.ephemeral(),
+    )
+    request = DecisionHistoryInputV1.model_validate(
+        {
+            "scope": {"kind": "project", "project_id": "p"},
+            "query": "private task words",
+            "valid_at": T.isoformat(),
+            "budget": {"max_items": 1, "max_bytes": 1000, "max_tokens": 1000},
+        }
+    )
+    error_type = RetrievalDeadlineExceeded if expected == "deadline" else ContextUnavailable
+    with pytest.raises(error_type) as raised:
+        asyncio.run(failing.decision_history(request, RequestContext("p")))
+    message = str(raised.value)
+    assert "SELECT" not in message and "private" not in message and "secret" not in message
+    assert raised.value.__cause__ is None and raised.value.__suppress_context__

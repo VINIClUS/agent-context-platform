@@ -23,8 +23,13 @@ A reference is built only from a stored event that:
   occurred AND was observed strictly before the end of the requested window (the start of the
   repository's next index run), so no later fact or later knowledge is ever cited; for
   `failure_history`, occurred before `valid_to`;
-- for revision-scoped tools, names no workspace snapshot in its payload other than the requested
-  one (for a commit: none). CI or test output of a dirty workspace never backs a commit answer.
+- for revision-scoped tools, if it is an execution event (`quality.*`: CI and test runs,
+  findings), names no workspace snapshot in its payload other than the requested one (for a
+  commit: none), and if it is a failure observation, was not made in such a dirty run. CI or test
+  output of a dirty workspace never backs a commit answer. Code events are exempt: a code claim
+  names the run that first observed it, so a commit that adopts code first indexed in a dirty
+  snapshot cites that replayed claim; whether a code fact belongs to the revision is decided by
+  the revision's membership (`retrieval/revision.py`).
 
 An event that fails any rule is not cited. An item left with no reference is dropped and the
 package carries the `items_without_evidence` warning.
