@@ -301,6 +301,17 @@ agent-context mcp-token revoke mcp_AbCd1234xyz            # prefix from `mcp-tok
   connection must be the schema owner or a role granted `SELECT, INSERT, UPDATE` on them. The
   grants are checked before any write; a missing one exits `1` naming it. The DSN is never printed.
 
+### Content maintenance, token probe and secret files
+
+`agent-context content sweep-orphans [--min-age SECONDS] [--dry-run] [--json]` deletes stored
+objects no catalog row references once older than the 24-hour floor (counts only).
+`GET /v1/auth/whoami` answers `204` and `X-Agent-Context-Token-Kind: producer|mcp` for a valid
+token and writes nothing. `AGENT_CONTEXT_SECRETS_DIR` reads secret settings from `0400` files named
+after their variables (the environment wins over a file). A stored object that fails verification
+raises the `content_integrity_failure` log line and the `integrity_failures` metric and answers a
+retryable `503` with `Retry-After: 60`; it is never repaired automatically. See
+[docs/operations/content-integrity.md](docs/operations/content-integrity.md).
+
 ### Migrating the schema
 
 `agent-context db upgrade [--expect-head <rev>] [--lock-timeout <seconds>] [--json]` upgrades the
