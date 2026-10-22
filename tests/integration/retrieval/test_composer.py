@@ -29,12 +29,14 @@ from sqlalchemy import event, text
 from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession
 
 from agent_context_platform.content.service import ContentService
+from agent_context_platform.operations.readiness import API_READ_TABLES
 from agent_context_platform.projection.neo4j import Neo4jStore, Neo4jTransaction
 from agent_context_platform.projection.registry import projectors_with_search
 from agent_context_platform.projection.schema import history_projectors, record_projection_history
 from agent_context_platform.retrieval.composer import (
     ContextBudgetTooSmall,
     ContextRequestError,
+    ContextUnavailable,
     RequestContext,
     ScopeNotFound,
 )
@@ -63,21 +65,25 @@ WIDE = {"max_items": 30, "max_bytes": 60_000, "max_tokens": 15_000}
 class Seeded:
     keys: dict[str, str]
     revisions: Revisions
+    api_login: str  # see `api_login` in tests/integration/retrieval/conftest.py
 
 
 @pytest.fixture(scope="module")
 def seeded(
-    postgres_dsn: str, projection_engine: AsyncEngine, tmp_path_factory: pytest.TempPathFactory
+    postgres_dsn: str,
+    projection_engine: AsyncEngine,
+    api_login: str,
+    tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[Seeded]:
     async def seed() -> Seeded:
         async with Neo4jStore(neo4j_integration_settings()) as store:
             await wipe(store)
-            world = EvalWorld(postgres_dsn, projection_engine, store)
+            world = EvalWorld(postgres_dsn, projection_engine, store, api_login)
             try:
                 await world.reset()
                 await world.seed(tmp_path_factory.mktemp("composer"))
                 assert (await world.project()).dead_lettered == 0
-                return Seeded(dict(world.keys), world.revisions)
+                return Seeded(dict(world.keys), world.revisions, api_login)
             finally:
                 await world.close()
 
@@ -97,7 +103,14 @@ def run_in_world[ResultT](
 ) -> ResultT:
     async def run() -> ResultT:
         async with Neo4jStore(neo4j_integration_settings()) as store:
-            world = EvalWorld(dsn, owner, store, keys=dict(seeded.keys), revisions=seeded.revisions)
+            world = EvalWorld(
+                dsn,
+                owner,
+                store,
+                seeded.api_login,
+                keys=dict(seeded.keys),
+                revisions=seeded.revisions,
+            )
             try:
                 return await body(world)
             finally:
@@ -453,6 +466,54 @@ def test_an_outdated_temporal_projection_is_a_warning_or_an_error_never_silent(
     page = run_in_world(seeded, postgres_dsn, projection_engine, body)
     assert "temporal_projection_outdated" in page.warnings
     assert not any(item.kind == "decision" for item in page.items)
+
+
+def test_retrieval_reads_run_as_a_login_member_of_the_api_role_only(
+    seeded: Seeded, postgres_dsn: str, projection_engine: AsyncEngine
+) -> None:
+    async def body(world: EvalWorld) -> tuple[Any, ...]:
+        async with world.api_reads() as session:
+            row = (
+                await session.execute(
+                    text(
+                        "SELECT current_user, session_user, "
+                        "pg_has_role('agent_context_api', 'MEMBER'), "
+                        "pg_has_role('agent_context_projector', 'MEMBER'), "
+                        "(SELECT rolsuper FROM pg_roles WHERE rolname = current_user)"
+                    )
+                )
+            ).one()
+        page = await world.composer().repository_overview(overview(seeded.revisions.c2), PRINCIPAL)
+        return (*row, page)
+
+    current, login, api, projector, superuser, page = run_in_world(
+        seeded, postgres_dsn, projection_engine, body
+    )
+    assert current == login == seeded.api_login.split("://", 1)[1].split(":", 1)[0]
+    assert (api, projector, superuser) == (True, False, False)
+    assert page.items and page.as_of_event_id
+
+
+# Freshness reads the projection progress tables of the API role's read grants (PLATFORM-055).
+@pytest.mark.parametrize(
+    "table", [table for table in API_READ_TABLES if table.startswith("projection.")]
+)
+def test_a_missing_projection_read_grant_fails_closed(
+    seeded: Seeded, postgres_dsn: str, projection_engine: AsyncEngine, table: str
+) -> None:
+    async def grant(statement: str) -> None:
+        async with projection_engine.begin() as connection:
+            await connection.execute(text(statement))
+
+    async def body(world: EvalWorld) -> None:
+        await grant(f"REVOKE SELECT ON {table} FROM agent_context_api")
+        try:
+            with pytest.raises(ContextUnavailable):
+                await world.composer().repository_overview(overview(seeded.revisions.c2), PRINCIPAL)
+        finally:
+            await grant(f"GRANT SELECT ON {table} TO agent_context_api")
+
+    run_in_world(seeded, postgres_dsn, projection_engine, body)
 
 
 def test_the_request_deadline_is_enforced(

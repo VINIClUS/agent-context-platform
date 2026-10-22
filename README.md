@@ -509,9 +509,10 @@ on) the client starts again from the first page.
 
 The composer runs as the API role (never the projector role, which can write projection state).
 `FreshnessReader` also reads projection checkpoints and dead letters (for `projection_checkpoint`,
-`staleness_ms` and the warnings); the API role's SELECT grants on them come with a separate
-migration, and until it lands the reader's session factory is injected (the tests pass one that
-has the grants).
+`staleness_ms` and the warnings) through the SELECT grants of migration `20261022_0001`
+(`API_READ_TABLES` in `operations/readiness.py`); without one of them a request fails closed with
+`ContextUnavailable`. The integration and evaluation suites run every composer read as a LOGIN
+member of `agent_context_api` with no grant of its own.
 
 `query_id`, `generated_at`, `staleness_ms` and `next_cursor` (it carries an expiry) are the only
 fields that depend on the wall clock: everything else is a function of the request and the

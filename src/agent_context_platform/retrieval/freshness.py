@@ -26,9 +26,9 @@
   and `projection_not_started:<projector>` when it has no checkpoint at all.
 
 Reading checkpoints and dead letters needs SELECT on `projection.projection_checkpoints` and
-`projection.dead_letters`. The reader is meant to run as the API role (never the projector role,
-which may write projection state); the API role's read grants come with a dedicated migration, and
-until then the session factory is injected so tests can use a role that has them.
+`projection.dead_letters`. The reader runs as the API role (never the projector role, which may
+write projection state), which reads them through migration 20261022_0001 (`API_READ_TABLES` in
+`operations/readiness.py`); a missing grant is a driver error, never a guessed answer.
 """
 
 from __future__ import annotations
@@ -95,8 +95,7 @@ class Freshness:
 
 class FreshnessReader:
     """Reads the projection state. Needs SELECT on the outbox, `ledger.events`, checkpoints and
-    dead letters: the API role once its read grants exist (today only the projector role has the
-    last two), so the session factory is injected."""
+    dead letters: give it sessions of the API role (see the module docstring)."""
 
     def __init__(
         self, sessions: async_sessionmaker[AsyncSession], *, statement_timeout_seconds: float = 5.0

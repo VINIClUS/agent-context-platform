@@ -12,7 +12,7 @@ from collections.abc import Iterator
 import pytest
 from integration.conftest import postgres_dsn  # noqa: F401  (fixture)
 from integration.projection.conftest import projection_engine  # noqa: F401  (fixture)
-from integration.retrieval.conftest import _set_schema
+from integration.retrieval.conftest import _set_schema, api_login  # noqa: F401  (fixture)
 
 
 @pytest.fixture(scope="module", autouse=True)

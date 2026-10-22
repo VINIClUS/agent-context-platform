@@ -64,7 +64,13 @@ from integration.retrieval.fake_embeddings import FakeEmbeddingProvider
 from integration.retrieval.search_harness import InlineOnlyBlobStore, role_engine
 from pydantic import SecretStr
 from sqlalchemy import text
-from sqlalchemy.ext.asyncio import AsyncEngine, AsyncSession, async_sessionmaker
+from sqlalchemy.ext.asyncio import (
+    AsyncEngine,
+    AsyncSession,
+    async_sessionmaker,
+    create_async_engine,
+)
+from sqlalchemy.pool import NullPool
 
 from agent_context_platform.content.service import ContentService
 from agent_context_platform.db import session_factory
@@ -194,6 +200,7 @@ class EvalWorld:
     dsn: str
     owner: AsyncEngine
     store: Neo4jStore
+    api_login: str  # a LOGIN member of agent_context_api: freshness reads with its grants only
     keys: dict[str, str] = field(default_factory=dict)
     symbols: dict[str, str] = field(default_factory=dict)  # qualified name -> symbol ID
     other_symbols: dict[str, str] = field(default_factory=dict)  # the same, second repository
@@ -204,9 +211,11 @@ class EvalWorld:
         self._engines = [
             role_engine(self.dsn, "agent_context_api"),
             role_engine(self.dsn, "agent_context_projector"),
+            create_async_engine(self.api_login, poolclass=NullPool),
         ]
         self.api: async_sessionmaker[AsyncSession] = session_factory(self._engines[0])
         self.projector: async_sessionmaker[AsyncSession] = session_factory(self._engines[1])
+        self.api_reads: async_sessionmaker[AsyncSession] = session_factory(self._engines[2])
         self.content = ContentService(InlineOnlyBlobStore(), RedactionPolicyV1())
         self.ingestion = IngestionService(self.content, self.api)
         self._services: list[Any] = []
@@ -236,9 +245,9 @@ class EvalWorld:
             graph=graph,
             graph_reader=self.store.read_only(),
             temporal=temporal,
-            search=SearchService(self.api, self.store.read_only(), self.embeddings),
-            ledger=EvidenceLedger(self.api, content or self.content),
-            freshness=FreshnessReader(self.projector),
+            search=SearchService(self.api_reads, self.store.read_only(), self.embeddings),
+            ledger=EvidenceLedger(self.api_reads, content or self.content),
+            freshness=FreshnessReader(self.api_reads),
             cursor=CursorCodec(CURSOR_KEY),
             clock=clock,
             default_deadline_seconds=deadline_seconds,

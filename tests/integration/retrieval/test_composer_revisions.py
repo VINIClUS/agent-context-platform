@@ -34,16 +34,20 @@ class Seeded:
     keys: dict[str, str]
     revisions: Revisions
     c3: str
+    api_login: str  # see `api_login` in tests/integration/retrieval/conftest.py
 
 
 @pytest.fixture(scope="module")
 def seeded(
-    postgres_dsn: str, projection_engine: AsyncEngine, tmp_path_factory: pytest.TempPathFactory
+    postgres_dsn: str,
+    projection_engine: AsyncEngine,
+    api_login: str,
+    tmp_path_factory: pytest.TempPathFactory,
 ) -> Iterator[Seeded]:
     async def seed() -> Seeded:
         async with Neo4jStore(neo4j_integration_settings()) as store:
             await wipe(store)
-            world = EvalWorld(postgres_dsn, projection_engine, store)
+            world = EvalWorld(postgres_dsn, projection_engine, store, api_login)
             try:
                 await world.reset()
                 await world.seed(tmp_path_factory.mktemp("revisions"))
@@ -80,7 +84,7 @@ def seeded(
                 )
                 c3 = await world.commit_worktree(6.5, "c3")
                 assert (await world.project()).dead_lettered == 0
-                return Seeded(dict(world.keys), world.revisions, c3)
+                return Seeded(dict(world.keys), world.revisions, c3, api_login)
             finally:
                 await world.close()
 
@@ -95,7 +99,14 @@ def seeded(
 def run(seeded: Seeded, dsn: str, owner: AsyncEngine, body: object) -> object:
     async def go() -> object:
         async with Neo4jStore(neo4j_integration_settings()) as store:
-            world = EvalWorld(dsn, owner, store, keys=dict(seeded.keys), revisions=seeded.revisions)
+            world = EvalWorld(
+                dsn,
+                owner,
+                store,
+                seeded.api_login,
+                keys=dict(seeded.keys),
+                revisions=seeded.revisions,
+            )
             try:
                 return await body(world)  # type: ignore[operator]
             finally:
