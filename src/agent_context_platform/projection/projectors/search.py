@@ -278,6 +278,18 @@ def extract_text(media_type: str, data: bytes) -> str:
     return decoded[:MAX_INDEXED_CHARS]
 
 
+async def _read_document(
+    content: ContentService, session: AsyncSession, ref: ContentRefV1
+) -> _Document | None:
+    """Read and extract one content object; None when it holds no text (nothing is indexed).
+
+    The single rule for what a content reference contributes, shared by indexing and by
+    `check_replay`, so the check can never be stricter or looser than the replay it guards.
+    """
+    body = extract_text(ref.media_type, await content.read(session, ref))
+    return _Document(ref, body) if body.strip() else None
+
+
 def _indexable(ref: ContentRefV1) -> bool:
     media = ref.media_type.split(";", 1)[0].strip().lower()
     return ref.disposition is ContentDisposition.SANITIZED and media in _INDEXABLE_MEDIA_TYPES
@@ -386,8 +398,10 @@ class SearchProjector:
         through the content service (digest-verified, bytes discarded), checking that a content
         ID always names the same scope, digest and media type. Raises
         `SearchReplayIntegrityError` with counts only; returns the number of documents checked.
-        Costs one extra read of all indexed content: the price of never wiping the live graph for
-        a replay that would fail.
+        A content object with no text is skipped like the replay skips it (`_read_document` is the
+        one rule for both). Costs one extra read of all indexed content, the price of never wiping
+        the live graph for a replay that would fail; each page of 500 events holds one PostgreSQL
+        transaction open while its content is read serially.
         """
         backend = self._require_backend()
         purged = await _ledger_purges(sessions)
@@ -412,15 +426,18 @@ class SearchProjector:
                     for ref in event.content_refs:
                         if not _indexable(ref) or ref.content_id in purged:
                             continue
+                        try:
+                            document = await _read_document(backend.content, session, ref)
+                        except ContentUnavailableError:
+                            unreadable += 1
+                            continue
+                        if document is None:  # no text: the replay writes nothing for it either
+                            continue
                         identity = (*scope, ref.content_sha256, ref.media_type)
                         if identities.setdefault(ref.content_id, identity) != identity:
                             conflicting += 1
                             continue
                         checked += 1
-                        try:
-                            await backend.content.read(session, ref)
-                        except ContentUnavailableError:
-                            unreadable += 1
         if unreadable or conflicting:
             raise SearchReplayIntegrityError(
                 f"the replay would fail: {unreadable} unreadable content object(s) and "
@@ -448,10 +465,9 @@ class SearchProjector:
             for ref in refs:
                 if ref.content_id in tombstoned:
                     continue
-                data = await backend.content.read(session, ref)
-                body = extract_text(ref.media_type, data)
-                if body.strip():
-                    documents.append(_Document(ref, body))
+                document = await _read_document(backend.content, session, ref)
+                if document is not None:
+                    documents.append(document)
         if not documents:
             return []
         if backend.embeddings is None:
