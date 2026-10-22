@@ -106,9 +106,10 @@ Duration histograms use the explicit bucket boundaries
   one event commit together. When a refresh fails or times out the gauges stop reporting until the
   next successful refresh (alert on absence). The API process never reports these gauges.
 - **Integrity.** `digest_mismatch`: a stored event failed its payload/envelope digest verification
-  when the projector loaded it, or a stored object failed verification when a batch reused it
-  (prepare) or attached it. `missing_object`: an object a batch reused or attached was gone. Each
-  object failure also logs one WARNING `content_integrity_failure` line (see
+  when the projector loaded it, or stored content failed verification when a batch reused it
+  (prepare), attached it, or the search projector read it. `missing_object`: an object the catalog
+  already references was gone at attach (an unreferenced object swept by the orphan sweep is not
+  counted). Each content failure also logs one WARNING `content_integrity_failure` line (see
   [content-integrity.md](content-integrity.md)). `hash_chain` and `checkpoint` are
   reserved for the stream hash-chain and signed checkpoint verifiers; no code path emits them yet.
 - **Index.** One sample per `index_checkout`: `success`, `failed` (indexing or ingestion error, or
