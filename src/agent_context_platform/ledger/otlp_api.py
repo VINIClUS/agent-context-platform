@@ -8,14 +8,15 @@ the events a conflict is attributable to), so idempotency comes from the mapper'
 collector retry of the same export is answered from the ledger.
 
 Order: authenticate (the ingestion producers' credentials, ``events:ingest`` scope, same bounded
-Argon2 path), rate limit per producer, media type and encoding, streamed size limit; then, on a
-bounded worker thread so the event loop never does per-record work: bounded gzip inflation,
-protobuf parsing, a structural pre-scan that stops at the first exceeded limit (spans, records,
-events per span, attributes per resource, scope, span or event: O(1) length checks before any
-record is converted) and mapping. Records the mapper does not model are counted as unmapped;
-records it refuses are rejected spans, reported through ``partial_success`` with a fixed message
-naming only fixed reason codes. No attribute value is ever logged, echoed or stored outside the
-mapped event.
+Argon2 path), rate limit per producer, media type and encoding, streamed size limit; then, behind
+a bounded admission gate (two decodes at once, four waiting, 503 beyond) and on a worker thread:
+bounded gzip inflation, a structural scan of the wire bytes that stops at the first exceeded
+request-level limit (``ledger.otlp_wire``: containers, spans, records, links, attributes, before
+any message is parsed), protobuf parsing and mapping (per-span limits reject that span only).
+The ingestion append that follows is async database work on the event loop, one statement round
+per event. Records the mapper does not model are counted as unmapped; records it refuses are
+rejected spans, reported through ``partial_success`` with a fixed message naming only fixed
+reason codes. No attribute value is ever logged, echoed or stored outside the mapped event.
 
 Status mapping (OTLP/HTTP): 200 (``partial_success`` when spans were rejected), 400 malformed,
 401/403 credentials, 413 with a fixed code per exceeded limit, 415 media type or encoding, 429
@@ -28,10 +29,12 @@ from __future__ import annotations
 import asyncio
 import logging
 import zlib
-from collections.abc import Iterable, Iterator, Mapping
+from collections.abc import AsyncIterator, Iterable, Iterator, Mapping
+from contextlib import asynccontextmanager
 from dataclasses import dataclass, field
 from datetime import UTC, datetime, timedelta
 from typing import Any, Final
+from urllib.parse import quote
 from uuid import UUID
 
 from agent_context_sdk import (  # type: ignore[import-untyped, unused-ignore]
@@ -55,7 +58,7 @@ from opentelemetry.proto.trace.v1.trace_pb2 import Span
 from sqlalchemy.exc import InterfaceError, OperationalError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
-from agent_context_platform.ledger import codex_otel
+from agent_context_platform.ledger import codex_otel, otlp_wire
 from agent_context_platform.ledger.auth import AuthError, ProducerAuthenticator
 from agent_context_platform.ledger.service import BATCH_REJECTED, IngestionService, IngestOutcome
 from agent_context_platform.mcp.auth import RateLimitedError, TokenBucketLimiter
@@ -68,18 +71,25 @@ PROTOBUF_MEDIA_TYPE: Final = "application/x-protobuf"
 PRODUCER_NAME: Final = "codex-otel-receiver"
 # Part of every mapped draft: a change makes re-exported records conflict, so it stays fixed.
 PRODUCER_VERSION: Final = "1.0.0"
-# One stream per producer and Codex session: a stream-level failure stays within one session.
+# One stream per producer and Codex session (``codex-otel:<producer>:<session>``, both
+# percent-encoded): a stream-level failure stays within one session.
 STREAM_PREFIX: Final = "codex-otel:"
 # One ingestion batch holds at most 500 events.
 MAX_DRAFTS: Final = 500
 # Any string attribute value longer than this rejects its record before mapping.
 MAX_ATTRIBUTE_VALUE_CHARS: Final = 16_384
 FUTURE_TIMESTAMP: Final = "future_timestamp"
+TOO_MANY_EVENTS: Final = "too_many_events"
+TOO_MANY_ATTRIBUTES: Final = "too_many_attributes"
 MISSING_TIMESTAMP: Final = "missing_timestamp"
 _RETRY_AFTER_SECONDS: Final = 5
 _READ_CHUNK_BYTES: Final = 65_536
-# Decoding and mapping run off the event loop, at most this many at once per application.
+# Decoding and mapping run off the event loop, at most this many at once per application, with
+# at most this many more waiting; beyond that a request is refused at once (503).
 DECODE_WORKERS: Final = 2
+DECODE_QUEUE_DEPTH: Final = 4
+# A refused batch is resubmitted without its offenders at most this many times in all.
+MAX_INGEST_ATTEMPTS: Final = 8
 
 # Fixed, content-free status messages; each 413 names its limit so collector logs show it.
 _MESSAGES: Final[Mapping[str, tuple[int, str]]] = {
@@ -104,14 +114,18 @@ _MESSAGES: Final[Mapping[str, tuple[int, str]]] = {
         Code.RESOURCE_EXHAUSTED,
         "too_many_records: span plus span event limit exceeded.",
     ),
-    "too_many_events": (
-        Code.RESOURCE_EXHAUSTED,
-        "too_many_events: span event limit per span exceeded.",
-    ),
     "too_many_attributes": (
         Code.RESOURCE_EXHAUSTED,
         "too_many_attributes: attribute limit exceeded.",
     ),
+    "too_many_resources": (
+        Code.RESOURCE_EXHAUSTED,
+        "too_many_resources: resource spans limit exceeded.",
+    ),
+    "too_many_scopes": (Code.RESOURCE_EXHAUSTED, "too_many_scopes: scope spans limit exceeded."),
+    "too_many_links": (Code.RESOURCE_EXHAUSTED, "too_many_links: span link limit exceeded."),
+    "decode_busy": (Code.UNAVAILABLE, "The receiver is busy; retry later."),
+    "client_disconnected": (Code.CANCELLED, "The client went away."),
     "too_many_drafts": (
         Code.RESOURCE_EXHAUSTED,
         "too_many_drafts: more than 500 distinct events in one export.",
@@ -125,9 +139,11 @@ _TOO_LARGE: Final = frozenset(
         "inflated_too_large",
         "too_many_spans",
         "too_many_records",
-        "too_many_events",
         "too_many_attributes",
         "too_many_drafts",
+        "too_many_resources",
+        "too_many_scopes",
+        "too_many_links",
     }
 )
 # Error code -> telemetry (outcome, reason).
@@ -142,6 +158,8 @@ _TELEMETRY: Final[Mapping[str, tuple[str, str]]] = {
     "unsupported_media_type": ("rejected", "unsupported_media_type"),
     "malformed_request": ("rejected", "malformed"),
     "internal_error": ("error", "internal"),
+    "decode_busy": ("error", "internal"),
+    "client_disconnected": ("rejected", "abandoned"),
     **dict.fromkeys(_TOO_LARGE, ("rejected", "too_large")),
 }
 
@@ -161,9 +179,49 @@ class OtlpReceiverRuntime:
     max_events_per_span: int = 64
     max_attributes: int = 128
     max_clock_skew: timedelta = timedelta(minutes=5)
-    decode_workers: asyncio.Semaphore = field(
-        default_factory=lambda: asyncio.Semaphore(DECODE_WORKERS), repr=False, compare=False
+    max_resources: int = 16
+    max_scopes: int = 64
+    max_links: int = 1_000
+    max_total_attributes: int = 65_536
+    decode_gate: DecodeGate = field(
+        default_factory=lambda: DecodeGate(DECODE_WORKERS, DECODE_QUEUE_DEPTH),
+        repr=False,
+        compare=False,
     )
+
+    def wire_limits(self) -> otlp_wire.WireLimits:
+        return otlp_wire.WireLimits(
+            max_resources=self.max_resources,
+            max_scopes=self.max_scopes,
+            max_spans=self.max_spans,
+            max_records=self.max_records,
+            max_links=self.max_links,
+            max_total_attributes=self.max_total_attributes,
+            max_container_attributes=self.max_attributes,
+        )
+
+
+class DecodeGate:
+    """At most ``workers`` decodes at once and ``queue_depth`` more waiting; the rest get 503.
+
+    Waiting is bounded so a burst cannot pile up CPU work for clients that already gave up.
+    """
+
+    def __init__(self, workers: int, queue_depth: int) -> None:
+        self._slots = asyncio.Semaphore(workers)
+        self._capacity = workers + queue_depth
+        self._admitted = 0
+
+    @asynccontextmanager
+    async def admit(self) -> AsyncIterator[None]:
+        if self._admitted >= self._capacity:
+            raise _RequestError(503, "decode_busy")
+        self._admitted += 1
+        try:
+            async with self._slots:
+                yield
+        finally:
+            self._admitted -= 1
 
 
 class _RequestError(Exception):
@@ -225,10 +283,14 @@ async def _handle(request: Request, runtime: OtlpReceiverRuntime) -> Response:
         producer=ProducerV1(
             producer_id=principal.producer_id, name=PRODUCER_NAME, version=PRODUCER_VERSION
         ),
-        stream_id=STREAM_PREFIX + principal.producer_id,
+        # Percent-encoded components: no producer/session pair can name another's stream.
+        stream_id=STREAM_PREFIX + quote(principal.producer_id, safe=""),
     )
     now = datetime.now(UTC)
-    async with runtime.decode_workers:
+    async with runtime.decode_gate.admit():
+        # A client that gave up while queued is not worth the decode.
+        if await request.is_disconnected():
+            raise _RequestError(499, "client_disconnected")
         mapping = await asyncio.to_thread(decode_and_map, body, gzipped, runtime, config, now)
 
     if mapping.drafts:
@@ -262,14 +324,15 @@ async def _handle(request: Request, runtime: OtlpReceiverRuntime) -> Response:
 
 
 async def _ingest(runtime: OtlpReceiverRuntime, mapping: _Mapping) -> None:
-    """Append the drafts as one batch; a refused batch is retried once without its offenders.
+    """Append the drafts as one batch; a refused batch is resubmitted without its offenders.
 
-    A conflict (or quarantined stream) is attributable to some events: those are rejected, the
-    others are resubmitted once so one bad record never discards its export. Events already
-    stored are ``existing``, never rejected.
+    A conflict (or quarantined stream) is attributable to some events: those are rejected and
+    the others resubmitted, until a batch is accepted, no offender is named or
+    ``MAX_INGEST_ATTEMPTS`` batches were tried (the ledger names one conflict per batch). Events
+    already stored are ``existing``, never rejected.
     """
     pending = list(mapping.drafts)
-    for attempt in range(2):
+    for attempt in range(1, MAX_INGEST_ATTEMPTS + 1):
         outcome = await runtime.service.ingest(
             IngestBatchRequestV1(batch_id=new_uuid7(), events=tuple(draft for _, draft in pending))
         )
@@ -279,12 +342,13 @@ async def _ingest(runtime: OtlpReceiverRuntime, mapping: _Mapping) -> None:
             return
         span_of = {draft.event_id: index for index, draft in pending}
         offenders = _offenders(outcome)
+        last = attempt == MAX_INGEST_ATTEMPTS or not offenders
         for result in outcome.response.rejected:
-            if result.event_id in offenders or attempt == 1:
+            if result.event_id in offenders or last:
                 mapping.reject(span_of[result.event_id], result.error_code)
         retry = {result.event_id for result in outcome.response.rejected} - offenders
         pending = [(index, draft) for index, draft in pending if draft.event_id in retry]
-        if not pending or not offenders:
+        if last or not pending:
             return
 
 
@@ -329,9 +393,22 @@ def decode_and_map(
 ) -> _Mapping:
     """Inflate, parse, pre-scan and map one export (blocking: runs on a worker thread)."""
     data = _gunzip(body, runtime.max_decompressed_bytes) if gzipped else body
+    try:
+        # Before parsing: parsing allocates per message, the scan is bounded by the limits.
+        otlp_wire.scan(data, runtime.wire_limits())
+    except otlp_wire.WireLimitExceeded as error:
+        raise _RequestError(413, error.code) from None
+    except otlp_wire.WireMalformed:
+        raise _RequestError(400, "malformed_request") from None
     export = _parse(data)
-    _check_structure(export, runtime)
-    mapping = map_export(config, export, now=now, max_clock_skew=runtime.max_clock_skew)
+    mapping = map_export(
+        config,
+        export,
+        now=now,
+        max_clock_skew=runtime.max_clock_skew,
+        max_events_per_span=runtime.max_events_per_span,
+        max_attributes=runtime.max_attributes,
+    )
     if len(mapping.drafts) > MAX_DRAFTS:
         raise _RequestError(413, "too_many_drafts")
     return mapping
@@ -368,33 +445,6 @@ def _parse(body: bytes) -> ExportTraceServiceRequest:
     except (DecodeError, RecursionError, ValueError):
         raise _RequestError(400, "malformed_request") from None
     return export
-
-
-def _check_structure(export: ExportTraceServiceRequest, runtime: OtlpReceiverRuntime) -> None:
-    """Count spans, records and attributes with O(1) length checks; stop at the first limit."""
-    spans = records = 0
-    limit = runtime.max_attributes
-    for resource_spans in export.resource_spans:
-        if len(resource_spans.resource.attributes) > limit:
-            raise _RequestError(413, "too_many_attributes")
-        for scope_spans in resource_spans.scope_spans:
-            if len(scope_spans.scope.attributes) > limit:
-                raise _RequestError(413, "too_many_attributes")
-            spans += len(scope_spans.spans)
-            if spans > runtime.max_spans:
-                raise _RequestError(413, "too_many_spans")
-            for span in scope_spans.spans:
-                events = len(span.events)
-                if events > runtime.max_events_per_span:
-                    raise _RequestError(413, "too_many_events")
-                records += 1 + events
-                if records > runtime.max_records:
-                    raise _RequestError(413, "too_many_records")
-                if len(span.attributes) > limit:
-                    raise _RequestError(413, "too_many_attributes")
-                for event in span.events:
-                    if len(event.attributes) > limit:
-                        raise _RequestError(413, "too_many_attributes")
 
 
 class _ValueTooLong:
@@ -490,6 +540,8 @@ def _map_record(
     ``observed_at`` is Codex's own OTLP time (stable across retries), never earlier than
     ``occurred_at``; neither may be later than ``latest`` (now plus the allowed clock skew).
     """
+    if any(value is _TOO_LONG for value in record.attributes.values()):
+        raise _RecordRejected(codex_otel.RejectionReason.ATTRIBUTE_VALUE_TOO_LONG.value)
     otlp_time = _otlp_time(time_unix_nano)
     if otlp_time is None:
         raise _RecordRejected(MISSING_TIMESTAMP)
@@ -503,7 +555,7 @@ def _map_record(
     # Per-session stream; observed_at no earlier than occurred_at. Deterministic, so a retry
     # yields the identical draft.
     session = draft.context.session_id if draft.context is not None else None
-    stream = f"{config.stream_id}:{session}" if session else config.stream_id
+    stream = f"{config.stream_id}:{quote(session, safe='')}" if session else config.stream_id
     return draft.model_copy(
         update={"stream_id": stream, "observed_at": max(draft.occurred_at, otlp_time)}
     )
@@ -521,25 +573,26 @@ def map_export(
     *,
     now: datetime,
     max_clock_skew: timedelta = timedelta(minutes=5),
+    max_events_per_span: int = 64,
+    max_attributes: int = 128,
 ) -> _Mapping:
     """Map every Codex event record of ``export``; duplicates (same idempotency key) collapse.
 
     A span is rejected when its resource or scope is refused, when it or one of its events
-    carries the platform-origin marker, or when the mapper refuses one of its records; a span
-    with no mapped and no refused record is unmapped. The first record with a given idempotency
-    key wins.
+    carries the platform-origin marker, when it has more than ``max_events_per_span`` events or
+    it or one of its events more than ``max_attributes`` attributes, or when the mapper refuses
+    one of its records; a span with no mapped and no refused record is unmapped. The first
+    record with a given idempotency key wins. A resource without spans is never converted.
     """
     mapping = _Mapping()
     seen: set[str] = set()
     latest = now + max_clock_skew
     index = -1
     for resource_spans in export.resource_spans:
+        if not any(scope_spans.spans for scope_spans in resource_spans.scope_spans):
+            continue
         resource = _attributes(resource_spans.resource.attributes)
-        try:
-            codex_otel.check_resource(resource)
-            resource_reason: str | None = None
-        except codex_otel.CodexOtelError as error:
-            resource_reason = error.reason.value
+        resource_reason = _resource_reason(resource)
         for scope_spans in resource_spans.scope_spans:
             scope_reason = resource_reason
             if scope_reason is None and _carries_marker(scope_spans.scope.attributes):
@@ -547,8 +600,11 @@ def map_export(
             for span in scope_spans.spans:
                 index += 1
                 mapping.span_count += 1
-                if scope_reason is not None:
-                    mapping.reject(index, scope_reason)
+                span_reason = scope_reason or _span_reason(
+                    span, max_events_per_span, max_attributes
+                )
+                if span_reason is not None:
+                    mapping.reject(index, span_reason)
                     continue
                 produced = False
                 for record, time_unix_nano in _records(span, resource):
@@ -571,6 +627,28 @@ def map_export(
                 if not produced and index not in mapping.rejected_spans:
                     mapping.unmapped_spans += 1
     return mapping
+
+
+def _resource_reason(resource: Mapping[str, object]) -> str | None:
+    """Why every span of this resource is rejected, or ``None``."""
+    if any(value is _TOO_LONG for value in resource.values()):
+        return codex_otel.RejectionReason.ATTRIBUTE_VALUE_TOO_LONG.value
+    try:
+        codex_otel.check_resource(resource)
+    except codex_otel.CodexOtelError as error:
+        return error.reason.value
+    return None
+
+
+def _span_reason(span: Span, max_events: int, max_attributes: int) -> str | None:
+    """Per-span limits (O(1) length checks): over them the span alone is rejected."""
+    if len(span.events) > max_events:
+        return TOO_MANY_EVENTS
+    if len(span.attributes) > max_attributes or any(
+        len(event.attributes) > max_attributes for event in span.events
+    ):
+        return TOO_MANY_ATTRIBUTES
+    return None
 
 
 def _failure(request: Request, status: int, code: str) -> Response:

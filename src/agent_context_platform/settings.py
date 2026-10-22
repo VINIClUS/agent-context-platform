@@ -283,9 +283,9 @@ class OtelReceiverSettings(BaseModel):
     idempotency_hmac_key: SecretStr | None = Field(default=None, repr=False)
     # Counted while streaming, before decompression.
     max_request_body_bytes: int = Field(default=4_194_304, gt=0)
-    # Bound on gzip output: a decompression bomb fails as 413 without being inflated. 8 MiB keeps
-    # the parsed message's peak memory near 100 MiB on the single VPS.
-    max_decompressed_bytes: int = Field(default=8_388_608, gt=0)
+    # Bound on gzip output: a decompression bomb fails as 413 without being inflated. 6 MiB is the
+    # collector's largest batch (3.73 MiB, docs/data/codex-otel-mapping.md) plus about 60%.
+    max_decompressed_bytes: int = Field(default=6_291_456, gt=0)
     # Spans per request (the collector's send_batch_max_size must not exceed it).
     max_spans: int = Field(default=500, gt=0, le=500)
     # Spans plus span events per request, span events per span and attributes per resource,
@@ -293,6 +293,11 @@ class OtelReceiverSettings(BaseModel):
     max_records: int = Field(default=1_000, gt=0, le=5_000)
     max_events_per_span: int = Field(default=64, gt=0, le=1_000)
     max_attributes: int = Field(default=128, gt=0, le=1_000)
+    # Request-level container and total limits, enforced on the wire bytes before parsing.
+    max_resources: int = Field(default=16, gt=0, le=1_000)
+    max_scopes: int = Field(default=64, gt=0, le=1_000)
+    max_links: int = Field(default=1_000, gt=0, le=100_000)
+    max_total_attributes: int = Field(default=65_536, gt=0, le=1_048_576)
     # How far in the future (by Codex's clock) a record's times may be.
     max_clock_skew_seconds: float = Field(default=300.0, ge=0, le=86_400, allow_inf_nan=False)
     # Per-producer, per-replica token bucket.

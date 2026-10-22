@@ -105,6 +105,10 @@ def _build_otlp_receiver(
         max_events_per_span=receiver.max_events_per_span,
         max_attributes=receiver.max_attributes,
         max_clock_skew=timedelta(seconds=receiver.max_clock_skew_seconds),
+        max_resources=receiver.max_resources,
+        max_scopes=receiver.max_scopes,
+        max_links=receiver.max_links,
+        max_total_attributes=receiver.max_total_attributes,
     )
 
 

@@ -20,7 +20,7 @@ from opentelemetry.proto.common.v1.common_pb2 import InstrumentationScope
 from opentelemetry.proto.resource.v1.resource_pb2 import Resource
 from opentelemetry.proto.trace.v1.trace_pb2 import ResourceSpans, ScopeSpans
 
-from agent_context_platform.ledger import otlp_api
+from agent_context_platform.ledger import otlp_api, otlp_wire
 from agent_context_platform.ledger.service import IngestOutcome
 
 from .test_otlp_receiver import (
@@ -78,7 +78,8 @@ async def test_a_flood_of_span_events_is_refused_before_any_mapping(
     elapsed = time.perf_counter() - started
 
     assert response.status_code == 413
-    assert _status(response).message.startswith("too_many_events:")
+    # One span with 40k events: a request-level record flood, refused on the wire bytes.
+    assert _status(response).message.startswith("too_many_records:")
     assert harness.service.batches == []
     # Inflating and parsing still cost something; the per-record work never happens.
     assert elapsed < 3.0
@@ -93,34 +94,104 @@ async def test_a_flood_of_span_events_is_refused_before_any_mapping(
             "too_many_records",
         ),
         (
-            {"max_events_per_span": 2},
-            lambda: _export(_span(events=[{"x": 1}] * 3)),
-            "too_many_events",
-        ),
-        (
-            {"max_attributes": 4},
-            lambda: _export(_span({f"a{i}": i for i in range(5)})),
-            "too_many_attributes",
-        ),
-        (
-            {"max_attributes": 4},
-            lambda: _export(_span(events=[{f"a{i}": i for i in range(5)}])),
-            "too_many_attributes",
-        ),
-        (
             {"max_attributes": 4},
             lambda: _export(_span({"x": 1}), resource={f"r{i}": i for i in range(5)}),
             "too_many_attributes",
         ),
+        (
+            {"max_resources": 2},
+            lambda: ExportTraceServiceRequest(
+                resource_spans=[ResourceSpans(resource=Resource()) for _ in range(3)]
+            ),
+            "too_many_resources",
+        ),
+        (
+            {"max_scopes": 2},
+            lambda: ExportTraceServiceRequest(
+                resource_spans=[ResourceSpans(scope_spans=[ScopeSpans() for _ in range(3)])]
+            ),
+            "too_many_scopes",
+        ),
+        (
+            {"max_links": 2},
+            lambda: _export(_linked_span(3)),
+            "too_many_links",
+        ),
+        (
+            {"max_total_attributes": 10},
+            lambda: _export(*(_span({f"a{i}": i for i in range(4)}) for _ in range(3))),
+            "too_many_attributes",
+        ),
+        (
+            {"max_total_attributes": 10},
+            lambda: _export(_span({"list": list(range(20))})),  # nested values count too
+            "too_many_attributes",
+        ),
+        (
+            {},
+            lambda: _export(_span({"deep": _nested(otlp_wire.MAX_VALUE_DEPTH + 2)})),
+            "too_many_attributes",
+        ),
     ],
 )
-async def test_each_structural_limit_has_its_own_fixed_413(
+async def test_each_request_level_limit_has_its_own_fixed_413(
     options: dict[str, Any], export: Any, code: str
 ) -> None:
     harness = Harness(**options)
     response = await harness.post(export().SerializeToString())
     assert response.status_code == 413
     assert _status(response).message.startswith(f"{code}:")
+    assert harness.service.batches == []
+
+
+def _linked_span(links: int) -> Any:
+    span = _span({"x": 1})
+    for _ in range(links):
+        span.links.add(trace_id=b"\x01" * 16, span_id=b"\x02" * 8)
+    return span
+
+
+def _nested(depth: int) -> Any:
+    value: Any = 1
+    for _ in range(depth):
+        value = [value]
+    return value
+
+
+@pytest.mark.parametrize(
+    ("options", "span", "reason"),
+    [
+        # max_attributes 30: above the 22 attributes of the other span's Codex event.
+        ({"max_events_per_span": 2}, lambda: _span(events=[{"x": 1}] * 3), "too_many_events"),
+        (
+            {"max_attributes": 30},
+            lambda: _span({f"a{i}": i for i in range(31)}),
+            "too_many_attributes",
+        ),
+        (
+            {"max_attributes": 30},
+            lambda: _span(events=[{f"a{i}": i for i in range(31)}]),
+            "too_many_attributes",
+        ),
+    ],
+)
+async def test_per_span_limits_reject_that_span_only(
+    options: dict[str, Any], span: Any, reason: str
+) -> None:
+    harness = Harness(**options)
+    export = _export(span(), _span(events=[_codex_event()]))
+
+    response = _response(await harness.post(export.SerializeToString()))
+
+    assert response.partial_success.rejected_spans == 1
+    assert response.partial_success.error_message == f"spans rejected: {reason}"
+    assert len(harness.service.batches[0].events) == 1
+
+
+async def test_malformed_wire_bytes_are_400_before_parsing() -> None:
+    harness = Harness()
+    for body in (b"\x0a\xff\xff\xff\xff\x0f", b"\x0b\x00", b"\x00\x00"):
+        assert (await harness.post(body)).status_code == 400
 
 
 async def test_scope_attribute_count_is_bounded() -> None:
@@ -335,3 +406,250 @@ async def test_resource_attributes_never_leak_into_the_record() -> None:
         )
     )
     assert harness.service.batches[0].events[0].payload["model"] is None
+
+
+# --- round 3: admission gate, multi-conflict loop, stream names, remaining mutants -----------------
+
+
+async def test_decodes_run_off_the_loop_two_at_a_time_and_a_full_queue_is_refused(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import asyncio
+    import threading
+
+    import httpx2
+
+    running = 0
+    peak = 0
+    lock = threading.Lock()
+    real = otlp_api.decode_and_map
+
+    def slow(*args: Any) -> Any:
+        nonlocal running, peak
+        with lock:
+            running += 1
+            peak = max(peak, running)
+        time.sleep(0.3)  # blocking work: it must not run on the event loop
+        with lock:
+            running -= 1
+        return real(*args)
+
+    monkeypatch.setattr(otlp_api, "decode_and_map", slow)
+    harness = Harness(burst=100)
+    body = _export(_span({"x": 1})).SerializeToString()
+
+    async def health() -> float:
+        async with httpx2.AsyncClient(
+            transport=httpx2.ASGITransport(app=harness.app), base_url="http://127.0.0.1:8000"
+        ) as client:
+            started = time.perf_counter()
+            assert (await client.get("/health/live")).status_code == 200
+            return time.perf_counter() - started
+
+    exports = [
+        asyncio.create_task(harness.post(body))
+        for _ in range(otlp_api.DECODE_WORKERS + otlp_api.DECODE_QUEUE_DEPTH + 2)
+    ]
+    await asyncio.sleep(0.1)
+    health_seconds = await health()
+    statuses = sorted(response.status_code for response in await asyncio.gather(*exports))
+
+    assert peak == otlp_api.DECODE_WORKERS
+    assert health_seconds < 0.25  # the loop stayed responsive while decodes ran
+    assert statuses.count(503) >= 2  # beyond two running and four waiting: refused at once
+    assert statuses.count(200) == otlp_api.DECODE_WORKERS + otlp_api.DECODE_QUEUE_DEPTH
+
+
+async def test_a_queued_request_whose_client_left_is_not_decoded(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from starlette.requests import Request
+
+    calls: list[int] = []
+
+    def counted(*args: Any) -> Any:
+        calls.append(1)
+        raise AssertionError("must not decode")
+
+    async def gone(_self: Request) -> bool:
+        return True
+
+    monkeypatch.setattr(otlp_api, "decode_and_map", counted)
+    monkeypatch.setattr(Request, "is_disconnected", gone)
+    harness = Harness()
+
+    response = await harness.post(_export(_span({"x": 1})).SerializeToString())
+
+    assert response.status_code == 499
+    assert calls == []
+
+
+class ConflictEach:
+    """The ledger names one conflict per batch: each listed session conflicts in turn."""
+
+    def __init__(self, conflicting: list[str]) -> None:
+        self.batches: list[IngestBatchRequestV1] = []
+        self._conflicting = list(conflicting)
+        self.error: Exception | None = None
+        self.status = 200
+
+    async def ingest(self, batch: IngestBatchRequestV1) -> IngestOutcome:
+        self.batches.append(batch)
+        sessions = [event.payload["session_id"] for event in batch.events]
+        offender = next((s for s in self._conflicting if s in sessions), None)
+        if offender is None:
+            accepted = tuple(
+                AcceptedEventV1(event_id=e.event_id, status="accepted", stream_sequence=1)
+                for e in batch.events
+            )
+            return IngestOutcome(
+                200, IngestBatchResponseV1(batch_id=batch.batch_id, accepted=accepted)
+            )
+        rejected = tuple(
+            RejectedEventV1(
+                event_id=event.event_id,
+                error_code="idempotency_conflict"
+                if event.payload["session_id"] == offender
+                else "batch_rejected",
+                retryable=False,
+            )
+            for event in batch.events
+        )
+        return IngestOutcome(409, IngestBatchResponseV1(batch_id=batch.batch_id, rejected=rejected))
+
+
+async def test_every_conflict_is_isolated_and_the_new_events_still_land() -> None:
+    harness = Harness()
+    service = ConflictEach([_session(1), _session(2)])
+    object.__setattr__(harness.runtime, "service", service)
+    export = _export(
+        *(_span(events=[_codex_event(**{"conversation.id": _session(i)})]) for i in (1, 2, 3, 4))
+    )
+
+    response = _response(await harness.post(export.SerializeToString()))
+
+    assert response.partial_success.rejected_spans == 2
+    assert response.partial_success.error_message == "spans rejected: idempotency_conflict"
+    assert [len(batch.events) for batch in service.batches] == [4, 3, 2]
+    assert {event.payload["session_id"] for event in service.batches[-1].events} == {
+        _session(3),
+        _session(4),
+    }
+
+
+async def test_conflicts_beyond_the_attempt_cap_reject_the_rest() -> None:
+    harness = Harness(max_spans=20)
+    sessions = [_session(i) for i in range(otlp_api.MAX_INGEST_ATTEMPTS + 2)]
+    service = ConflictEach(sessions)
+    object.__setattr__(harness.runtime, "service", service)
+    export = _export(
+        *(_span(events=[_codex_event(**{"conversation.id": session})]) for session in sessions)
+    )
+
+    response = _response(await harness.post(export.SerializeToString()))
+
+    assert len(service.batches) == otlp_api.MAX_INGEST_ATTEMPTS
+    assert response.partial_success.rejected_spans == len(sessions)
+    assert response.partial_success.error_message == (
+        "spans rejected: batch_rejected,idempotency_conflict"
+    )
+
+
+async def test_stream_names_encode_their_components_unambiguously() -> None:
+    harness = Harness()
+    session = "x:y"
+    export = _export(_span(events=[_codex_event(**{"conversation.id": session})]))
+
+    _response(await harness.post(export.SerializeToString()))
+
+    (draft,) = harness.service.batches[0].events
+    assert draft.stream_id == "codex-otel:codex-otel-producer:x%3Ay"
+
+
+async def test_the_span_marker_rejects_a_span_whose_child_event_is_a_codex_event() -> None:
+    harness = Harness()
+    span = _span({"agent_context.origin": "platform"}, events=[_codex_event()])
+
+    response = _response(await harness.post(_export(span).SerializeToString()))
+
+    assert response.partial_success.error_message == "spans rejected: platform_origin"
+    assert harness.service.batches == []
+
+
+async def test_an_over_long_value_the_mapper_would_accept_is_refused_by_name() -> None:
+    harness = Harness()
+    # error.message is never read by the mapper, and its own cap is 1 MiB: only the receiver's
+    # 16 KiB guard refuses it.
+    big = _codex_event(**{"error.message": "e" * (otlp_api.MAX_ATTRIBUTE_VALUE_CHARS + 1)})
+
+    response = _response(await harness.post(_export(_span(events=[big])).SerializeToString()))
+
+    assert response.partial_success.error_message == "spans rejected: attribute_value_too_long"
+
+
+async def test_event_attributes_win_over_resource_attributes() -> None:
+    harness = Harness()
+    resource = {**_fixture()["resource"], "model": "resource-model"}
+    span = _span(events=[_codex_event(model="event-model")])
+
+    _response(await harness.post(_export(span, resource=resource).SerializeToString()))
+
+    assert harness.service.batches[0].events[0].payload["model"] == "event-model"
+
+
+@pytest.mark.parametrize("seed", range(6))
+def test_the_wire_scan_counts_what_the_parser_parses(seed: int) -> None:
+    import random
+
+    generator = random.Random(seed)
+    spans = []
+    for _ in range(generator.randint(1, 6)):
+        span = _span(
+            {
+                f"s{i}": generator.choice(["v", 1, 2.5, True, [1, [2]]])
+                for i in range(generator.randint(0, 5))
+            },
+            events=[
+                {f"e{i}": "x" * generator.randint(0, 200) for i in range(generator.randint(0, 4))}
+                for _ in range(generator.randint(0, 5))
+            ],
+        )
+        for _ in range(generator.randint(0, 3)):
+            span.links.add(trace_id=b"\x01" * 16, span_id=b"\x02" * 8, attributes=_pairs({"l": 1}))
+        spans.append(span)
+    data = _export(*spans).SerializeToString()
+    limits = otlp_wire.WireLimits(16, 64, 500, 1000, 1000, 65_536, 128)
+    scanner = otlp_wire._Scanner(data, limits)
+    scanner.request()
+    parsed = ExportTraceServiceRequest.FromString(data)
+
+    def nested(value: Any) -> int:
+        kind = value.WhichOneof("value")
+        if kind == "array_value":
+            return sum(1 + nested(item) for item in value.array_value.values)
+        if kind == "kvlist_value":
+            return sum(1 + nested(item.value) for item in value.kvlist_value.values)
+        return 0
+
+    def count(pairs: Any) -> int:
+        return sum(1 + nested(pair.value) for pair in pairs)
+
+    expected_attributes = sum(
+        count(rs.resource.attributes)
+        + sum(
+            count(ss.scope.attributes)
+            + sum(
+                count(sp.attributes)
+                + sum(count(ev.attributes) for ev in sp.events)
+                + sum(count(link.attributes) for link in sp.links)
+                for sp in ss.spans
+            )
+            for ss in rs.scope_spans
+        )
+        for rs in parsed.resource_spans
+    )
+    spans_parsed = [sp for rs in parsed.resource_spans for ss in rs.scope_spans for sp in ss.spans]
+    assert scanner.counts.spans == len(spans_parsed)
+    assert scanner.counts.records == len(spans_parsed) + sum(len(sp.events) for sp in spans_parsed)
+    assert scanner.counts.links == sum(len(sp.links) for sp in spans_parsed)
+    assert scanner.counts.attributes == expected_attributes
