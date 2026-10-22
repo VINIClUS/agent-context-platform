@@ -1,7 +1,9 @@
 from __future__ import annotations
 
+import os
+import stat
 from pathlib import Path
-from typing import Annotated, Literal, Self
+from typing import Annotated, Any, Final, Literal, Self
 
 from pydantic import (
     AnyHttpUrl,
@@ -16,7 +18,12 @@ from pydantic import (
     field_validator,
     model_validator,
 )
-from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic.fields import FieldInfo
+from pydantic_settings import (
+    BaseSettings,
+    PydanticBaseSettingsSource,
+    SettingsConfigDict,
+)
 
 from agent_context_platform.operations.faults import FaultLabel
 
@@ -342,3 +349,135 @@ class Settings(BaseSettings):
         if missing:
             raise ValueError(f"Missing production settings: {', '.join(missing)}")
         return self
+
+    @classmethod
+    def settings_customise_sources(
+        cls,
+        settings_cls: type[BaseSettings],
+        init_settings: PydanticBaseSettingsSource,
+        env_settings: PydanticBaseSettingsSource,
+        dotenv_settings: PydanticBaseSettingsSource,
+        file_secret_settings: PydanticBaseSettingsSource,
+    ) -> tuple[PydanticBaseSettingsSource, ...]:
+        # Precedence, first wins: explicit arguments, the environment, then secret files.
+        return (
+            init_settings,
+            env_settings,
+            dotenv_settings,
+            _SecretFilesSource(settings_cls),
+            file_secret_settings,
+        )
+
+
+# --- file-based secrets (PLATFORM-054) ------------------------------------------------------------
+# `AGENT_CONTEXT_SECRETS_DIR` names a directory of files, each named after the variable it replaces
+# (`AGENT_CONTEXT_POSTGRESQL__API_DSN`) and holding only the value (one trailing newline is
+# dropped). INFRA mounts them 0400 instead of exporting secrets into the process environment,
+# where `/proc/<pid>/environ` shows them. Only the secret fields have file names
+# (`SECRET_FILE_NAMES`); a variable set in the environment wins over its file. Everything is
+# refused, never skipped, when it is not as expected: a relative or missing directory, a directory
+# or file that is a symlink, a directory others can write, a file that is not regular, not owned by
+# this process's user or root, has any group or other permission bit, is empty, has more than one
+# line or exceeds 64 KiB, and an `AGENT_CONTEXT_*` file that is not a secret setting (it would
+# never apply). Errors name the file, never its content.
+
+SECRETS_DIR_ENV: Final = "AGENT_CONTEXT_SECRETS_DIR"
+_SECRET_FILE_MAX_BYTES: Final = 65_536
+_SECRET_FILE_PREFIX: Final = "AGENT_CONTEXT_"
+
+
+class SecretFileError(ValueError):
+    """A secrets directory or file is not safe to read; the message names it, never its value."""
+
+
+def _secret_fields() -> dict[str, tuple[str, str]]:
+    """`AGENT_CONTEXT_<SECTION>__<FIELD>` -> (section, field) for every secret-typed field."""
+    names: dict[str, tuple[str, str]] = {}
+    for section, info in Settings.model_fields.items():
+        model = info.annotation
+        if not (isinstance(model, type) and issubclass(model, BaseModel)):
+            continue
+        for field, sub in model.model_fields.items():
+            if "Secret" in repr(sub.annotation):
+                names[f"{_SECRET_FILE_PREFIX}{section.upper()}__{field.upper()}"] = (section, field)
+    return names
+
+
+def _refuse_unsafe(name: str, info: os.stat_result, *, kind: str) -> None:
+    if info.st_uid not in (os.geteuid(), 0):
+        raise SecretFileError(f"{name}: the {kind} owner must be this process's user or root")
+
+
+def read_secret_files(directory: str) -> dict[str, dict[str, str]]:
+    """The secret settings in `directory`, nested by section (see the section comment above)."""
+    path = Path(directory)
+    if not path.is_absolute():
+        raise SecretFileError(f"{SECRETS_DIR_ENV} must be an absolute path")
+    try:
+        directory_fd = os.open(path, os.O_RDONLY | os.O_DIRECTORY | os.O_NOFOLLOW | os.O_CLOEXEC)
+    except OSError:
+        raise SecretFileError(
+            f"{SECRETS_DIR_ENV} must name an existing directory (not a symlink)"
+        ) from None
+    try:
+        info = os.fstat(directory_fd)
+        _refuse_unsafe(SECRETS_DIR_ENV, info, kind="directory")
+        if info.st_mode & 0o022:
+            raise SecretFileError(
+                f"{SECRETS_DIR_ENV}: the directory is writable by group or others"
+            )
+        values: dict[str, dict[str, str]] = {}
+        for name in sorted(os.listdir(directory_fd)):
+            if not name.startswith(_SECRET_FILE_PREFIX):
+                continue  # not ours (a mount may hold other files)
+            target = SECRET_FILE_NAMES.get(name)
+            if target is None:
+                raise SecretFileError(f"{name}: not a secret setting, so a file would never apply")
+            section, field = target
+            values.setdefault(section, {})[field] = _read_secret_file(directory_fd, name)
+        return values
+    finally:
+        os.close(directory_fd)
+
+
+def _read_secret_file(directory_fd: int, name: str) -> str:
+    try:
+        fd = os.open(
+            name, os.O_RDONLY | os.O_NOFOLLOW | os.O_NONBLOCK | os.O_CLOEXEC, dir_fd=directory_fd
+        )
+    except OSError:
+        raise SecretFileError(f"{name}: must be a readable regular file, not a symlink") from None
+    try:
+        info = os.fstat(fd)
+        if not stat.S_ISREG(info.st_mode):
+            raise SecretFileError(f"{name}: must be a readable regular file, not a symlink")
+        _refuse_unsafe(name, info, kind="file")
+        if info.st_mode & 0o077:
+            raise SecretFileError(f"{name}: readable or writable by group or others (use 0400)")
+        data = os.read(fd, _SECRET_FILE_MAX_BYTES + 1)
+    finally:
+        os.close(fd)
+    if len(data) > _SECRET_FILE_MAX_BYTES:
+        raise SecretFileError(f"{name}: larger than {_SECRET_FILE_MAX_BYTES} bytes")
+    try:
+        text = data.decode("utf-8")
+    except UnicodeDecodeError:
+        raise SecretFileError(f"{name}: not UTF-8 text") from None
+    value = text.removesuffix("\n").removesuffix("\r")
+    if not value or any(character in value for character in "\r\n\x00"):
+        raise SecretFileError(f"{name}: must hold exactly one non-empty line")
+    return value
+
+
+class _SecretFilesSource(PydanticBaseSettingsSource):
+    """Reads `read_secret_files(AGENT_CONTEXT_SECRETS_DIR)` when that variable is set."""
+
+    def get_field_value(self, field: FieldInfo, field_name: str) -> tuple[Any, str, bool]:
+        return None, field_name, False  # `__call__` reads the whole directory at once
+
+    def __call__(self) -> dict[str, Any]:
+        directory = os.environ.get(SECRETS_DIR_ENV)
+        return {} if directory is None else read_secret_files(directory)
+
+
+SECRET_FILE_NAMES: Final = _secret_fields()

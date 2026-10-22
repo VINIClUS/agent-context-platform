@@ -109,7 +109,7 @@ from agent_context_platform.retrieval.embeddings import (
     load_manifest,
     verify_model_dir,
 )
-from agent_context_platform.settings import Neo4jSettings, Settings
+from agent_context_platform.settings import Neo4jSettings, SecretFileError, Settings
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -214,6 +214,8 @@ def _load_settings() -> Settings:
         settings = Settings()
     except ValidationError:
         raise CliUsageError("invalid AGENT_CONTEXT_* configuration") from None
+    except SecretFileError as error:  # names the file, never its content
+        raise CliUsageError(str(error)) from None
     faults.configure(settings.fault_injection)
     return settings
 
