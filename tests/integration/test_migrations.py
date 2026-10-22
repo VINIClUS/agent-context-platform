@@ -323,6 +323,14 @@ _PRE_CONTENT_REVISION = "20260823_0001"
 _CONTENT_REVISION = "20260928_0001"
 _MCP_TOKENS_REVISION = "20260929_0001"
 _SEARCH_REVISION = "20261002_0001"
+_API_READ_GRANTS_REVISION = "20261022_0001"
+# Exactly what the API role reads for readiness (the schema head) and freshness (projection
+# progress): SELECT and nothing else.
+_API_READ_TABLES = (
+    "public.alembic_version",
+    "projection.projection_checkpoints",
+    "projection.dead_letters",
+)
 _LEGACY_DIGEST = hashlib.sha256(b"legacy-content-that-was-never-stored").hexdigest()
 
 
@@ -447,6 +455,66 @@ async def _exercise_search_step(dsn: str) -> None:
                     )
                     assert await connection.scalar(
                         text("SELECT to_regclass('operations.mcp_tokens')")
+                    )
+            finally:
+                await connection.rollback()
+                await _run_alembic(connection, command.downgrade, "base")
+                await connection.commit()
+    finally:
+        await engine.dispose()
+
+
+def test_api_read_grants_revision_steps_down_and_up_cleanly(postgres_dsn: str) -> None:
+    """The read-grant revision adds and removes only the API role's SELECT on three tables."""
+    asyncio.run(_exercise_api_read_grants_step(postgres_dsn))
+
+
+async def _api_privileges(connection: AsyncConnection) -> dict[tuple[str, str], bool]:
+    privileges: dict[tuple[str, str], bool] = {}
+    for table in _API_READ_TABLES:
+        for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE"):
+            privileges[(table, privilege)] = bool(
+                await connection.scalar(
+                    text("SELECT has_table_privilege('agent_context_api', :table, :privilege)"),
+                    {"table": table, "privilege": privilege},
+                )
+            )
+    return privileges
+
+
+async def _exercise_api_read_grants_step(dsn: str) -> None:
+    engine = create_async_engine(dsn, poolclass=NullPool)
+    granted = {
+        (table, privilege): privilege == "SELECT"
+        for table in _API_READ_TABLES
+        for privilege in ("SELECT", "INSERT", "UPDATE", "DELETE", "TRUNCATE")
+    }
+    try:
+        async with engine.connect() as connection:
+            try:
+                for _ in range(2):
+                    await _run_alembic(connection, command.upgrade, _API_READ_GRANTS_REVISION)
+                    await connection.commit()
+                    assert await _api_privileges(connection) == granted
+                    # The projector role's own privileges are untouched.
+                    assert await connection.scalar(
+                        text(
+                            "SELECT has_table_privilege('agent_context_projector', "
+                            "'projection.dead_letters', 'INSERT')"
+                        )
+                    )
+                    assert not await connection.scalar(
+                        text(
+                            "SELECT has_table_privilege('agent_context_projector', "
+                            "'public.alembic_version', 'SELECT')"
+                        )
+                    )
+
+                    await _run_alembic(connection, command.downgrade, _SEARCH_REVISION)
+                    await connection.commit()
+                    assert not any((await _api_privileges(connection)).values())
+                    assert await connection.scalar(
+                        text("SELECT to_regclass('retrieval.search_documents')")
                     )
             finally:
                 await connection.rollback()
@@ -1065,6 +1133,7 @@ EXPECTED_TABLE_GRANTS = (
     | _table_grants("agent_context_projector", LEDGER_TABLES, {"SELECT"})
     | _table_grants("agent_context_projector", {"catalog.inline_contents"}, {"SELECT"})
     | _table_grants("agent_context_api", {"retrieval.search_documents"}, {"SELECT"})
+    | _table_grants("agent_context_api", set(_API_READ_TABLES), {"SELECT"})
     | _table_grants(
         "agent_context_projector",
         {"retrieval.search_documents"},
