@@ -114,12 +114,15 @@ Duration histograms use the explicit bucket boundaries
 - **Index.** One sample per `index_checkout`: `success`, `failed` (indexing or ingestion error, or
   an unsuccessful completion) or `refused` (repository mismatch, refused scan, structural sandbox
   unavailable).
-- **Codex OTLP receiver** (`POST /v1/otel/traces`, PLATFORM-053). One `requests` sample per
-  export: `accepted` for every 200 (rejected spans included), `rejected` for a 4xx (`auth` 401/403,
-  `rate_limited` 429, `unsupported_media_type` 415, `too_large` 413 for size, inflation or span
-  count, `malformed` 400), `error` with `internal` for 5xx. `spans` counts each span once:
-  `mapped` (it produced a stored or already-stored event), `unmapped` (no Codex event the mapper
-  models) or `rejected` (refused by the mapper, its resource, or the ingestion batch).
+- **Codex OTLP receiver** (`POST /v1/otel/traces`, PLATFORM-053). One `requests` sample per export:
+  `accepted` for every 200 (rejected spans included), `rejected` for a 4xx (`auth` 401/403,
+  `rate_limited` 429, `unsupported_media_type` 415, `too_large` 413 for any size, inflation, span,
+  record, event or attribute limit, `malformed` 400), `error` with `internal` for 5xx. `spans`
+  counts each span once: `mapped` (it produced a stored or already-stored event), `unmapped` (no
+  Codex event the mapper models) or `rejected` (refused by the mapper, its resource or scope, the
+  platform-origin marker, its times, or the ingestion batch). These are the receiver's only signals:
+  its batches bypass the ingestion route, so `agent_context.ingestion.*` and its span never count
+  them.
 - **Retrieval.** One sample per retrieval operation, recorded with
   `observability.retrieval_span(operation, client_errors=..., deadline_errors=...)` (or the
   `traced_retrieval` decorator); the composer and MCP tools adopt it. `client_error` is a typed

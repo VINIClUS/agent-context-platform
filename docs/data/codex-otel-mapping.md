@@ -1,10 +1,10 @@
 # Codex OTel mapping (PLATFORM-051)
 
-`agent_context_platform.ledger.codex_otel` is a pure mapping library: it turns one decoded
-Codex OTel record into an `EventDraftV1`, or into nothing. It does no I/O; the OTLP receiver
-(PLATFORM-053) is described under [Receiver](#receiver). The SDK is pinned at **v0.3.2**; no private contract exists. Anything without a
-v0.3.2 contract is listed in the gap table below and is the input to **SDK-019** (v0.4.0, then
-the PIN-P update).
+`agent_context_platform.ledger.codex_otel` is a pure mapping library: it turns one decoded Codex
+OTel record into an `EventDraftV1`, or into nothing. It does no I/O; the OTLP receiver
+(PLATFORM-053) is described under [Receiver](#receiver). The SDK is pinned at **v0.3.2**; no private
+contract exists. Anything without a v0.3.2 contract is listed in the gap table below and is the
+input to **SDK-019** (v0.4.0, then the PIN-P update).
 
 Sources (all paths under `codex-rs/`, cited at both tags `rust-v0.147.0` = supported floor and
 `rust-v0.157.1` = installed):
@@ -73,37 +73,82 @@ feeds every Codex event record through this mapper. It is not part of the frozen
 `/v1/ingestion/*` OpenAPI document.
 
 - **Encoding.** `Content-Type: application/x-protobuf` only (OTLP/JSON is not accepted: 415), with
-  `Content-Encoding` identity or `gzip` (anything else: 415).
+  `Content-Encoding` identity or `gzip` (anything else: 415). A gzip body must be exactly one
+  member: truncated, trailing or multi-member data is 400.
 - **Auth.** Exactly the ingestion producers' credentials: `Authorization: Bearer <prefix>.<secret>`
   of a registered producer with scope `events:ingest` (a `memory:read` token is 403), verified on the
-  same bounded Argon2 path. Every mapped draft names that producer (`name`
-  `codex-otel-receiver`, version `1.0.0`) and the stream `codex-otel:<producer_id>`.
-- **Limits** (`AGENT_CONTEXT_OTEL_RECEIVER__*`): request body 4 MiB counted while streaming
-  (`MAX_REQUEST_BODY_BYTES`), gzip output 16 MiB (`MAX_DECOMPRESSED_BYTES`; a bomb fails as 413
-  without being inflated, a truncated or trailing-data member is 400), 500 spans per request
-  (`MAX_SPANS`, also the bound on mapped records: one atomic ingestion batch), a per-producer token
-  bucket of 5/s, burst 20 (`RATE_LIMIT_PER_SECOND`, `RATE_LIMIT_BURST`; 429 with `Retry-After`).
-- **Idempotency key.** `IDEMPOTENCY_HMAC_KEY` (>= 32 characters) keys the mapper's digest. It must
-  be stable across restarts and replicas; until it is set (and ingestion is configured) the route
-  answers 503. `observed_at` is the record's own OTLP time (span event time, else span end), so a
-  collector retry of the same export maps to identical drafts and is answered `existing`.
+  same bounded Argon2 path, before any byte of the body is read. Every mapped draft names that
+  producer (`name` `codex-otel-receiver`, version `1.0.0`).
+- **Limits** (`AGENT_CONTEXT_OTEL_RECEIVER__*`). Each exceeded limit answers 413 with a
+  `google.rpc.Status` whose message starts with a fixed code, so the collector's logs show which:
+  | Limit | Default | Code |
+  | --- | --- | --- |
+  | `MAX_REQUEST_BODY_BYTES`, counted while streaming | 4 MiB | `request_too_large` |
+  | `MAX_DECOMPRESSED_BYTES`, gzip output (a bomb is never inflated past it) | 8 MiB | `inflated_too_large` |
+  | `MAX_SPANS` per request (at most 500) | 500 | `too_many_spans` |
+  | `MAX_RECORDS`, spans plus span events per request | 1000 | `too_many_records` |
+  | `MAX_EVENTS_PER_SPAN` | 64 | `too_many_events` |
+  | `MAX_ATTRIBUTES` per resource, scope, span or span event | 128 | `too_many_attributes` |
+  | distinct mapped events per request (one ingestion batch) | 500 | `too_many_drafts` |
+
+  Counts are O(1) length checks on the parsed message, made before any record is converted and
+  stopping at the first exceeded limit. A string value over 16 KiB rejects its record (not the
+  request). Inflation, parsing and mapping run on a worker thread (two at a time per process), never
+  on the event loop: at the limits this costs about 0.4 s to inflate and parse 8 MiB and about 55 ms
+  to map 1000 records. Parsing 16 MiB was measured at about 200 MiB of peak process memory;
+  8 MiB roughly halves that on the single VPS and is far above any Codex batch within the span and
+  record limits. A per-producer token
+  bucket of 5/s, burst 20 (`RATE_LIMIT_PER_SECOND`, `RATE_LIMIT_BURST`) answers 429 with
+  `Retry-After`.
+- **Idempotency key.** `IDEMPOTENCY_HMAC_KEY` (at least 32 characters, at least 8 distinct) keys the
+  mapper's digest. Until it is set (and ingestion is configured) the route answers 503 with
+  `Retry-After`; the collector retries for at most an hour and then drops the batch.
+  **Rotation** (or a change of the producer name or version) changes the keys of re-exported
+  records, so queued re-exports would become duplicate events: drain the collector's sending queue
+  first (stop Codex export, wait until the queue is empty), then rotate and restart.
 - **Records.** A span whose attributes carry `event.name` is one record; so is each span event that
   does (Codex's `trace_event!` inside a span). The resource is checked once per `ResourceSpans`
-  (`check_resource`): a platform-origin or unknown resource rejects all its spans. Records the
-  mapper does not model are unmapped (counted, not errors); records it refuses, or that have no
-  OTLP time, reject their span. Records with the same idempotency key in one export collapse into
-  one draft. All drafts of one request are appended as one atomic batch.
+  (`check_resource`): a platform-origin or unknown resource rejects all its spans. The
+  `agent_context.origin` marker rejects at every level: resource, scope (all its spans), span and
+  span event (the span). Records the mapper does not model are unmapped (counted, not errors);
+  records it refuses reject their span. Records with the same idempotency key in one export collapse
+  into one draft and the **first one wins**: a span and a span event describing the same Codex event
+  with different attributes would map to different keys, and so to two events (Codex emits each
+  trace-safe event once, so this is not expected).
+- **Times.** `event.timestamp` (`occurred_at`) and the OTLP time (span event time, else span end) are
+  **Codex's clock**, not the platform's. A record with no OTLP time is rejected
+  (`missing_timestamp`); one whose OTLP time or `occurred_at` is more than
+  `MAX_CLOCK_SKEW_SECONDS` (300) in the future is rejected (`future_timestamp`). `observed_at` is
+  the later of `occurred_at` and the OTLP time: deterministic, so a collector retry of the same export
+  maps to identical drafts and is answered `existing`.
+- **Streams and batches.** Drafts go to the stream `codex-otel:<producer_id>:<session_id>`, one per
+  producer and Codex session, so a stream-level failure (a quarantined stream after a failed
+  integrity verification) stays within one session. All drafts of one request are appended as one
+  atomic batch. When the batch is refused, the events it is attributable to (an
+  `idempotency_conflict`, a `stream_quarantined` stream) are rejected and the others are resubmitted
+  once; events already stored are `existing`, never rejected. One conflicting record therefore never
+  discards the rest of its export.
 - **Response.** 200 with an `ExportTraceServiceResponse`; when spans were rejected,
   `partial_success.rejected_spans` and the fixed `error_message` `spans rejected: <reason codes>`
-  (sorted fixed codes such as `platform_origin` or `idempotency_conflict`, never a value). Errors
-  answer a `google.rpc.Status` with a fixed message: 400 malformed, 401/403 credentials, 413, 415,
-  429, and 503 (with `Retry-After`) when unconfigured or on a retryable outage, so the collector
-  retries. Logs carry ids, counts and fixed codes only.
+  (sorted fixed codes such as `platform_origin`, `future_timestamp` or `idempotency_conflict`, never
+  a value). Partial success is final: the collector does not retry it. Errors answer a
+  `google.rpc.Status` with a fixed message: 400 malformed, 401/403 credentials, 413 (code above),
+  415, 429, and 503 (with `Retry-After`) when unconfigured or on a retryable outage. Logs carry ids,
+  counts and fixed codes only. Telemetry: `agent_context.otel.requests` and
+  `agent_context.otel.spans` are the receiver's only signals (these batches do not go through the
+  ingestion route, so `agent_context.ingestion.*` and its span never count them; see
+  `docs/operations/telemetry.md`).
+- **Threat note.** Any `events:ingest` producer can append `agent.session.started` for any
+  `conversation.id` it chooses, but only into its own streams (`codex-otel:<its producer_id>:...`)
+  and under its own producer id: projections can tell the sources apart, and revoking the producer
+  stops it. Only the collector should hold the receiver's producer token.
 - **For the collector (INFRA-050).** The `otlphttp` exporter targets
   `http://platform-api:8000/v1/otel/traces` (set `traces_endpoint`, since the path is not the OTLP
   default) with `encoding: proto`, optionally `compression: gzip`, and the header
-  `Authorization: Bearer <producer token>` of a producer registered with scope `events:ingest`. It
-  forwards only the Codex trace-safe pipeline, never platform-origin signals.
+  `Authorization: Bearer <producer token>` of a producer registered with scope `events:ingest`.
+  The batch processor must keep requests inside the limits above: `send_batch_max_size` at most
+  500, and batches well under 4 MiB (and 8 MiB inflated). A 413 is permanent for `otlphttp`, which
+  drops the batch. It forwards only the Codex trace-safe pipeline, never platform-origin signals.
 
 ## Mapped (SDK v0.3.2)
 
