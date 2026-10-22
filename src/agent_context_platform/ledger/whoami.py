@@ -38,7 +38,7 @@ from agent_context_platform.mcp.auth import (
     McpAuthHolder,
     RateLimitedError,
 )
-from agent_context_platform.mcp.protocol_guard import _matches as allowlisted
+from agent_context_platform.mcp.protocol_guard import allowed_header
 from agent_context_platform.security.bearer import (
     AuthError,
     AuthOverloadedError,
@@ -109,21 +109,15 @@ class _Refused(Exception):
         self.code = code
 
 
-def _single(request: Request, name: str) -> tuple[int, str | None]:
-    values = request.headers.getlist(name)
-    return len(values), (values[0] if values else None)
-
-
 def _check_origin(request: Request, settings: MCPSettings) -> None:
-    """A present Origin must be allowed (a missing one is a non-browser client); never repeated."""
-    count, origin = _single(request, "origin")
-    if count > 1 or (origin is not None and not allowlisted(origin, settings.allowed_origins)):
+    if not allowed_header(
+        request.headers.getlist("origin"), settings.allowed_origins, required=False
+    ):
         raise _Refused(403, "invalid_origin")
 
 
 def _check_host(request: Request, settings: MCPSettings) -> None:
-    count, host = _single(request, "host")
-    if count != 1 or host is None or not allowlisted(host, settings.allowed_hosts):
+    if not allowed_header(request.headers.getlist("host"), settings.allowed_hosts, required=True):
         raise _Refused(421, "invalid_host")
 
 
