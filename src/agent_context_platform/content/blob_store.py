@@ -83,31 +83,7 @@ class S3BlobStore:
     @classmethod
     def from_settings(cls, settings: S3Settings) -> S3BlobStore:
         """Build the single, explicitly configured S3 client for this store."""
-        access_key_id = (
-            None if settings.access_key_id is None else settings.access_key_id.get_secret_value()
-        )
-        secret_access_key = (
-            None
-            if settings.secret_access_key is None
-            else settings.secret_access_key.get_secret_value()
-        )
-        session = boto3.session.Session(
-            aws_access_key_id=access_key_id,
-            aws_secret_access_key=secret_access_key,
-            region_name=settings.region_name,
-        )
-        client = session.client(
-            "s3",
-            endpoint_url=None if settings.endpoint_url is None else str(settings.endpoint_url),
-            region_name=settings.region_name,
-            config=Config(
-                connect_timeout=settings.connect_timeout_seconds,
-                read_timeout=settings.read_timeout_seconds,
-                retries={"total_max_attempts": settings.max_attempts, "mode": "standard"},
-                s3={"addressing_style": settings.addressing_style},
-            ),
-        )
-        return cls(settings, client=client)
+        return cls(settings, client=build_s3_client(settings))
 
     async def put_verified(self, content: bytes, media_type: str) -> StoredBlob:
         """Store content and verify server-visible metadata before returning it."""
@@ -333,6 +309,34 @@ class S3BlobStore:
             raise BlobIntegrityError("object uncompressed byte count does not match")
         if actual.media_type != expected.media_type:
             raise BlobIntegrityError("object media type does not match")
+
+
+def build_s3_client(settings: S3Settings) -> Any:
+    """The one way to build a boto3 S3 client from settings (the store and the orphan sweeper)."""
+    access_key_id = (
+        None if settings.access_key_id is None else settings.access_key_id.get_secret_value()
+    )
+    secret_access_key = (
+        None
+        if settings.secret_access_key is None
+        else settings.secret_access_key.get_secret_value()
+    )
+    session = boto3.session.Session(
+        aws_access_key_id=access_key_id,
+        aws_secret_access_key=secret_access_key,
+        region_name=settings.region_name,
+    )
+    return session.client(
+        "s3",
+        endpoint_url=None if settings.endpoint_url is None else str(settings.endpoint_url),
+        region_name=settings.region_name,
+        config=Config(
+            connect_timeout=settings.connect_timeout_seconds,
+            read_timeout=settings.read_timeout_seconds,
+            retries={"total_max_attempts": settings.max_attempts, "mode": "standard"},
+            s3={"addressing_style": settings.addressing_style},
+        ),
+    )
 
 
 def _object_key(digest: str) -> str:
