@@ -104,8 +104,10 @@ def calls(monkeypatch: pytest.MonkeyPatch) -> Calls:
 
 
 REGISTERED = sorted(f"{item.name}:{item.version}" for item in registered_projectors())
+# The marker never names the search projector (`records_history = False`).
+RECORDED = [item for item in REGISTERED if item != "search:1"]
 REQUIRED = ["knowledge:2", "quality:2"]
-OTHERS = [item for item in REGISTERED if item not in REQUIRED]
+OTHERS = [item for item in RECORDED if item not in REQUIRED]
 MISSING = {"state": "missing", "missing": REQUIRED, "others_missing": OTHERS}
 
 
@@ -252,7 +254,7 @@ def test_verify_human_output_and_no_record(monkeypatch: pytest.MonkeyPatch, call
     lines = result.output.splitlines()
     assert lines[-2].startswith("history: missing, rebuild required before temporal reads")
     assert "knowledge:2" in lines[-2] and lines[-1] == "verified"
-    calls.history = ProjectionHistory(frozenset(REGISTERED))
+    calls.history = ProjectionHistory(frozenset(RECORDED))
     complete = run("projection", "verify", "--no-record")
     assert "history: complete for temporal reads\n" in complete.output
     # the same set the temporal reads check: other projectors are only listed
@@ -489,7 +491,7 @@ def test_status_lists_each_projector_read_only(
     machine = json.loads(run("projection", "status", "--json").output)
     assert [item["name"] for item in machine["projectors"]] == ["git", "code"]
     assert machine["history"] == MISSING
-    calls.history = ProjectionHistory(frozenset(REGISTERED))
+    calls.history = ProjectionHistory(frozenset(RECORDED))
     machine = json.loads(run("projection", "status", "--json").output)
     assert machine["history"] == {"state": "complete", "missing": [], "others_missing": []}
     assert machine["search"] == {

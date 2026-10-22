@@ -605,13 +605,8 @@ def test_a_graph_replay_without_an_embedder_is_refused_at_construction() -> None
         SearchBackend(FakeSessions(), FakeContent({}), None, write_documents=False)  # type: ignore[arg-type]
 
 
-def test_a_lexical_only_search_projector_is_never_named_in_the_history_marker() -> None:
+def test_the_search_projector_is_never_named_in_the_history_marker() -> None:
     from agent_context_platform.projection.schema import history_projectors
 
-    full = Rig({}).projector
-    lexical = Rig({}, lexical=True).projector
-
-    assert full.records_history and not lexical.records_history
-    assert SearchProjector().records_history  # the registered identity status expects
-    assert history_projectors([full]) == [("search", "1")]
-    assert history_projectors([lexical]) == []
+    for projector in (Rig({}).projector, Rig({}, lexical=True).projector, SearchProjector()):
+        assert history_projectors([projector]) == []
