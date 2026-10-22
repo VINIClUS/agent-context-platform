@@ -10,6 +10,7 @@ import threading
 import time
 import uuid
 from collections.abc import Iterator
+from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
@@ -119,16 +120,28 @@ def test_ready_when_every_service_is_reachable_and_the_schema_is_at_head(
     assert _ready(_settings(migrated, services))[:2] == (200, {"status": "ready"})
 
 
-async def _quiet_write_counters(dsn: str) -> int:
-    """Rows written in this database so far, once no other backend can still flush statistics.
+# The platform's own tables: autovacuum and autoanalyze write system catalogs (pg_class,
+# pg_statistic) at any moment, so database-wide counters are not the probe's writes.
+PLATFORM_SCHEMAS = ("ledger", "projection", "catalog", "operations", "retrieval")
+VERSION_TABLE = "public.alembic_version"
 
-    A backend flushes its counters when it exits (or at most a second after a transaction), so
-    wait until this connection is the only one on the database before reading them.
+
+@dataclass(frozen=True)
+class TableCounters:
+    writes: dict[str, int]  # inserted + updated + deleted tuples per table (HOT is a subset)
+    version_reads: int  # sequential and index scans of the version table
+
+
+async def _quiet_table_counters(dsn: str) -> TableCounters:
+    """Per-table counters of the platform's tables, once nothing else can still flush them.
+
+    A backend (an autovacuum worker included) flushes its counters when it exits (or at most a
+    second after a transaction), so wait until this connection is the only one on the database.
     """
     engine = create_async_engine(dsn, poolclass=NullPool)
     try:
         async with engine.connect() as connection:
-            for _ in range(200):
+            for _ in range(600):
                 others = await connection.scalar(
                     text(
                         "SELECT count(*) FROM pg_stat_activity "
@@ -141,21 +154,29 @@ async def _quiet_write_counters(dsn: str) -> int:
                 await asyncio.sleep(0.05)
             assert others == 0
             await connection.execute(text("SELECT pg_stat_clear_snapshot()"))
-            written = await connection.scalar(
-                text(
-                    "SELECT tup_inserted + tup_updated + tup_deleted "
-                    "FROM pg_stat_database WHERE datname = current_database()"
+            rows = (
+                await connection.execute(
+                    text(
+                        "SELECT schemaname || '.' || relname, n_tup_ins + n_tup_upd + n_tup_del, "
+                        "coalesce(seq_scan, 0) + coalesce(idx_scan, 0) "
+                        "FROM pg_stat_user_tables "
+                        "WHERE schemaname = ANY(:schemas) "
+                        "OR schemaname || '.' || relname = :version_table"
+                    ),
+                    {"schemas": list(PLATFORM_SCHEMAS), "version_table": VERSION_TABLE},
                 )
-            )
-            return int(written or 0)
+            ).all()
+            await connection.commit()
     finally:
         await engine.dispose()
+    reads = {str(row[0]): int(row[2]) for row in rows}
+    return TableCounters({str(row[0]): int(row[1]) for row in rows}, reads.get(VERSION_TABLE, 0))
 
 
 def test_the_probe_writes_nothing(
     migrated: str, services: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    """Three complete probes (every check answered ok) change no row in the database.
+    """Three complete probes (every check answered ok) change no row of the platform's tables.
 
     The 200 proves each check actually ran to the end; the probe gets a generous timeout of its
     own so a slow Neo4j or S3 answer under full-suite load cannot turn that into a timeout. What
@@ -166,7 +187,10 @@ def test_the_probe_writes_nothing(
     head = migrate.image_head(migrate.alembic_config(ALEMBIC_INI))
     assert settings.postgresql.dsn is not None
 
-    before = asyncio.run(_quiet_write_counters(migrated))
+    before = asyncio.run(_quiet_table_counters(migrated))
+    # Not vacuous: every platform table is counted, the ones readiness touches included.
+    assert set(readiness.API_READ_TABLES) <= before.writes.keys()
+    assert len(before.writes) >= 20
     engine = readiness.readiness_engine(settings.postgresql.dsn, LOADED_TIMEOUT_SECONDS)
     store = Neo4jStore(settings.neo4j)
     probe = readiness.build_probe(
@@ -185,9 +209,17 @@ def test_the_probe_writes_nothing(
         finally:
             # The driver and the engine belong to the client's event loop.
             client.portal.call(close)  # type: ignore[union-attr]
-    after = asyncio.run(_quiet_write_counters(migrated))
+    after = asyncio.run(_quiet_table_counters(migrated))
 
-    assert after == before
+    changed = {
+        table: (before.writes.get(table), count)
+        for table, count in after.writes.items()
+        if before.writes.get(table) != count
+    }
+    assert changed == {}
+    assert after.writes.keys() == before.writes.keys()
+    # The probes really read the schema head: one scan of the version table each, at least.
+    assert after.version_reads - before.version_reads >= 3
 
 
 def test_a_schema_behind_the_image_is_not_ready(

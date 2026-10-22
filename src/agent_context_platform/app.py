@@ -29,6 +29,7 @@ from agent_context_platform.ledger.auth import (
 from agent_context_platform.ledger.otlp_api import OtlpReceiverRuntime
 from agent_context_platform.ledger.otlp_api import router as otlp_router
 from agent_context_platform.ledger.service import IngestionService
+from agent_context_platform.ledger.whoami import router as whoami_router
 from agent_context_platform.mcp.auth import (
     MEMORY_READ_SCOPE,
     McpAuthenticator,
@@ -257,8 +258,10 @@ def create_app(
     application.state.ingestion = ingestion
     application.state.readiness = readiness
     application.state.otlp_receiver = otlp_receiver
+    application.state.mcp_auth = mcp_holder  # read by the token probe (`ledger.whoami`)
     application.include_router(router)
     application.include_router(otlp_router)  # PLATFORM-053; outside the frozen OpenAPI
+    application.include_router(whoami_router)  # outside the frozen ingestion OpenAPI
     # Inside the request-context middleware: the server span is a child of the caller's trace.
     application.add_middleware(HttpTelemetryMiddleware)
     application.add_middleware(RequestContextMiddleware)

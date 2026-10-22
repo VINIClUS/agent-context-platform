@@ -50,7 +50,11 @@ from sqlalchemy.exc import InterfaceError, OperationalError, SQLAlchemyError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from agent_context_platform.content.blob_store import BlobStoreError
+from agent_context_platform.content.blob_store import (
+    BlobInputLimitError,
+    BlobIntegrityError,
+    BlobStoreError,
+)
 from agent_context_platform.content.service import (
     ContentService,
     ContentServiceError,
@@ -78,6 +82,12 @@ SERVICE_UNAVAILABLE: Final = "service_unavailable"
 _TRANSIENT_ERRORS: Final = (BlobStoreError, OperationalError, InterfaceError, PoolTimeoutError)
 
 _TRANSIENT_RETRY_AFTER_SECONDS: Final = 5
+# A stored object failed verification: it needs an operator, not a quick retry. The frozen
+# ingestion contract has no non-retryable code for "the platform's stored copy is corrupt", and the
+# batch itself is valid (it succeeds once the object is repaired), so it stays a retryable
+# `service_unavailable`, only paced slower; the alarm is raised where the check failed
+# (`content_integrity_failure`, `agent_context.ledger.integrity_failures`).
+_INTEGRITY_RETRY_AFTER_SECONDS: Final = 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -120,6 +130,17 @@ class IngestionService:
                 event.event_id for event in batch.events if event.stream_id == error.stream_id
             }
             return await self._reject(batch, 409, STREAM_QUARANTINED, offenders)
+        except BlobIntegrityError as error:
+            limited = isinstance(error, BlobInputLimitError)
+            return await self._reject(
+                batch,
+                503,
+                SERVICE_UNAVAILABLE,
+                retryable=True,
+                retry_after=(
+                    _TRANSIENT_RETRY_AFTER_SECONDS if limited else _INTEGRITY_RETRY_AFTER_SECONDS
+                ),
+            )
         except _TRANSIENT_ERRORS:
             return await self._reject(
                 batch,

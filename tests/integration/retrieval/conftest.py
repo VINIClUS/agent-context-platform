@@ -10,10 +10,14 @@ parameterized.
 from __future__ import annotations
 
 import asyncio
+import uuid
 from collections.abc import Awaitable, Callable, Iterator, Sequence
 from typing import Any, LiteralString
 
 import pytest
+from sqlalchemy import text
+from sqlalchemy.engine import make_url
+from sqlalchemy.ext.asyncio import AsyncEngine
 
 from agent_context_platform.projection.neo4j import Neo4jStore, Neo4jTransaction
 from agent_context_platform.projection.schema import SCHEMA_STATEMENTS, ensure_schema
@@ -206,6 +210,38 @@ def retrieval_graph_schema() -> Iterator[None]:
         yield
     finally:
         asyncio.run(_set_schema(present=False))
+
+
+@pytest.fixture(scope="module")
+def api_login(
+    postgres_dsn: str,
+    projection_engine: AsyncEngine,  # noqa: F811
+) -> Iterator[str]:
+    """DSN of a LOGIN member of ``agent_context_api`` with no grant of its own, as infra creates
+    it (the PLATFORM-055 readiness test does the same): retrieval reads run with exactly the API
+    role's migrated grants, never the owner's or the projector's."""
+    name = f"agent_context_api_login_{uuid.uuid4().hex[:12]}"
+    password = uuid.uuid4().hex
+
+    async def run(*statements: str) -> None:
+        async with projection_engine.begin() as connection:
+            for statement in statements:
+                await connection.execute(text(statement))
+
+    asyncio.run(
+        run(
+            f"CREATE ROLE {name} LOGIN INHERIT PASSWORD '{password}'",
+            f"GRANT agent_context_api TO {name}",
+        )
+    )
+    try:
+        yield (
+            make_url(postgres_dsn)
+            .set(username=name, password=password)
+            .render_as_string(hide_password=False)
+        )
+    finally:
+        asyncio.run(run(f"DROP ROLE {name}"))
 
 
 def with_graph(

@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import asyncio
 import hashlib
+import logging
 from types import SimpleNamespace
 from typing import Any
 
@@ -104,3 +105,43 @@ def test_object_content_that_is_gone_or_does_not_match_is_unavailable() -> None:
     no_key = ref.model_copy(update={"object_key": None})
     with pytest.raises(ContentUnavailableError, match="no object key"):
         asyncio.run(_service(Blobs(DATA)).read(Session(None), no_key))  # type: ignore[arg-type]
+
+
+def test_corrupt_or_missing_bytes_on_the_read_path_raise_the_integrity_alarm(
+    caplog: pytest.LogCaptureFixture, telemetry: Any
+) -> None:
+    # No platform code deletes stored bytes (the sweep only takes unreferenced objects) and
+    # callers skip purged content before reading, so missing bytes are a loss, too.
+    from agent_context_platform.content.blob_store import BlobIntegrityError
+    from agent_context_platform.observability import contract
+
+    caplog.set_level(logging.WARNING, logger="agent_context_platform.content.service")
+    obj, inline = _ref(ContentStorage.OBJECT), _ref(ContentStorage.INLINE)
+    for service, session, ref in (
+        (_service(Blobs(BlobIntegrityError("frame checksum"))), Session(None), obj),
+        (_service(Blobs(b"other bytes!!!")), Session(None), obj),
+        (_service(), Session(b"tampered text!"), inline),
+        (_service(Blobs(BlobNotFoundError("gone"))), Session(None), obj),
+        (_service(), Session(None), inline),
+    ):
+        with pytest.raises(ContentUnavailableError):
+            asyncio.run(service.read(session, ref))  # type: ignore[arg-type]
+    assert telemetry.points(contract.LEDGER_INTEGRITY_FAILURES) == {
+        (("check", "digest_mismatch"),): 3,
+        (("check", "missing_object"),): 2,
+    }
+    alarms = [r for r in caplog.records if "content_integrity" in r.getMessage()]
+    assert {r.stage for r in alarms} == {"read"}  # type: ignore[attr-defined]
+
+
+def test_an_unreachable_store_on_the_read_path_is_no_integrity_failure(telemetry: Any) -> None:
+    from agent_context_platform.content.blob_store import BlobStoreError
+    from agent_context_platform.observability import contract
+
+    with pytest.raises(ContentUnavailableError):
+        asyncio.run(
+            _service(Blobs(BlobStoreError("S3 get_object failed (503)"))).read(
+                Session(None), _ref(ContentStorage.OBJECT)
+            )  # type: ignore[arg-type]
+        )
+    assert telemetry.points(contract.LEDGER_INTEGRITY_FAILURES) == {}

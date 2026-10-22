@@ -68,6 +68,7 @@ import base64
 import binascii
 import hashlib
 import json
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar, Final, cast
@@ -84,12 +85,13 @@ from agent_context_sdk import (
     canonical_json_bytes,
     redact_json,
 )
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_context_platform.catalog.models import ContentObjectRow
 from agent_context_platform.content.blob_store import (
+    BlobInputLimitError,
     BlobIntegrityError,
     BlobNotFoundError,
     BlobStore,
@@ -104,6 +106,8 @@ from agent_context_platform.observability import (
     traced,
 )
 from agent_context_platform.operations.faults import fault_point
+
+logger = logging.getLogger("agent_context_platform.content.service")
 
 #: Fixed namespace for every advisory lock this module (and the orphan
 #: sweeper) takes on a content digest. Arbitrary but stable: changing it
@@ -125,6 +129,31 @@ _MAX_JSON_DEPTH: Final[int] = 256
 #: regardless of the claimed media type. See "Object-storage media type is
 #: a fixed constant" in the module docstring.
 _OBJECT_STORAGE_MEDIA_TYPE: Final[str] = "application/octet-stream"
+
+
+def _integrity_failure(check: str, stage: str, content_sha256: str) -> None:
+    """Raise the operator alarm for a stored object that failed verification.
+
+    One content-free WARNING line (`content_integrity_failure`: the check, the stage, the digest
+    and its canonical object key, never bytes or the exception text) and the contract counter
+    `agent_context.ledger.integrity_failures{check}` (PLATFORM-050), which INFRA alerts on. The
+    ingestion response stays a retryable 503 (`ledger.service`): the batch is valid and succeeds
+    once the object is repaired.
+    """
+    object_key = f"sha256/{content_sha256[:2]}/{content_sha256[2:4]}/{content_sha256}.zst"
+    logger.warning(
+        "content_integrity_failure check=%s stage=%s content_sha256=%s",
+        check,
+        stage,
+        content_sha256,
+        extra={
+            "check": check,
+            "stage": stage,
+            "content_sha256": content_sha256,
+            "object_key": object_key,
+        },
+    )
+    record_integrity_failure(check)
 
 
 class ContentServiceError(ValueError):
@@ -531,7 +560,18 @@ class ContentService:
             # get_verified() round-trip inside put_verified()'s own reuse
             # check.
             fault_point("content.before_s3_put")
-            stored_blob = await self._blob_store.put_verified(data, _OBJECT_STORAGE_MEDIA_TYPE)
+            try:
+                stored_blob = await self._blob_store.put_verified(data, _OBJECT_STORAGE_MEDIA_TYPE)
+            except BlobInputLimitError:
+                raise  # the content is too large; nothing stored was checked
+            except BlobNotFoundError:
+                _integrity_failure("missing_object", "prepare", claim.content_sha256)
+                raise
+            except BlobIntegrityError:
+                # An object already stored under this digest failed re-verification. It is
+                # reported and left as is: never repaired, overwritten or deleted here.
+                _integrity_failure("digest_mismatch", "prepare", claim.content_sha256)
+                raise
             fault_point("content.after_head_verification")
             object_blob_cache[claim.content_sha256] = stored_blob
         ref = ContentRefV1(
@@ -598,10 +638,25 @@ class ContentService:
             try:
                 await self._blob_store.get_verified(stored_blob.object_key, digest)
             except BlobNotFoundError:
-                record_integrity_failure("missing_object")  # telemetry (PLATFORM-050)
+                # Under the digest lock: a catalog row means a referenced object is gone (the
+                # sweep never deletes those), and an object this request wrote seconds ago is
+                # no old orphan either: both are integrity failures. Otherwise the orphan sweep
+                # deleted an old unreferenced object this batch was reusing: nothing is lost and
+                # the retried batch uploads it again, so it raises no alarm.
+                referenced = await session.scalar(
+                    select(ContentObjectRow.id).where(ContentObjectRow.content_sha256 == digest)
+                )
+                if referenced is not None or stored_blob.created:
+                    _integrity_failure("missing_object", "attach", digest)
+                else:
+                    logger.info(
+                        "content_object_swept_before_attach content_sha256=%s",
+                        digest,
+                        extra={"content_sha256": digest},
+                    )
                 raise
             except BlobIntegrityError:
-                record_integrity_failure("digest_mismatch")  # telemetry (PLATFORM-050)
+                _integrity_failure("digest_mismatch", "attach", digest)
                 raise
             insert_object = (
                 pg_insert(ContentObjectRow)
@@ -649,6 +704,8 @@ class ContentService:
         if ref.storage is ContentStorage.INLINE:
             row = await session.get(InlineContentRow, ref.inline_id)
             if row is None:
+                # Nothing deletes inline rows and callers skip purged content first: a loss.
+                _integrity_failure("missing_object", "read", ref.content_sha256)
                 raise ContentUnavailableError("inline content is not stored")
             data = row.data
         else:
@@ -656,12 +713,22 @@ class ContentService:
                 raise ContentUnavailableError("content ref has no object key")
             try:
                 data = await self._blob_store.get_verified(ref.object_key, ref.content_sha256)
+            except BlobIntegrityError:
+                _integrity_failure("digest_mismatch", "read", ref.content_sha256)
+                raise ContentUnavailableError("object content could not be read") from None
+            except BlobNotFoundError:
+                # No platform code deletes referenced bytes (the sweep takes only unreferenced
+                # objects) and callers skip purged content before reading: a loss.
+                _integrity_failure("missing_object", "read", ref.content_sha256)
+                raise ContentUnavailableError("object content could not be read") from None
             except BlobStoreError:
+                # Unreachable, not wrong: an outage, no integrity alarm.
                 raise ContentUnavailableError("object content could not be read") from None
         if (
             len(data) != ref.uncompressed_bytes
             or hashlib.sha256(data).hexdigest() != ref.content_sha256
         ):
+            _integrity_failure("digest_mismatch", "read", ref.content_sha256)
             raise ContentUnavailableError("stored content does not match its ref")
         return data
 

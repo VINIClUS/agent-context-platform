@@ -5,6 +5,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import hashlib
+import logging
 from typing import Any
 
 import pytest
@@ -17,6 +18,7 @@ from agent_context_sdk import (
 )
 
 from agent_context_platform.content.blob_store import (
+    BlobInputLimitError,
     BlobIntegrityError,
     BlobNotFoundError,
     StoredBlob,
@@ -38,11 +40,15 @@ _INLINE_THRESHOLD = 64
 class MemoryBlobStore:
     def __init__(self) -> None:
         self.failure: Exception | None = None
+        self.put_failure: Exception | None = None
+        self.created = False
 
     async def put_verified(self, content: bytes, media_type: str) -> StoredBlob:
+        if self.put_failure is not None:
+            raise self.put_failure
         digest = hashlib.sha256(content).hexdigest()
         key = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}.zst"
-        return StoredBlob(digest, key, len(content), len(content), media_type)
+        return StoredBlob(digest, key, len(content), len(content), media_type, self.created)
 
     async def get_verified(self, object_key: str, expected_sha256: str) -> bytes:
         if self.failure is not None:
@@ -54,8 +60,14 @@ class MemoryBlobStore:
 
 
 class RecordingSession:
+    def __init__(self, *, referenced: bool = True) -> None:
+        self.referenced = referenced  # whether catalog.content_objects already has the digest
+
     async def execute(self, *_args: Any, **_kwargs: Any) -> None:
         return None
+
+    async def scalar(self, *_args: Any, **_kwargs: Any) -> int | None:
+        return 1 if self.referenced else None
 
 
 def _item(content_id: str, data: bytes, media_type: str = "text/plain") -> SanitizedContentItemV1:
@@ -158,3 +170,111 @@ def test_attach_counts_integrity_failures(
         asyncio.run(service.attach(RecordingSession(), prepared))  # type: ignore[arg-type]
 
     assert telemetry.points(contract.LEDGER_INTEGRITY_FAILURES) == {(("check", check),): 1}
+
+
+def _integrity_logs(caplog: pytest.LogCaptureFixture) -> list[logging.LogRecord]:
+    return [r for r in caplog.records if r.getMessage().startswith("content_integrity_failure")]
+
+
+@pytest.mark.parametrize(
+    ("failure", "check"),
+    [
+        (BlobNotFoundError("gone"), "missing_object"),
+        (BlobIntegrityError("object metadata SHA-256 does not match"), "digest_mismatch"),
+    ],
+)
+@pytest.mark.parametrize("stage", ["prepare", "attach"])
+def test_every_integrity_failure_is_logged_and_counted_with_ids_only(
+    telemetry: Capture,
+    canaries: Canaries,
+    caplog: pytest.LogCaptureFixture,
+    failure: Exception,
+    check: str,
+    stage: str,
+) -> None:
+    caplog.set_level(logging.WARNING, logger="agent_context_platform.content.service")
+    data = (canaries.content * 8).encode()
+    digest = hashlib.sha256(data).hexdigest()
+    store = MemoryBlobStore()
+    service = _service(store)
+    if stage == "prepare":  # reusing an already-stored object re-verifies it
+        store.put_failure = failure
+        with pytest.raises(type(failure)):
+            asyncio.run(service.prepare([_item("o", data)]))
+    else:
+        prepared = asyncio.run(service.prepare([_item("o", data)]))
+        store.failure = failure
+        with pytest.raises(type(failure)):
+            asyncio.run(service.attach(RecordingSession(), prepared))  # type: ignore[arg-type]
+
+    assert telemetry.points(contract.LEDGER_INTEGRITY_FAILURES) == {(("check", check),): 1}
+    [record] = _integrity_logs(caplog)
+    assert record.levelno == logging.WARNING
+    fields = {key: getattr(record, key) for key in ("check", "stage", "content_sha256")}
+    assert fields == {"check": check, "stage": stage, "content_sha256": digest}
+    assert record.object_key == f"sha256/{digest[:2]}/{digest[2:4]}/{digest}.zst"
+    canaries.assert_absent(caplog.text + repr([vars(r) for r in caplog.records]))
+    assert str(failure) not in caplog.text  # the exception text is never logged
+
+
+def test_content_over_the_storage_limit_raises_no_integrity_alarm(
+    telemetry: Capture, canaries: Canaries, caplog: pytest.LogCaptureFixture
+) -> None:
+    store = MemoryBlobStore()
+    store.put_failure = BlobInputLimitError("uncompressed payload exceeds configured limit")
+
+    with pytest.raises(BlobInputLimitError):
+        asyncio.run(_service(store).prepare([_item("o", (canaries.content * 8).encode())]))
+
+    assert telemetry.points(contract.LEDGER_INTEGRITY_FAILURES) == {}
+    assert _integrity_logs(caplog) == []
+
+
+def test_an_unreferenced_object_swept_before_attach_is_no_integrity_failure(
+    telemetry: Capture, canaries: Canaries, caplog: pytest.LogCaptureFixture
+) -> None:
+    # The orphan sweep may delete an old unreferenced object a batch is reusing: nothing referenced
+    # it, so nothing is lost. The batch is retried (and re-uploads); no alarm is raised.
+    caplog.set_level(logging.INFO, logger="agent_context_platform.content.service")
+    store = MemoryBlobStore()
+    service = _service(store)
+    data = (canaries.content * 8).encode()
+    prepared = asyncio.run(service.prepare([_item("o", data)]))
+    store.failure = BlobNotFoundError("gone")
+
+    with pytest.raises(BlobNotFoundError):
+        asyncio.run(service.attach(RecordingSession(referenced=False), prepared))  # type: ignore[arg-type]
+
+    assert telemetry.points(contract.LEDGER_INTEGRITY_FAILURES) == {}
+    assert _integrity_logs(caplog) == []
+    [record] = [r for r in caplog.records if r.getMessage().startswith("content_object_swept")]
+    assert record.content_sha256 == hashlib.sha256(data).hexdigest()
+    # Corrupt bytes are a failure whether or not anything references them yet.
+    store.failure = BlobIntegrityError("digest differs")
+    with pytest.raises(BlobIntegrityError):
+        asyncio.run(service.attach(RecordingSession(referenced=False), prepared))  # type: ignore[arg-type]
+    assert telemetry.points(contract.LEDGER_INTEGRITY_FAILURES) == {
+        (("check", "digest_mismatch"),): 1
+    }
+
+
+def test_an_object_this_batch_uploaded_that_vanishes_before_attach_is_a_loss(
+    telemetry: Capture, canaries: Canaries, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Not an old orphan the sweep may take: this request wrote it seconds ago.
+    caplog.set_level(logging.INFO, logger="agent_context_platform.content.service")
+    store = MemoryBlobStore()
+    store.created = True
+    service = _service(store)
+    prepared = asyncio.run(service.prepare([_item("o", (canaries.content * 8).encode())]))
+    store.failure = BlobNotFoundError("gone")
+
+    with pytest.raises(BlobNotFoundError):
+        asyncio.run(service.attach(RecordingSession(referenced=False), prepared))  # type: ignore[arg-type]
+
+    assert telemetry.points(contract.LEDGER_INTEGRITY_FAILURES) == {
+        (("check", "missing_object"),): 1
+    }
+    [alarm] = _integrity_logs(caplog)
+    assert (alarm.check, alarm.stage) == ("missing_object", "attach")  # type: ignore[attr-defined]
+    assert not [r for r in caplog.records if r.getMessage().startswith("content_object_swept")]

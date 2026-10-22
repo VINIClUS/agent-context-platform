@@ -1,0 +1,937 @@
+{
+  "description": "PLATFORM-043 context-quality evaluation: 30 questions (6 per tool) over the deterministic world of tests/evaluation/world.py. Placeholders: {NAME} is a world value (C1, C2, SNAPSHOT, OTHER_C1, OTHER_SNAPSHOT, REPOSITORY, PROJECT, FP_ROUNDING, FP_FLAKY, SYMBOL:<qualified name>, OTHER_SYMBOL:<qualified name> of the second repository); @H is T0 + H hours (ISO 8601). required_evidence names world events (EvalWorld.keys); forbidden_claims are case-sensitive substrings that must appear in no item title or content; not_after bounds the occurred_at of every cited event (exclusive); every cited event must belong to the question's repository (project for project-scoped questions); pages is how many pages are fetched by following next_cursor.",
+  "questions": [
+    {
+      "id": "task-01",
+      "tool": "context_for_task",
+      "question": "At C1, why does add in calc fail with rounding drift?",
+      "input": {
+        "repository_id": "{REPOSITORY}",
+        "revision": {
+          "kind": "commit",
+          "commit_id": "{C1}"
+        },
+        "task": "why does add in calc fail with rounding drift",
+        "budget": {
+          "max_items": 20,
+          "max_bytes": 40000,
+          "max_tokens": 10000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [
+        "c1:symbol:pkg.calc.add",
+        "failure:fail_rounding",
+        "session:sess_eval_1:tool_output",
+        "decision:dec_rounding_v2"
+      ],
+      "forbidden_claims": [
+        "pkg/draft.py",
+        "pkg.report.average",
+        "fail_dirty",
+        "sess_eval_2",
+        "dec_average",
+        "decision dec_rounding_v1: ACTIVE",
+        "ci_run_2",
+        "late observed note",
+        "ci_other_1",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@3",
+      "expect_error": null
+    },
+    {
+      "id": "task-02",
+      "tool": "context_for_task",
+      "question": "At C2, what touches the rename of the legacy parser module?",
+      "input": {
+        "repository_id": "{REPOSITORY}",
+        "revision": {
+          "kind": "commit",
+          "commit_id": "{C2}"
+        },
+        "task": "rename of the legacy parser module",
+        "budget": {
+          "max_items": 20,
+          "max_bytes": 40000,
+          "max_tokens": 10000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [
+        "c2:file:pkg/parser.py",
+        "c2:symbol:pkg.parser.parse_legacy",
+        "decision:dec_parser"
+      ],
+      "forbidden_claims": [
+        "pkg/draft.py",
+        "pkg.report.average",
+        "fail_dirty",
+        "dec_average",
+        "sess_eval_2",
+        "late observed note",
+        "dirty workspace test output",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@5",
+      "expect_error": null
+    },
+    {
+      "id": "task-03",
+      "tool": "context_for_task",
+      "question": "In the dirty snapshot, what is known about the average helper in report?",
+      "input": {
+        "repository_id": "{REPOSITORY}",
+        "revision": {
+          "kind": "workspace_snapshot",
+          "snapshot_id": "{SNAPSHOT}"
+        },
+        "task": "add an average helper to report",
+        "budget": {
+          "max_items": 20,
+          "max_bytes": 40000,
+          "max_tokens": 10000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [
+        "snapshot:symbol:pkg.report.average",
+        "session:sess_eval_2:user",
+        "decision:dec_average"
+      ],
+      "forbidden_claims": [
+        "decision dec_rounding_v1: ACTIVE",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": null,
+      "expect_error": null
+    },
+    {
+      "id": "task-04",
+      "tool": "context_for_task",
+      "question": "At C2 (before the dirty snapshot), is there an average helper in report?",
+      "input": {
+        "repository_id": "{REPOSITORY}",
+        "revision": {
+          "kind": "commit",
+          "commit_id": "{C2}"
+        },
+        "task": "average helper in report",
+        "budget": {
+          "max_items": 20,
+          "max_bytes": 40000,
+          "max_tokens": 10000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [
+        "c2:symbol:pkg.report.total",
+        "c2:file:pkg/report.py"
+      ],
+      "forbidden_claims": [
+        "pkg.report.average",
+        "pkg/draft.py",
+        "sess_eval_2",
+        "dec_average",
+        "fail_dirty",
+        "dirty workspace test output",
+        "late observed note",
+        "ci_run_dirty_output",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@5",
+      "expect_error": null
+    },
+    {
+      "id": "task-05",
+      "tool": "context_for_task",
+      "question": "A workspace snapshot of ANOTHER repository, asked under this one.",
+      "input": {
+        "repository_id": "{REPOSITORY}",
+        "revision": {
+          "kind": "workspace_snapshot",
+          "snapshot_id": "{OTHER_SNAPSHOT}"
+        },
+        "task": "rounding drift in add",
+        "budget": {
+          "max_items": 20,
+          "max_bytes": 40000,
+          "max_tokens": 10000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [],
+      "forbidden_claims": [
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": null,
+      "expect_error": "RevisionNotFound"
+    },
+    {
+      "id": "task-06",
+      "tool": "context_for_task",
+      "question": "At C2, what do we know about the flaky lint timeout?",
+      "input": {
+        "repository_id": "{REPOSITORY}",
+        "revision": {
+          "kind": "commit",
+          "commit_id": "{C2}"
+        },
+        "task": "flaky lint timeout",
+        "budget": {
+          "max_items": 20,
+          "max_bytes": 40000,
+          "max_tokens": 10000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [
+        "failure:fail_flaky",
+        "ci:ci_run_4"
+      ],
+      "forbidden_claims": [
+        "fail_dirty",
+        "ci_run_5",
+        "pkg.report.average",
+        "dirty workspace test output",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@5",
+      "expect_error": null
+    },
+    {
+      "id": "overview-01",
+      "tool": "repository_overview",
+      "question": "Overview of the repository at C1.",
+      "input": {
+        "repository_id": "{REPOSITORY}",
+        "commit_id": "{C1}",
+        "budget": {
+          "max_items": 30,
+          "max_bytes": 60000,
+          "max_tokens": 15000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [
+        "c1:file:pkg/calc.py",
+        "failure:fail_rounding",
+        "decision:dec_rounding_v2",
+        "c1:dependency"
+      ],
+      "forbidden_claims": [
+        "renamed pkg/legacy_parser.py",
+        "pkg/draft.py",
+        "subtract",
+        "fail_dirty",
+        "fail_flaky",
+        "decision dec_rounding_v1: ACTIVE",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@3",
+      "expect_error": null
+    },
+    {
+      "id": "overview-02",
+      "tool": "repository_overview",
+      "question": "Overview of the repository at C2, including what changed since C1.",
+      "input": {
+        "repository_id": "{REPOSITORY}",
+        "commit_id": "{C2}",
+        "budget": {
+          "max_items": 30,
+          "max_bytes": 60000,
+          "max_tokens": 15000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [
+        "c2:file:pkg/parser.py",
+        "c1:file:pkg/legacy_parser.py",
+        "decision:dec_parser",
+        "decision:dec_rounding_v2",
+        "c2:file:pkg/calc.py"
+      ],
+      "forbidden_claims": [
+        "pkg/draft.py",
+        "average",
+        "fail_dirty",
+        "failure fail_rounding (unresolved)",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@5",
+      "expect_error": null
+    },
+    {
+      "id": "overview-03",
+      "tool": "repository_overview",
+      "question": "First three overview items at C2 (budget-limited).",
+      "input": {
+        "repository_id": "{REPOSITORY}",
+        "commit_id": "{C2}",
+        "budget": {
+          "max_items": 3,
+          "max_bytes": 20000,
+          "max_tokens": 5000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [
+        "c2:file:pkg/calc.py"
+      ],
+      "forbidden_claims": [
+        "pkg/draft.py",
+        "average",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@5",
+      "expect_error": null
+    },
+    {
+      "id": "overview-04",
+      "tool": "repository_overview",
+      "question": "Page through the C2 overview three items at a time.",
+      "input": {
+        "repository_id": "{REPOSITORY}",
+        "commit_id": "{C2}",
+        "budget": {
+          "max_items": 3,
+          "max_bytes": 20000,
+          "max_tokens": 5000
+        }
+      },
+      "pages": 4,
+      "required_evidence": [
+        "c2:file:pkg/parser.py",
+        "decision:dec_parser",
+        "decision:dec_rounding_v2",
+        "c2:dependency"
+      ],
+      "forbidden_claims": [
+        "pkg/draft.py",
+        "average",
+        "fail_dirty",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@5",
+      "expect_error": null
+    },
+    {
+      "id": "overview-05",
+      "tool": "repository_overview",
+      "question": "C1 overview under a tight token budget, two pages.",
+      "input": {
+        "repository_id": "{REPOSITORY}",
+        "commit_id": "{C1}",
+        "budget": {
+          "max_items": 10,
+          "max_bytes": 100000,
+          "max_tokens": 2500
+        }
+      },
+      "pages": 2,
+      "required_evidence": [
+        "c1:file:pkg/calc.py",
+        "decision:dec_rounding_v2"
+      ],
+      "forbidden_claims": [
+        "renamed pkg/legacy_parser.py",
+        "pkg/draft.py",
+        "subtract",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@3",
+      "expect_error": null
+    },
+    {
+      "id": "overview-06",
+      "tool": "repository_overview",
+      "question": "Overview at a commit of ANOTHER repository, asked under this one.",
+      "input": {
+        "repository_id": "{REPOSITORY}",
+        "commit_id": "{OTHER_C1}",
+        "budget": {
+          "max_items": 30,
+          "max_bytes": 60000,
+          "max_tokens": 15000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [],
+      "forbidden_claims": [
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": null,
+      "expect_error": "RevisionNotFound"
+    },
+    {
+      "id": "symbol-01",
+      "tool": "symbol_context",
+      "question": "Who calls add at C1, and which decisions govern it?",
+      "input": {
+        "repository_id": "{REPOSITORY}",
+        "commit_id": "{C1}",
+        "symbol_name": "add",
+        "budget": {
+          "max_items": 30,
+          "max_bytes": 60000,
+          "max_tokens": 15000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [
+        "c1:symbol:pkg.calc.add",
+        "c1:relation:pkg.report.total CALLS pkg.calc.add",
+        "decision:dec_rounding_v2",
+        "decision:dec_rounding_v1"
+      ],
+      "forbidden_claims": [
+        "subtract",
+        "pkg/parser.py",
+        "pkg.report.average",
+        "decision dec_rounding_v1: ACTIVE",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@3",
+      "expect_error": null
+    },
+    {
+      "id": "symbol-02",
+      "tool": "symbol_context",
+      "question": "add at C2: definition, callers and history.",
+      "input": {
+        "repository_id": "{REPOSITORY}",
+        "commit_id": "{C2}",
+        "symbol_name": "pkg.calc.add",
+        "budget": {
+          "max_items": 30,
+          "max_bytes": 60000,
+          "max_tokens": 15000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [
+        "c2:symbol:pkg.calc.add",
+        "c1:symbol:pkg.calc.add",
+        "decision:dec_rounding_v2"
+      ],
+      "forbidden_claims": [
+        "pkg.report.average",
+        "pkg/draft.py",
+        "decision dec_rounding_v1: ACTIVE",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@5",
+      "expect_error": null
+    },
+    {
+      "id": "symbol-03",
+      "tool": "symbol_context",
+      "question": "Where is parse_legacy defined at C2 (after the rename)?",
+      "input": {
+        "repository_id": "{REPOSITORY}",
+        "commit_id": "{C2}",
+        "symbol_name": "parse_legacy",
+        "budget": {
+          "max_items": 30,
+          "max_bytes": 60000,
+          "max_tokens": 15000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [
+        "c2:symbol:pkg.parser.parse_legacy",
+        "decision:dec_parser"
+      ],
+      "forbidden_claims": [
+        "pkg/legacy_parser.py",
+        "pkg.legacy_parser.parse_legacy",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@5",
+      "expect_error": null
+    },
+    {
+      "id": "symbol-04",
+      "tool": "symbol_context",
+      "question": "Where is parse_legacy defined at C1 (before the rename)?",
+      "input": {
+        "repository_id": "{REPOSITORY}",
+        "commit_id": "{C1}",
+        "symbol_name": "parse_legacy",
+        "budget": {
+          "max_items": 30,
+          "max_bytes": 60000,
+          "max_tokens": 15000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [
+        "c1:symbol:pkg.legacy_parser.parse_legacy"
+      ],
+      "forbidden_claims": [
+        "pkg/parser.py",
+        "pkg.parser.parse_legacy",
+        "dec_parser",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@3",
+      "expect_error": null
+    },
+    {
+      "id": "symbol-05",
+      "tool": "symbol_context",
+      "question": "What does total call at C2 (by symbol ID)?",
+      "input": {
+        "repository_id": "{REPOSITORY}",
+        "commit_id": "{C2}",
+        "symbol_id": "{SYMBOL:pkg.report.total}",
+        "budget": {
+          "max_items": 30,
+          "max_bytes": 60000,
+          "max_tokens": 15000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [
+        "c2:symbol:pkg.report.total",
+        "c2:relation:pkg.report.total CALLS pkg.calc.add"
+      ],
+      "forbidden_claims": [
+        "pkg.report.average",
+        "pkg/draft.py",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@5",
+      "expect_error": null
+    },
+    {
+      "id": "symbol-06",
+      "tool": "symbol_context",
+      "question": "A symbol ID of ANOTHER repository (same qualified name), asked at C2.",
+      "input": {
+        "repository_id": "{REPOSITORY}",
+        "commit_id": "{C2}",
+        "symbol_id": "{OTHER_SYMBOL:pkg.calc.add}",
+        "budget": {
+          "max_items": 30,
+          "max_bytes": 60000,
+          "max_tokens": 15000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [],
+      "forbidden_claims": [
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": null,
+      "expect_error": "SymbolNotFound"
+    },
+    {
+      "id": "decision-01",
+      "tool": "decision_history",
+      "question": "Which rounding decision held at 09:30 (before v2 existed)?",
+      "input": {
+        "scope": {
+          "kind": "project",
+          "project_id": "{PROJECT}"
+        },
+        "query": "rounding add",
+        "valid_at": "@1.5",
+        "budget": {
+          "max_items": 30,
+          "max_bytes": 60000,
+          "max_tokens": 15000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [
+        "decision:dec_rounding_v1"
+      ],
+      "forbidden_claims": [
+        "dec_rounding_v2",
+        "dec_average",
+        "dec_parser",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@1.5",
+      "expect_error": null
+    },
+    {
+      "id": "decision-02",
+      "tool": "decision_history",
+      "question": "Rounding decisions at 12:00: which is active, which superseded?",
+      "input": {
+        "scope": {
+          "kind": "project",
+          "project_id": "{PROJECT}"
+        },
+        "query": "rounding",
+        "valid_at": "@4",
+        "budget": {
+          "max_items": 30,
+          "max_bytes": 60000,
+          "max_tokens": 15000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [
+        "decision:dec_rounding_v2",
+        "decision:dec_rounding_v1"
+      ],
+      "forbidden_claims": [
+        "decision dec_rounding_v1: ACTIVE",
+        "dec_average",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@4",
+      "expect_error": null
+    },
+    {
+      "id": "decision-03",
+      "tool": "decision_history",
+      "question": "Repository-scoped: the parser rename decision at 12:00.",
+      "input": {
+        "scope": {
+          "kind": "repository",
+          "repository_id": "{REPOSITORY}"
+        },
+        "query": "parser rename",
+        "valid_at": "@4",
+        "budget": {
+          "max_items": 30,
+          "max_bytes": 60000,
+          "max_tokens": 15000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [
+        "decision:dec_parser"
+      ],
+      "forbidden_claims": [
+        "dec_average",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@4",
+      "expect_error": null
+    },
+    {
+      "id": "decision-04",
+      "tool": "decision_history",
+      "question": "Is there an average decision at 12:00 (it starts at 14:00)?",
+      "input": {
+        "scope": {
+          "kind": "project",
+          "project_id": "{PROJECT}"
+        },
+        "query": "average",
+        "valid_at": "@4",
+        "budget": {
+          "max_items": 30,
+          "max_bytes": 60000,
+          "max_tokens": 15000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [
+        "decision:dec_rounding_v2"
+      ],
+      "forbidden_claims": [
+        "dec_average",
+        "decision dec_rounding_v1: ACTIVE",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@4",
+      "expect_error": null
+    },
+    {
+      "id": "decision-05",
+      "tool": "decision_history",
+      "question": "The average decision at 15:00.",
+      "input": {
+        "scope": {
+          "kind": "project",
+          "project_id": "{PROJECT}"
+        },
+        "query": "average empty list",
+        "valid_at": "@7",
+        "budget": {
+          "max_items": 30,
+          "max_bytes": 60000,
+          "max_tokens": 15000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [
+        "decision:dec_average"
+      ],
+      "forbidden_claims": [
+        "decision dec_rounding_v1: ACTIVE",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": null,
+      "expect_error": null
+    },
+    {
+      "id": "decision-06",
+      "tool": "decision_history",
+      "question": "Top rounding decision only (one item budget).",
+      "input": {
+        "scope": {
+          "kind": "project",
+          "project_id": "{PROJECT}"
+        },
+        "query": "rounding",
+        "valid_at": "@4",
+        "budget": {
+          "max_items": 1,
+          "max_bytes": 8000,
+          "max_tokens": 2000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [
+        "decision:dec_rounding_v2"
+      ],
+      "forbidden_claims": [
+        "dec_average",
+        "decision dec_rounding_v1: ACTIVE",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@4",
+      "expect_error": null
+    },
+    {
+      "id": "failure-01",
+      "tool": "failure_history",
+      "question": "Rounding failure by fingerprint before any fix (08:00-10:00).",
+      "input": {
+        "repository_id": "{REPOSITORY}",
+        "fingerprint": "{FP_ROUNDING}",
+        "valid_from": "@0",
+        "valid_to": "@2",
+        "budget": {
+          "max_items": 30,
+          "max_bytes": 60000,
+          "max_tokens": 15000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [
+        "failure:fail_rounding",
+        "ci:ci_run_1"
+      ],
+      "forbidden_claims": [
+        "ci_run_2",
+        "passed in run",
+        "resolution: resolved",
+        "ci_other_1",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@2",
+      "expect_error": null
+    },
+    {
+      "id": "failure-02",
+      "tool": "failure_history",
+      "question": "Rounding failure by fingerprint through 12:00, with its fix path.",
+      "input": {
+        "repository_id": "{REPOSITORY}",
+        "fingerprint": "{FP_ROUNDING}",
+        "valid_from": "@0",
+        "valid_to": "@4",
+        "budget": {
+          "max_items": 30,
+          "max_bytes": 60000,
+          "max_tokens": 15000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [
+        "failure:fail_rounding",
+        "ci:ci_run_1",
+        "ci:ci_run_2"
+      ],
+      "forbidden_claims": [
+        "SAME commit",
+        "fail_dirty",
+        "ci_other_1",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@4",
+      "expect_error": null
+    },
+    {
+      "id": "failure-03",
+      "tool": "failure_history",
+      "question": "The flaky lint failure and its same-commit re-run.",
+      "input": {
+        "repository_id": "{REPOSITORY}",
+        "query": "flaky lint",
+        "valid_from": "@3",
+        "valid_to": "@4",
+        "budget": {
+          "max_items": 30,
+          "max_bytes": 60000,
+          "max_tokens": 15000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [
+        "failure:fail_flaky",
+        "ci:ci_run_3",
+        "ci:ci_run_4"
+      ],
+      "forbidden_claims": [
+        "a different revision than the failing run",
+        "fail_rounding",
+        "fail_dirty",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@4",
+      "expect_error": null
+    },
+    {
+      "id": "failure-04",
+      "tool": "failure_history",
+      "question": "Failures mentioning rounding drift through 14:00.",
+      "input": {
+        "repository_id": "{REPOSITORY}",
+        "query": "rounding drift",
+        "valid_from": "@0",
+        "valid_to": "@6",
+        "budget": {
+          "max_items": 30,
+          "max_bytes": 60000,
+          "max_tokens": 15000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [
+        "failure:fail_rounding",
+        "ci:ci_run_2"
+      ],
+      "forbidden_claims": [
+        "fail_dirty",
+        "fail_flaky",
+        "ci_other_1",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@6",
+      "expect_error": null
+    },
+    {
+      "id": "failure-05",
+      "tool": "failure_history",
+      "question": "The failure seen only in the dirty snapshot.",
+      "input": {
+        "repository_id": "{REPOSITORY}",
+        "query": "dirty average",
+        "valid_from": "@5",
+        "valid_to": "@7",
+        "budget": {
+          "max_items": 30,
+          "max_bytes": 60000,
+          "max_tokens": 15000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [
+        "failure:fail_dirty",
+        "ci:ci_run_5"
+      ],
+      "forbidden_claims": [
+        "fail_rounding",
+        "fail_flaky",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@7",
+      "expect_error": null
+    },
+    {
+      "id": "failure-06",
+      "tool": "failure_history",
+      "question": "Flaky lint fingerprint in a window with no occurrence (14:00-15:00).",
+      "input": {
+        "repository_id": "{REPOSITORY}",
+        "fingerprint": "{FP_FLAKY}",
+        "valid_from": "@6",
+        "valid_to": "@7",
+        "budget": {
+          "max_items": 30,
+          "max_bytes": 60000,
+          "max_tokens": 15000
+        }
+      },
+      "pages": 1,
+      "required_evidence": [],
+      "forbidden_claims": [
+        "fail_flaky",
+        "fail_rounding",
+        "operator purged",
+        "other-repository",
+        "banker"
+      ],
+      "not_after": "@7",
+      "expect_error": null
+    }
+  ]
+}

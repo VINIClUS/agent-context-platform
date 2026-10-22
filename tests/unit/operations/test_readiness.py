@@ -472,7 +472,11 @@ def test_the_readiness_engine_never_pools_and_bounds_connects_and_dead_sockets()
 
     assert isinstance(engine.pool, NullPool)
     connect_args = readiness.readiness_connect_args(2.0)
-    assert connect_args["connect_timeout"] == 2
+    # Strictly longer than the probe's bound: a silent server is reported "timeout" by the
+    # probe, never raced by libpq into "unavailable".
+    assert connect_args["connect_timeout"] == 3
+    for timeout in (0.5, 1.0, 1.5, 2.0, 2.5, 7.0):
+        assert readiness.readiness_connect_args(timeout)["connect_timeout"] > timeout
     assert connect_args["keepalives"] == 1
     assert 0 < connect_args["tcp_user_timeout"] <= 10_000
     assert readiness.readiness_connect_args(0.5)["connect_timeout"] == 2  # libpq minimum

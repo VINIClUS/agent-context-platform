@@ -30,7 +30,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Protocol
 from uuid import uuid4
@@ -46,7 +46,8 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
-from agent_context_platform.content.blob_store import S3BlobStore
+from agent_context_platform.content.blob_store import S3BlobStore, build_s3_client
+from agent_context_platform.content.orphans import OrphanSweeper, SweepReport
 from agent_context_platform.content.service import ContentService
 from agent_context_platform.db import session_factory
 from agent_context_platform.indexing.emitter import IndexingConfig, IndexingService
@@ -108,7 +109,7 @@ from agent_context_platform.retrieval.embeddings import (
     load_manifest,
     verify_model_dir,
 )
-from agent_context_platform.settings import Neo4jSettings, Settings
+from agent_context_platform.settings import Neo4jSettings, SecretFileError, Settings
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -213,6 +214,8 @@ def _load_settings() -> Settings:
         settings = Settings()
     except ValidationError:
         raise CliUsageError("invalid AGENT_CONTEXT_* configuration") from None
+    except SecretFileError as error:  # names the file, never its content
+        raise CliUsageError(str(error)) from None
     faults.configure(settings.fault_injection)
     return settings
 
@@ -1561,6 +1564,108 @@ def mcp_token_list_command(json_output: _JSON = False) -> None:
         return EXIT_OK
 
     _run(main)
+
+
+# --- `agent-context content` (PLATFORM-054): maintenance of stored content. ---------------------
+# `sweep-orphans` drives the existing `OrphanSweeper` (an INFRA timer runs it). It connects with
+# AGENT_CONTEXT_POSTGRESQL__API_DSN (falling back to __DSN; the sweeper only reads
+# catalog.content_objects under the per-digest advisory lock `attach` takes) and the AGENT_CONTEXT_S3__*
+# settings. It prints counts only, never keys or digests.
+
+content_app = typer.Typer(
+    help="Maintain stored content.",
+    no_args_is_help=True,
+    add_completion=False,
+    pretty_exceptions_enable=False,
+)
+app.add_typer(content_app, name="content")
+
+#: The sweeper's own grace window: an upload whose batch has not attached yet must never be
+#: deleted. A shorter min-age needs --allow-short-min-age, which production refuses.
+SWEEP_MIN_AGE_FLOOR_SECONDS = 86_400
+_SWEEP_MAX_MIN_AGE_SECONDS = 10 * 365 * 86_400
+
+
+def _sweep_lines(report: SweepReport, min_age: int) -> list[str]:
+    if report.dry_run:
+        counts = f"examined {report.examined}, would delete {report.would_delete}"
+    else:
+        counts = f"examined {report.examined}, deleted {report.deleted}"
+    return [
+        f"orphan sweep{' (dry run)' if report.dry_run else ''}: {counts}, retained "
+        f"{report.retained}, skipped recent {report.skipped_recent} (min age {min_age} s)"
+    ]
+
+
+@content_app.command("sweep-orphans")
+def sweep_orphans_command(
+    min_age: Annotated[
+        int,
+        typer.Option(
+            "--min-age",
+            help=f"Only objects older than this many seconds (default and floor "
+            f"{SWEEP_MIN_AGE_FLOOR_SECONDS}).",
+        ),
+    ] = SWEEP_MIN_AGE_FLOOR_SECONDS,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Count what would be deleted; delete nothing.")
+    ] = False,
+    allow_short_min_age: Annotated[
+        bool,
+        typer.Option(
+            "--allow-short-min-age",
+            help="Tests and development only: accept a min-age below the floor. "
+            "Refused in production.",
+        ),
+    ] = False,
+    json_output: _JSON = False,
+) -> None:
+    """Delete content objects no catalog row references, once older than the min-age."""
+
+    async def main() -> int:
+        if not 0 <= min_age <= _SWEEP_MAX_MIN_AGE_SECONDS:
+            raise CliUsageError(f"--min-age must be in [0, {_SWEEP_MAX_MIN_AGE_SECONDS}] seconds")
+        settings = _load_settings()
+        if allow_short_min_age and settings.environment == "production":
+            raise CliUsageError("--allow-short-min-age is refused in production")
+        if min_age < SWEEP_MIN_AGE_FLOOR_SECONDS and not allow_short_min_age:
+            raise CliUsageError(
+                f"--min-age below {SWEEP_MIN_AGE_FLOOR_SECONDS} s could delete an upload whose "
+                "batch has not attached yet; tests may pass --allow-short-min-age"
+            )
+        s3 = settings.s3
+        if s3.endpoint_url is None:
+            raise CliUsageError("AGENT_CONTEXT_S3__ENDPOINT_URL is required")
+        engine = _engine(settings.postgresql.effective_api_dsn, "API_DSN")
+        try:
+            sweeper = OrphanSweeper(
+                build_s3_client(s3),
+                s3.bucket_name,
+                session_factory(engine),
+                min_age=timedelta(seconds=min_age),
+            )
+            report = await sweeper.run(datetime.now(UTC), dry_run=dry_run)
+        finally:
+            await engine.dispose()
+        _emit(
+            {
+                "examined": report.examined,
+                "deleted": report.deleted,
+                "retained": report.retained,
+                "skipped_recent": report.skipped_recent,
+                "would_delete": report.would_delete,
+                "dry_run": report.dry_run,
+                "min_age_seconds": min_age,
+            },
+            as_json=json_output,
+            lines=_sweep_lines(report, min_age),
+        )
+        return EXIT_OK
+
+    _run(main)
+
+
+# --- end of `agent-context content` -------------------------------------------------------------
 
 
 # --- `agent-context db` (PLATFORM-049): schema migrations for the platform-migrate role. ---------
