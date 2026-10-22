@@ -33,11 +33,15 @@ class FakeOrig(Exception):
 
 
 class FakeResult:
-    def __init__(self, rows: list[str]) -> None:
+    def __init__(self, rows: list[str], value: object = None) -> None:
         self._rows = rows
+        self._value = value
 
     def scalars(self) -> list[str]:
         return self._rows
+
+    def scalar(self) -> object:
+        return self._value
 
 
 class FakeConnection:
@@ -52,8 +56,11 @@ class FakeConnection:
     async def __aexit__(self, *_args: object) -> None:
         return None
 
-    async def execute(self, statement: Any) -> FakeResult:
+    async def execute(self, statement: Any, parameters: Any = None) -> FakeResult:
         self._engine.statements.append(str(statement))
+        if "has_table_privilege" in str(statement):
+            self._engine.privilege_parameters.append(parameters)
+            return FakeResult([], self._engine.privileged)
         if "alembic_version" in str(statement):
             if self._engine.query_error is not None:
                 raise self._engine.query_error
@@ -73,8 +80,11 @@ class FakeEngine:
         connect_error: Exception | None = None,
         query_error: Exception | None = None,
         delay: float = 0.0,
+        privileged: bool | None = True,
     ) -> None:
         self.rows = [HEAD] if rows is None else rows
+        self.privileged = privileged
+        self.privilege_parameters: list[Any] = []
         self.connect_error = connect_error
         self.query_error = query_error
         self.delay = delay
@@ -102,6 +112,8 @@ async def _postgresql(engine: FakeEngine, head: str | None = HEAD) -> Components
         (FakeEngine([]), HEAD, {"postgresql": "ok", "schema": "mismatch"}),
         (FakeEngine([HEAD, "other"]), HEAD, {"postgresql": "ok", "schema": "mismatch"}),
         (FakeEngine(), None, {"postgresql": "ok", "schema": "unconfigured"}),
+        (FakeEngine(privileged=False), HEAD, {"postgresql": "ok", "schema": "forbidden"}),
+        (FakeEngine(privileged=None), HEAD, {"postgresql": "ok", "schema": "forbidden"}),
         (
             FakeEngine(query_error=_sql_error(ProgrammingError, "42501")),
             HEAD,
@@ -142,8 +154,19 @@ def test_postgresql_check_only_reads_in_a_read_only_transaction() -> None:
         "SET TRANSACTION READ ONLY",
         "SET LOCAL statement_timeout = 2000",
         "SELECT version_num FROM public.alembic_version",
+        "SELECT bool_and(has_table_privilege(name, 'SELECT')) "
+        "FROM unnest(CAST(:tables AS text[])) AS name",
     ]
+    assert engine.privilege_parameters == [{"tables": list(readiness.API_READ_TABLES)}]
     assert engine.rollbacks == 1
+
+
+def test_the_api_reads_exactly_the_tables_the_migration_grants() -> None:
+    assert readiness.API_READ_TABLES == (
+        "public.alembic_version",
+        "projection.projection_checkpoints",
+        "projection.dead_letters",
+    )
 
 
 class FakeStore:

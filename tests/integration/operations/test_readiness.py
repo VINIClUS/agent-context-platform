@@ -8,6 +8,7 @@ import os
 import socket
 import threading
 import time
+import uuid
 from collections.abc import Iterator
 from pathlib import Path
 from typing import Any
@@ -20,13 +21,16 @@ from sqlalchemy.ext.asyncio import create_async_engine
 from sqlalchemy.pool import NullPool
 
 from agent_context_platform.app import create_app
-from agent_context_platform.operations import migrate
+from agent_context_platform.operations import migrate, readiness
+from agent_context_platform.projection.neo4j import Neo4jStore
 from agent_context_platform.settings import Settings
 from alembic import command
 
 pytestmark = pytest.mark.integration
 
 ALEMBIC_INI = Path(__file__).parents[3] / "alembic.ini"
+# Only for the test that must see every check answer, however loaded the machine is.
+LOADED_TIMEOUT_SECONDS = 30.0
 SERVICE_VARIABLES = (
     "AGENT_CONTEXT_TEST_NEO4J_URI",
     "AGENT_CONTEXT_TEST_NEO4J_USERNAME",
@@ -115,34 +119,75 @@ def test_ready_when_every_service_is_reachable_and_the_schema_is_at_head(
     assert _ready(_settings(migrated, services))[:2] == (200, {"status": "ready"})
 
 
+async def _quiet_write_counters(dsn: str) -> int:
+    """Rows written in this database so far, once no other backend can still flush statistics.
+
+    A backend flushes its counters when it exits (or at most a second after a transaction), so
+    wait until this connection is the only one on the database before reading them.
+    """
+    engine = create_async_engine(dsn, poolclass=NullPool)
+    try:
+        async with engine.connect() as connection:
+            for _ in range(200):
+                others = await connection.scalar(
+                    text(
+                        "SELECT count(*) FROM pg_stat_activity "
+                        "WHERE datname = current_database() AND pid <> pg_backend_pid()"
+                    )
+                )
+                await connection.commit()
+                if others == 0:
+                    break
+                await asyncio.sleep(0.05)
+            assert others == 0
+            await connection.execute(text("SELECT pg_stat_clear_snapshot()"))
+            written = await connection.scalar(
+                text(
+                    "SELECT tup_inserted + tup_updated + tup_deleted "
+                    "FROM pg_stat_database WHERE datname = current_database()"
+                )
+            )
+            return int(written or 0)
+    finally:
+        await engine.dispose()
+
+
 def test_the_probe_writes_nothing(
     migrated: str, services: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
+    """Three complete probes (every check answered ok) change no row in the database.
+
+    The 200 proves each check actually ran to the end; the probe gets a generous timeout of its
+    own so a slow Neo4j or S3 answer under full-suite load cannot turn that into a timeout. What
+    is asserted is unchanged: a full probe, and not a single written tuple.
+    """
     monkeypatch.setenv(migrate.ALEMBIC_CONFIG_ENV, str(ALEMBIC_INI))
+    settings = _settings(migrated, services)
+    head = migrate.image_head(migrate.alembic_config(ALEMBIC_INI))
+    assert settings.postgresql.dsn is not None
 
-    async def counters() -> tuple[int, int]:
-        engine = create_async_engine(migrated, poolclass=NullPool)
+    before = asyncio.run(_quiet_write_counters(migrated))
+    engine = readiness.readiness_engine(settings.postgresql.dsn, LOADED_TIMEOUT_SECONDS)
+    store = Neo4jStore(settings.neo4j)
+    probe = readiness.build_probe(
+        settings, engine, store, head, timeout_seconds=LOADED_TIMEOUT_SECONDS
+    )
+
+    async def close() -> None:
+        await store.close()
+        await engine.dispose()
+
+    with TestClient(create_app(settings, readiness=probe)) as client:
         try:
-            async with engine.connect() as connection:
-                await connection.execute(text("SELECT pg_stat_force_next_flush()"))
-                row = (
-                    await connection.execute(
-                        text(
-                            "SELECT xact_commit, tup_inserted + tup_updated + tup_deleted "
-                            "FROM pg_stat_database WHERE datname = current_database()"
-                        )
-                    )
-                ).one()
-                return int(row[0]), int(row[1])
+            for _ in range(3):
+                response = client.get("/health/ready")
+                assert (response.status_code, response.json()) == (200, {"status": "ready"})
         finally:
-            await engine.dispose()
+            # The driver and the engine belong to the client's event loop.
+            client.portal.call(close)  # type: ignore[union-attr]
+    after = asyncio.run(_quiet_write_counters(migrated))
 
-    before = asyncio.run(counters())
-    for _ in range(3):
-        assert _ready(_settings(migrated, services))[0] == 200
-    after = asyncio.run(counters())
-
-    assert after[1] == before[1]
+    assert after == before
 
 
 def test_a_schema_behind_the_image_is_not_ready(
@@ -169,14 +214,68 @@ def test_a_schema_behind_the_image_is_not_ready(
         asyncio.run(set_version(head))
 
 
-def test_an_api_role_without_select_on_alembic_version_is_not_ready(
-    migrated: str, services: dict[str, str], monkeypatch: pytest.MonkeyPatch
+@pytest.fixture
+def api_login(migrated: str) -> Iterator[str]:
+    """A LOGIN member of ``agent_context_api`` with no grant of its own, as infra creates it."""
+    name = f"agent_context_api_login_{uuid.uuid4().hex[:12]}"
+    password = uuid.uuid4().hex
+
+    async def run(*statements: str) -> None:
+        engine = create_async_engine(migrated, poolclass=NullPool)
+        try:
+            async with engine.begin() as connection:
+                for statement in statements:
+                    await connection.execute(text(statement))
+        finally:
+            await engine.dispose()
+
+    asyncio.run(
+        run(
+            f"CREATE ROLE {name} LOGIN INHERIT PASSWORD '{password}'",
+            f"GRANT agent_context_api TO {name}",
+        )
+    )
+    try:
+        url = make_url(migrated).set(username=name, password=password)
+        yield url.render_as_string(hide_password=False)
+    finally:
+        asyncio.run(run(f"DROP ROLE {name}"))
+
+
+def test_the_least_privileged_api_login_is_ready_with_only_the_migrated_grants(
+    api_login: str, services: dict[str, str], monkeypatch: pytest.MonkeyPatch
 ) -> None:
     monkeypatch.setenv(migrate.ALEMBIC_CONFIG_ENV, str(ALEMBIC_INI))
-    url = make_url(migrated).update_query_dict({"options": "-c role=agent_context_api"})
-    dsn = url.render_as_string(hide_password=False)
 
-    assert _ready(_settings(dsn, services))[:2] == (503, _not_ready(schema="forbidden"))
+    assert _ready(_settings(api_login, services))[:2] == (200, {"status": "ready"})
+
+
+@pytest.mark.parametrize("table", readiness.API_READ_TABLES)
+def test_an_api_login_missing_one_read_grant_is_not_ready(
+    api_login: str,
+    migrated: str,
+    services: dict[str, str],
+    monkeypatch: pytest.MonkeyPatch,
+    table: str,
+) -> None:
+    monkeypatch.setenv(migrate.ALEMBIC_CONFIG_ENV, str(ALEMBIC_INI))
+
+    async def grant(statement: str) -> None:
+        engine = create_async_engine(migrated, poolclass=NullPool)
+        try:
+            async with engine.begin() as connection:
+                await connection.execute(text(statement))
+        finally:
+            await engine.dispose()
+
+    asyncio.run(grant(f"REVOKE SELECT ON {table} FROM agent_context_api"))
+    try:
+        assert _ready(_settings(api_login, services))[:2] == (
+            503,
+            _not_ready(schema="forbidden"),
+        )
+    finally:
+        asyncio.run(grant(f"GRANT SELECT ON {table} TO agent_context_api"))
 
 
 def test_unreachable_dependencies_are_reported_without_hosts_or_credentials(

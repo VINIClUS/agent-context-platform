@@ -61,9 +61,12 @@ transaction) and concurrent requests share a probe while it is younger than the 
 bound holds even when a dependency vanishes mid-request: a timed-out check is cancelled but never
 awaited (at most four are kept per check), and PostgreSQL is reached over readiness's own unpooled
 engine with libpq connect, keepalive and TCP user timeouts plus a statement timeout, so a dead
-socket left by a failover is never reused. The API's login role needs `SELECT` on
-`public.alembic_version`, which the migrations do not grant yet: without it the schema is
-reported `forbidden` (not ready), never assumed current.
+socket left by a failover is never reused. The API's login role, a member of
+`agent_context_api`, needs `SELECT` on `public.alembic_version`, `projection.projection_checkpoints`
+and `projection.dead_letters` (the schema head, and projection progress for freshness); migration
+`20261022_0001` grants exactly these to `agent_context_api`, so a migrated database needs no extra
+grant. Readiness checks all three: if one is missing the schema is reported `forbidden` (not ready),
+never assumed current.
 
 Two consequences of these rules are deliberate. Readiness requires the *exact* head, so a
 replica running an older image leaves rotation as soon as a newer image's migration commits
@@ -334,7 +337,7 @@ default command is exec-form.
 ```bash
 docker build -f containers/platform/Dockerfile \
   --build-arg REVISION="$(git rev-parse HEAD)" --build-arg VERSION=0.1.0 \
-  --build-arg SDK_VERSION=0.6.0 --build-arg ALEMBIC_HEAD=20261002_0001 \
+  --build-arg SDK_VERSION=0.6.0 --build-arg ALEMBIC_HEAD=20261022_0001 \
   -t agent-context-platform:dev .
 ```
 
@@ -351,7 +354,11 @@ does). Unset, they read `unknown`/`dev` (local builds).
 | `platform-projector` | `agent-context projection run` | `__POSTGRESQL__PROJECTOR_DSN`, `__NEO4J__*`, `__S3__*`, and `__SEARCH__MODEL_DIR` (model volume) or `AGENT_CONTEXT_PROJECTION_LEXICAL_ONLY=1` (see Search and embeddings) |
 | `platform-indexer` | `agent-context index --repository-id <id> --checkout /work` | `__POSTGRESQL__API_DSN`; run with `user: "10001:10001"` |
 
-The migrate role needs only its DSN: it does not set `AGENT_CONTEXT_ENVIRONMENT=production`,
+Every serving role logs in as a LOGIN member (`INHERIT`) of the migrations' group role and needs
+no grant of its own: the API login of `agent_context_api` (whose reads include
+`public.alembic_version`, `projection.projection_checkpoints` and `projection.dead_letters`, see
+`/health/ready`), the projector login of `agent_context_projector`. The migrate role needs only its
+DSN, as the schema owner: it does not set `AGENT_CONTEXT_ENVIRONMENT=production`,
 whose completeness check covers the serving roles. Only the API serves HTTP, so the image declares
 no `HEALTHCHECK`; the API's compose service uses the stdlib probe (no curl, no shell):
 `test: ["CMD", "python", "/app/healthcheck.py", "/health/ready"]` (`/health/live` is the
