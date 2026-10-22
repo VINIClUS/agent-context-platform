@@ -41,13 +41,14 @@ class MemoryBlobStore:
     def __init__(self) -> None:
         self.failure: Exception | None = None
         self.put_failure: Exception | None = None
+        self.created = False
 
     async def put_verified(self, content: bytes, media_type: str) -> StoredBlob:
         if self.put_failure is not None:
             raise self.put_failure
         digest = hashlib.sha256(content).hexdigest()
         key = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}.zst"
-        return StoredBlob(digest, key, len(content), len(content), media_type)
+        return StoredBlob(digest, key, len(content), len(content), media_type, self.created)
 
     async def get_verified(self, object_key: str, expected_sha256: str) -> bytes:
         if self.failure is not None:
@@ -255,3 +256,25 @@ def test_an_unreferenced_object_swept_before_attach_is_no_integrity_failure(
     assert telemetry.points(contract.LEDGER_INTEGRITY_FAILURES) == {
         (("check", "digest_mismatch"),): 1
     }
+
+
+def test_an_object_this_batch_uploaded_that_vanishes_before_attach_is_a_loss(
+    telemetry: Capture, canaries: Canaries, caplog: pytest.LogCaptureFixture
+) -> None:
+    # Not an old orphan the sweep may take: this request wrote it seconds ago.
+    caplog.set_level(logging.INFO, logger="agent_context_platform.content.service")
+    store = MemoryBlobStore()
+    store.created = True
+    service = _service(store)
+    prepared = asyncio.run(service.prepare([_item("o", (canaries.content * 8).encode())]))
+    store.failure = BlobNotFoundError("gone")
+
+    with pytest.raises(BlobNotFoundError):
+        asyncio.run(service.attach(RecordingSession(referenced=False), prepared))  # type: ignore[arg-type]
+
+    assert telemetry.points(contract.LEDGER_INTEGRITY_FAILURES) == {
+        (("check", "missing_object"),): 1
+    }
+    [alarm] = _integrity_logs(caplog)
+    assert (alarm.check, alarm.stage) == ("missing_object", "attach")  # type: ignore[attr-defined]
+    assert not [r for r in caplog.records if r.getMessage().startswith("content_object_swept")]
