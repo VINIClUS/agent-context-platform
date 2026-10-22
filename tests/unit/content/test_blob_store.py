@@ -367,3 +367,57 @@ def test_content_over_the_upload_limits_is_an_input_error_not_a_stored_object_fa
     with pytest.raises(BlobInputLimitError, match="compressed"):
         _run(_store(client, max_compressed_bytes=1).put_verified(b"ab", "text/plain"))
     assert issubclass(BlobInputLimitError, BlobIntegrityError)  # existing callers unchanged
+
+
+@pytest.mark.parametrize("write_mode", ["content_addressed", "if_none_match"])
+@pytest.mark.parametrize("level", [1, 19])
+def test_an_object_compressed_differently_but_intact_is_reused_as_is(
+    write_mode: str, level: int
+) -> None:
+    # Another zstd version, level or tool: the frame checksum, the declared lengths and the
+    # SHA-256 of the decompressed bytes prove the object, not its compressed size.
+    import zstandard as zstd
+
+    content = b" ".join(
+        hashlib.sha256(str(n).encode()).hexdigest()[: n % 7 + 3].encode() for n in range(400)
+    )
+    digest = hashlib.sha256(content).hexdigest()
+    key = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}.zst"
+    other = zstd.ZstdCompressor(level=level, write_content_size=True, write_checksum=True)
+    body = other.compress(content)
+    ours = zstd.ZstdCompressor(level=3, write_content_size=True, write_checksum=True)
+    assert len(body) != len(ours.compress(content))  # the case this test is about
+    client = FakeS3Client()
+    client.objects[key] = {
+        "Body": body,
+        "ContentLength": len(body),
+        "Metadata": {"sha256": digest, "uncompressed-bytes": str(len(content))},
+        "ContentType": "text/plain",
+        "ContentEncoding": "zstd",
+    }
+    attempts = client.put_attempts
+
+    stored = _run(_store(client, write_mode=write_mode).put_verified(content, "text/plain"))
+
+    assert stored.object_key == key and stored.compressed_bytes == len(body)
+    assert stored.uncompressed_bytes == len(content)
+    assert client.objects[key]["Body"] == body  # never rewritten
+    if write_mode == "content_addressed":
+        assert client.put_attempts == attempts
+
+
+def test_a_reused_object_still_fails_on_a_wrong_declared_length_or_media_type() -> None:
+    content = b"reusable content " * 64
+    client = FakeS3Client()
+    stored = _run(_store(client).put_verified(content, "text/plain"))
+    original = dict(client.objects[stored.object_key])
+
+    client.objects[stored.object_key]["Metadata"] = {
+        "sha256": stored.sha256,
+        "uncompressed-bytes": str(len(content) + 1),
+    }
+    with pytest.raises(BlobIntegrityError, match="uncompressed"):
+        _run(_store(client).put_verified(content, "text/plain"))
+    client.objects[stored.object_key] = {**original, "ContentType": "application/json"}
+    with pytest.raises(BlobIntegrityError, match="media type"):
+        _run(_store(client).put_verified(content, "text/plain"))

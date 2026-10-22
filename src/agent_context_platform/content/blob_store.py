@@ -104,10 +104,10 @@ class S3BlobStore:
             uncompressed_bytes=len(content),
             media_type=media_type,
         )
-        if self._settings.write_mode == "content_addressed" and await self._reuse_existing(
-            object_key, content, expected_metadata
-        ):
-            return self._stored_blob(object_key, expected_metadata)
+        if self._settings.write_mode == "content_addressed":
+            existing = await self._reuse_existing(object_key, content, expected_metadata)
+            if existing is not None:
+                return self._stored_blob(object_key, existing)
 
         request: dict[str, Any] = {
             "Bucket": self._settings.bucket_name,
@@ -124,9 +124,9 @@ class S3BlobStore:
             self._verify_expected_metadata(
                 self._validate_response(head, expected_sha256=digest), expected_metadata
             )
-        else:
-            await self._verify_existing(object_key, content, expected_metadata)
-        return self._stored_blob(object_key, expected_metadata)
+            return self._stored_blob(object_key, expected_metadata)
+        existing = await self._verify_existing(object_key, content, expected_metadata)
+        return self._stored_blob(object_key, existing)
 
     @staticmethod
     def _stored_blob(object_key: str, metadata: _ObjectMetadata) -> StoredBlob:
@@ -140,24 +140,33 @@ class S3BlobStore:
 
     async def _reuse_existing(
         self, object_key: str, content: bytes, expected_metadata: _ObjectMetadata
-    ) -> bool:
+    ) -> _ObjectMetadata | None:
         try:
-            await self._verify_existing(object_key, content, expected_metadata)
+            return await self._verify_existing(object_key, content, expected_metadata)
         except BlobNotFoundError:
-            return False
-        return True
+            return None
 
     async def _verify_existing(
         self, object_key: str, content: bytes, expected_metadata: _ObjectMetadata
-    ) -> None:
+    ) -> _ObjectMetadata:
+        """Prove an object someone already stored under this digest; return its own metadata.
+
+        Its compressed size is NOT compared with what this process would write: another zstd
+        version, level or tool compresses the same bytes differently and is still intact. What
+        proves it is `get_verified` (the object's own declared lengths, the Zstandard frame
+        checksum and the SHA-256 of the decompressed bytes), plus the declared uncompressed
+        length and the media type this protocol fixes.
+        """
         head = await self._head(object_key)
-        self._verify_expected_metadata(
-            self._validate_response(head, expected_sha256=expected_metadata.sha256),
-            expected_metadata,
-        )
+        actual = self._validate_response(head, expected_sha256=expected_metadata.sha256)
+        if actual.uncompressed_bytes != expected_metadata.uncompressed_bytes:
+            raise BlobIntegrityError("object uncompressed byte count does not match")
+        if actual.media_type != expected_metadata.media_type:
+            raise BlobIntegrityError("object media type does not match")
         existing_content = await self.get_verified(object_key, expected_metadata.sha256)
         if existing_content != content:
             raise BlobIntegrityError("stored content does not match the requested content")
+        return actual
 
     async def get_verified(self, object_key: str, expected_sha256: str) -> bytes:
         """Download only a canonical object and prove its compressed and raw identities."""

@@ -633,3 +633,76 @@ def test_a_corrupted_stored_object_raises_the_alarm_and_is_left_untouched(
         assert after["ContentEncoding"] == "zstd"
 
     _run(exercise())
+
+
+def test_an_intact_object_compressed_by_another_writer_is_reused_without_an_alarm(
+    stack: Stack, s3_settings: S3Settings, caplog: pytest.LogCaptureFixture
+) -> None:
+    """An object at another zstd level (another version or tool) is valid: reuse, never page."""
+    import zstandard as zstd
+    from unit.observability._capture import capture_telemetry
+
+    from agent_context_platform.observability import contract
+
+    caplog.set_level(logging.DEBUG)
+    run = uuid4().hex
+    # Letters, not hex (the redaction re-check may treat hex as a secret); low enough redundancy
+    # that compression levels give different sizes.
+    words = [
+        "".join(chr(97 + int(c, 16)) for c in hashlib.sha256(f"{run}-{n}".encode()).hexdigest())[
+            : n % 7 + 3
+        ]
+        for n in range(12_000)
+    ]
+    data = " ".join(words).encode()
+    assert len(data) > INLINE_MAX_BYTES
+    claim = ContentClaimV1(
+        content_id=f"content-{run}",
+        content_sha256=hashlib.sha256(data).hexdigest(),
+        media_type="text/plain",
+        uncompressed_bytes=len(data),
+    )
+    item = SanitizedContentItemV1(
+        claim=claim,
+        sanitized_bytes_base64=base64.b64encode(data).decode("ascii"),
+        redaction_report=RedactionReportV1(
+            policy_version="1.0.0", disposition=ContentDisposition.SANITIZED
+        ),
+    )
+    digest = claim.content_sha256
+    key = f"sha256/{digest[:2]}/{digest[2:4]}/{digest}.zst"
+    body = zstd.ZstdCompressor(level=19, write_content_size=True, write_checksum=True).compress(
+        data
+    )
+    ours = zstd.ZstdCompressor(level=3, write_content_size=True, write_checksum=True)
+    assert len(body) != len(ours.compress(data))
+    s3 = _raw_s3(s3_settings)
+    s3.put_object(
+        Bucket=s3_settings.bucket_name,
+        Key=key,
+        Body=body,
+        Metadata={"sha256": digest, "uncompressed-bytes": str(len(data))},
+        ContentType="application/octet-stream",
+        ContentEncoding="zstd",
+    )
+    before = s3.head_object(Bucket=s3_settings.bucket_name, Key=key)["ETag"]
+
+    async def exercise() -> None:
+        batch = _batch((_draft(f"z-{run}", stream_id=f"s-{run}", claims=(claim,)),), (item,))
+        with capture_telemetry() as telemetry:
+            response = await stack.post(batch)
+            assert telemetry.points(contract.LEDGER_INTEGRITY_FAILURES) == {}
+        assert response.status_code == 200, response.text
+        assert (
+            await stack.count(
+                "catalog.content_objects",
+                "content_sha256 = :d AND compressed_bytes = :n",
+                d=digest,
+                n=len(body),
+            )
+            == 1
+        )
+
+    _run(exercise())
+    assert not [r for r in caplog.records if r.getMessage().startswith("content_integrity")]
+    assert s3.head_object(Bucket=s3_settings.bucket_name, Key=key)["ETag"] == before
