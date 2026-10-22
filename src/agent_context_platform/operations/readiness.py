@@ -49,6 +49,13 @@ Check = Callable[[], Awaitable[Components]]
 
 _INSUFFICIENT_PRIVILEGE: Final = "42501"
 _UNDEFINED_TABLE: Final = "42P01"
+# What the API role reads outside the request path: the schema head (readiness) and projection
+# progress (freshness). Migration 20261022_0001 grants SELECT on exactly these.
+API_READ_TABLES: Final = (
+    "public.alembic_version",
+    "projection.projection_checkpoints",
+    "projection.dead_letters",
+)
 _FORBIDDEN_S3_CODES: Final = frozenset({"403", "AccessDenied", "Forbidden"})
 
 
@@ -194,8 +201,9 @@ def postgresql_check(
 ) -> tuple[Check, Components]:
     """Connect, read ``alembic_version`` read-only and compare it with the image's head.
 
-    The connecting role needs ``SELECT`` on ``public.alembic_version``; without it the schema
-    is reported ``forbidden`` (fail closed), never assumed current.
+    The connecting role needs ``SELECT`` on every table of ``API_READ_TABLES`` (migration
+    20261022_0001 grants exactly that to ``agent_context_api``); a missing one reports the
+    schema ``forbidden`` (fail closed), never assumed current.
     """
 
     statement_ms = max(1, math.ceil(timeout_seconds * 1000))
@@ -212,6 +220,15 @@ def postgresql_check(
                         )
                     ).scalars()
                     revisions = tuple(rows)
+                    privileged = (
+                        await connection.execute(
+                            text(
+                                "SELECT bool_and(has_table_privilege(name, 'SELECT')) "
+                                "FROM unnest(CAST(:tables AS text[])) AS name"
+                            ),
+                            {"tables": list(API_READ_TABLES)},
+                        )
+                    ).scalar()
                 except DBAPIError as error:
                     sqlstate = getattr(error.orig, "sqlstate", None)
                     if sqlstate == _INSUFFICIENT_PRIVILEGE:
@@ -223,6 +240,8 @@ def postgresql_check(
                     await connection.rollback()
         except (SQLAlchemyError, OSError):
             return {"postgresql": "unavailable", "schema": "unknown"}
+        if privileged is not True:
+            return {"postgresql": "ok", "schema": "forbidden"}
         if expected_head is None:
             return {"postgresql": "ok", "schema": "unconfigured"}
         return {
