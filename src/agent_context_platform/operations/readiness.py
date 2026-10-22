@@ -175,7 +175,9 @@ def readiness_connect_args(timeout_seconds: float) -> dict[str, Any]:
     """libpq options that bound a connect and make a dead socket fail instead of hang."""
     return {
         "application_name": READINESS_APPLICATION_NAME,
-        "connect_timeout": max(2, math.ceil(timeout_seconds)),  # libpq's minimum is 2
+        # Whole seconds, at least libpq's minimum of 2, and strictly longer than the probe's
+        # bound, so a silent server is reported "timeout" rather than racing into "unavailable".
+        "connect_timeout": max(2, math.floor(timeout_seconds) + 1),
         "keepalives": 1,
         "keepalives_idle": 5,
         "keepalives_interval": 2,
