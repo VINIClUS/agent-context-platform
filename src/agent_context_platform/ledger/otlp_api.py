@@ -3,30 +3,36 @@
 The VPS collector forwards Codex trace-safe telemetry here as an OTLP/HTTP
 ``ExportTraceServiceRequest`` (protobuf). Each Codex event record (a span, or a span event,
 carrying ``event.name``) goes through the pure mapper ``ledger.codex_otel``; the mapped drafts
-are appended through the ingestion service as ONE atomic batch per request, so idempotency comes
-from the mapper's keys and a collector retry of the same export is answered from the ledger.
+are appended through the ingestion service as one atomic batch per request (retried once without
+the events a conflict is attributable to), so idempotency comes from the mapper's keys and a
+collector retry of the same export is answered from the ledger.
 
-Order, mirroring ``POST /v1/ingestion/batches``: authenticate (the same producer credentials,
-``events:ingest`` scope, same bounded Argon2 path), rate limit per producer, media type and
-encoding, streamed size limit, bounded gzip inflation, protobuf parsing, span limit, mapping,
-ingestion. Records the mapper does not model are counted as unmapped; records it refuses are
-rejected spans, reported through ``partial_success`` with a fixed message naming only fixed
-reason codes. No attribute value is ever logged, echoed or stored outside the mapped event.
+Order: authenticate (the ingestion producers' credentials, ``events:ingest`` scope, same bounded
+Argon2 path), rate limit per producer, media type and encoding, streamed size limit; then, on a
+bounded worker thread so the event loop never does per-record work: bounded gzip inflation,
+protobuf parsing, a structural pre-scan that stops at the first exceeded limit (spans, records,
+events per span, attributes per resource, scope, span or event: O(1) length checks before any
+record is converted) and mapping. Records the mapper does not model are counted as unmapped;
+records it refuses are rejected spans, reported through ``partial_success`` with a fixed message
+naming only fixed reason codes. No attribute value is ever logged, echoed or stored outside the
+mapped event.
 
 Status mapping (OTLP/HTTP): 200 (``partial_success`` when spans were rejected), 400 malformed,
-401/403 credentials, 413 too large or too many spans, 415 media type or encoding, 429 rate
-limited, 503 not configured or a retryable outage (``Retry-After``). Error bodies are a
+401/403 credentials, 413 with a fixed code per exceeded limit, 415 media type or encoding, 429
+rate limited, 503 not configured or a retryable outage (``Retry-After``). Error bodies are a
 ``google.rpc.Status`` with a fixed message. Not part of the frozen ``/v1/ingestion/*`` OpenAPI.
 """
 
 from __future__ import annotations
 
+import asyncio
 import logging
 import zlib
 from collections.abc import Iterable, Iterator, Mapping
 from dataclasses import dataclass, field
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from typing import Any, Final
+from uuid import UUID
 
 from agent_context_sdk import (  # type: ignore[import-untyped, unused-ignore]
     EventDraftV1,
@@ -51,7 +57,7 @@ from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from agent_context_platform.ledger import codex_otel
 from agent_context_platform.ledger.auth import AuthError, ProducerAuthenticator
-from agent_context_platform.ledger.service import IngestionService
+from agent_context_platform.ledger.service import BATCH_REJECTED, IngestionService, IngestOutcome
 from agent_context_platform.mcp.auth import RateLimitedError, TokenBucketLimiter
 from agent_context_platform.observability import record_otel_request, record_otel_spans
 
@@ -62,12 +68,20 @@ PROTOBUF_MEDIA_TYPE: Final = "application/x-protobuf"
 PRODUCER_NAME: Final = "codex-otel-receiver"
 # Part of every mapped draft: a change makes re-exported records conflict, so it stays fixed.
 PRODUCER_VERSION: Final = "1.0.0"
+# One stream per producer and Codex session: a stream-level failure stays within one session.
 STREAM_PREFIX: Final = "codex-otel:"
+# One ingestion batch holds at most 500 events.
+MAX_DRAFTS: Final = 500
+# Any string attribute value longer than this rejects its record before mapping.
+MAX_ATTRIBUTE_VALUE_CHARS: Final = 16_384
+FUTURE_TIMESTAMP: Final = "future_timestamp"
+MISSING_TIMESTAMP: Final = "missing_timestamp"
 _RETRY_AFTER_SECONDS: Final = 5
 _READ_CHUNK_BYTES: Final = 65_536
-_UNMAPPED: Final = "unmapped"
+# Decoding and mapping run off the event loop, at most this many at once per application.
+DECODE_WORKERS: Final = 2
 
-# Fixed, content-free status messages.
+# Fixed, content-free status messages; each 413 names its limit so collector logs show it.
 _MESSAGES: Final[Mapping[str, tuple[int, str]]] = {
     "receiver_unavailable": (Code.UNAVAILABLE, "The OTLP receiver is not available."),
     "service_unavailable": (Code.UNAVAILABLE, "The service is temporarily unavailable."),
@@ -80,11 +94,42 @@ _MESSAGES: Final[Mapping[str, tuple[int, str]]] = {
         Code.INVALID_ARGUMENT,
         "Only application/x-protobuf, identity or gzip, is accepted.",
     ),
-    "request_too_large": (Code.RESOURCE_EXHAUSTED, "The request exceeds a size limit."),
-    "too_many_spans": (Code.RESOURCE_EXHAUSTED, "The request holds too many spans."),
+    "request_too_large": (Code.RESOURCE_EXHAUSTED, "request_too_large: body over the limit."),
+    "inflated_too_large": (
+        Code.RESOURCE_EXHAUSTED,
+        "inflated_too_large: decompressed body over the limit.",
+    ),
+    "too_many_spans": (Code.RESOURCE_EXHAUSTED, "too_many_spans: span limit exceeded."),
+    "too_many_records": (
+        Code.RESOURCE_EXHAUSTED,
+        "too_many_records: span plus span event limit exceeded.",
+    ),
+    "too_many_events": (
+        Code.RESOURCE_EXHAUSTED,
+        "too_many_events: span event limit per span exceeded.",
+    ),
+    "too_many_attributes": (
+        Code.RESOURCE_EXHAUSTED,
+        "too_many_attributes: attribute limit exceeded.",
+    ),
+    "too_many_drafts": (
+        Code.RESOURCE_EXHAUSTED,
+        "too_many_drafts: more than 500 distinct events in one export.",
+    ),
     "malformed_request": (Code.INVALID_ARGUMENT, "The request is not a valid OTLP export."),
     "internal_error": (Code.INTERNAL, "The request could not be processed."),
 }
+_TOO_LARGE: Final = frozenset(
+    {
+        "request_too_large",
+        "inflated_too_large",
+        "too_many_spans",
+        "too_many_records",
+        "too_many_events",
+        "too_many_attributes",
+        "too_many_drafts",
+    }
+)
 # Error code -> telemetry (outcome, reason).
 _TELEMETRY: Final[Mapping[str, tuple[str, str]]] = {
     "receiver_unavailable": ("error", "internal"),
@@ -95,10 +140,9 @@ _TELEMETRY: Final[Mapping[str, tuple[str, str]]] = {
     "insufficient_scope": ("rejected", "auth"),
     "rate_limited": ("rejected", "rate_limited"),
     "unsupported_media_type": ("rejected", "unsupported_media_type"),
-    "request_too_large": ("rejected", "too_large"),
-    "too_many_spans": ("rejected", "too_large"),
     "malformed_request": ("rejected", "malformed"),
     "internal_error": ("error", "internal"),
+    **dict.fromkeys(_TOO_LARGE, ("rejected", "too_large")),
 }
 
 
@@ -113,6 +157,13 @@ class OtlpReceiverRuntime:
     max_request_body_bytes: int
     max_decompressed_bytes: int
     max_spans: int
+    max_records: int = 1_000
+    max_events_per_span: int = 64
+    max_attributes: int = 128
+    max_clock_skew: timedelta = timedelta(minutes=5)
+    decode_workers: asyncio.Semaphore = field(
+        default_factory=lambda: asyncio.Semaphore(DECODE_WORKERS), repr=False, compare=False
+    )
 
 
 class _RequestError(Exception):
@@ -131,6 +182,10 @@ class _Mapping:
     reasons: set[str] = field(default_factory=set)
     unmapped_spans: int = 0
     span_count: int = 0
+
+    def reject(self, index: int, reason: str) -> None:
+        self.rejected_spans.add(index)
+        self.reasons.add(reason)
 
 
 router = APIRouter(prefix="/v1/otel", tags=["otel"])
@@ -163,46 +218,27 @@ async def _handle(request: Request, runtime: OtlpReceiverRuntime) -> Response:
     except RateLimitedError:
         raise _RequestError(429, "rate_limited") from None
 
-    _check_media_type(request)
-    body = await _read_body(request, runtime)
-    export = _parse(body)
-    span_count = sum(
-        len(scope_spans.spans)
-        for resource_spans in export.resource_spans
-        for scope_spans in resource_spans.scope_spans
-    )
-    if span_count > runtime.max_spans:
-        raise _RequestError(413, "too_many_spans")
-
+    gzipped = _check_media_type(request)
+    body = await _read_body(request, runtime.max_request_body_bytes)
     config = codex_otel.CodexOtelMapperConfig(
         hmac_key=runtime.hmac_key,
         producer=ProducerV1(
             producer_id=principal.producer_id, name=PRODUCER_NAME, version=PRODUCER_VERSION
         ),
-        stream_id=f"{STREAM_PREFIX}{principal.producer_id}",
+        stream_id=STREAM_PREFIX + principal.producer_id,
     )
-    mapping = map_export(config, export)
-    if len(mapping.drafts) > runtime.max_spans:
-        raise _RequestError(413, "too_many_spans")
+    now = datetime.now(UTC)
+    async with runtime.decode_workers:
+        mapping = await asyncio.to_thread(decode_and_map, body, gzipped, runtime, config, now)
 
     if mapping.drafts:
-        outcome = await runtime.service.ingest(
-            IngestBatchRequestV1(
-                batch_id=new_uuid7(), events=tuple(draft for _, draft in mapping.drafts)
-            )
-        )
-        if outcome.http_status >= 500:
-            raise _RequestError(503, "service_unavailable")
-        if outcome.http_status != 200:
-            # The whole batch was refused (conflict, quarantined stream): its spans are rejected.
-            mapping.rejected_spans.update(index for index, _ in mapping.drafts)
-            mapping.reasons.update(result.error_code for result in outcome.response.rejected)
+        await _ingest(runtime, mapping)
 
     rejected = len(mapping.rejected_spans)
     mapped = len({index for index, _ in mapping.drafts} - mapping.rejected_spans)
     record_otel_spans("rejected", rejected)
     record_otel_spans("mapped", mapped)
-    record_otel_spans(_UNMAPPED, mapping.unmapped_spans)
+    record_otel_spans("unmapped", mapping.unmapped_spans)
     record_otel_request("accepted", "none")
     _log(
         request,
@@ -225,16 +261,52 @@ async def _handle(request: Request, runtime: OtlpReceiverRuntime) -> Response:
     return Response(response.SerializeToString(), media_type=PROTOBUF_MEDIA_TYPE)
 
 
-def _check_media_type(request: Request) -> None:
+async def _ingest(runtime: OtlpReceiverRuntime, mapping: _Mapping) -> None:
+    """Append the drafts as one batch; a refused batch is retried once without its offenders.
+
+    A conflict (or quarantined stream) is attributable to some events: those are rejected, the
+    others are resubmitted once so one bad record never discards its export. Events already
+    stored are ``existing``, never rejected.
+    """
+    pending = list(mapping.drafts)
+    for attempt in range(2):
+        outcome = await runtime.service.ingest(
+            IngestBatchRequestV1(batch_id=new_uuid7(), events=tuple(draft for _, draft in pending))
+        )
+        if outcome.http_status >= 500:
+            raise _RequestError(503, "service_unavailable")
+        if outcome.http_status == 200:
+            return
+        span_of = {draft.event_id: index for index, draft in pending}
+        offenders = _offenders(outcome)
+        for result in outcome.response.rejected:
+            if result.event_id in offenders or attempt == 1:
+                mapping.reject(span_of[result.event_id], result.error_code)
+        retry = {result.event_id for result in outcome.response.rejected} - offenders
+        pending = [(index, draft) for index, draft in pending if draft.event_id in retry]
+        if not pending or not offenders:
+            return
+
+
+def _offenders(outcome: IngestOutcome) -> set[UUID]:
+    return {
+        result.event_id
+        for result in outcome.response.rejected
+        if result.error_code != BATCH_REJECTED
+    }
+
+
+def _check_media_type(request: Request) -> bool:
+    """Whether the body is gzip; anything but protobuf, identity or gzip is a 415."""
     media_type = request.headers.get("content-type", "").split(";", 1)[0].strip().lower()
     encoding = request.headers.get("content-encoding", "identity").strip().lower()
     if media_type != PROTOBUF_MEDIA_TYPE or encoding not in {"identity", "gzip"}:
         raise _RequestError(415, "unsupported_media_type")
+    return encoding == "gzip"
 
 
-async def _read_body(request: Request, runtime: OtlpReceiverRuntime) -> bytes:
-    """The request body, size-limited while streaming and inflated within a fixed bound."""
-    limit = runtime.max_request_body_bytes
+async def _read_body(request: Request, limit: int) -> bytes:
+    """The request body, size-limited while streaming (``Content-Length`` is only a hint)."""
     declared = request.headers.get("content-length")
     if declared is not None and declared.isascii() and declared.isdigit() and int(declared) > limit:
         raise _RequestError(413, "request_too_large")
@@ -245,10 +317,24 @@ async def _read_body(request: Request, runtime: OtlpReceiverRuntime) -> bytes:
         if total > limit:
             raise _RequestError(413, "request_too_large")
         chunks.append(chunk)
-    body = b"".join(chunks)
-    if request.headers.get("content-encoding", "identity").strip().lower() == "gzip":
-        return _gunzip(body, runtime.max_decompressed_bytes)
-    return body
+    return b"".join(chunks)
+
+
+def decode_and_map(
+    body: bytes,
+    gzipped: bool,
+    runtime: OtlpReceiverRuntime,
+    config: codex_otel.CodexOtelMapperConfig,
+    now: datetime,
+) -> _Mapping:
+    """Inflate, parse, pre-scan and map one export (blocking: runs on a worker thread)."""
+    data = _gunzip(body, runtime.max_decompressed_bytes) if gzipped else body
+    export = _parse(data)
+    _check_structure(export, runtime)
+    mapping = map_export(config, export, now=now, max_clock_skew=runtime.max_clock_skew)
+    if len(mapping.drafts) > MAX_DRAFTS:
+        raise _RequestError(413, "too_many_drafts")
+    return mapping
 
 
 def _gunzip(data: bytes, limit: int) -> bytes:
@@ -262,14 +348,14 @@ def _gunzip(data: bytes, limit: int) -> bytes:
             piece = inflater.decompress(pending, _READ_CHUNK_BYTES)
             produced += len(piece)
             if produced > limit:
-                raise _RequestError(413, "request_too_large")
+                raise _RequestError(413, "inflated_too_large")
             output.append(piece)
             pending = inflater.unconsumed_tail
             if not piece and not pending:
                 break  # truncated: no input left and no progress
     except zlib.error:
         raise _RequestError(400, "malformed_request") from None
-    # Exactly one complete member: truncated or trailing data is malformed.
+    # Exactly one complete member: truncated, trailing or multi-member data is malformed.
     if not inflater.eof or inflater.unused_data:
         raise _RequestError(400, "malformed_request")
     return b"".join(output)
@@ -284,11 +370,46 @@ def _parse(body: bytes) -> ExportTraceServiceRequest:
     return export
 
 
+def _check_structure(export: ExportTraceServiceRequest, runtime: OtlpReceiverRuntime) -> None:
+    """Count spans, records and attributes with O(1) length checks; stop at the first limit."""
+    spans = records = 0
+    limit = runtime.max_attributes
+    for resource_spans in export.resource_spans:
+        if len(resource_spans.resource.attributes) > limit:
+            raise _RequestError(413, "too_many_attributes")
+        for scope_spans in resource_spans.scope_spans:
+            if len(scope_spans.scope.attributes) > limit:
+                raise _RequestError(413, "too_many_attributes")
+            spans += len(scope_spans.spans)
+            if spans > runtime.max_spans:
+                raise _RequestError(413, "too_many_spans")
+            for span in scope_spans.spans:
+                events = len(span.events)
+                if events > runtime.max_events_per_span:
+                    raise _RequestError(413, "too_many_events")
+                records += 1 + events
+                if records > runtime.max_records:
+                    raise _RequestError(413, "too_many_records")
+                if len(span.attributes) > limit:
+                    raise _RequestError(413, "too_many_attributes")
+                for event in span.events:
+                    if len(event.attributes) > limit:
+                        raise _RequestError(413, "too_many_attributes")
+
+
+class _ValueTooLong:
+    """Marker for an over-long string value: the mapper refuses it as non-scalar."""
+
+
+_TOO_LONG: Final = _ValueTooLong()
+
+
 def _scalar(value: AnyValue) -> object:
-    """A scalar attribute value, or a marker the mapper rejects as non-scalar."""
+    """A scalar attribute value, or a marker the mapper rejects."""
     kind = value.WhichOneof("value")
     if kind == "string_value":
-        return value.string_value
+        text = value.string_value
+        return _TOO_LONG if len(text) > MAX_ATTRIBUTE_VALUE_CHARS else text
     if kind == "bool_value":
         return value.bool_value
     if kind == "int_value":
@@ -304,8 +425,11 @@ def _attributes(pairs: Iterable[KeyValue]) -> dict[str, object]:
     return {pair.key: _scalar(pair.value) for pair in pairs}
 
 
-def _observed_at(time_unix_nano: int) -> datetime | None:
-    """The record's own OTLP time: stable across retries, unlike the arrival time."""
+def _carries_marker(pairs: Iterable[KeyValue]) -> bool:
+    return any(pair.key == codex_otel.PLATFORM_ORIGIN_ATTRIBUTE for pair in pairs)
+
+
+def _otlp_time(time_unix_nano: int) -> datetime | None:
     if time_unix_nano <= 0:
         return None
     try:
@@ -316,39 +440,98 @@ def _observed_at(time_unix_nano: int) -> datetime | None:
 
 def _records(
     span: Span, resource: Mapping[str, object]
-) -> Iterator[tuple[codex_otel.CodexOtelRecord, int]]:
-    """The Codex event records one span carries: itself and its events, when named events."""
+) -> Iterator[tuple[codex_otel.CodexOtelRecord | None, int]]:
+    """The Codex event records of one span (itself and its events, when named events).
+
+    A ``None`` record is one carrying the platform-origin marker: the span is rejected.
+    """
     trace_id = span.trace_id.hex() or None
     span_id = span.span_id.hex() or None
-    attributes = _attributes(span.attributes)
-    if "event.name" in attributes:
+    if _carries_marker(span.attributes):
+        yield None, 0
+        return
+    if any(pair.key == "event.name" for pair in span.attributes):
         yield (
             codex_otel.CodexOtelRecord(
-                codex_otel.OtelSignal.TRACE, resource, attributes, trace_id, span_id
+                codex_otel.OtelSignal.TRACE,
+                resource,
+                _attributes(span.attributes),
+                trace_id,
+                span_id,
             ),
             span.end_time_unix_nano or span.start_time_unix_nano,
         )
     for event in span.events:
-        event_attributes = _attributes(event.attributes)
-        if "event.name" in event_attributes:
+        if _carries_marker(event.attributes):
+            yield None, 0
+            continue
+        if any(pair.key == "event.name" for pair in event.attributes):
             yield (
                 codex_otel.CodexOtelRecord(
-                    codex_otel.OtelSignal.TRACE, resource, event_attributes, trace_id, span_id
+                    codex_otel.OtelSignal.TRACE,
+                    resource,
+                    _attributes(event.attributes),
+                    trace_id,
+                    span_id,
                 ),
                 event.time_unix_nano,
             )
 
 
+def _map_record(
+    config: codex_otel.CodexOtelMapperConfig,
+    record: codex_otel.CodexOtelRecord,
+    time_unix_nano: int,
+    *,
+    latest: datetime,
+) -> EventDraftV1 | None:
+    """Map one record with bounded, deterministic times; raises ``CodexOtelError`` or a reason.
+
+    ``observed_at`` is Codex's own OTLP time (stable across retries), never earlier than
+    ``occurred_at``; neither may be later than ``latest`` (now plus the allowed clock skew).
+    """
+    otlp_time = _otlp_time(time_unix_nano)
+    if otlp_time is None:
+        raise _RecordRejected(MISSING_TIMESTAMP)
+    if otlp_time > latest:
+        raise _RecordRejected(FUTURE_TIMESTAMP)
+    draft = codex_otel.map_record(config, record, observed_at=otlp_time)
+    if draft is None:
+        return None
+    if draft.occurred_at > latest:
+        raise _RecordRejected(FUTURE_TIMESTAMP)
+    # Per-session stream; observed_at no earlier than occurred_at. Deterministic, so a retry
+    # yields the identical draft.
+    session = draft.context.session_id if draft.context is not None else None
+    stream = f"{config.stream_id}:{session}" if session else config.stream_id
+    return draft.model_copy(
+        update={"stream_id": stream, "observed_at": max(draft.occurred_at, otlp_time)}
+    )
+
+
+class _RecordRejected(Exception):
+    def __init__(self, reason: str) -> None:
+        super().__init__(reason)
+        self.reason = reason
+
+
 def map_export(
-    config: codex_otel.CodexOtelMapperConfig, export: ExportTraceServiceRequest
+    config: codex_otel.CodexOtelMapperConfig,
+    export: ExportTraceServiceRequest,
+    *,
+    now: datetime,
+    max_clock_skew: timedelta = timedelta(minutes=5),
 ) -> _Mapping:
     """Map every Codex event record of ``export``; duplicates (same idempotency key) collapse.
 
-    A span is rejected when its resource, or any of its records, is refused by the mapper; a
-    span with no mapped and no refused record is unmapped.
+    A span is rejected when its resource or scope is refused, when it or one of its events
+    carries the platform-origin marker, or when the mapper refuses one of its records; a span
+    with no mapped and no refused record is unmapped. The first record with a given idempotency
+    key wins.
     """
     mapping = _Mapping()
     seen: set[str] = set()
+    latest = now + max_clock_skew
     index = -1
     for resource_spans in export.resource_spans:
         resource = _attributes(resource_spans.resource.attributes)
@@ -358,25 +541,26 @@ def map_export(
         except codex_otel.CodexOtelError as error:
             resource_reason = error.reason.value
         for scope_spans in resource_spans.scope_spans:
+            scope_reason = resource_reason
+            if scope_reason is None and _carries_marker(scope_spans.scope.attributes):
+                scope_reason = codex_otel.RejectionReason.PLATFORM_ORIGIN.value
             for span in scope_spans.spans:
                 index += 1
                 mapping.span_count += 1
-                if resource_reason is not None:
-                    mapping.rejected_spans.add(index)
-                    mapping.reasons.add(resource_reason)
+                if scope_reason is not None:
+                    mapping.reject(index, scope_reason)
                     continue
                 produced = False
                 for record, time_unix_nano in _records(span, resource):
-                    observed_at = _observed_at(time_unix_nano)
                     try:
-                        if observed_at is None:
-                            raise codex_otel.CodexOtelError(
-                                codex_otel.RejectionReason.INVALID_EVENT
-                            )
-                        draft = codex_otel.map_record(config, record, observed_at=observed_at)
+                        if record is None:
+                            raise _RecordRejected(codex_otel.RejectionReason.PLATFORM_ORIGIN.value)
+                        draft = _map_record(config, record, time_unix_nano, latest=latest)
                     except codex_otel.CodexOtelError as error:
-                        mapping.rejected_spans.add(index)
-                        mapping.reasons.add(error.reason.value)
+                        mapping.reject(index, error.reason.value)
+                        continue
+                    except _RecordRejected as error:
+                        mapping.reject(index, error.reason)
                         continue
                     if draft is None:
                         continue

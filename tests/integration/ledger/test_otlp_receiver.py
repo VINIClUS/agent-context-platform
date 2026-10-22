@@ -212,7 +212,7 @@ def test_a_codex_export_becomes_one_canonical_event_idempotently(
 
         (event,) = await receiver.events(session_id)
         assert event["event_type"] == "agent.session.started"
-        assert event["stream_id"] == f"codex-otel:{PRODUCER_ID}"
+        assert event["stream_id"] == f"codex-otel:{PRODUCER_ID}:{session_id}"
         payload = json.loads(event["payload"])
         assert payload["session_id"] == session_id
         assert payload["source"] == "codex_otel"
@@ -242,5 +242,63 @@ def test_a_platform_origin_export_never_reaches_the_ledger(receiver: Receiver) -
             "spans rejected: platform_origin",
         )
         assert await receiver.events(session_id) == []
+
+    asyncio.run(exercise())
+
+
+def _multi_export(resource: dict[str, Any], records: list[tuple[str, dict[str, Any]]]) -> bytes:
+    """One span per record; the span id is given per record (it is part of the trace context)."""
+    spans = []
+    for span_id, attributes in records:
+        span = Span(
+            trace_id=bytes.fromhex("4bf92f3577b34da6a3ce929d0e0e4736"),
+            span_id=bytes.fromhex(span_id),
+            name="session_task",
+            start_time_unix_nano=EVENT_TIME_NS - 1_000,
+            end_time_unix_nano=EVENT_TIME_NS,
+        )
+        span.events.add(name="event", time_unix_nano=EVENT_TIME_NS, attributes=_pairs(attributes))
+        spans.append(span)
+    return ExportTraceServiceRequest(
+        resource_spans=[
+            ResourceSpans(
+                resource=Resource(attributes=_pairs(resource)),
+                scope_spans=[ScopeSpans(spans=spans)],
+            )
+        ]
+    ).SerializeToString()
+
+
+def test_one_conflicting_record_never_drops_the_rest_of_its_export(receiver: Receiver) -> None:
+    """Review S1: A = [X, Q]; B = [X again, Q under another span id, Y new]."""
+    fixture = _fixture()
+    ids = {name: f"0198a4b1-98c0-7c28-ae3f-{secrets.token_hex(6)}" for name in ("x", "q", "y")}
+
+    def record(name: str) -> dict[str, Any]:
+        return {**fixture["attributes"], "conversation.id": ids[name]}
+
+    first = _multi_export(
+        fixture["resource"], [("00f067aa0ba902b7", record("x")), ("00f067aa0ba902b8", record("q"))]
+    )
+    second = _multi_export(
+        fixture["resource"],
+        [
+            ("00f067aa0ba902b7", record("x")),  # identical: already stored, `existing`
+            ("1111111111111111", record("q")),  # same key, other trace context: a conflict
+            ("00f067aa0ba902b9", record("y")),  # new
+        ],
+    )
+
+    async def exercise() -> None:
+        assert (await receiver.post(first)).status_code == 200
+        response = await receiver.post(second)
+        assert response.status_code == 200
+        partial = ExportTraceServiceResponse.FromString(response.content).partial_success
+        assert (partial.rejected_spans, partial.error_message) == (
+            1,
+            "spans rejected: idempotency_conflict",
+        )
+        for name in ("x", "q", "y"):
+            assert len(await receiver.events(ids[name])) == 1, name
 
     asyncio.run(exercise())

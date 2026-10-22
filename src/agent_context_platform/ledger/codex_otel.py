@@ -330,6 +330,9 @@ def map_record(
     if record.signal is not config.accepted_signal:
         raise CodexOtelError(RejectionReason.UNSUPPORTED_SIGNAL)
     _check_service(record.resource)
+    if PLATFORM_ORIGIN_ATTRIBUTE in record.attributes:
+        # The loop-prevention marker at record level too, not only on the resource.
+        raise CodexOtelError(RejectionReason.PLATFORM_ORIGIN)
     if len(record.attributes) > MAX_ATTRIBUTES:
         raise CodexOtelError(RejectionReason.TOO_MANY_ATTRIBUTES)
     _check_scalars(record.attributes)

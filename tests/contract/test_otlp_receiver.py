@@ -162,6 +162,7 @@ class Harness:
         max_body: int = 1_000_000,
         max_inflated: int = 1_000_000,
         max_spans: int = 10,
+        **limits: Any,
     ) -> None:
         # A fresh secret per harness (the token shape is `<prefix>.<43 url-safe chars>`).
         self.token = f"{PREFIX}.{secrets.token_urlsafe(32)}"
@@ -195,6 +196,7 @@ class Harness:
             max_request_body_bytes=max_body,
             max_decompressed_bytes=max_inflated,
             max_spans=max_spans,
+            **limits,
         )
         self.app = create_app(Settings(environment="test"), otlp_receiver=self.runtime)
 
@@ -242,7 +244,9 @@ async def test_a_codex_event_becomes_one_canonical_draft_in_one_batch() -> None:
     assert draft.event_type == "agent.session.started"
     assert draft.producer.producer_id == PRODUCER_ID
     assert draft.producer.name == PRODUCER_NAME
-    assert draft.stream_id == f"{STREAM_PREFIX}{PRODUCER_ID}"
+    session_id = _fixture()["attributes"]["conversation.id"]
+    # One stream per producer and Codex session.
+    assert draft.stream_id == f"{STREAM_PREFIX}{PRODUCER_ID}:{session_id}"
     assert draft.payload["session_id"] == _fixture()["attributes"]["conversation.id"]
     assert draft.trace is not None and draft.trace.trace_id == "4bf92f3577b34da6a3ce929d0e0e4736"
     # The record's own OTLP time, not the arrival time: a retry maps to the identical draft.
@@ -310,7 +314,7 @@ async def test_refused_records_are_rejected_spans_and_the_rest_is_ingested() -> 
 
     assert response.partial_success.rejected_spans == 3
     assert response.partial_success.error_message == (
-        "spans rejected: invalid_attribute,invalid_event,non_scalar_attribute"
+        "spans rejected: invalid_attribute,missing_timestamp,non_scalar_attribute"
     )
     (batch,) = harness.service.batches
     assert len(batch.events) == 1
@@ -434,7 +438,7 @@ async def test_too_many_spans_are_refused() -> None:
     response = await harness.post(body)
 
     assert response.status_code == 413
-    assert _status(response).message == "The request holds too many spans."
+    assert _status(response).message == "too_many_spans: span limit exceeded."
 
 
 @pytest.mark.parametrize("body", [b"\xff\xff\xff\xff", b"\x0a\x05abc"])
@@ -507,19 +511,23 @@ async def test_attribute_values_are_never_echoed_logged_or_exported(
     assert harness.token not in caplog.text
 
 
+KEY = "Zq8r1Lx0VmPa4Tb7Nc2Wd5Ye9Kf3Hg6Uj"
+
+
 def test_receiver_settings_require_a_long_stable_key(monkeypatch: pytest.MonkeyPatch) -> None:
     from pydantic import ValidationError
 
     from agent_context_platform.settings import OtelReceiverSettings
 
-    with pytest.raises(ValidationError) as info:
-        OtelReceiverSettings(idempotency_hmac_key="short-secret-value")
-    assert "short-secret-value" not in str(info.value)
-    monkeypatch.setenv("AGENT_CONTEXT_OTEL_RECEIVER__IDEMPOTENCY_HMAC_KEY", "k" * 40)
+    for weak in ("short-secret-value", "k" * 40, "ab" * 20):
+        with pytest.raises(ValidationError) as info:
+            OtelReceiverSettings(idempotency_hmac_key=weak)
+        assert weak not in str(info.value)
+    monkeypatch.setenv("AGENT_CONTEXT_OTEL_RECEIVER__IDEMPOTENCY_HMAC_KEY", KEY)
     monkeypatch.setenv("AGENT_CONTEXT_OTEL_RECEIVER__MAX_SPANS", "100")
     receiver = Settings().otel_receiver
     assert receiver.max_spans == 100
-    assert "k" * 40 not in repr(receiver)
+    assert KEY not in repr(receiver)
 
 
 def test_the_app_builds_the_receiver_only_with_ingestion_and_a_key() -> None:
@@ -530,13 +538,13 @@ def test_the_app_builds_the_receiver_only_with_ingestion_and_a_key() -> None:
 
     ingestion = SimpleNamespace(authenticator=object(), service=object())
     keyed = Settings(
-        environment="test", otel_receiver=OtelReceiverSettings(idempotency_hmac_key="k" * 40)
+        environment="test", otel_receiver=OtelReceiverSettings(idempotency_hmac_key=KEY)
     )
     assert _build_otlp_receiver(Settings(environment="test"), ingestion) is None  # type: ignore[arg-type]
     assert _build_otlp_receiver(keyed, None) is None
     runtime = _build_otlp_receiver(keyed, ingestion)  # type: ignore[arg-type]
     assert runtime is not None
-    assert runtime.hmac_key == b"k" * 40
+    assert runtime.hmac_key == KEY.encode()
     assert runtime.authenticator is ingestion.authenticator
 
 

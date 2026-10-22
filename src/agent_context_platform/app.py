@@ -101,6 +101,10 @@ def _build_otlp_receiver(
         max_request_body_bytes=receiver.max_request_body_bytes,
         max_decompressed_bytes=receiver.max_decompressed_bytes,
         max_spans=receiver.max_spans,
+        max_records=receiver.max_records,
+        max_events_per_span=receiver.max_events_per_span,
+        max_attributes=receiver.max_attributes,
+        max_clock_skew=timedelta(seconds=receiver.max_clock_skew_seconds),
     )
 
 

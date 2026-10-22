@@ -265,10 +265,18 @@ class OtelReceiverSettings(BaseModel):
     idempotency_hmac_key: SecretStr | None = Field(default=None, repr=False)
     # Counted while streaming, before decompression.
     max_request_body_bytes: int = Field(default=4_194_304, gt=0)
-    # Bound on gzip output: a decompression bomb fails as 413 without being inflated.
-    max_decompressed_bytes: int = Field(default=16_777_216, gt=0)
-    # Spans per request; also bounds the mapped records (one ingestion batch holds 500 events).
+    # Bound on gzip output: a decompression bomb fails as 413 without being inflated. 8 MiB keeps
+    # the parsed message's peak memory near 100 MiB on the single VPS.
+    max_decompressed_bytes: int = Field(default=8_388_608, gt=0)
+    # Spans per request (the collector's send_batch_max_size must not exceed it).
     max_spans: int = Field(default=500, gt=0, le=500)
+    # Spans plus span events per request, span events per span and attributes per resource,
+    # scope, span or event: checked before any record is converted.
+    max_records: int = Field(default=1_000, gt=0, le=5_000)
+    max_events_per_span: int = Field(default=64, gt=0, le=1_000)
+    max_attributes: int = Field(default=128, gt=0, le=1_000)
+    # How far in the future (by Codex's clock) a record's times may be.
+    max_clock_skew_seconds: float = Field(default=300.0, ge=0, le=86_400, allow_inf_nan=False)
     # Per-producer, per-replica token bucket.
     rate_limit_per_second: float = Field(default=5.0, gt=0, allow_inf_nan=False)
     rate_limit_burst: int = Field(default=20, gt=0)
@@ -276,8 +284,12 @@ class OtelReceiverSettings(BaseModel):
     @field_validator("idempotency_hmac_key")
     @classmethod
     def require_long_hmac_key(cls, key: SecretStr | None) -> SecretStr | None:
-        if key is not None and len(key.get_secret_value().strip()) < 32:
-            raise ValueError("OTel receiver HMAC key must be at least 32 characters")
+        value = None if key is None else key.get_secret_value().strip()
+        # Length and a cheap entropy floor: a repeated or near-constant string is no key.
+        if value is not None and (len(value) < 32 or len(set(value)) < 8):
+            raise ValueError(
+                "OTel receiver HMAC key must be at least 32 characters with 8 distinct ones"
+            )
         return key
 
 
