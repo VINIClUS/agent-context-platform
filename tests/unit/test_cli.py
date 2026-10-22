@@ -484,7 +484,7 @@ def test_status_lists_each_projector_read_only(
     assert human.exit_code == 0
     assert "git 1: state active, checkpoint 4/6, lag 2, last error RuntimeError" in human.output
     assert "code 1: state none" in human.output and "last run never" in human.output
-    assert "search: 5 documents, 3 embeddings (2 without embeddings: run" in human.output
+    assert "search: 5 documents, 3 embeddings (about 2 without embeddings: run" in human.output
 
     assert "history: missing, rebuild required before temporal reads" in human.output
 
