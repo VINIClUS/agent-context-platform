@@ -801,3 +801,202 @@ async def test_events_per_span_admits_exactly_its_value(events: int, rejected: i
         await harness.post(_export(_span(events=[{"x": 1}] * events)).SerializeToString())
     )
     assert response.partial_success.rejected_spans == rejected
+
+
+# --- round 5: unknown fields, wiring from settings, producer fairness, remaining mutants ----------
+
+
+async def test_an_export_with_unknown_fields_and_entity_refs_is_accepted() -> None:
+    harness = Harness()
+    resource = Resource()
+    for key, value in _fixture()["resource"].items():
+        resource.attributes.add(key=key).value.string_value = str(value)
+    resource.entity_refs.add(type="service", id_keys=["service.name"])
+    export = _export(_span(events=[_codex_event()]))
+    export.resource_spans[0].resource.CopyFrom(resource)
+    # Unknown fields from a newer schema, at the top and inside the span.
+    unknown = b"\xf8\x06\x01" + b"\xfa\x06\x03abc"  # field 111: a varint, then bytes
+    span = export.resource_spans[0].scope_spans[0].spans[0]
+    span.MergeFromString(unknown)
+
+    response = _response(await harness.post(export.SerializeToString() + unknown))
+
+    assert not response.HasField("partial_success")
+    (draft,) = harness.service.batches[0].events
+    assert "abc" not in draft.model_dump_json()
+
+
+async def test_a_singular_field_sent_twice_is_reported_as_unsupported() -> None:
+    from unit.observability._capture import capture_telemetry
+
+    from agent_context_platform.observability import contract
+
+    resource = Resource().SerializeToString()
+    resource_spans = b"\x0a" + bytes([len(resource)]) + resource
+    data = b"\x0a" + bytes([2 * len(resource_spans)]) + resource_spans * 2
+    with capture_telemetry() as telemetry:
+        response = await Harness().post(data)
+        assert telemetry.value(contract.OTEL_REQUESTS, outcome="rejected", reason="unsupported")
+        assert not telemetry.value(contract.OTEL_REQUESTS, outcome="rejected", reason="malformed")
+    assert response.status_code == 400
+    assert "unsupported" in contract.OTEL_REASONS
+
+
+async def test_an_event_without_a_model_never_takes_the_resource_model() -> None:
+    harness = Harness()
+    resource = {**_fixture()["resource"], "model": "resource-model-canary"}
+    event = _codex_event()
+    event.pop("model", None)
+    assert "model" not in event
+
+    _response(
+        await harness.post(_export(_span(events=[event]), resource=resource).SerializeToString())
+    )
+
+    (draft,) = harness.service.batches[0].events
+    assert draft.payload["model"] is None
+    assert "resource-model-canary" not in draft.model_dump_json()
+
+
+def test_stream_ids_length_prefix_every_part() -> None:
+    assert otlp_api.stream_id("ab", "c") != otlp_api.stream_id("a", "bc")
+    assert otlp_api.stream_id("", "abc") != otlp_api.stream_id("abc", "")
+
+
+def _built_runtime(**receiver: Any) -> otlp_api.OtlpReceiverRuntime:
+    from types import SimpleNamespace
+
+    from agent_context_platform.app import _build_otlp_receiver
+    from agent_context_platform.settings import OtelReceiverSettings, Settings
+
+    settings = Settings(
+        environment="test",
+        otel_receiver=OtelReceiverSettings(
+            idempotency_hmac_key="k0123456789abcdef" * 2, **receiver
+        ),
+    )
+    ingestion = SimpleNamespace(authenticator=object(), service=object())
+    runtime = _build_otlp_receiver(settings, ingestion)  # type: ignore[arg-type]
+    assert runtime is not None
+    return runtime
+
+
+def test_every_wire_limit_is_wired_from_settings() -> None:
+    values = {
+        "max_resources": 3,
+        "max_scopes": 5,
+        "max_spans": 7,
+        "max_records": 11,
+        "max_links": 13,
+        "max_total_attributes": 17,
+        "max_attributes": 19,
+        "max_fields": 23,
+        "max_objects": 29,
+    }
+    limits = _built_runtime(**values).wire_limits()
+
+    assert limits == otlp_wire.WireLimits(
+        max_resources=3,
+        max_scopes=5,
+        max_spans=7,
+        max_records=11,
+        max_links=13,
+        max_total_attributes=17,
+        max_container_attributes=19,
+        max_fields=23,
+        max_objects=29,
+    )
+    spans = _export(*(_span({"x": 1}) for _ in range(3))).SerializeToString()
+    with pytest.raises(otlp_wire.WireLimitExceeded) as info:
+        otlp_wire.scan(spans, limits)
+    assert info.value.code == "too_many_fields"
+
+
+async def test_the_built_gate_runs_two_decodes_and_queues_four() -> None:
+    import asyncio
+    import threading
+
+    assert (otlp_api.DECODE_WORKERS, otlp_api.DECODE_QUEUE_DEPTH) == (2, 4)
+    gate = _built_runtime().decode_gate
+    running = peak = 0
+    lock = threading.Lock()
+    release = threading.Event()
+
+    def work() -> str:
+        nonlocal running, peak
+        with lock:
+            running += 1
+            peak = max(peak, running)
+        release.wait(5)
+        with lock:
+            running -= 1
+        return "done"
+
+    tasks = [
+        asyncio.create_task(gate.run(f"producer-{i}", _Connected(), work))  # type: ignore[arg-type]
+        for i in range(6)
+    ]
+    await asyncio.sleep(0.1)
+    assert gate.admitted == 6
+    with pytest.raises(otlp_api._RequestError) as info:
+        await gate.run("producer-7", _Connected(), work)  # type: ignore[arg-type]
+    assert info.value.status == 503
+    release.set()
+    assert await asyncio.gather(*tasks) == ["done"] * 6
+    assert peak == 2
+
+
+async def test_one_producer_never_holds_both_workers() -> None:
+    import asyncio
+    import threading
+
+    gate = otlp_api.DecodeGate(workers=2, queue_depth=4)
+    started: list[str] = []
+    release = {name: threading.Event() for name in ("p1", "p2", "q")}
+
+    def work(name: str) -> Any:
+        def run() -> str:
+            started.append(name)
+            release[name].wait(5)
+            return name
+
+        return run
+
+    first = asyncio.create_task(gate.run("p", _Connected(), work("p1")))  # type: ignore[arg-type]
+    await asyncio.sleep(0.05)
+    second = asyncio.create_task(gate.run("p", _Connected(), work("p2")))  # type: ignore[arg-type]
+    await asyncio.sleep(0.05)
+    assert started == ["p1"]  # p's second decode waits for p's own turn, not for a worker
+    other = asyncio.create_task(gate.run("q", _Connected(), work("q")))  # type: ignore[arg-type]
+    await asyncio.sleep(0.05)
+    assert started == ["p1", "q"]  # the free worker went to the other producer
+
+    release["p1"].set()
+    assert await first == "p1"
+    await asyncio.sleep(0.05)
+    assert started == ["p1", "q", "p2"]
+    release["p2"].set()
+    release["q"].set()
+    assert await asyncio.gather(second, other) == ["p2", "q"]
+    assert gate.admitted == 0
+
+
+async def test_a_place_cancelled_while_waiting_for_its_turn_gives_everything_back() -> None:
+    import asyncio
+    import threading
+
+    gate = otlp_api.DecodeGate(workers=2, queue_depth=4)
+    release = threading.Event()
+    first = asyncio.create_task(gate.run("p", _Connected(), lambda: release.wait(5)))  # type: ignore[arg-type]
+    await asyncio.sleep(0.05)
+    waiting = asyncio.create_task(gate.run("p", _Connected(), lambda: "never"))  # type: ignore[arg-type]
+    await asyncio.sleep(0.05)
+    waiting.cancel()
+    with pytest.raises(asyncio.CancelledError):
+        await waiting
+    assert gate.admitted == 1
+    release.set()
+    assert await first is True
+    assert gate.admitted == 0
+    # Both places and both workers are free again, for the same producer too.
+    assert await gate.run("p", _Connected(), lambda: "ok") == "ok"  # type: ignore[arg-type]

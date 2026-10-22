@@ -6,11 +6,14 @@ descriptors as its only schema, and is sound for every field the schema has:
 
 - it visits EVERY field occurrence of every message reachable from the request descriptor and
   counts it against a field budget, so its own cost is bounded by the limits, not by the bytes;
-- it counts EVERY repeated element (message or scalar, packed or not) against an object budget,
-  so the parser never allocates more than the limits allow;
-- it refuses what the receiver never needs and cannot bound otherwise: unknown fields, fields
-  listed in ``REFUSED_FIELDS``, a second occurrence of a singular message field (the parser would
-  merge it into one container), and a wire type that does not match the field's type;
+- it counts EVERY repeated element (message, string or bytes; the traces schema has no other
+  repeated field, and the descriptor tables refuse to build if it gains one) against an object
+  budget, so the parser never allocates more than the limits allow;
+- an unknown field (a newer schema) is counted and skipped by its length, never descended into:
+  the parser keeps it as raw bytes, so OTLP stays forward compatible;
+- it refuses only what it cannot bound otherwise: a second occurrence of a singular message field
+  (the parser would merge it into one container), and a wire type that does not match a known
+  field, groups and reserved wire types included;
 - on top, domain hooks bound resources, scopes, spans, records (spans plus events), links,
   attributes (every level, nested values included), attributes per resource or scope, and the
   nesting depth of attribute values.
@@ -44,8 +47,6 @@ _FIXED32: Final = 5
 
 # Nested attribute values (arrays, key-value lists) deeper than this are refused.
 MAX_VALUE_DEPTH: Final = 4
-# Fields the receiver never needs and refuses outright (Codex does not send them).
-REFUSED_FIELDS: Final = frozenset({(Resource.DESCRIPTOR.full_name, "entity_refs")})
 
 _WIRE_TYPE_BY_FIELD_TYPE: Final[Mapping[int, int]] = {
     FieldDescriptor.TYPE_DOUBLE: _FIXED64,
@@ -74,7 +75,6 @@ class _Field:
     wire_type: int
     repeated: bool
     message: Descriptor | None
-    refused: bool
 
 
 def _table(descriptor: Descriptor) -> dict[int, _Field]:
@@ -84,7 +84,6 @@ def _table(descriptor: Descriptor) -> dict[int, _Field]:
             wire_type=_WIRE_TYPE_BY_FIELD_TYPE[item.type],
             repeated=item.is_repeated,
             message=item.message_type,
-            refused=(descriptor.full_name, item.name) in REFUSED_FIELDS,
         )
         for item in descriptor.fields
     }
@@ -97,7 +96,13 @@ def _tables(root: Descriptor) -> dict[str, dict[int, _Field]]:
         descriptor = pending.pop()
         if descriptor.full_name in tables:
             continue
-        tables[descriptor.full_name] = _table(descriptor)
+        table = _table(descriptor)
+        for spec in table.values():
+            if spec.repeated and spec.wire_type != _LENGTH_DELIMITED:
+                # A packable repeated scalar (none in OTLP traces today): the walk below does not
+                # count packed elements, so a schema that adds one must extend it first.
+                raise TypeError(f"{descriptor.full_name}.{spec.number} is a repeated scalar")
+        tables[descriptor.full_name] = table
         pending.extend(item.message_type for item in descriptor.fields if item.message_type)
     return tables
 
@@ -235,8 +240,11 @@ class _Scanner:
                 tag, position = self._varint(position, end)
             number, wire_type = tag >> 3, tag & 0x7
             spec = table.get(number)
-            if spec is None or spec.refused:
-                raise WireRefused("unsupported_field")
+            if spec is None:
+                # Unknown (a newer schema): counted above, never descended into; the parser keeps
+                # it as raw bytes, bounded by the inflation cap. OTLP stays forward compatible.
+                position = self._skip_unknown(position, end, wire_type)
+                continue
             if wire_type == _LENGTH_DELIMITED:
                 if position < end and data[position] < 0x80:
                     length = data[position]
@@ -270,15 +278,10 @@ class _Scanner:
                             self._message(position, field_end, child, child_depth)
                     elif spec.repeated:
                         self._objects(1)  # a repeated string or bytes element
-                elif spec.repeated:
-                    # A packed repeated scalar: every element is an object.
-                    self._objects(self._packed_count(position, field_end, spec.wire_type))
                 else:
                     raise WireRefused("malformed_request")  # wire type mismatch
                 position = field_end
-            elif wire_type == spec.wire_type:
-                if spec.repeated:
-                    self._objects(1)
+            elif wire_type == spec.wire_type:  # a singular scalar (no repeated scalar, see _tables)
                 position = self._skip(position, end, wire_type)
             else:
                 raise WireRefused("malformed_request")  # wire type mismatch, groups, reserved
@@ -348,23 +351,15 @@ class _Scanner:
             self._field_visited()
         return True
 
-    def _packed_count(self, start: int, end: int, wire_type: int) -> int:
-        if wire_type == _FIXED64:
-            size = 8
-        elif wire_type == _FIXED32:
-            size = 4
-        else:
-            count = 0
-            position = start
-            while position < end:
-                _, position = self._varint(position, end)
-                count += 1
-                if count > self._limits.max_objects:
-                    raise WireLimitExceeded("too_many_objects")
-            return count
-        if (end - start) % size:
-            raise WireRefused("malformed_request")
-        return (end - start) // size
+    def _skip_unknown(self, position: int, end: int, wire_type: int) -> int:
+        if wire_type == _LENGTH_DELIMITED:
+            length, position = self._varint(position, end)
+            if position + length > end:
+                raise WireRefused("malformed_request")
+            return position + length
+        if wire_type in (_VARINT, _FIXED64, _FIXED32):
+            return self._skip(position, end, wire_type)
+        raise WireRefused("malformed_request")  # groups (3, 4) and reserved types (6, 7)
 
     def _skip(self, position: int, end: int, wire_type: int) -> int:
         if wire_type == _VARINT:

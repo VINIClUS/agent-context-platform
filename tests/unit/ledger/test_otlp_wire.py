@@ -1,9 +1,10 @@
 """The OTLP wire scan (PLATFORM-053): sound for every descriptor field, bounded by its limits.
 
 A generator fills EVERY field of every message reachable from the request descriptor (including
-``Resource.entity_refs``), then mutates the wire bytes (merged singular fields, overlong varints,
-unknown fields, byte flips). Whatever the input, the scan either refuses it with a fixed code or
-accepts it, and when it accepts, its counts equal what the parser actually builds.
+``Resource.entity_refs``), then mutates the wire bytes (merged singular fields, unknown fields,
+byte flips). Whatever the input, the scan either refuses it with a fixed code or accepts it, and
+when it accepts, its counts equal what the parser actually builds. Unknown fields are counted and
+skipped, never refused or descended into.
 """
 
 from __future__ import annotations
@@ -77,18 +78,68 @@ def _field(number: int, payload: bytes) -> bytes:
 # --- refusals ------------------------------------------------------------------------------------
 
 
-def test_entity_refs_are_refused_whatever_their_size() -> None:
+def _nested(span: bytes) -> bytes:
+    """A request holding ``span`` as the only span: ResourceSpans.scope_spans.spans."""
+    return _field(1, _field(2, _field(2, span)))
+
+
+def test_unknown_fields_are_counted_and_skipped_at_every_level() -> None:
+    known = _nested(Span(name="s").SerializeToString())
+    base = _scan(known)
+    # Every unknown wire type a parser keeps: varint, fixed64, length-delimited, fixed32. The
+    # length-delimited one holds bytes that would be malformed if they were descended into.
+    unknown = (
+        _varint((99 << 3) | 0)
+        + b"\x01"
+        + _varint((98 << 3) | 1)
+        + bytes(8)
+        + _field(97, b"\x0b\xff\xff")
+        + _varint((96 << 3) | 5)
+        + bytes(4)
+    )
+    for data in (
+        known + unknown,  # request level
+        _nested(Span(name="s").SerializeToString() + unknown),  # inside a span
+    ):
+        counts = _scan(data)
+        assert counts.fields == base.fields + 4
+        assert counts.objects == base.objects
+        assert counts.spans == 1
+        parsed = ExportTraceServiceRequest.FromString(data)  # the parser keeps them as bytes
+        assert parsed.resource_spans[0].scope_spans[0].spans[0].name == "s"
+
+
+def test_an_unknown_field_flood_hits_the_field_budget() -> None:
+    flood = (_varint((99 << 3) | 0) + b"\x00") * 1000
+    assert _scan(flood, max_fields=1000).fields == 1000
+    assert _code(flood, max_fields=999) == "too_many_fields"
+    nested = _nested(Span().SerializeToString() + flood)
+    assert _code(nested, max_fields=1000) == "too_many_fields"
+
+
+def test_entity_refs_are_scanned_counted_and_bounded() -> None:
     resource = Resource()
-    resource.entity_refs.add()
-    assert _code(_request(ResourceSpans(resource=resource))) == "unsupported_field"
+    for index in range(3):
+        resource.entity_refs.add(
+            schema_url="u", type="t", id_keys=[f"i{index}", "j"], description_keys=["d"]
+        )
+    data = _request(ResourceSpans(resource=resource))
+
+    counts = _scan(data)
+
+    parsed = ExportTraceServiceRequest.FromString(data)
+    # One ResourceSpans, three EntityRefs and their nine repeated strings, as the parser builds.
+    assert counts.objects == _objects(parsed) == 13
+    assert _code(data, max_objects=12) == "too_many_objects"
+    assert _code(data, max_fields=counts.fields - 1) == "too_many_fields"
+    _scan(data, max_objects=13, max_fields=counts.fields)
 
 
-def test_unknown_fields_are_refused_at_every_level() -> None:
-    unknown = _varint((99 << 3) | 0) + b"\x01"
-    assert _code(unknown) == "unsupported_field"
-    span = Span(name="s").SerializeToString() + unknown
-    scope = _field(2, span)  # ScopeSpans.spans
-    assert _code(_field(1, _field(2, scope))) == "unsupported_field"
+def test_a_known_field_with_a_mismatched_wire_type_is_refused() -> None:
+    # Span.name (field 5) is a string: as a varint it does not match.
+    assert _code(_nested(_varint((5 << 3) | 0) + b"\x01")) == "malformed_request"
+    # Span.flags (field 16) is a fixed32: length-delimited does not match.
+    assert _code(_nested(_field(16, b"\x00\x00\x00\x00"))) == "malformed_request"
 
 
 def test_a_repeated_singular_message_field_is_refused() -> None:
@@ -107,12 +158,17 @@ def test_a_repeated_singular_message_field_is_refused() -> None:
         b"\x0c",  # group end (wire type 4)
         b"\x0e\x00",  # reserved wire type 6
         b"\x08\x01",  # resource_spans with a varint wire type
+        b"\xfb\x06",  # unknown field 111 as a group start
+        b"\xff\x06",  # unknown field 111 with reserved wire type 7
+        b"\xfe\x06",  # unknown field 111 with reserved wire type 6
+        b"\xfa\x06\x05\x00",  # unknown length-delimited field beyond the input
+        b"\xf9\x06\x00\x00",  # unknown fixed64 field beyond the input
         b"\x0a\x01" + b"\x08",  # truncated varint inside
         b"\x0a" + b"\xff" * 11,  # varint longer than 64 bits
     ],
 )
 def test_malformed_wire_data_is_refused(data: bytes) -> None:
-    assert _code(data) in {"malformed_request", "unsupported_field"}
+    assert _code(data) == "malformed_request"
 
 
 # --- request-level limits at the boundary --------------------------------------------------------
@@ -306,10 +362,11 @@ def _mutate(data: bytes, generator: random.Random) -> bytes:
     return data + data  # a merge: resource_spans are repeated, so this is a valid duplicate
 
 
-@pytest.mark.parametrize("seed", range(300))
-def test_whatever_the_input_the_scan_refuses_it_or_counts_what_the_parser_builds(
-    seed: int,
-) -> None:
+SEEDS = range(300)
+
+
+def _compare(seed: int) -> bool:
+    """Scan and parse one generated input; ``True`` when both accepted it and counts agree."""
     generator = random.Random(seed)
     message = ExportTraceServiceRequest()
     _fill(message, generator)
@@ -318,13 +375,28 @@ def test_whatever_the_input_the_scan_refuses_it_or_counts_what_the_parser_builds
     try:
         counts = otlp_wire.scan(data, LIMITS)
     except (otlp_wire.WireLimitExceeded, otlp_wire.WireRefused):
-        return
+        return False
     try:
         parsed = ExportTraceServiceRequest.FromString(data)
     except DecodeError:
-        return  # e.g. invalid UTF-8 in a string: the receiver answers 400 too
+        return False  # e.g. invalid UTF-8 in a string: the receiver answers 400 too
     assert counts.objects == _objects(parsed)
-    assert not any(rs.resource.entity_refs for rs in parsed.resource_spans)
+    assert counts.spans == sum(
+        len(scope.spans) for rs in parsed.resource_spans for scope in rs.scope_spans
+    )
+    return True
+
+
+@pytest.mark.parametrize("seed", SEEDS)
+def test_whatever_the_input_the_scan_refuses_it_or_counts_what_the_parser_builds(
+    seed: int,
+) -> None:
+    _compare(seed)
+
+
+def test_most_generated_inputs_reach_the_comparison() -> None:
+    # Only the deliberately merged singular fields and a few byte flips are refused.
+    assert sum(_compare(seed) for seed in SEEDS) >= 240
 
 
 def test_overlong_varints_are_accepted_like_the_parser_does() -> None:
@@ -338,3 +410,126 @@ def test_overlong_varints_are_accepted_like_the_parser_does() -> None:
         ExportTraceServiceRequest.FromString(data).resource_spans[0].scope_spans[0].spans[0].name
         == "s"
     )
+
+
+# --- exact boundaries of the global budgets, the depth and the varint cap -------------------------
+
+
+def test_fields_objects_and_attributes_admit_exactly_their_limit() -> None:
+    attributes = [_kv(f"k{i}", AnyValue(string_value="v")) for i in range(5)]
+    span = Span(attributes=attributes)
+    data = _request(ResourceSpans(scope_spans=[ScopeSpans(spans=[span, Span()])]))
+    counts = _scan(data)
+    assert counts.attributes == 5
+
+    for limit, code, value in (
+        ("max_fields", "too_many_fields", counts.fields),
+        ("max_objects", "too_many_objects", counts.objects),
+        ("max_total_attributes", "too_many_attributes", counts.attributes),
+    ):
+        assert _scan(data, **{limit: value}) == counts
+        assert _code(data, **{limit: value - 1}) == code
+
+
+def _value_of_depth(depth: int) -> AnyValue:
+    """An attribute value nested in ``depth`` alternating key-value lists and arrays."""
+    value = AnyValue(int_value=1)
+    for level in range(depth):
+        value = (
+            AnyValue(array_value=ArrayValue(values=[value]))
+            if level % 2
+            else AnyValue(kvlist_value=KeyValueList(values=[_kv("k", value)]))
+        )
+    return value
+
+
+@pytest.mark.parametrize("depth", [otlp_wire.MAX_VALUE_DEPTH - 1, otlp_wire.MAX_VALUE_DEPTH])
+def test_values_nested_up_to_the_depth_limit_are_admitted(depth: int) -> None:
+    span = Span(attributes=[_kv("deep", _value_of_depth(depth))])
+    _scan(_request(ResourceSpans(scope_spans=[ScopeSpans(spans=[span])])))
+    assert otlp_wire.MAX_VALUE_DEPTH == 4
+
+
+def test_a_value_nested_one_level_deeper_is_refused() -> None:
+    span = Span(attributes=[_kv("deep", _value_of_depth(otlp_wire.MAX_VALUE_DEPTH + 1))])
+    data = _request(ResourceSpans(scope_spans=[ScopeSpans(spans=[span])]))
+    assert _code(data) == "too_many_attributes"
+
+
+def _overlong(value: int, size: int) -> bytes:
+    """``value`` (below 128) as a varint padded to ``size`` bytes."""
+    return bytes([value | 0x80]) + b"\x80" * (size - 2) + b"\x00"
+
+
+def test_a_ten_byte_varint_is_admitted_and_an_eleven_byte_one_refused() -> None:
+    def dropped_attributes(size: int) -> bytes:
+        # Span.dropped_attributes_count (field 10, varint) = 1, padded to `size` bytes.
+        return _nested(_varint((10 << 3) | 0) + _overlong(1, size))
+
+    admitted = dropped_attributes(10)
+    assert _scan(admitted).spans == 1
+    parsed = ExportTraceServiceRequest.FromString(admitted)  # the parser takes ten bytes too
+    assert parsed.resource_spans[0].scope_spans[0].spans[0].dropped_attributes_count == 1
+    refused = dropped_attributes(11)
+    assert _code(refused) == "malformed_request"
+    with pytest.raises(DecodeError):
+        ExportTraceServiceRequest.FromString(refused)  # and refuses eleven
+
+
+def test_the_tables_refuse_a_schema_with_a_repeated_scalar() -> None:
+    from google.protobuf.descriptor_pb2 import SourceCodeInfo
+
+    with pytest.raises(TypeError, match="repeated scalar"):
+        otlp_wire._tables(SourceCodeInfo.DESCRIPTOR)  # `Location.path` is a packed int32
+
+
+# --- the inline attribute read counts exactly like the generic walk ------------------------------
+
+
+class _GenericOnly(otlp_wire._Scanner):
+    def _plain_attribute(self, start: int, end: int, depth: int) -> bool:
+        return False
+
+
+def _random_value(generator: random.Random, depth: int) -> AnyValue:
+    choice = generator.randrange(5 if depth < 3 else 2)
+    if choice == 0:
+        length = generator.choice([0, 1, 60, 120, 125, 126, 127, 128, 300])
+        return AnyValue(string_value="v" * length)
+    if choice == 1:
+        return AnyValue(int_value=generator.randrange(-5, 5))
+    if choice == 2:
+        return AnyValue(string_value=generator.choice(["", "é", "x" * 127]))
+    if choice == 3:
+        return AnyValue(
+            array_value=ArrayValue(
+                values=[_random_value(generator, depth + 1) for _ in range(generator.randrange(3))]
+            )
+        )
+    return AnyValue(
+        kvlist_value=KeyValueList(
+            values=[_random_kv(generator, depth + 1) for _ in range(generator.randrange(3))]
+        )
+    )
+
+
+def _random_kv(generator: random.Random, depth: int) -> KeyValue:
+    key = "k" * generator.choice([0, 1, 100, 124, 125, 126, 127, 128])
+    if generator.random() < 0.1:
+        return KeyValue(key=key)  # no value at all
+    return _kv(key, _random_value(generator, depth))
+
+
+@pytest.mark.parametrize("seed", range(40))
+def test_the_inline_attribute_read_counts_like_the_generic_walk(seed: int) -> None:
+    generator = random.Random(seed)
+    resource = Resource(attributes=[_random_kv(generator, 0) for _ in range(5)])
+    span = Span(attributes=[_random_kv(generator, 0) for _ in range(20)])
+    data = _request(ResourceSpans(resource=resource, scope_spans=[ScopeSpans(spans=[span])]))
+
+    fast = otlp_wire._Scanner(data, LIMITS)
+    fast.request()
+    generic = _GenericOnly(data, LIMITS)
+    generic.request()
+
+    assert fast.counts == generic.counts

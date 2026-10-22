@@ -146,10 +146,6 @@ _MESSAGES: Final[Mapping[str, tuple[int, str]]] = {
         "too_many_drafts: more than 500 distinct events in one export.",
     ),
     "malformed_request": (Code.INVALID_ARGUMENT, "The request is not a valid OTLP export."),
-    "unsupported_field": (
-        Code.INVALID_ARGUMENT,
-        "unsupported_field: a field the receiver does not accept (unknown or refused).",
-    ),
     "repeated_singular_field": (
         Code.INVALID_ARGUMENT,
         "repeated_singular_field: a singular message field occurs more than once.",
@@ -187,8 +183,7 @@ _TELEMETRY: Final[Mapping[str, tuple[str, str]]] = {
     "rate_limited": ("rejected", "rate_limited"),
     "unsupported_media_type": ("rejected", "unsupported_media_type"),
     "malformed_request": ("rejected", "malformed"),
-    "unsupported_field": ("rejected", "malformed"),
-    "repeated_singular_field": ("rejected", "malformed"),
+    "repeated_singular_field": ("rejected", "unsupported"),
     "internal_error": ("error", "internal"),
     "decode_busy": ("error", "internal"),
     "client_disconnected": ("rejected", "abandoned"),
@@ -241,11 +236,12 @@ class DecodeGate:
     """Admission for blocking decodes: bounded concurrency, queue and per-producer share.
 
     At most ``workers`` decodes run at once and ``queue_depth`` more wait; one producer holds at
-    most ``per_producer`` of those places (one running plus one waiting by default), so a producer
-    within its own rate limit cannot starve the others. Anything beyond answers 503 at once. A
-    place is given back when the worker thread finishes, not when the request is cancelled: a
-    cancelled request's decode keeps its slot until the thread is done, so no more than
-    ``workers`` threads ever decode.
+    most ``per_producer`` of those places and runs at most ONE decode at a time (its other places
+    wait for its own turn before they compete for a worker), so a producer within its own rate
+    limit never holds more than one worker and cannot starve the others. Anything beyond answers
+    503 at once. A place is given back when the worker thread finishes, not when the request is
+    cancelled: a cancelled request's decode keeps its slot until the thread is done, so no more
+    than ``workers`` threads ever decode.
     """
 
     def __init__(self, workers: int, queue_depth: int, per_producer: int = 2) -> None:
@@ -254,6 +250,7 @@ class DecodeGate:
         self._per_producer = per_producer
         self._admitted = 0
         self._by_producer: dict[str, int] = {}
+        self._turns: dict[str, asyncio.Lock] = {}
 
     async def run(self, producer: str, request: Request, work: Callable[[], _T]) -> _T:
         """Run ``work`` on a worker thread once admitted; skip it if the client has left."""
@@ -262,11 +259,16 @@ class DecodeGate:
             or self._by_producer.get(producer, 0) >= self._per_producer
         ):
             raise _RequestError(503, "decode_busy")
-        self._admit(producer)
+        turn = self._admit(producer)
         holds_slot = False
         handed_over = False
         try:
-            await self._slots.acquire()
+            await turn.acquire()  # released with the slot by `_release`
+            try:
+                await self._slots.acquire()
+            except BaseException:
+                turn.release()
+                raise
             holds_slot = True
             if await request.is_disconnected():
                 raise _RequestError(499, "client_disconnected")
@@ -282,19 +284,22 @@ class DecodeGate:
             if not handed_over:
                 self._release(producer, holds_slot=holds_slot)
 
-    def _admit(self, producer: str) -> None:
+    def _admit(self, producer: str) -> asyncio.Lock:
         self._admitted += 1
         self._by_producer[producer] = self._by_producer.get(producer, 0) + 1
+        return self._turns.setdefault(producer, asyncio.Lock())
 
     def _release(self, producer: str, *, holds_slot: bool) -> None:
         if holds_slot:
             self._slots.release()
+            self._turns[producer].release()
         self._admitted -= 1
         remaining = self._by_producer[producer] - 1
         if remaining:
             self._by_producer[producer] = remaining
         else:
             del self._by_producer[producer]
+            del self._turns[producer]  # no other place of this producer can hold or await it
 
     @property
     def admitted(self) -> int:

@@ -114,6 +114,7 @@ OTEL_REASONS: Final = frozenset(
         "unsupported_media_type",
         "too_large",
         "malformed",
+        "unsupported",
         "abandoned",
         "internal",
     }
