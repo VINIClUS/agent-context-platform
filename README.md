@@ -497,6 +497,49 @@ lexical search needs only PostgreSQL. Rebuild and replay-check jobs need the vol
 compares the ONNX output with sentence-transformers and runs only when
 `AGENT_CONTEXT_TEST_MODEL_PARITY=1`.
 
+## Context packages
+
+`retrieval/composer.py` (`ContextComposer`) answers the five memory tools (`context_for_task`,
+`repository_overview`, `symbol_context`, `decision_history`, `failure_history`) with an SDK
+`ContextPackageV1`. It resolves the explicit scope first (unknown repository, project, revision
+or symbol: a typed error, never a wider answer), reads code as indexed at the requested commit or
+workspace snapshot, fuses graph, temporal and lexical/vector candidates deterministically, and
+enforces the item, byte and token budget (`ceil(bytes / 4)`). Every item cites at least one stored
+event; the evidence form, including the metadata-only form of events that carry no content, is
+documented in `docs/data/context-evidence.md`.
+
+Pagination cursors are opaque and HMAC-signed, so any replica can continue a page another one
+issued. Set the shared key (at least 32 characters, required in production):
+
+```bash
+export AGENT_CONTEXT_MCP__CURSOR_HMAC_KEY=...   # from the secret store, the same on every replica
+```
+
+A cursor is valid for the same tool, input, principal and projection snapshot until it expires
+(15 minutes); once the projection moves (a new event delivered to a projector the answer depends
+on) the client starts again from the first page.
+
+The composer runs as the API role (never the projector role, which can write projection state).
+`FreshnessReader` also reads projection checkpoints and dead letters (for `projection_checkpoint`,
+`staleness_ms` and the warnings) through the SELECT grants of migration `20261022_0001`
+(`API_READ_TABLES` in `operations/readiness.py`); without one of them a request fails closed with
+`ContextUnavailable`. The integration and evaluation suites run every composer read as a LOGIN
+member of `agent_context_api` with no grant of its own.
+
+`query_id`, `generated_at`, `staleness_ms` and `next_cursor` (it carries an expiry) are the only
+fields that depend on the wall clock: everything else is a function of the request and the
+projection snapshot.
+
+`tests/evaluation/` holds the context-quality evaluation: 30 golden questions (6 per tool,
+`questions.json`) over a world seeded through the real ingestion service and projection runner.
+It needs the integration services and asserts provenance, budgets, zero unsupported claims, zero
+temporal leaks, required-evidence recall (90% overall, 80% per tool) and byte-identical answers
+after an empty-graph replay:
+
+```bash
+uv run pytest -q tests/evaluation
+```
+
 ## Ingestion API contract
 
 `openapi/agent-context-v1.json` freezes the ingestion v1 HTTP surface (`/v1/ingestion/*` and the
