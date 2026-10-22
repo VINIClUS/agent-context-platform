@@ -144,6 +144,8 @@ class S3Settings(BaseModel):
     access_key_id: SecretStr | None = Field(default=None, repr=False)
     secret_access_key: SecretStr | None = Field(default=None, repr=False)
     addressing_style: Literal["path"] = "path"
+    # Deploy `content_addressed`. `if_none_match` needs a backend that refuses a conditional PUT
+    # over an existing key (412); Garage v2.3.0 ignores If-None-Match and would overwrite.
     write_mode: Literal["content_addressed", "if_none_match"] = "content_addressed"
     max_compressed_bytes: int = 67_108_864
     max_uncompressed_bytes: int = 268_435_456
