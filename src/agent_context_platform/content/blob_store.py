@@ -31,6 +31,8 @@ class StoredBlob:
     compressed_bytes: int
     uncompressed_bytes: int
     media_type: str
+    # Whether this call wrote the object (a missing one then cannot be a swept orphan).
+    created: bool = False
 
 
 class BlobStore(Protocol):
@@ -107,7 +109,7 @@ class S3BlobStore:
         if self._settings.write_mode == "content_addressed":
             existing = await self._reuse_existing(object_key, content, expected_metadata)
             if existing is not None:
-                return self._stored_blob(object_key, existing)
+                return self._stored_blob(object_key, existing, created=False)
 
         request: dict[str, Any] = {
             "Bucket": self._settings.bucket_name,
@@ -120,11 +122,7 @@ class S3BlobStore:
         created = await self._put(request)
         fault_point("content.after_s3_put")
         if created:
-            head = await self._head(object_key)
-            self._verify_expected_metadata(
-                self._validate_response(head, expected_sha256=digest), expected_metadata
-            )
-            return self._stored_blob(object_key, expected_metadata)
+            return await self._verify_created(object_key, content, expected_metadata)
         try:
             existing = await self._verify_existing(object_key, content, expected_metadata)
         except BlobNotFoundError:
@@ -133,22 +131,35 @@ class S3BlobStore:
             # it once more (a second disappearance is reported as it is).
             if not await self._put(request):
                 existing = await self._verify_existing(object_key, content, expected_metadata)
-                return self._stored_blob(object_key, existing)
-            head = await self._head(object_key)
-            self._verify_expected_metadata(
-                self._validate_response(head, expected_sha256=digest), expected_metadata
-            )
-            return self._stored_blob(object_key, expected_metadata)
-        return self._stored_blob(object_key, existing)
+                return self._stored_blob(object_key, existing, created=False)
+            return await self._verify_created(object_key, content, expected_metadata)
+        return self._stored_blob(object_key, existing, created=False)
+
+    async def _verify_created(
+        self, object_key: str, content: bytes, expected_metadata: _ObjectMetadata
+    ) -> StoredBlob:
+        """Check the object this call just wrote.
+
+        Usually the HEAD shows exactly what was sent. If it shows another (intact) object, another
+        writer (a replica of another version, compressing differently) stored the same digest
+        between our PUT and our HEAD: that object is proven the way a reused one is, never
+        reported as corrupt for its size alone.
+        """
+        head = await self._head(object_key)
+        actual = self._validate_response(head, expected_sha256=expected_metadata.sha256)
+        if actual != expected_metadata:
+            actual = await self._verify_existing(object_key, content, expected_metadata)
+        return self._stored_blob(object_key, actual, created=True)
 
     @staticmethod
-    def _stored_blob(object_key: str, metadata: _ObjectMetadata) -> StoredBlob:
+    def _stored_blob(object_key: str, metadata: _ObjectMetadata, *, created: bool) -> StoredBlob:
         return StoredBlob(
             sha256=metadata.sha256,
             object_key=object_key,
             compressed_bytes=metadata.compressed_bytes,
             uncompressed_bytes=metadata.uncompressed_bytes,
             media_type=metadata.media_type,
+            created=created,
         )
 
     async def _reuse_existing(
@@ -170,19 +181,24 @@ class S3BlobStore:
         checksum and the SHA-256 of the decompressed bytes), plus the declared uncompressed
         length and the media type this protocol fixes.
         """
-        head = await self._head(object_key)
-        actual = self._validate_response(head, expected_sha256=expected_metadata.sha256)
+        existing_content, actual = await self._read_verified(object_key, expected_metadata.sha256)
         if actual.uncompressed_bytes != expected_metadata.uncompressed_bytes:
             raise BlobIntegrityError("object uncompressed byte count does not match")
         if actual.media_type != expected_metadata.media_type:
             raise BlobIntegrityError("object media type does not match")
-        existing_content = await self.get_verified(object_key, expected_metadata.sha256)
         if existing_content != content:
             raise BlobIntegrityError("stored content does not match the requested content")
         return actual
 
     async def get_verified(self, object_key: str, expected_sha256: str) -> bytes:
         """Download only a canonical object and prove its compressed and raw identities."""
+        content, _metadata = await self._read_verified(object_key, expected_sha256)
+        return content
+
+    async def _read_verified(
+        self, object_key: str, expected_sha256: str
+    ) -> tuple[bytes, _ObjectMetadata]:
+        """`get_verified`, plus the metadata of the same HEAD and GET the bytes were proven by."""
         digest = _validate_key(object_key)
         if expected_sha256 != digest:
             raise BlobIntegrityError("object key digest does not match expected SHA-256")
@@ -232,7 +248,7 @@ class S3BlobStore:
                 raise BlobIntegrityError(
                     "uncompressed payload SHA-256 does not match expected digest"
                 )
-            return content
+            return content, get_metadata
         finally:
             await asyncio.to_thread(body.close)
 
@@ -322,15 +338,6 @@ class S3BlobStore:
             uncompressed_bytes=uncompressed_bytes,
             media_type=content_type,
         )
-
-    @staticmethod
-    def _verify_expected_metadata(actual: _ObjectMetadata, expected: _ObjectMetadata) -> None:
-        if actual.compressed_bytes != expected.compressed_bytes:
-            raise BlobIntegrityError("object compressed byte count does not match")
-        if actual.uncompressed_bytes != expected.uncompressed_bytes:
-            raise BlobIntegrityError("object uncompressed byte count does not match")
-        if actual.media_type != expected.media_type:
-            raise BlobIntegrityError("object media type does not match")
 
 
 def build_s3_client(settings: S3Settings) -> Any:

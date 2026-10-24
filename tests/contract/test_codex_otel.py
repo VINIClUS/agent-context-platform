@@ -286,6 +286,11 @@ def test_any_platform_origin_marker_is_rejected_even_from_an_allowed_service(
     assert _reason(gap_record, LOG_CONFIG) is RejectionReason.PLATFORM_ORIGIN
 
 
+def test_the_platform_marker_on_record_attributes_is_rejected_too() -> None:
+    record = _record(attributes={**_attrs(), "agent_context.origin": "platform"})
+    assert _reason(record) is RejectionReason.PLATFORM_ORIGIN
+
+
 def test_the_platform_telemetry_resource_is_rejected_as_platform_origin() -> None:
     from agent_context_platform.observability.setup import build_resource
     from agent_context_platform.settings import Settings

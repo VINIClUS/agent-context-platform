@@ -40,6 +40,8 @@ RETRIEVAL_DURATION: Final = "agent_context.retrieval.duration"
 MCP_REQUESTS: Final = "agent_context.mcp.requests"
 MCP_DURATION: Final = "agent_context.mcp.duration"
 HTTP_SERVER_DURATION: Final = "http.server.request.duration"
+OTEL_REQUESTS: Final = "agent_context.otel.requests"
+OTEL_SPANS: Final = "agent_context.otel.spans"
 
 DURATION_BUCKETS: Final = (
     0.005,
@@ -102,6 +104,22 @@ RETRIEVAL_OPERATIONS: Final = frozenset(
         "search",
     }
 )
+# Codex OTLP trace receiver (PLATFORM-053).
+OTEL_OUTCOMES: Final = frozenset({"accepted", "rejected", "error"})
+OTEL_REASONS: Final = frozenset(
+    {
+        "none",
+        "auth",
+        "rate_limited",
+        "unsupported_media_type",
+        "too_large",
+        "malformed",
+        "unsupported",
+        "abandoned",
+        "internal",
+    }
+)
+OTEL_SPAN_RESULTS: Final = frozenset({"mapped", "unmapped", "rejected"})
 RETRIEVAL_OUTCOMES: Final = frozenset({"ok", "client_error", "server_error", "deadline"})
 # The methods `mcp/server.py` serves (`_ALWAYS_SERVED | _TOOL_METHODS`); a test keeps them equal.
 MCP_METHODS: Final = frozenset({"server/discover", "tools/list", "tools/call"})

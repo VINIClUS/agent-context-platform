@@ -116,8 +116,12 @@ class EvidenceScope:
       that first observed it, so an unchanged symbol committed after being indexed in a dirty
       snapshot is a replayed claim whose only event names that snapshot. Whether a code fact
       belongs to the revision is decided by the revision's membership (`revision.py`).
-    - `excluded_runs` are the CI and test runs the answer dropped (dirty runs): a failure
-      observation (`knowledge.failure.observed`) made in one of them is not cited either.
+    - In a revision query, a failure observation (`knowledge.failure.observed`) made in a CI or
+      test run is cited only when every run it names is one the answer KEPT (`kept_runs`: visible
+      in the window and run on the revision's own state). An allow-list, not a deny-list: a dirty
+      run that completes after the window, or never reports completion, is never seen at the
+      cut, and its observations must not back the answer either. Session observations name no
+      run and are not affected.
     - `max_outbox_id` bounds its outbox position to the package's `as_of_event_id`, so an event
       delivered after the snapshot (while an earlier one was still pending) is never cited.
     """
@@ -128,7 +132,7 @@ class EvidenceScope:
     recorded_before: datetime | None = None
     revision_mode: bool = False
     snapshot_id: str | None = None
-    excluded_runs: frozenset[str] = frozenset()
+    kept_runs: frozenset[str] = frozenset()
     max_outbox_id: int | None = None
 
     def __post_init__(self) -> None:
@@ -150,9 +154,9 @@ class EvidenceScope:
             named = payload.get("snapshot_id")
             if named is not None and str(named) != self.snapshot_id:
                 return False
-        if self.excluded_runs and event.event_type == FAILURE_OBSERVED_TYPE:
+        if self.revision_mode and event.event_type == FAILURE_OBSERVED_TYPE:
             runs = {str(payload[k]) for k in ("ci_run_id", "test_run_id") if payload.get(k)}
-            if runs & self.excluded_runs:
+            if not runs <= self.kept_runs:
                 return False
         return True
 

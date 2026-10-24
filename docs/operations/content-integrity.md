@@ -17,8 +17,12 @@ it is. The alarm is raised when:
 
 * `digest_mismatch`: a stored object (at `prepare`, `attach` or `read`) or an inline row (at
   `read`) fails that verification;
-* `missing_object`: an object the catalog already references is gone at `attach` (the sweep below
-  never deletes a referenced object, so this is a real loss).
+* `missing_object`: an object is gone where nothing may have deleted it: at `attach`, when the
+  catalog already references the digest (the sweep below never deletes a referenced object) or
+  when this very request uploaded it; at `prepare`, when it vanishes again after the retried
+  conditional PUT (`if_none_match` mode); at `read`, for any object or inline row (nothing in the
+  platform deletes referenced bytes, and readers skip content the ledger records as purged before
+  reading).
 
 It consists of:
 
@@ -50,14 +54,15 @@ The platform **never repairs, overwrites or deletes** a failing object. To repai
    same key.
 
 A read-path alarm (`stage=read`) makes the search projector fail closed for that content
-(`SearchReplayIntegrityError` on a replay); repair the object the same way. Bytes removed by a
-purge are unavailable, not corrupt, and raise no alarm.
+(`SearchReplayIntegrityError` on a replay); repair the object the same way. An unreachable store
+(an outage) is not an integrity failure and raises no alarm.
 
 **Race with the orphan sweep (no alarm by design).** An old object nothing references yet can be
 reused by `prepare` without a new upload, so its age does not change, and the sweep may delete it
 before the batch attaches. Nothing referenced it, so nothing is lost: `attach` finds no catalog row
-for the digest under its lock, logs `content_object_swept_before_attach` at INFO (no metric) and
-fails the batch retryably (`Retry-After: 5`); the retry uploads it again. In `if_none_match` write
+for the digest under its lock and the request did not upload it itself, logs
+`content_object_swept_before_attach` at INFO (no metric) and fails the batch retryably
+(`Retry-After: 5`); the retry uploads it again. In `if_none_match` write
 mode the same deletion can happen between the refused conditional PUT and its verification at
 `prepare`: the PUT is retried once, so that is no alarm either. Any `missing_object` alarm is
 therefore worth a look; `increase(agent_context_ledger_integrity_failures_total[15m]) > 0` is a
@@ -65,6 +70,14 @@ suitable INFRA-051 rule for both checks.
 
 Content over the configured upload size (`AGENT_CONTEXT_S3__MAX_*_BYTES`) is an input limit, not an
 integrity failure, and raises no alarm.
+
+**Write mode.** The default and the mode to deploy is `AGENT_CONTEXT_S3__WRITE_MODE=content_addressed`:
+an existing object is verified before anything is written, and a failing one is never written over.
+`if_none_match` relies on the backend refusing `PUT` with `If-None-Match: *` over an existing key
+(`412`). **Garage v2.3.0 ignores that header** and accepts the PUT, so against Garage
+`if_none_match` would silently overwrite an existing object instead of verifying it (the repair
+this document forbids). Use `if_none_match` only with a backend that honours conditional writes
+(for example AWS S3); INFRA must keep `content_addressed` for Garage.
 
 ## Orphan sweep
 
@@ -138,8 +151,9 @@ file named after its variable, holding only the value (one trailing newline is d
 ```
 
 The secret settings are `AGENT_CONTEXT_POSTGRESQL__{DSN,API_DSN,PROJECTOR_DSN,ADMIN_DSN,MIGRATION_DSN}`,
-`AGENT_CONTEXT_NEO4J__PASSWORD`, `AGENT_CONTEXT_S3__{ACCESS_KEY_ID,SECRET_ACCESS_KEY}` and
-`AGENT_CONTEXT_MCP__TOKEN_HMAC_KEY` (`settings.SECRET_FILE_NAMES`). **A variable set both in the
+`AGENT_CONTEXT_NEO4J__PASSWORD`, `AGENT_CONTEXT_S3__{ACCESS_KEY_ID,SECRET_ACCESS_KEY}`,
+`AGENT_CONTEXT_MCP__{TOKEN_HMAC_KEY,CURSOR_HMAC_KEY}` and
+`AGENT_CONTEXT_OTEL_RECEIVER__IDEMPOTENCY_HMAC_KEY` (`settings.SECRET_FILE_NAMES`). **A variable set both in the
 environment (even to an empty value, in any letter case) and as a file refuses to start**, naming
 the variable: a stale variable left after a rotation would otherwise keep the old value in use
 and visible in `/proc/<pid>/environ`. Export a secret OR mount it, never both. Everything else
