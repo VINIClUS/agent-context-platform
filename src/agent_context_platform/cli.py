@@ -39,6 +39,7 @@ import typer
 from agent_context_sdk import RedactionPolicyV1
 from pydantic import PostgresDsn, Secret, ValidationError
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -54,6 +55,8 @@ from agent_context_platform.indexing.emitter import IndexingConfig, IndexingServ
 from agent_context_platform.indexing.identity import repository_namespace
 from agent_context_platform.indexing.pipeline import IndexReport, IndexRequest, index_checkout
 from agent_context_platform.ledger.service import IngestionService
+from agent_context_platform.ledger.verify import DEFAULT_BATCH_SIZE as LEDGER_BATCH_SIZE
+from agent_context_platform.ledger.verify import LedgerVerification, verify_ledger
 from agent_context_platform.observability import setup as telemetry_setup
 from agent_context_platform.observability.projection import ProjectionSampler
 from agent_context_platform.operations import faults, migrate, provisioning
@@ -96,6 +99,7 @@ from agent_context_platform.projection.verify import (
     RunnerActiveError,
     TargetNotEmptyError,
     VerificationReport,
+    check_grants,
     preflight,
     projection_status,
     public_error_class,
@@ -1666,6 +1670,108 @@ def sweep_orphans_command(
 
 
 # --- end of `agent-context content` -------------------------------------------------------------
+
+
+# --- `agent-context ledger verify` (PLATFORM-056): read-only ledger integrity. ------------------
+# Connects with AGENT_CONTEXT_POSTGRESQL__PROJECTOR_DSN (falling back to __DSN): the projector role
+# holds SELECT and nothing else on the three ledger tables, and the walk runs in one READ ONLY
+# transaction (`ledger/verify.py`). Exit 0: every stream verifies; 1: an integrity check failed;
+# 2: a usage, grant, connection or database error (so 1 always means the ledger itself).
+
+ledger_app = typer.Typer(
+    help="Verify the event ledger.",
+    no_args_is_help=True,
+    add_completion=False,
+    pretty_exceptions_enable=False,
+)
+app.add_typer(ledger_app, name="ledger")
+
+LEDGER_READ_GRANTS = tuple(
+    GrantRequirement("table", table, "SELECT")
+    for table in ("ledger.events", "ledger.event_streams", "ledger.event_content_refs")
+)
+_INSUFFICIENT_PRIVILEGE = "42501"  # SQLSTATE insufficient_privilege
+
+
+def _ledger_lines(report: LedgerVerification) -> list[str]:
+    totals = report.to_dict()["totals"]
+    lines = [
+        f"ledger: {totals['streams']} streams, {totals['events']} events verified, "
+        f"{totals['streams_failed']} failed"
+    ]
+    for stream in report.streams:
+        failure = stream.failure
+        if failure is None:
+            continue
+        where = "" if failure.stream_sequence is None else f" at sequence {failure.stream_sequence}"
+        lines.append(
+            f"stream {stream.stream_id}: {failure.check} failed{where} "
+            f"(expected {failure.expected or '-'}, actual {failure.actual or '-'})"
+        )
+    lines.append("ok" if report.ok else "INTEGRITY FAILURE")
+    return lines
+
+
+@ledger_app.command("verify")
+def ledger_verify_command(
+    stream: Annotated[
+        list[str] | None,
+        typer.Option("--stream", help="Verify only this stream (repeatable); default: all."),
+    ] = None,
+    since_sequence: Annotated[
+        int,
+        typer.Option(
+            "--since-sequence",
+            min=1,
+            help="Start each stream at this sequence (its link to the one before is checked).",
+        ),
+    ] = 1,
+    batch_size: Annotated[
+        int, typer.Option("--batch-size", min=1, max=10_000, help="Events read per batch.")
+    ] = LEDGER_BATCH_SIZE,
+    json_output: _JSON = False,
+) -> None:
+    """Check sequences, payload and envelope digests, the hash chain and the stream heads."""
+
+    async def main() -> int:
+        settings = _load_settings()
+        engine = _engine(settings.postgresql.effective_projector_dsn, "PROJECTOR_DSN")
+        sessions = session_factory(engine)
+        try:
+            await check_grants(sessions, LEDGER_READ_GRANTS, role="projector")
+            report = await verify_ledger(
+                sessions,
+                streams=tuple(stream or ()),
+                since_sequence=since_sequence,
+                batch_size=batch_size,
+            )
+        except MissingGrantError as error:
+            raise CliUsageError(str(error)) from None
+        except DBAPIError as error:
+            # Never the driver's message: it can carry the statement and its parameters.
+            if getattr(error.orig, "sqlstate", None) == _INSUFFICIENT_PRIVILEGE:
+                # Without USAGE on the schema, even the grant preflight is refused.
+                raise CliUsageError(
+                    "the projector role may not read the ledger (permission denied); it needs "
+                    "USAGE on schema ledger and SELECT on ledger.events, ledger.event_streams "
+                    "and ledger.event_content_refs"
+                ) from None
+            raise CliUsageError(
+                "the ledger could not be read (connection or database error)"
+            ) from None
+        except (SQLAlchemyError, OSError):
+            raise CliUsageError(
+                "the ledger could not be read (connection or database error)"
+            ) from None
+        finally:
+            await engine.dispose()
+        _emit(report.to_dict(), as_json=json_output, lines=_ledger_lines(report))
+        return EXIT_OK if report.ok else EXIT_FAILED
+
+    _run(main)
+
+
+# --- end of `agent-context ledger` --------------------------------------------------------------
 
 
 # --- `agent-context db` (PLATFORM-049): schema migrations for the platform-migrate role. ---------
