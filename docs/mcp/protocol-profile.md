@@ -164,6 +164,7 @@ Authentication failures are not JSON-RPC: `401`/`403`/`503` carry `{"error": <co
 | Requests per principal, per replica | 5 per second, burst 20 | `AGENT_CONTEXT_MCP__RATE_LIMIT_PER_SECOND`, `AGENT_CONTEXT_MCP__RATE_LIMIT_BURST` |
 | Revocation bound (principal cache) | 30 s (max 300) | `AGENT_CONTEXT_MCP__PRINCIPAL_CACHE_TTL_SECONDS` |
 | Tool request deadline | 10 s | composer default (`DEFAULT_DEADLINE_SECONDS`); a timeout is the tool error `deadline_exceeded` |
+| Tool argument length | 1000 characters of free text, 512 for other strings | checked before the composer runs ([tool contracts](tool-contracts.md#tools)) |
 
 The rate limit is per replica: with N replicas a principal's ceiling is N times the rate.
 

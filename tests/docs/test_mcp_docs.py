@@ -489,3 +489,12 @@ def test_legacy_requests_answer_as_documented(app_client: TestClient) -> None:
             assert response.headers["allow"] == "POST"
         if code == jsonrpc.UNSUPPORTED_PROTOCOL_VERSION:
             assert response.json()["error"]["data"]["supported"] == list(MODERN_PROTOCOL_VERSIONS)
+
+
+def test_documented_input_limits_are_the_enforced_ones() -> None:
+    rows = _table(MCP_DOCS / "tool-contracts.md", "input-limits")
+    free_text, other = rows
+    assert set(_code(free_text["Arguments"])) == set(tools._TEXT_FIELDS)
+    assert free_text["At most"] == f"{tools.MAX_TEXT_CHARS} characters"
+    assert other["At most"] == f"{tools.MAX_ID_CHARS} characters"
+    assert set(_code(other["Arguments"])) >= set(tools._UNBOUNDED_FIELDS) - {"kind"}

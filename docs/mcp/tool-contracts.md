@@ -17,7 +17,17 @@ Inputs and outputs are the Agent Context SDK `0.6.0` contracts; every tool retur
 | `failure_history` | Failures in one repository between `valid_from` and `valid_to`, with runs, fixes and evidence. | `repository_id`, `valid_from`, `valid_to`, exactly one of `query` or `fingerprint` | `FailureHistoryInputV1` | `FailureHistoryOutputV1` |
 
 Every input also requires `budget` and accepts an optional `cursor`. Times are UTC RFC 3339
-(`Z` or `+00:00`); commit IDs are 40 or 64 lowercase hex digits. Unknown fields are rejected. No
+(`Z` or `+00:00`); commit IDs are 40 or 64 lowercase hex digits. Unknown fields are rejected, and
+string arguments are bounded before the composer runs (an over-long value is `invalid_arguments`
+naming its field path):
+
+<!-- docs-check: input-limits -->
+| Arguments | At most |
+| --- | --- |
+| free text: `task`, `query`, `symbol_name` | 1000 characters |
+| every other string (IDs such as `repository_id`, `project_id`, `symbol_id`, `fingerprint`), except `cursor` | 512 characters |
+
+No
 input takes SQL, Cypher, a filesystem path or a URL, and no tool infers state from earlier calls:
 the scope is explicit on every call and an unknown repository, project, revision or symbol is an
 error, never a wider answer.
@@ -55,7 +65,7 @@ A successful call returns:
 Every item cites at least one `EvidenceRefV1` from a real stored event
 ([context evidence](../data/context-evidence.md)). Same input at the same ledger state gives the
 same package except `query_id`, `generated_at`, `staleness_ms` and `next_cursor`. `warnings` are
-stable strings that qualify the answer (for example `vector_search_unavailable`,
+stable strings that qualify the answer (for example `revision_index_incomplete`,
 `projection_backlog_hides_recent_facts`, `items_without_evidence`); they never replace an error.
 
 ## Budgets, truncation and cursors
@@ -95,7 +105,7 @@ name is not a tool error but the protocol error `-32602` ([protocol profile](pro
 <!-- docs-check: tool-error-codes -->
 | Code | Meaning | Retryable | Caller action |
 | --- | --- | --- | --- |
-| `invalid_arguments` | The arguments do not match the input schema. | no | Fix the named fields. |
+| `invalid_arguments` | The arguments do not match the input schema, or a value is too long (see the input limits). | no | Fix the named fields. |
 | `invalid_request` | Arguments that pass the schema but that the composer cannot answer as asked. | no | Rephrase or narrow the request. |
 | `scope_not_found` | The repository or project is unknown. | no | Check the ID; nothing is widened. |
 | `revision_not_found` | The commit or workspace snapshot was never indexed for the repository. | no | Index it, or ask about an indexed revision. |
@@ -109,7 +119,7 @@ name is not a tool error but the protocol error `-32602` ([protocol profile](pro
 | `temporal_projection_outdated` | The temporal projection needs a rebuild before history can be answered. | no | Tell the operator (`agent-context projection rebuild`). |
 | `projection_not_ready` | Nothing has been projected yet. | yes | Retry later. |
 | `deadline_exceeded` | The request exceeded its deadline. | yes | Retry, or ask a narrower question. |
-| `context_unavailable` | A backing store (PostgreSQL, Neo4j, S3) is unavailable or not configured. | yes | Retry later. |
+| `context_unavailable` | A backing store (PostgreSQL, Neo4j, S3) is unreachable, refuses the login or the database, or is not configured. | yes | Retry later. |
 | `unauthenticated` | The call reached the tool without an authenticated principal. | no | Present a valid `memory:read` token. |
 | `internal_error` | Anything unexpected (logged by class only). | no | Report it; do not retry blindly. |
 
@@ -125,8 +135,11 @@ operator, whatever it says.
   label `evidence excerpt (untrusted, quoted)`, JSON-quoted, with control and format characters
   removed. Titles are bounded and cleaned the same way.
 - The text block names items only by their JSON-quoted titles (at most 80 characters, at most 20
-  items), so control characters and quotes arrive escaped, and it ends by restating that item
-  content is untrusted evidence.
+  items). In titles, item kinds and warnings every control, format (bidi overrides included), line
+  or paragraph separator, private-use and surrogate character (Unicode categories `Cc`, `Cf`,
+  `Zl`, `Zp`, `Co`, `Cs`) is written as a `\uXXXX` escape, so untrusted text can never start a new
+  line or reorder what follows it. The block ends by restating that item content is untrusted
+  evidence. `structuredContent` keeps the exact values.
 - Evidence `resource_uri` values are stable names, not capabilities: no resource is served and none
   is linked ([context evidence](../data/context-evidence.md)).
 
@@ -135,6 +148,7 @@ operator, whatever it says.
 Authorization is one scope. A token with `memory:read` may read **every project and every
 repository in the installation**: there is no per-project or per-repository authorization in the
 MVP (design spec §14.5, single scope). The principal is taken from the verified token and only
-identifies the caller (audit, rate limit, cursor binding); it does not narrow what can be read.
+identifies the caller: it binds cursors to their caller and names the audit line and the rate-limit
+bucket, never narrows a query, and no argument can name a principal.
 Issue tokens only to clients that may see all of the installation's memory. Per-project
 authorization is future work.

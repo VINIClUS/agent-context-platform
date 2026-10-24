@@ -15,7 +15,9 @@ ansible-vault) belongs to the infrastructure repositories; see `agent-context-in
   is kept per client between requests; the server never mints a session.
 - Every replica must share `AGENT_CONTEXT_MCP__CURSOR_HMAC_KEY`: it signs and verifies pagination
   cursors, so a cursor one replica issues is valid on another only with the same key. Rotating it
-  invalidates outstanding cursors (`cursor_invalid`; clients start again from the first page).
+  invalidates outstanding cursors (`cursor_invalid`; clients start again from the first page). A
+  blank value counts as unset: production refuses to start, and elsewhere each process uses a
+  random key, so cursors neither cross replicas nor survive a restart.
 - `AGENT_CONTEXT_MCP__TOKEN_HMAC_KEY` keys each replica's in-memory principal cache. It is required
   in production; replicas need not share it for correctness (each cache is private), but keeping one
   value in the secret store with the cursor key is simplest.
@@ -41,7 +43,7 @@ ansible-vault) belongs to the infrastructure repositories; see `agent-context-in
 | `AGENT_CONTEXT_MCP__ALLOWED_ORIGINS` | no | JSON list; Codex sends no `Origin`. Only browser clients need an entry. |
 | `AGENT_CONTEXT_MCP__MAX_REQUEST_BODY_BYTES` | no | Default 1 MiB. |
 | `AGENT_CONTEXT_POSTGRESQL__DSN` | yes | The API login (below): token lookup, ingestion, readiness. |
-| `AGENT_CONTEXT_POSTGRESQL__API_DSN` | no (falls back to `AGENT_CONTEXT_POSTGRESQL__DSN`) | The composer's reads, when they use a separate login. |
+| `AGENT_CONTEXT_POSTGRESQL__API_DSN` | no (falls back to `AGENT_CONTEXT_POSTGRESQL__DSN`) | The composer's reads, on their own pool. |
 | `AGENT_CONTEXT_NEO4J__URI`, `AGENT_CONTEXT_NEO4J__USERNAME`, `AGENT_CONTEXT_NEO4J__PASSWORD` | yes | The graph the tools read. |
 | `AGENT_CONTEXT_S3__ENDPOINT_URL`, `AGENT_CONTEXT_S3__ACCESS_KEY_ID`, `AGENT_CONTEXT_S3__SECRET_ACCESS_KEY` | yes | Sanitized content for evidence excerpts. |
 | `AGENT_CONTEXT_SEARCH__MODEL_DIR` | no | Enables vector search (lexical-only mode below). |
@@ -64,6 +66,12 @@ fails closed: the request answers `context_unavailable` and readiness reports th
 `forbidden`. Token lookup reads `operations.mcp_tokens` through `AGENT_CONTEXT_POSTGRESQL__DSN`
 (`SELECT` only: the API role cannot mint, extend or un-revoke a token).
 
+The composer has its own bounded PostgreSQL pool (5 connections plus 5 overflow, 5 s to acquire
+one), on `AGENT_CONTEXT_POSTGRESQL__API_DSN` (falling back to `AGENT_CONTEXT_POSTGRESQL__DSN`) and
+apart from the pool that ingestion and token lookup use, so a burst of tool calls can never starve
+authentication, nor the reverse. Size PostgreSQL's connection limit for both pools on every
+replica.
+
 ## Composer dependencies
 
 At start-up the API builds the tools' composer when PostgreSQL, a complete Neo4j login and S3
@@ -72,17 +80,21 @@ are configured. It needs:
 | Dependency | Used for | Unavailable |
 | --- | --- | --- |
 | PostgreSQL (API role) | ledger evidence, lexical search, projection freshness | `context_unavailable` (retryable) |
-| Neo4j | code graph, revisions, decisions and failures | `context_unavailable` (retryable) |
+| Neo4j | code graph, revisions, decisions and failures | `context_unavailable` (retryable), also when it refuses the login or the database |
 | S3-compatible store | sanitized content for bounded excerpts | `context_unavailable` (retryable) |
 | Model directory (optional) | query embeddings for vector search | lexical-only mode |
 
 Until all three stores are configured every tool call answers `context_unavailable`; the MCP
-surface itself (discovery, listing, authentication) still works.
+surface itself (discovery, listing, authentication) still works. The composer's Neo4j drivers
+connect within at most 2 s, wait at most 4 s for a connection and retry a transaction for at most
+2 s (lower configured values win), so an unreachable graph answers `context_unavailable` well
+inside the tools' 10 s deadline.
 
 ## Lexical-only mode
 
 Without `AGENT_CONTEXT_SEARCH__MODEL_DIR` the API has no embedder and the tools search lexically
-only; answers then carry the warning `vector_search_unavailable`. A configured model directory is
+only: the vector leg is skipped, not attempted, so answers carry no warning and no failed search
+is recorded. A configured model directory is
 verified at start-up and a digest mismatch refuses to start (fail closed). The projection worker
 has its own lexical-only switch; see the README's "Search and embeddings" section.
 
