@@ -37,7 +37,7 @@ if [[ -z "$package" || -z "$version" || -z "$requirements" ]]; then
 fi
 
 pids=()
-# shellcheck disable=SC2317  # reached through the trap below
+# shellcheck disable=SC2317,SC2329  # reached through the trap below
 cleanup() {
   local pid
   for pid in "${pids[@]}"; do
@@ -52,9 +52,12 @@ trap cleanup EXIT INT TERM
 rm -rf "$out"
 mkdir -p "$out"
 
-# One bearer token per run, known only to the servers and the scanner (never written to disk).
-AGENT_CONTEXT_CONFORMANCE_TOKEN="mcp_conform01.$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')"
-export AGENT_CONTEXT_CONFORMANCE_TOKEN
+# One bearer token per run, given only to the loopback servers and the scanner, never exported
+# (npx and the suite run without it) and never written to disk. GitHub Actions masks it in logs.
+run_token="mcp_conform01.$(head -c 32 /dev/urandom | base64 | tr '+/' '-_' | tr -d '=\n')"
+if [[ -n "${GITHUB_ACTIONS:-}" ]]; then
+  echo "::add-mask::$run_token"
+fi
 
 wait_for_port() {
   local port_file="$1" pid="$2" attempt
@@ -76,7 +79,8 @@ wait_for_port() {
 
 for profile in shipping fixture; do
   mkdir -p "$out/$profile"
-  "${python[@]}" "$conformance_dir/loopback.py" --profile "$profile" \
+  AGENT_CONTEXT_CONFORMANCE_TOKEN="$run_token" \
+    "${python[@]}" "$conformance_dir/loopback.py" --profile "$profile" \
     --port-file "$out/$profile/port" >"$out/$profile/app.log" 2>&1 &
   server=$!
   pids+=("$server")
@@ -111,5 +115,6 @@ status=0
   --shipping "$out/shipping/results" \
   --fixture "$out/fixture/results" \
   --out "$out" || status=1
-"${python[@]}" "$conformance_dir/secret_scan.py" "$out" || status=1
+AGENT_CONTEXT_CONFORMANCE_TOKEN="$run_token" \
+  "${python[@]}" "$conformance_dir/secret_scan.py" "$out" || status=1
 exit "$status"

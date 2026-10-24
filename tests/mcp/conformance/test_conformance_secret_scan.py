@@ -51,6 +51,20 @@ def test_the_runtime_token_is_found_wherever_it_hides(
     assert "app.log:2: runtime_token" in capsys.readouterr().err
 
 
+def test_the_runtime_tokens_secret_is_found_without_its_prefix(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capsys: pytest.CaptureFixture[str]
+) -> None:
+    secret = secrets.token_urlsafe(32)
+    monkeypatch.setenv(secret_scan.TOKEN_ENV, f"mcp_conform01.{secret}")
+    (tmp_path / "suite.txt").write_text(
+        f"ok\nsecret={secret}\nmcp_conform01 is a prefix\n", "utf-8"
+    )
+
+    assert secret_scan.main([str(tmp_path)]) == 1
+    assert capsys.readouterr().err.count(": runtime_token") == 1  # the bare prefix is not secret
+    assert secret_scan.token_needles(None) == ()
+
+
 def test_clean_suite_output_passes(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:
     # What the suite and the servers really write: ids, statuses, URLs without credentials,
     # cursor-free tool listings and the platform's log lines.

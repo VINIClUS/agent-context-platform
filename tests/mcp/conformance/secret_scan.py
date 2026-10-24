@@ -1,8 +1,9 @@
 """Fail closed when a conformance artifact holds a credential (PLATFORM-047).
 
 Run over the runner's output directory before anything is archived. It looks for the exact
-bearer token the loopback profiles used (passed in the environment, never on the command line)
-and for credential shapes: bearer tokens (`<prefix>.<secret>`, `security/bearer.py`), an
+bearer token the loopback profiles used (passed in the environment, never on the command line),
+and for each of its segments on its own (the secret after the `.` most of all), and for
+credential shapes: bearer tokens (`<prefix>.<secret>`, `security/bearer.py`), an
 ``Authorization: Bearer`` value, URLs or DSNs with a password, private keys, cloud and GitHub
 tokens, and the repository's test canaries (``AGENT_CONTEXT_CANARY``). A hit prints the file,
 line and pattern name, never the match, and exits 1.
@@ -29,12 +30,23 @@ PATTERNS: Final[tuple[tuple[str, re.Pattern[str]], ...]] = (
     ("test_canary", re.compile(r"AGENT_CONTEXT_CANARY")),
 )
 MAX_FILE_BYTES: Final = 64 * 1024 * 1024
+# A token segment shorter than this (the `mcp_` lookup prefix is 13) is not secret on its own.
+MIN_SEGMENT_CHARS: Final = 16
+
+
+def token_needles(token: str | None) -> tuple[str, ...]:
+    """The whole token and every segment long enough to be secret on its own."""
+    if not token:
+        return ()
+    segments = [segment for segment in token.split(".") if len(segment) >= MIN_SEGMENT_CHARS]
+    return (token, *segments)
 
 
 def scan_text(text: str, token: str | None = None) -> Iterator[tuple[int, str]]:
     """Yield ``(line, pattern name)`` for every hit; never the matched text."""
+    needles = token_needles(token)
     for number, line in enumerate(text.splitlines(), start=1):
-        if token and token in line:
+        if any(needle in line for needle in needles):
             yield number, "runtime_token"
         for name, pattern in PATTERNS:
             if pattern.search(line):
