@@ -1,0 +1,134 @@
+name: MCP conformance
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: mcp-conformance-${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  # The conformance suite itself is pinned in tests/mcp/conformance/conformance.lock.
+  NODE_VERSION: "22.22.0"
+  NODE_SHA256: "9aa8e9d2298ab68c600bd6fb86a6c13bce11a4eca1ba9b39d79fa021755d7c37"
+  OUTPUT_DIR: build/mcp-conformance
+
+jobs:
+  conformance:
+    name: Conformance (shipping and fixture profiles)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.28"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Python
+        run: uv python install "3.12"
+
+      - name: Require private SDK token
+        env:
+          SDK_READ_TOKEN: ${{ secrets.AGENT_CONTEXT_SDK_READ_TOKEN }}
+        run: |
+          if [ -z "$SDK_READ_TOKEN" ]; then
+            echo "::error::AGENT_CONTEXT_SDK_READ_TOKEN is required to download the private SDK release"
+            exit 1
+          fi
+
+      - name: Read SDK release metadata
+        run: |
+          uv run --no-project --python "3.12" python <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          metadata = tomllib.loads(Path("pyproject.toml").read_text())["tool"]["agent-context"]["sdk"]
+          variables = {
+              "SDK_REPOSITORY": metadata["repository"],
+              "SDK_VERSION": metadata["version"],
+              "SDK_TAG": metadata["tag"],
+              "SDK_COMMIT": metadata["commit"],
+              "SDK_WHEEL_SHA256": metadata["wheel-sha256"],
+              "SDK_WHEEL": f"agent_context_sdk-{metadata['version']}-py3-none-any.whl",
+          }
+          with Path(os.environ["GITHUB_ENV"]).open("a") as github_env:
+              for name, value in variables.items():
+                  print(f"{name}={value}", file=github_env)
+          PY
+
+      - name: Download private SDK wheel
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_CONTEXT_SDK_READ_TOKEN }}
+        run: |
+          mkdir -p build/sdk
+          gh release download "$SDK_TAG" \
+            --repo "$SDK_REPOSITORY" \
+            --pattern "$SDK_WHEEL" \
+            --dir build/sdk
+
+      - name: Verify private SDK wheel
+        run: echo "$SDK_WHEEL_SHA256  build/sdk/$SDK_WHEEL" | sha256sum --check --strict -
+
+      - name: Verify lockfile
+        run: uv lock --check --python "3.12"
+
+      - name: Sync project
+        run: uv sync --frozen --python "3.12"
+
+      - name: Install Node (pinned, checksum-verified)
+        run: |
+          archive="node-v${NODE_VERSION}-linux-x64.tar.xz"
+          curl -fsSL --retry 3 -o "$RUNNER_TEMP/$archive" "https://nodejs.org/dist/v${NODE_VERSION}/$archive"
+          echo "$NODE_SHA256  $RUNNER_TEMP/$archive" | sha256sum --check --strict -
+          mkdir -p "$RUNNER_TEMP/node"
+          tar -xJf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/node" --strip-components=1
+          echo "$RUNNER_TEMP/node/bin" >> "$GITHUB_PATH"
+
+      - name: Check Node and the runner script
+        run: |
+          test "$(node --version)" = "v${NODE_VERSION}"
+          shellcheck scripts/run-mcp-conformance.sh
+
+      - name: Run the pinned conformance suite
+        id: conformance
+        continue-on-error: true
+        env:
+          PYTHON: uv run --frozen --python 3.12 python
+        run: scripts/run-mcp-conformance.sh "$OUTPUT_DIR"
+
+      - name: Scan the results for credentials
+        id: scan
+        if: always()
+        run: uv run --frozen python tests/mcp/conformance/secret_scan.py "$OUTPUT_DIR"
+
+      - name: Upload checks and application logs
+        if: always() && steps.scan.outcome == 'success'
+        uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
+        with:
+          name: mcp-conformance
+          path: |
+            ${{ env.OUTPUT_DIR }}/summary.json
+            ${{ env.OUTPUT_DIR }}/*/checks.json
+            ${{ env.OUTPUT_DIR }}/*/suite.txt
+            ${{ env.OUTPUT_DIR }}/*/app.log
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Fail on conformance failures
+        if: steps.conformance.outcome != 'success'
+        run: |
+          echo "::error::MCP conformance failed; see the job log and the mcp-conformance artifact"
+          exit 1

@@ -1,0 +1,319 @@
+# Conformance applicability manifest (PLATFORM-047). Read by `evaluate.py`; policy in
+# docs/mcp/conformance.md. Pinned suite: `conformance.lock`. Citations point into the pinned
+# package's `dist/index.js` (one bundled file); `source_literal` must occur in it verbatim and
+# `scenario` must be a scenario class of it (the runner checks both).
+#
+# `[[exclusion]]`: a scored check that exercises only a capability the platform does not
+# advertise. Each capability lists the methods that would serve it; tests assert that the shipping
+# `server/discover` does not advertise it and that every method answers -32601. A scenario whose
+# behaviour is ours (stateless/session, transport security, headers, authorization) can never be
+# excluded (`evaluate.PROTECTED`).
+#
+# `[[fixture]]`: shipping profile only. A scored check that needs one of the suite's fixture tools,
+# which the shipping server must never list. It is NOT a waiver: the evaluator requires the same
+# check to PASS on the fixture profile, which serves that tool on the shipping transport stack.
+#
+# A listed check that passes (stale), does not run (missing) or names an unknown scenario fails
+# the run, as does any unlisted scored failure. Unscored scenarios are never listed.
+
+[capability.resources]
+discover_key = "resources"
+methods = ["resources/list", "resources/read", "resources/templates/list"]
+description = "Server resources (list, read, templates). The platform serves no resources: evidence resource_uri values are names, not readable resources (mcp/tools.py)."
+
+[capability.prompts]
+discover_key = "prompts"
+methods = ["prompts/list", "prompts/get"]
+description = "Server prompts. The platform serves no prompts."
+
+[capability.completions]
+discover_key = "completions"
+methods = ["completion/complete"]
+description = "Argument completion for prompts and resource templates, which the platform does not serve."
+
+[capability.input_requests]
+methods = ["elicitation/create", "sampling/createMessage", "roots/list"]
+description = "InputRequiredResult (SEP-2322, MRTR) asking the client for elicitation, sampling or roots. No memory tool needs client input; none of these client features is ever requested."
+
+[capability.response_stream]
+methods = ["tools/call"]
+description = "SSE response streams carrying request-scoped notifications (progress). The stateless server answers every POST with a single application/json body (json_response=True), so notifications have no wire; Streamable HTTP lets a server answer application/json."
+
+[[exclusion]]
+scenario = "resources-list"
+checks = ["resources-list"]
+profiles = ["shipping", "fixture"]
+capability = "resources"
+justification = "Calls only resources/list; resources are not served (-32601)."
+source = "dist/index.js scenario `resources-list`: requests `resources/list` and checks its result only"
+source_literal = '`resources/list`'
+
+[[exclusion]]
+scenario = "resources-read-text"
+checks = ["resources-read-text"]
+profiles = ["shipping", "fixture"]
+capability = "resources"
+justification = "Calls only resources/read; resources are not served (-32601)."
+source = "dist/index.js scenario `resources-read-text`: requests `resources/read` and checks its result only"
+source_literal = '`resources/read`'
+
+[[exclusion]]
+scenario = "resources-read-binary"
+checks = ["resources-read-binary"]
+profiles = ["shipping", "fixture"]
+capability = "resources"
+justification = "Calls only resources/read; resources are not served (-32601)."
+source = "dist/index.js scenario `resources-read-binary`: requests `resources/read` and checks its result only"
+source_literal = '`resources/read`'
+
+[[exclusion]]
+scenario = "resources-templates-read"
+checks = ["resources-templates-read"]
+profiles = ["shipping", "fixture"]
+capability = "resources"
+justification = "Calls only resources/read; resources are not served (-32601)."
+source = "dist/index.js scenario `resources-templates-read`: requests `resources/read` and checks its result only"
+source_literal = '`resources/read`'
+
+[[exclusion]]
+scenario = "prompts-list"
+checks = ["prompts-list"]
+profiles = ["shipping", "fixture"]
+capability = "prompts"
+justification = "Calls only prompts/list; prompts are not served (-32601)."
+source = "dist/index.js scenario `prompts-list`: requests `prompts/list` and checks its result only"
+source_literal = '`prompts/list`'
+
+[[exclusion]]
+scenario = "prompts-get-simple"
+checks = ["prompts-get-simple"]
+profiles = ["shipping", "fixture"]
+capability = "prompts"
+justification = "Calls only prompts/get; prompts are not served (-32601)."
+source = "dist/index.js scenario `prompts-get-simple`: requests `prompts/get` and checks its result only"
+source_literal = '`prompts/get`'
+
+[[exclusion]]
+scenario = "prompts-get-with-args"
+checks = ["prompts-get-with-args"]
+profiles = ["shipping", "fixture"]
+capability = "prompts"
+justification = "Calls only prompts/get; prompts are not served (-32601)."
+source = "dist/index.js scenario `prompts-get-with-args`: requests `prompts/get` and checks its result only"
+source_literal = '`prompts/get`'
+
+[[exclusion]]
+scenario = "prompts-get-embedded-resource"
+checks = ["prompts-get-embedded-resource"]
+profiles = ["shipping", "fixture"]
+capability = "prompts"
+justification = "Calls only prompts/get; prompts are not served (-32601)."
+source = "dist/index.js scenario `prompts-get-embedded-resource`: requests `prompts/get` and checks its result only"
+source_literal = '`prompts/get`'
+
+[[exclusion]]
+scenario = "prompts-get-with-image"
+checks = ["prompts-get-with-image"]
+profiles = ["shipping", "fixture"]
+capability = "prompts"
+justification = "Calls only prompts/get; prompts are not served (-32601)."
+source = "dist/index.js scenario `prompts-get-with-image`: requests `prompts/get` and checks its result only"
+source_literal = '`prompts/get`'
+
+[[exclusion]]
+scenario = "completion-complete"
+checks = ["completion-complete"]
+profiles = ["shipping", "fixture"]
+capability = "completions"
+justification = "Calls only completion/complete for a prompt argument; completions are not served (-32601)."
+source = "dist/index.js scenario `completion-complete`: requests `completion/complete` with ref/prompt `test_prompt_with_arguments`"
+source_literal = '`completion/complete`'
+
+[[exclusion]]
+scenario = "caching"
+checks = ["sep-2549-prompts-list-caching-hints"]
+profiles = ["shipping", "fixture"]
+capability = "prompts"
+justification = "Checks cache hints on prompts/list, which is not served; the tools/list hints in the same scenario pass."
+source = "dist/index.js scenario `caching`: check `sep-2549-prompts-list-caching-hints` requests `prompts/list`"
+source_literal = '`prompts/list`'
+
+[[exclusion]]
+scenario = "caching"
+checks = ["sep-2549-resources-list-caching-hints", "sep-2549-resources-templates-list-caching-hints"]
+profiles = ["shipping", "fixture"]
+capability = "resources"
+justification = "Checks cache hints on resources/list and resources/templates/list, which are not served."
+source = "dist/index.js scenario `caching`: checks request `resources/list` and `resources/templates/list`"
+source_literal = '`resources/templates/list`'
+
+[[exclusion]]
+scenario = "input-required-result-basic-elicitation"
+checks = ["sep-2322-elicitation-incomplete"]
+profiles = ["shipping", "fixture"]
+capability = "input_requests"
+justification = "Needs a tool that returns InputRequiredResult with an elicitation/create input request; the platform never asks the client for input."
+source = "dist/index.js scenario `input-required-result-basic-elicitation`: calls `test_input_required_result_elicitation` and requires an InputRequiredResult"
+source_literal = '`test_input_required_result_elicitation`'
+
+[[exclusion]]
+scenario = "input-required-result-basic-sampling"
+checks = ["sep-2322-sampling-incomplete"]
+profiles = ["shipping", "fixture"]
+capability = "input_requests"
+justification = "Needs a tool that returns InputRequiredResult with a sampling/createMessage input request; the platform never asks the client for input."
+source = "dist/index.js scenario `input-required-result-basic-sampling`: calls `test_input_required_result_sampling` and requires an InputRequiredResult"
+source_literal = '`test_input_required_result_sampling`'
+
+[[exclusion]]
+scenario = "input-required-result-basic-list-roots"
+checks = ["sep-2322-list-roots-incomplete"]
+profiles = ["shipping", "fixture"]
+capability = "input_requests"
+justification = "Needs a tool that returns InputRequiredResult with a roots/list input request; the platform never asks the client for input."
+source = "dist/index.js scenario `input-required-result-basic-list-roots`: calls `test_input_required_result_list_roots` and requires an InputRequiredResult"
+source_literal = '`test_input_required_result_list_roots`'
+
+[[exclusion]]
+scenario = "input-required-result-request-state"
+checks = ["sep-2322-request-state-incomplete"]
+profiles = ["shipping", "fixture"]
+capability = "input_requests"
+justification = "Needs a tool that returns InputRequiredResult with an input request with requestState; the platform never asks the client for input."
+source = "dist/index.js scenario `input-required-result-request-state`: calls `test_input_required_result_request_state` and requires an InputRequiredResult"
+source_literal = '`test_input_required_result_request_state`'
+
+[[exclusion]]
+scenario = "input-required-result-multiple-input-requests"
+checks = ["sep-2322-multiple-inputs-incomplete"]
+profiles = ["shipping", "fixture"]
+capability = "input_requests"
+justification = "Needs a tool that returns InputRequiredResult with several input requests; the platform never asks the client for input."
+source = "dist/index.js scenario `input-required-result-multiple-input-requests`: calls `test_input_required_result_multiple_inputs` and requires an InputRequiredResult"
+source_literal = '`test_input_required_result_multiple_inputs`'
+
+[[exclusion]]
+scenario = "input-required-result-multi-round"
+checks = ["sep-2322-multi-round-r1"]
+profiles = ["shipping", "fixture"]
+capability = "input_requests"
+justification = "Needs a tool that returns InputRequiredResult with input requests over several rounds; the platform never asks the client for input."
+source = "dist/index.js scenario `input-required-result-multi-round`: calls `test_input_required_result_multi_round` and requires an InputRequiredResult"
+source_literal = '`test_input_required_result_multi_round`'
+
+[[exclusion]]
+scenario = "input-required-result-non-tool-request"
+checks = ["sep-2322-non-tool-incomplete"]
+profiles = ["shipping", "fixture"]
+capability = "input_requests"
+justification = "Needs a tool that returns InputRequiredResult with an input request from prompts/get; the platform never asks the client for input."
+source = "dist/index.js scenario `input-required-result-non-tool-request`: calls `test_input_required_result_prompt` and requires an InputRequiredResult"
+source_literal = '`test_input_required_result_prompt`'
+
+[[exclusion]]
+scenario = "input-required-result-result-type"
+checks = ["sep-2322-result-type-included"]
+profiles = ["shipping", "fixture"]
+capability = "input_requests"
+justification = "Needs a tool that returns InputRequiredResult with resultType input_required; the platform never asks the client for input."
+source = "dist/index.js scenario `input-required-result-result-type`: calls `test_input_required_result_elicitation` and requires an InputRequiredResult"
+source_literal = '`test_input_required_result_elicitation`'
+
+[[exclusion]]
+scenario = "input-required-result-tampered-state"
+checks = ["sep-2322-reject-tampered-state"]
+profiles = ["shipping", "fixture"]
+capability = "input_requests"
+justification = "Needs a tool that returns InputRequiredResult with a signed requestState it can verify; the platform never asks the client for input."
+source = "dist/index.js scenario `input-required-result-tampered-state`: calls `test_input_required_result_tampered_state` and requires an InputRequiredResult"
+source_literal = '`test_input_required_result_tampered_state`'
+
+[[exclusion]]
+scenario = "input-required-result-capability-check"
+checks = ["sep-2322-respect-client-capabilities"]
+profiles = ["shipping", "fixture"]
+capability = "input_requests"
+justification = "Needs a tool that returns InputRequiredResult with an input request gated on client capabilities; the platform never asks the client for input."
+source = "dist/index.js scenario `input-required-result-capability-check`: calls `test_input_required_result_capabilities` and requires an InputRequiredResult"
+source_literal = '`test_input_required_result_capabilities`'
+
+[[exclusion]]
+scenario = "tools-call-with-progress"
+checks = ["tools-call-with-progress"]
+profiles = ["shipping", "fixture"]
+capability = "response_stream"
+justification = "Requires notifications/progress on the tools/call response stream; the JSON-response transport has no request-scoped notification wire (the fixture tool reports progress and the SDK drops it)."
+source = "dist/index.js scenario `tools-call-with-progress`: requires at least three `notifications/progress` for `test_tool_with_progress`"
+source_literal = '`test_tool_with_progress`'
+
+[[fixture]]
+scenario = "tools-call-simple-text"
+checks = ["tools-call-simple-text"]
+tool = "test_simple_text"
+justification = "A fixture tool the shipping server must not list; passes on the fixture profile."
+source = "dist/index.js scenario `tools-call-simple-text`: calls the fixture tool `test_simple_text`"
+source_literal = '`test_simple_text`'
+
+[[fixture]]
+scenario = "tools-call-image"
+checks = ["tools-call-image"]
+tool = "test_image_content"
+justification = "A fixture tool the shipping server must not list; passes on the fixture profile."
+source = "dist/index.js scenario `tools-call-image`: calls the fixture tool `test_image_content`"
+source_literal = '`test_image_content`'
+
+[[fixture]]
+scenario = "tools-call-audio"
+checks = ["tools-call-audio"]
+tool = "test_audio_content"
+justification = "A fixture tool the shipping server must not list; passes on the fixture profile."
+source = "dist/index.js scenario `tools-call-audio`: calls the fixture tool `test_audio_content`"
+source_literal = '`test_audio_content`'
+
+[[fixture]]
+scenario = "tools-call-embedded-resource"
+checks = ["tools-call-embedded-resource"]
+tool = "test_embedded_resource"
+justification = "A fixture tool the shipping server must not list; passes on the fixture profile."
+source = "dist/index.js scenario `tools-call-embedded-resource`: calls the fixture tool `test_embedded_resource`"
+source_literal = '`test_embedded_resource`'
+
+[[fixture]]
+scenario = "tools-call-mixed-content"
+checks = ["tools-call-mixed-content"]
+tool = "test_multiple_content_types"
+justification = "A fixture tool the shipping server must not list; passes on the fixture profile."
+source = "dist/index.js scenario `tools-call-mixed-content`: calls the fixture tool `test_multiple_content_types`"
+source_literal = '`test_multiple_content_types`'
+
+[[fixture]]
+scenario = "tools-call-error"
+checks = ["tools-call-error"]
+tool = "test_error_handling"
+justification = "A fixture tool the shipping server must not list; passes on the fixture profile."
+source = "dist/index.js scenario `tools-call-error`: calls the fixture tool `test_error_handling`"
+source_literal = '`test_error_handling`'
+
+[[fixture]]
+scenario = "server-stateless"
+checks = ["sep-2575-server-rejects-undeclared-capability", "sep-2575-missing-capability-http-400"]
+tool = "test_missing_capability"
+justification = "Diagnostic tool needing the client's sampling capability (-32021, HTTP 400); passes on the fixture profile."
+source = "dist/index.js scenario `server-stateless`: calls the fixture tool `test_missing_capability`"
+source_literal = '`test_missing_capability`'
+
+[[fixture]]
+scenario = "server-stateless"
+checks = ["sep-2575-http-server-no-independent-requests-on-stream"]
+tool = "test_streaming_elicitation"
+justification = "Diagnostic tool for the response stream; passes on the fixture profile."
+source = "dist/index.js scenario `server-stateless`: calls the fixture tool `test_streaming_elicitation`"
+source_literal = '`test_streaming_elicitation`'
+
+[[fixture]]
+scenario = "server-stateless"
+checks = ["sep-2575-server-no-log-without-loglevel"]
+tool = "test_logging_tool"
+justification = "Diagnostic tool that logs without a requested log level; passes on the fixture profile."
+source = "dist/index.js scenario `server-stateless`: calls the fixture tool `test_logging_tool`"
+source_literal = '`test_logging_tool`'
