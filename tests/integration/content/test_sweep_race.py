@@ -1,8 +1,9 @@
 """The orphan sweep racing a batch that reuses an old object (PLATFORM-054 S4), real PG and S3.
 
-An unreferenced object the sweep deletes between `prepare` and `attach` loses nothing: the batch
-fails and is retried, and no integrity alarm is raised. A REFERENCED object that disappears is a
-real loss: `attach` raises `content_integrity_failure check=missing_object`.
+An old unreferenced object the sweep deletes between `prepare` and `attach` loses nothing: the
+batch fails and is retried, and no integrity alarm is raised. A REFERENCED object, or one the same
+request uploaded, that disappears is a real loss: `attach` raises
+`content_integrity_failure check=missing_object`.
 """
 
 from __future__ import annotations
@@ -69,8 +70,12 @@ def test_a_swept_orphan_fails_the_attach_quietly_but_a_lost_referenced_object_al
 
     async def exercise() -> None:
         orphan = _item("orphan")
+        # An earlier request uploaded it and never attached it: an old, unreferenced object.
+        await content_service.prepare([orphan])
         with capture_telemetry() as telemetry:
-            prepared = await content_service.prepare([orphan])  # uploads, references nothing
+            prepared = await content_service.prepare([orphan])  # reuses it without an upload
+            [stored] = [item.stored_blob for item in prepared._items]
+            assert stored is not None and not stored.created
             sweeper = OrphanSweeper(
                 s3_client, s3_settings.bucket_name, content_session_factory, min_age=timedelta(0)
             )
@@ -104,5 +109,18 @@ def test_a_swept_orphan_fails_the_attach_quietly_but_a_lost_referenced_object_al
             }
         [alarm] = _alarms(caplog)
         assert (alarm.check, alarm.stage) == ("missing_object", "attach")  # type: ignore[attr-defined]
+
+        # An object this very request uploaded that vanishes is no old orphan: a loss.
+        fresh = _item("fresh")
+        uploaded = await content_service.prepare([fresh])
+        [ref] = uploaded.resolve([fresh.claim])
+        s3_client.delete_object(Bucket=s3_settings.bucket_name, Key=ref.object_key)
+        with capture_telemetry() as telemetry:
+            with pytest.raises(BlobNotFoundError):
+                async with content_session_factory() as session, session.begin():
+                    await content_service.attach(session, uploaded)
+            assert telemetry.points(contract.LEDGER_INTEGRITY_FAILURES) == {
+                (("check", "missing_object"),): 1
+            }
 
     asyncio.run(exercise())
