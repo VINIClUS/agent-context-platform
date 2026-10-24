@@ -577,7 +577,14 @@ URL, and paging is the explicit, signed `cursor` (see Context packages).
   `cursor_stale` (start again from the first page), `temporal_projection_outdated`,
   `projection_not_ready`, `deadline_exceeded`, `context_unavailable`, `unauthenticated` and
   `internal_error`. `retryable` is true only for `projection_not_ready`, `deadline_exceeded` and
-  `context_unavailable`.
+  `context_unavailable`. `context_unavailable` covers every store outage: PostgreSQL (a failed
+  connection or the composer's pool exhausted after 5 s), Neo4j (unreachable, refused login,
+  unknown database) and S3 (connection refused, DNS failure, connect or read timeout, connection
+  closed). Misconfiguration (Neo4j or S3 credentials, a missing database or region) answers the
+  same and is also logged at ERROR with the exception class only. `internal_error` is left for
+  bugs (an invalid request to S3, a graph query error, a package failing its schema); inside a
+  request the composer reports every PostgreSQL driver error, a query bug included, as
+  `context_unavailable` (PLATFORM-043).
 * **No resources.** `resources/*` and prompts are not served and no resource links are emitted.
   The `resource_uri` of an evidence reference is a stable name, not a capability
   (`docs/data/context-evidence.md`): dereferencing it would need a reader that re-checks scope,

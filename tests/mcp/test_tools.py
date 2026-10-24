@@ -10,14 +10,17 @@ from __future__ import annotations
 import hashlib
 import json
 import logging
+import time
 from collections.abc import Iterator
 from datetime import UTC, datetime
 from importlib import resources
 from typing import Any
 
+import botocore.exceptions as boto_errors
 import jsonschema
 import neo4j.exceptions as neo4j_errors
 import pytest
+import sqlalchemy.exc as sa_errors
 from agent_context_sdk import (
     CommitRevisionV1,
     ContentDisposition,
@@ -486,6 +489,29 @@ def test_an_unknown_tool_is_a_protocol_error(client: TestClient) -> None:
         (_database_not_found(), "context_unavailable", True),
         (ConnectionRefusedError(SECRET_WORDS), "context_unavailable", True),
         (neo4j_errors.CypherSyntaxError(SECRET_WORDS), "internal_error", False),
+        (
+            boto_errors.EndpointConnectionError(endpoint_url=SECRET_WORDS),
+            "context_unavailable",
+            True,
+        ),
+        (boto_errors.ConnectTimeoutError(endpoint_url=SECRET_WORDS), "context_unavailable", True),
+        (boto_errors.ReadTimeoutError(endpoint_url=SECRET_WORDS), "context_unavailable", True),
+        (boto_errors.ConnectionClosedError(endpoint_url=SECRET_WORDS), "context_unavailable", True),
+        (boto_errors.ParamValidationError(report=SECRET_WORDS), "internal_error", False),
+        (sa_errors.TimeoutError(SECRET_WORDS), "context_unavailable", True),
+        (sa_errors.DisconnectionError(SECRET_WORDS), "context_unavailable", True),
+        (
+            sa_errors.OperationalError(SECRET_WORDS, {}, OSError("refused")),
+            "context_unavailable",
+            True,
+        ),
+        (
+            sa_errors.InterfaceError(SECRET_WORDS, {}, OSError("closed")),
+            "context_unavailable",
+            True,
+        ),
+        (sa_errors.ProgrammingError(SECRET_WORDS, {}, Exception("x")), "internal_error", False),
+        (sa_errors.DataError(SECRET_WORDS, {}, Exception("x")), "internal_error", False),
         (RuntimeError(SECRET_WORDS), "internal_error", False),
     ],
 )
@@ -603,3 +629,78 @@ def test_a_package_that_fails_the_output_schema_is_never_sent() -> None:
         error = tool_error(call(http, "repository_overview", VALID["repository_overview"]))
 
     assert error["code"] == "internal_error"
+
+
+@pytest.mark.parametrize(
+    "raised",
+    [
+        boto_errors.NoCredentialsError(),
+        boto_errors.PartialCredentialsError(provider="env", cred_var="secret"),
+        boto_errors.CredentialRetrievalError(provider="sts", error_msg=SECRET_WORDS),
+        boto_errors.NoRegionError(),
+        neo4j_errors.AuthError(SECRET_WORDS),
+        _database_not_found(),
+    ],
+)
+def test_misconfigured_stores_are_unavailable_and_logged_by_class_only(
+    raised: Exception, caplog: pytest.LogCaptureFixture
+) -> None:
+    with caplog.at_level(logging.ERROR), serve(FakeComposer(raised)) as http:
+        result = call(http, "repository_overview", VALID["repository_overview"])
+
+    error = tool_error(result)
+    assert (error["code"], error["retryable"]) == ("context_unavailable", True)
+    assert type(raised).__name__ in caplog.text
+    assert "hunter2" not in caplog.text and "hunter2" not in json.dumps(result)
+
+
+class ObjectReadingComposer(FakeComposer):
+    """Reads one object-stored content through the REAL content service and S3 client."""
+
+    def __init__(self, content: Any) -> None:
+        super().__init__()
+        self.content = content
+
+    async def repository_overview(self, request: Any, context: RequestContext) -> Any:
+        data = b"x" * 70_000
+        digest = hashlib.sha256(data).hexdigest()
+        ref = ContentRefV1(
+            content_id="c-object",
+            content_sha256=digest,
+            media_type="text/plain",
+            uncompressed_bytes=len(data),
+            disposition=ContentDisposition.SANITIZED,
+            storage=ContentStorage.OBJECT,
+            object_key=f"sha256/{digest[:2]}/{digest[2:4]}/{digest}.zst",
+            encoding="zstd",
+        )
+        await self.content.read(None, ref)
+        raise AssertionError("an unreachable S3 endpoint returned content")
+
+
+def test_an_unreachable_object_store_is_unavailable_within_the_deadline() -> None:
+    from agent_context_sdk import RedactionPolicyV1
+
+    from agent_context_platform.content.blob_store import S3BlobStore
+    from agent_context_platform.content.service import ContentService
+    from agent_context_platform.settings import S3Settings
+
+    store = S3BlobStore.from_settings(
+        S3Settings(
+            endpoint_url="http://127.0.0.1:1",
+            access_key_id="test-access-key",
+            secret_access_key="test-secret-key",
+            connect_timeout_seconds=1.0,
+            read_timeout_seconds=1.0,
+            max_attempts=2,
+        )
+    )
+    composer = ObjectReadingComposer(ContentService(store, RedactionPolicyV1()))
+    with serve(composer) as http:
+        started = time.monotonic()
+        result = call(http, "repository_overview", VALID["repository_overview"])
+        elapsed = time.monotonic() - started
+
+    error = tool_error(result)
+    assert (error["code"], error["retryable"]) == ("context_unavailable", True)
+    assert elapsed < 10.0  # inside the composer's default deadline
