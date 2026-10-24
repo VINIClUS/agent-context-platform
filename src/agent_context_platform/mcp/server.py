@@ -7,13 +7,15 @@ from typing import Any, Final
 from mcp.server._otel import OpenTelemetryMiddleware
 from mcp.server.caching import CacheHint
 from mcp.server.context import CallNext, HandlerResult, ServerRequestContext
-from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver import Context, MCPServer
 from mcp.server.transport_security import TransportSecuritySettings
 from mcp.shared.exceptions import MCPError
-from mcp_types import METHOD_NOT_FOUND
+from mcp_types import INVALID_PARAMS, METHOD_NOT_FOUND, CallToolResult
+from mcp_types import Tool as MCPTool
 from starlette.applications import Starlette
 from starlette.types import ASGIApp
 
+from agent_context_platform.mcp.auth import PRINCIPAL_SCOPE_KEY, McpPrincipal
 from agent_context_platform.mcp.protocol_guard import AccessGate, ProtocolGuard
 from agent_context_platform.mcp.telemetry import (
     McpSpanScope,
@@ -21,6 +23,7 @@ from agent_context_platform.mcp.telemetry import (
     MetaTraceContext,
     ObservedAccessGate,
 )
+from agent_context_platform.mcp.tools import ComposerHolder, call_memory_tool, memory_tools
 from agent_context_platform.settings import MCPSettings
 
 MCP_PATH: Final = "/mcp"
@@ -67,13 +70,59 @@ class _SortedToolsServer(MCPServer[Any]):
         return sorted(await super().list_tools(), key=lambda tool: tool.name)
 
 
-def create_mcp_server(*, advertise_tools: bool = False) -> MCPServer[Any]:
-    """Build the read-only MCP server; tools are registered by PLATFORM-046."""
-    server = _SortedToolsServer(
-        SERVER_NAME,
-        version=SERVER_VERSION,
-        cache_hints={"tools/list": LIST_CACHE_HINT},
-        middleware=[_ServedSurface(advertise_tools=advertise_tools)],
+class _MemoryToolsServer(_SortedToolsServer):
+    """Serves exactly the five memory tools (`mcp.tools`), bound to the late-bound composer.
+
+    The listing is the process-wide, name-sorted `memory_tools()` definitions: deterministic
+    across replicas. A call reads the principal the access gate stored in the ASGI scope (never
+    a client-supplied value) and answers every failure as a content-free tool error, so nothing
+    reaches the SDK's own error path, which would log the exception text.
+    """
+
+    def __init__(self, composer: ComposerHolder, **options: Any) -> None:
+        super().__init__(SERVER_NAME, **options)
+        self._composer = composer
+
+    async def list_tools(self) -> list[MCPTool]:
+        return [tool.definition for tool in memory_tools().values()]
+
+    async def call_tool(
+        self, name: str, arguments: dict[str, Any], context: Context[Any, Any] | None = None
+    ) -> CallToolResult:
+        tool = memory_tools().get(name)
+        if tool is None:
+            raise MCPError(code=INVALID_PARAMS, message="Unknown tool")
+        return await call_memory_tool(tool, arguments, _principal_id(context), self._composer)
+
+
+def _principal_id(context: Context[Any, Any] | None) -> str | None:
+    """The authenticated principal of this HTTP request, or `None` (the call then fails)."""
+    try:
+        request = None if context is None else context.request_context.request
+    except ValueError:  # no request context: not an HTTP request
+        return None
+    scope = getattr(request, "scope", None)
+    principal = scope.get(PRINCIPAL_SCOPE_KEY) if isinstance(scope, dict) else None
+    return principal.principal if isinstance(principal, McpPrincipal) else None
+
+
+def create_mcp_server(
+    *, advertise_tools: bool = False, composer: ComposerHolder | None = None
+) -> MCPServer[Any]:
+    """Build the read-only MCP server.
+
+    With ``composer`` it serves the five memory tools (PLATFORM-046) and advertises them;
+    ``advertise_tools`` alone advertises whatever tools a caller registers (tests).
+    """
+    options: dict[str, Any] = {
+        "version": SERVER_VERSION,
+        "cache_hints": {"tools/list": LIST_CACHE_HINT},
+        "middleware": [_ServedSurface(advertise_tools=advertise_tools or composer is not None)],
+    }
+    server: MCPServer[Any] = (
+        _SortedToolsServer(SERVER_NAME, **options)
+        if composer is None
+        else _MemoryToolsServer(composer, **options)
     )
     # The SDK's default OpenTelemetry middleware (its documented opt-out is removing it) imports
     # the whole `params._meta` carrier, tracestate and baggage included; the platform's own keeps

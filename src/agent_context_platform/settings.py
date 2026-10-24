@@ -186,8 +186,11 @@ class MCPSettings(BaseModel):
     @field_validator("token_hmac_key", "cursor_hmac_key")
     @classmethod
     def require_long_hmac_key(cls, key: SecretStr | None) -> SecretStr | None:
-        # Blank is reported as missing in production; a short non-blank key is never valid.
-        if key is not None and 0 < len(key.get_secret_value().strip()) < 32:
+        # Blank means unset (reported as missing in production; elsewhere a random per-process
+        # key is used); a short non-blank key is never valid.
+        if key is None or not key.get_secret_value().strip():
+            return None
+        if len(key.get_secret_value().strip()) < 32:
             raise ValueError("MCP HMAC keys must be at least 32 characters")
         return key
 
