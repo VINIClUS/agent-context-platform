@@ -2,21 +2,27 @@
 
 The pinned suite (`conformance.lock`) writes one ``<out>/server-<scenario>-<timestamp>/checks.json``
 per scenario. A profile passes only when every SCORED check that failed is accounted for by
-`applicability.toml`, and the manifest itself is current:
+`applicability.toml`, and the manifest itself is current and honest:
 
 - a failed check (``FAILURE`` or ``ERROR``) of a scored scenario must be listed for that profile,
   either as a capability exclusion (the check exercises only a capability the platform does not
   advertise) or, on the shipping profile only, as fixture coverage (the check needs one of the
   suite's fixture tools and MUST then pass on the fixture profile);
+- a listed failure counts only with the suite's own not-applicable evidence in its report
+  (`EVIDENCE`: "Method not found" for an unserved method, "Unknown tool" or "Not testable" for a
+  missing fixture tool, and so on); a listed check that failed for any other reason is an
+  unexpected failure, so an entry can never mask a regression of what it does not describe;
+- only allowlisted scenarios (and, where a scenario mixes applicable checks, allowlisted check
+  ids) may be listed at all (`EXCLUDABLE`, `FIXTURE_COVERABLE`): stateless and session behaviour,
+  transport security, headers, authorization and integrity are never excludable;
 - every listed check must have run and failed: a listed check that passes is a stale entry, one
   that did not run is a missing entry, and both fail the run;
 - a scenario the results or the manifest name that the requirement set does not know fails the
-  run; a scored scenario that did not run fails it too;
+  run; a scored scenario that did not run, or reported no check, fails it too;
 - unscored scenarios (the requirement set's ``not_scored``) are reported and never gate; listing
   them is an error;
-- a capability exclusion may not touch a protected scenario (stateless/session behaviour,
-  transport security, headers, authorization), and every citation must name a scenario and a
-  literal that exist in the pinned package's ``dist/index.js``.
+- every citation is checked inside the cited scenario's own class in the pinned package's
+  ``dist/index.js``: the cited literal and every listed check id must occur there.
 
 It writes one aggregated ``checks.json`` per profile and a ``summary.json`` of counts, and prints
 counts and the ids of offending checks, never check details. Exit status 0 when both profiles
@@ -41,9 +47,89 @@ import yaml
 PROFILES: Final = ("shipping", "fixture")
 FAILED: Final = frozenset({"FAILURE", "ERROR"})
 STATUSES: Final = frozenset({"SUCCESS", "FAILURE", "ERROR", "WARNING", "SKIPPED", "INFO"})
-# Scenarios whose checks may never be excluded for a capability: their behaviour is ours.
-PROTECTED: Final = re.compile(r"stateless|session|auth|dns-rebinding|header|security|sse")
 _RESULT_DIR: Final = re.compile(r"^server-(?P<scenario>.+)-\d{4}-\d{2}-\d{2}T[\d-]+Z$")
+_INPUT_REQUIRED_RESULT: Final = tuple(
+    f"input-required-result-{name}"
+    for name in (
+        "basic-elicitation",
+        "basic-sampling",
+        "basic-list-roots",
+        "request-state",
+        "multiple-input-requests",
+        "multi-round",
+        "non-tool-request",
+        "result-type",
+        # It tampers with the requestState of the server's own InputRequiredResult: a server that
+        # never asks the client for input issues no requestState, so nothing can be tampered with.
+        # The server's other integrity checks are in scenarios that are not excludable.
+        "tampered-state",
+        "capability-check",
+    )
+)
+# The only scenarios a capability exclusion may name, per capability; `None` admits every check of
+# the scenario, a set only those check ids (the scenario's other checks apply and must pass).
+EXCLUDABLE: Final[Mapping[str, Mapping[str, frozenset[str] | None]]] = {
+    "resources": {
+        "resources-list": None,
+        "resources-read-text": None,
+        "resources-read-binary": None,
+        "resources-templates-read": None,
+        "caching": frozenset(
+            {
+                "sep-2549-resources-list-caching-hints",
+                "sep-2549-resources-templates-list-caching-hints",
+            }
+        ),
+    },
+    "prompts": {
+        "prompts-list": None,
+        "prompts-get-simple": None,
+        "prompts-get-with-args": None,
+        "prompts-get-embedded-resource": None,
+        "prompts-get-with-image": None,
+        "caching": frozenset({"sep-2549-prompts-list-caching-hints"}),
+    },
+    "completions": {"completion-complete": None},
+    "input_requests": dict.fromkeys(_INPUT_REQUIRED_RESULT),
+    "response_stream": {"tools-call-with-progress": None},
+}
+# The only scenarios (and check ids) fixture coverage may name.
+FIXTURE_COVERABLE: Final[Mapping[str, frozenset[str] | None]] = {
+    "tools-call-simple-text": None,
+    "tools-call-image": None,
+    "tools-call-audio": None,
+    "tools-call-embedded-resource": None,
+    "tools-call-mixed-content": None,
+    "tools-call-error": None,
+    # Only the four diagnostic checks: every other server-stateless check must pass on shipping.
+    "server-stateless": frozenset(
+        {
+            "sep-2575-server-rejects-undeclared-capability",
+            "sep-2575-missing-capability-http-400",
+            "sep-2575-http-server-no-independent-requests-on-stream",
+            "sep-2575-server-no-log-without-loglevel",
+        }
+    ),
+}
+# The suite's own words for "this does not apply here", per capability and for fixture coverage.
+# A listed failure whose report carries none of them failed for another reason.
+_UNSERVED: Final = ("Method not found", "-32601")
+EVIDENCE: Final[Mapping[str, tuple[str, ...]]] = {
+    "resources": _UNSERVED,
+    "prompts": _UNSERVED,
+    "completions": _UNSERVED,
+    "input_requests": (
+        "Unknown tool",
+        "Method not found",
+        "Prerequisite failed",
+        "InputRequiredResult",
+        'resultType "input_required"',
+    ),
+    "response_stream": ("Unknown tool", "No progress notifications received"),
+    "fixture": ("Unknown tool", "Not testable"),
+}
+# A tool a report names: `Unknown tool: <name>` or a quoted `'<name>'`.
+_NAMED_TOOL: Final = re.compile(r"Unknown tool: ([A-Za-z0-9_]+)|'(test_[A-Za-z0-9_]+)'")
 
 
 class ManifestError(ValueError):
@@ -68,6 +154,18 @@ class Entry:
     justification: str
     source: str
     source_literal: str
+
+    @property
+    def evidence(self) -> tuple[str, ...]:
+        return EVIDENCE["fixture" if self.kind == "fixture" else self.reason]
+
+    @property
+    def tool(self) -> str | None:
+        """The tool a not-applicable report may name: the fixture or cited suite tool."""
+        if self.kind == "fixture":
+            return self.reason
+        literal = self.source_literal.strip("`")
+        return literal if literal.startswith("test_") else None
 
 
 @dataclass(frozen=True, slots=True)
@@ -140,6 +238,21 @@ def _text(table: Mapping[str, Any], key: str, where: str) -> str:
     return value
 
 
+def _check_allowed(entry: Entry, where: str) -> None:
+    """Only allowlisted scenarios and check ids may be listed; everything else must pass."""
+    allowlist = FIXTURE_COVERABLE if entry.kind == "fixture" else EXCLUDABLE[entry.reason]
+    if entry.scenario not in allowlist:
+        raise ManifestError(
+            f"{where}: {entry.scenario!r} may not be listed"
+            + ("" if entry.kind == "fixture" else f" for {entry.reason!r}")
+            + "; it must pass"
+        )
+    allowed_checks = allowlist[entry.scenario]
+    if allowed_checks is not None and not set(entry.checks) <= allowed_checks:
+        extra = sorted(set(entry.checks) - allowed_checks)
+        raise ManifestError(f"{where}: checks {extra} of {entry.scenario!r} must pass")
+
+
 def load_manifest(path: Path) -> Manifest:
     data = tomllib.loads(path.read_text(encoding="utf-8"))
     unknown = set(data) - {"capability", "exclusion", "fixture"}
@@ -148,6 +261,8 @@ def load_manifest(path: Path) -> Manifest:
     capabilities: dict[str, Capability] = {}
     for name, table in data.get("capability", {}).items():
         where = f"capability.{name}"
+        if name not in EXCLUDABLE:
+            raise ManifestError(f"{where}: not an excludable capability")
         key = table.get("discover_key")
         if key is not None and not isinstance(key, str):
             raise ManifestError(f"{where}: `discover_key` must be a string")
@@ -185,23 +300,20 @@ def load_manifest(path: Path) -> Manifest:
             if not set(profiles) <= set(PROFILES):
                 raise ManifestError(f"{where}: unknown profile in {profiles}")
             reason = _text(row, "capability" if kind == "capability" else "tool", where)
-            if kind == "capability":
-                if reason not in capabilities:
-                    raise ManifestError(f"{where}: unknown capability {reason!r}")
-                if PROTECTED.search(scenario):
-                    raise ManifestError(f"{where}: {scenario!r} is protected; it must pass")
-            entries.append(
-                Entry(
-                    kind=kind,
-                    scenario=scenario,
-                    checks=_strings(row.get("checks"), f"{where}.checks"),
-                    profiles=profiles,
-                    reason=reason,
-                    justification=_text(row, "justification", where),
-                    source=_text(row, "source", where),
-                    source_literal=_text(row, "source_literal", where),
-                )
+            if kind == "capability" and reason not in capabilities:
+                raise ManifestError(f"{where}: unknown capability {reason!r}")
+            entry = Entry(
+                kind=kind,
+                scenario=scenario,
+                checks=_strings(row.get("checks"), f"{where}.checks"),
+                profiles=profiles,
+                reason=reason,
+                justification=_text(row, "justification", where),
+                source=_text(row, "source", where),
+                source_literal=_text(row, "source_literal", where),
             )
+            _check_allowed(entry, where)
+            entries.append(entry)
     manifest = Manifest(capabilities=capabilities, entries=tuple(entries))
     for profile in PROFILES:
         seen: Counter[tuple[str, str]] = Counter(
@@ -248,19 +360,47 @@ def load_results(directory: Path) -> dict[str, list[dict[str, Any]]]:
 # --- evaluation ---------------------------------------------------------------------------------
 
 
+def scenario_source(package_source: str, scenario: str) -> str | None:
+    """The source of the scenario's own class in the bundle, or ``None`` when it is not there once.
+
+    The bundle declares each scenario as a class whose constructor sets ``this.name``: the span
+    runs from the class keyword before that assignment to the class keyword before the next
+    scenario's assignment.
+    """
+    markers = [f"this.name=`{scenario}`", f"this.name = `{scenario}`"]
+    positions = [index for marker in markers if (index := package_source.find(marker)) != -1]
+    if len(positions) != 1 or any(package_source.count(marker) > 1 for marker in markers):
+        return None
+    position = positions[0]
+    start = package_source.rfind("class", 0, position)
+    following = [
+        index
+        for marker in ("this.name=`", "this.name = `")
+        if (index := package_source.find(marker, position + 1)) != -1
+    ]
+    end = len(package_source)
+    if following:
+        next_name = min(following)
+        class_start = package_source.rfind("class", position, next_name)
+        end = class_start if class_start != -1 else next_name
+    return package_source[max(start, 0) : end]
+
+
 def check_sources(manifest: Manifest, package_source: str) -> list[str]:
-    """Every citation names a scenario and a literal of the pinned package."""
+    """Each citation's literal and listed check ids occur in the cited scenario's own class."""
     errors = []
     for entry in manifest.entries:
-        if f"this.name=`{entry.scenario}`" not in package_source and (
-            f"this.name = `{entry.scenario}`" not in package_source
-        ):
+        source = scenario_source(package_source, entry.scenario)
+        if source is None:
             errors.append(f"citation: scenario {entry.scenario!r} not in the pinned package")
-        if entry.source_literal not in package_source:
+            continue
+        if entry.source_literal not in source:
             errors.append(
-                f"citation: literal {entry.source_literal!r} of {entry.scenario!r} not in the "
-                "pinned package"
+                f"citation: literal {entry.source_literal!r} not in scenario {entry.scenario!r}"
             )
+        for check in entry.checks:
+            if f"`{check}`" not in source:
+                errors.append(f"citation: check {check!r} not in scenario {entry.scenario!r}")
     return errors
 
 
@@ -272,27 +412,48 @@ def _status(check: Mapping[str, Any], where: str, errors: list[str]) -> str:
     return str(status)
 
 
+@dataclass(slots=True)
+class _Group:
+    status: str
+    failures: list[Mapping[str, Any]]
+
+
 def _grouped(
     scenario: str, checks: Sequence[Mapping[str, Any]], errors: list[str]
-) -> dict[str, str]:
+) -> dict[str, _Group]:
     """One status per check id: a scenario may report an id once per variant it probes.
 
     The id failed if any of its reports failed, passed if all passed, else it is the first
-    other status (a warning, a skip or information).
+    other status (a warning, a skip or information). Failed reports are kept for their evidence.
     """
-    statuses: dict[str, list[str]] = {}
+    reports: dict[str, list[tuple[str, Mapping[str, Any]]]] = {}
     for check in checks:
         check_id = check.get("id")
         if not isinstance(check_id, str) or not check_id:
             errors.append(f"results: {scenario} has a check without an id")
             continue
-        statuses.setdefault(check_id, []).append(_status(check, f"{scenario}/{check_id}", errors))
+        status = _status(check, f"{scenario}/{check_id}", errors)
+        reports.setdefault(check_id, []).append((status, check))
     grouped = {}
-    for check_id, values in statuses.items():
-        failed = [value for value in values if value in FAILED]
-        others = [value for value in values if value != "SUCCESS"]
-        grouped[check_id] = failed[0] if failed else (others[0] if others else "SUCCESS")
+    for check_id, values in reports.items():
+        failures = [check for status, check in values if status in FAILED]
+        others = [status for status, _ in values if status != "SUCCESS"]
+        status = (
+            next(status for status, _ in values if status in FAILED)
+            if failures
+            else (others[0] if others else "SUCCESS")
+        )
+        grouped[check_id] = _Group(status, failures)
     return grouped
+
+
+def has_evidence(entry: Entry, report: Mapping[str, Any]) -> bool:
+    """The failed report says, in the suite's own words, that the entry's reason applies."""
+    text = str(report.get("errorMessage") or "") + "\n" + json.dumps(report.get("details"))
+    if not any(marker in text for marker in entry.evidence):
+        return False
+    named = {name for match in _NAMED_TOOL.finditer(text) for name in match.groups() if name}
+    return not named or (entry.tool is not None and named == {entry.tool})
 
 
 def evaluate_profile(
@@ -321,21 +482,29 @@ def evaluate_profile(
                 report.unscored_failed_scenarios += 1
             continue
         report.scenarios += 1
-        for check_id, status in _grouped(scenario, checks, report.errors).items():
+        if not checks:
+            report.errors.append(f"results: scored scenario {scenario!r} reported no check")
+        for check_id, group in _grouped(scenario, checks, report.errors).items():
             key = (scenario, check_id)
             seen.add(key)
             entry = listed.get(key)
-            if status in FAILED:
+            if group.status in FAILED:
                 if entry is None:
                     report.failed += 1
                     report.errors.append(f"unexpected failure: {scenario}/{check_id}")
+                elif not all(has_evidence(entry, failure) for failure in group.failures):
+                    report.failed += 1
+                    report.errors.append(
+                        f"unexpected failure: {scenario}/{check_id} (listed for "
+                        f"{entry.reason!r}, but the report shows no such reason)"
+                    )
                 elif entry.kind == "fixture":
                     report.covered += 1
                 else:
                     report.excluded += 1
             elif entry is not None:
-                report.errors.append(f"stale entry: {scenario}/{check_id} now {status}")
-            elif status == "SUCCESS":
+                report.errors.append(f"stale entry: {scenario}/{check_id} now {group.status}")
+            elif group.status == "SUCCESS":
                 report.passed += 1
             else:
                 report.other += 1
@@ -349,16 +518,17 @@ def check_fixture_coverage(
     manifest: Manifest, fixture: Mapping[str, Sequence[Mapping[str, Any]]]
 ) -> list[str]:
     """A check the shipping profile leaves to the fixture tools must pass on the fixture profile."""
-    errors = []
+    errors: list[str] = []
     for entry in manifest.entries:
         if entry.kind != "fixture":
             continue
-        statuses = _grouped(entry.scenario, fixture.get(entry.scenario, ()), errors)
+        groups = _grouped(entry.scenario, fixture.get(entry.scenario, ()), errors)
         for check_id in entry.checks:
-            if statuses.get(check_id) != "SUCCESS":
+            status = groups[check_id].status if check_id in groups else "missing"
+            if status != "SUCCESS":
                 errors.append(
-                    f"fixture coverage: {entry.scenario}/{check_id} is "
-                    f"{statuses.get(check_id, 'missing')} on the fixture profile"
+                    f"fixture coverage: {entry.scenario}/{check_id} is {status} on the fixture "
+                    "profile"
                 )
     return errors
 
@@ -417,9 +587,7 @@ def main(argv: Iterable[str] | None = None) -> int:
         "profiles": [report.as_dict() for report in reports],
         "errors": len(errors) + sum(len(report.errors) for report in reports),
     }
-    (arguments.out / "summary.json").write_text(
-        json.dumps(summary, indent=2) + "\n", encoding="utf-8"
-    )
+    (arguments.out / "summary.json").write_text(json.dumps(summary, indent=2) + "\n", "utf-8")
     for report in reports:
         counts = report.as_dict()
         print(
