@@ -49,6 +49,14 @@ from agent_context_sdk.contracts.mcp import (
     SymbolContextInputV1,
 )
 from agent_context_sdk.registry import TOOL_INPUT_MODELS, TOOL_OUTPUT_MODELS
+from botocore.exceptions import ConnectionError as BotoConnectionError
+from botocore.exceptions import (
+    CredentialRetrievalError,
+    NoCredentialsError,
+    NoRegionError,
+    PartialCredentialsError,
+)
+from botocore.exceptions import HTTPClientError as BotoHTTPClientError
 from mcp_types import CallToolResult, TextContent, ToolAnnotations
 from mcp_types import Tool as MCPTool
 from neo4j.exceptions import (
@@ -63,6 +71,8 @@ from neo4j.exceptions import (
     TransientError,
 )
 from pydantic import BaseModel, ValidationError
+from sqlalchemy.exc import DisconnectionError, InterfaceError, OperationalError
+from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 
 from agent_context_platform.retrieval.composer import (
     MAX_QUERY_CHARS,
@@ -180,7 +190,17 @@ class _ErrorKind:
     code: str
     message: str
     retryable: bool = False
+    # A deployment fault an operator must fix (credentials, a missing database): logged at ERROR
+    # with the exception class only, while the caller sees the same retryable unavailability.
+    misconfigured: bool = False
 
+
+_UNAVAILABLE_KIND: Final = _ErrorKind(
+    ToolErrorCode.CONTEXT_UNAVAILABLE, "memory is temporarily unavailable", True
+)
+_MISCONFIGURED_KIND: Final = _ErrorKind(
+    ToolErrorCode.CONTEXT_UNAVAILABLE, "memory is temporarily unavailable", True, True
+)
 
 # Most specific first: the first matching class decides.
 _ERRORS: Final[tuple[tuple[type[BaseException], _ErrorKind], ...]] = (
@@ -219,24 +239,38 @@ _ERRORS: Final[tuple[tuple[type[BaseException], _ErrorKind], ...]] = (
         ContextUnavailable,
         _ErrorKind(ToolErrorCode.CONTEXT_UNAVAILABLE, "memory is temporarily unavailable", True),
     ),
-    # The graph cannot be reached, or refuses the login or the database: not the caller's fault,
-    # and never the full deadline (the composer's drivers connect and retry briefly, `app.py`).
+    # A store cannot be reached, its pool is exhausted, or it refuses the login or the database:
+    # not the caller's fault, and never the full deadline (the composer's drivers connect and
+    # retry briefly and its PostgreSQL pool waits 5 s at most, `app.py`). Neo4j, S3 (botocore's
+    # connection and HTTP-client families; S3 `ClientError`s are already `BlobStoreError`s the
+    # content service handles) and PostgreSQL connection failures (the composer itself turns any
+    # driver error inside a request into `ContextUnavailable`).
     *(
-        (
-            graph_error,
-            _ErrorKind(
-                ToolErrorCode.CONTEXT_UNAVAILABLE, "memory is temporarily unavailable", True
-            ),
-        )
-        for graph_error in (
+        (outage, _UNAVAILABLE_KIND)
+        for outage in (
             ServiceUnavailable,
             SessionExpired,
             ConnectionAcquisitionTimeoutError,
             DatabaseUnavailable,
             TransientError,
+            BotoConnectionError,
+            BotoHTTPClientError,
+            PoolTimeoutError,
+            DisconnectionError,
+            OperationalError,
+            InterfaceError,
+        )
+    ),
+    *(
+        (misconfiguration, _MISCONFIGURED_KIND)
+        for misconfiguration in (
             AuthError,
             TokenExpired,
             Forbidden,
+            NoCredentialsError,
+            PartialCredentialsError,
+            CredentialRetrievalError,
+            NoRegionError,
         )
     ),
     (
@@ -379,7 +413,7 @@ async def call_memory_tool(
         structured = tool.output_model.model_validate(package.model_dump()).model_dump(mode="json")
     except Exception as error:  # every failure must become a tool error
         kind = _classify(error)
-        if kind is _INTERNAL:
+        if kind is _INTERNAL or kind.misconfigured:
             # The class only: messages and causes can carry statements or the caller's words.
             logger.error("memory tool %s failed: %s", tool.name, type(error).__name__)
         return _error(kind)
@@ -397,7 +431,7 @@ def _classify(error: BaseException) -> _ErrorKind:
         if isinstance(error, error_type):
             return kind
     if isinstance(error, ClientError) and error.code == _DATABASE_NOT_FOUND:
-        return _UNAVAILABLE
+        return _MISCONFIGURED_KIND
     if isinstance(error, OSError):  # a connection refused or reset below the driver
         return _UNAVAILABLE
     return _INTERNAL
