@@ -39,7 +39,7 @@ MEMORY_TOOLS = {
 EXCLUDED_METHODS = sorted(
     (capability.name, method)
     for capability in MANIFEST.capabilities.values()
-    if capability.name != "response_stream"
+    if capability.name != "response_stream"  # served methods; see the stream test below
     for method in capability.methods
 )
 
@@ -113,30 +113,73 @@ def test_every_method_of_an_excluded_capability_is_not_found(
     assert response.json()["error"]["code"] == -32601
 
 
-@pytest.mark.parametrize("profile", ["shipping", "fixture"])
-def test_a_tool_call_is_answered_with_one_json_body_even_when_a_stream_is_accepted(
-    request: pytest.FixtureRequest, profile: str
+STREAMED_METHODS = MANIFEST.capabilities["response_stream"].methods
+
+
+def _with_progress_token(method: str, params: dict[str, Any] | None) -> dict[str, Any]:
+    body = rpc_body(method, params)
+    body["params"]["_meta"] = {**body["params"]["_meta"], "progressToken": "progress-1"}
+    return body
+
+
+def _assert_one_json_body(response: Any) -> dict[str, Any]:
+    assert response.headers["content-type"].split(";")[0] == "application/json"
+    assert "text/event-stream" not in response.headers["content-type"]
+    assert "notifications/progress" not in response.text
+    payload: dict[str, Any] = response.json()
+    assert isinstance(payload, dict) and ("result" in payload or "error" in payload)
+    return payload
+
+
+@pytest.mark.parametrize("method", [*STREAMED_METHODS, *(m for _, m in EXCLUDED_METHODS)])
+def test_every_shipping_method_answers_one_json_body_never_a_stream(
+    shipping: TestClient, method: str
 ) -> None:
-    """`response_stream`: no SSE response, so request-scoped notifications have no wire."""
-    client: TestClient = request.getfixturevalue(profile)
-    name = "repository_overview" if profile == "shipping" else "test_tool_with_progress"
-    arguments: dict[str, Any] = (
-        {"repository_id": "repo-1", "commit_id": "a" * 40, "budget": _BUDGET}
-        if profile == "shipping"
-        else {}
+    """`response_stream`: request-scoped notifications are unsupported by design.
+
+    The client accepts `text/event-stream` (`mcp_headers`) and asks for progress; the server
+    still answers one `application/json` object and no notification. The memory tools emit no
+    notification, so this alone would pass with streaming turned on; the decisive check is the
+    fixture progress tool below, on the same transport settings.
+    """
+    params: dict[str, Any] | None = None
+    headers: dict[str, str] = {}
+    if method == "tools/call":
+        params = {"name": "repository_overview", "arguments": _arguments("repository_overview")}
+        headers["mcp-name"] = "repository_overview"
+    elif method in {"prompts/get", "resources/read"}:
+        params = {"name": "x", "uri": "test://x"}
+        headers["mcp-name"] = "x" if method == "prompts/get" else "test://x"
+    response = shipping.post(
+        "/mcp",
+        headers=mcp_headers(method, **headers),
+        json=_with_progress_token(method, params),
     )
-    params = {"name": name, "arguments": arguments, "_meta": {"progressToken": "p-1"}}
-    body = rpc_body("tools/call", params)
-    body["params"]["_meta"] = {**body["params"]["_meta"], "progressToken": "p-1"}
-    response = client.post(
-        "/mcp", headers=mcp_headers("tools/call", **{"mcp-name": name}), json=body
+
+    payload = _assert_one_json_body(response)
+    if method in STREAMED_METHODS:
+        assert response.status_code == 200, response.text
+        assert "result" in payload
+        assert payload["result"].get("isError") is not True
+        assert payload["result"].get("resultType", "complete") == "complete"
+
+
+def test_the_fixture_progress_tool_answers_one_json_body_too(fixture: TestClient) -> None:
+    """The fixture profile keeps the shipping transport settings: its progress is dropped.
+
+    With streaming turned on (`json_response=False`) this answer becomes an SSE stream carrying
+    the progress notifications: this test fails, and on the suite the `tools-call-with-progress`
+    exclusion goes stale, so that scenario becomes required.
+    """
+    params = {"name": "test_tool_with_progress", "arguments": {}}
+    response = fixture.post(
+        "/mcp",
+        headers=mcp_headers("tools/call", **{"mcp-name": "test_tool_with_progress"}),
+        json=_with_progress_token("tools/call", params),
     )
 
     assert response.status_code == 200, response.text
-    assert response.headers["content-type"].startswith("application/json")
-    payload = response.json()
-    assert isinstance(payload, dict) and "result" in payload  # one response, no notification
-    assert payload["result"].get("resultType", "complete") == "complete"
+    assert _assert_one_json_body(response)["result"]["content"][0]["text"] == "Progress reported."
 
 
 _BUDGET = {"max_items": 5, "max_bytes": 20_000, "max_tokens": 5_000}

@@ -36,8 +36,10 @@ methods = ["elicitation/create", "sampling/createMessage", "roots/list"]
 description = "InputRequiredResult (SEP-2322, MRTR) asking the client for elicitation, sampling or roots. No memory tool needs client input; none of these client features is ever requested."
 
 [capability.response_stream]
-methods = ["tools/call"]
-description = "SSE response streams carrying request-scoped notifications (progress). The stateless server answers every POST with a single application/json body (json_response=True), so notifications have no wire; Streamable HTTP lets a server answer application/json."
+# The methods the shipping server serves: each must answer one application/json body, never an
+# SSE stream, even to a client that accepts text/event-stream and sends a progress token.
+methods = ["server/discover", "tools/list", "tools/call"]
+description = "SSE response streams carrying request-scoped notifications (progress). Unsupported by design: the stateless server answers every request with a single application/json body (json_response=True). The 2026-07-28 Streamable HTTP transport lets a server answer a request with application/json instead of an SSE stream, and a server receiving a progress token MAY choose not to send any progress notifications."
 
 [[exclusion]]
 scenario = "resources-list"
@@ -242,8 +244,8 @@ scenario = "tools-call-with-progress"
 checks = ["tools-call-with-progress"]
 profiles = ["shipping", "fixture"]
 capability = "response_stream"
-justification = "Requires notifications/progress on the tools/call response stream; the JSON-response transport has no request-scoped notification wire (the fixture tool reports progress and the SDK drops it)."
-source = "dist/index.js scenario `tools-call-with-progress`: requires at least three `notifications/progress` for `test_tool_with_progress`"
+justification = "Requires notifications/progress on the tools/call response stream. The stateless JSON-response transport has no request-scoped notification wire by design (the fixture tool reports progress and the SDK drops it); the specification allows both the JSON answer and sending no progress."
+source = "dist/index.js scenario `tools-call-with-progress`: requires at least three `notifications/progress` for `test_tool_with_progress`; spec 2026-07-28 (modelcontextprotocol/modelcontextprotocol docs/specification/2026-07-28/basic/transports/streamable-http.mdx): the server MUST return either `Content-Type: application/json` (a single JSON object) or `Content-Type: text/event-stream`; docs/specification/2026-07-28/basic/patterns/progress.mdx: servers receiving a progress token MAY choose not to send any progress notifications"
 source_literal = '`test_tool_with_progress`'
 
 [[fixture]]

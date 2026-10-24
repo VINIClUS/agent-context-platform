@@ -80,8 +80,9 @@ lists only scored checks, and `evaluate.py` enforces:
    - the shipping `server/discover` advertises only `tools`;
    - every listed method answers `-32601` with HTTP 404;
    - for `input_requests`, no memory tool returns `InputRequiredResult`;
-   - for `response_stream`, a tool call is answered with one `application/json` body even when the
-     client accepts `text/event-stream`.
+   - for `response_stream`, every shipping method and the fixture progress tool answer one
+     `application/json` body with no notification, even when the client accepts
+     `text/event-stream` and sends a progress token (see below).
 
    A protected scenario (stateless/session behaviour, transport security, headers, authorization;
    `evaluate.PROTECTED`) can never be excluded.
@@ -105,12 +106,42 @@ one gated behind a server capability the server did not advertise (e.g., calling
 when the `prompts` capability was not advertised)" (`dist/index.js`, the `MethodNotFoundError`
 description).
 
-`response_stream` covers one required scenario, `tools-call-with-progress`. Its fixture tool
-reports progress, but the platform's stateless transport answers every POST with a single
-`application/json` body (`json_response=True`). The SDK documents that this mode removes the
-request-scoped back-channel and drops its notifications (`mcp/server/streamable_http.py`).
-Streamable HTTP lets a server answer `application/json`. This classification is a coordinator
-decision recorded for PLATFORM-047.
+### Request-scoped notifications are unsupported by design
+
+The platform's stateless transport answers every request with a single `application/json` body
+(`json_response=True` in `mcp/server.py`). It never opens an SSE response stream, so
+request-scoped notifications, progress among them, have no wire. The SDK documents that this mode
+removes the request-scoped back-channel and drops its notifications
+(`mcp/server/streamable_http.py`). The specification allows both halves
+(`modelcontextprotocol/modelcontextprotocol`, `docs/specification/2026-07-28/`):
+
+- `basic/transports/streamable-http.mdx`: "If the body is a JSON-RPC _request_, the server
+  **MUST** return either `Content-Type: application/json` (a single JSON object) or
+  `Content-Type: text/event-stream` (an SSE response stream). The client **MUST** support both."
+- `basic/patterns/progress.mdx`: "Servers receiving a request with a progress token **MAY**:
+  Choose not to send any progress notifications".
+
+This is the `response_stream` capability. It excludes one required scenario,
+`tools-call-with-progress`. The scenario's check (`dist/index.js`) requires at least three
+`notifications/progress` for `test_tool_with_progress`. The fixture tool reports progress on the
+shipping transport settings, and the SDK drops it. The fixture profile is never given a streaming
+transport.
+
+Mechanically:
+
+- every shipping method, served or not, answers one `application/json` object with no
+  notification, even when the client accepts `text/event-stream` and sends `_meta.progressToken`;
+- served calls still succeed;
+- the fixture progress tool answers the same way.
+
+If streaming is turned on (`json_response=False`), the fixture test fails, and on the suite the
+exclusion goes stale (the scenario then passes on the fixture profile), so the run fails until the
+entry is removed and the scenario is required. Both effects were checked by making that change.
+
+**Operational consequence:** a client gets no progress for a long call. It waits for one final
+answer, bounded by the tool's deadline (the composer's default retrieval deadline, 10 s in
+`retrieval/composer.py`; an overrun answers the retryable `deadline_exceeded` tool error). There is no partial result and no keep-alive stream to hold
+open.
 
 ## Manifest
 
@@ -140,7 +171,7 @@ Capability exclusions (both profiles unless stated):
 | `input-required-result-result-type` | `sep-2322-result-type-included` | shipping, fixture | `input_requests` | Needs a tool that returns InputRequiredResult with resultType input_required; the platform never asks the client for input. | dist/index.js scenario `input-required-result-result-type`: calls `test_input_required_result_elicitation` and requires an InputRequiredResult |
 | `input-required-result-tampered-state` | `sep-2322-reject-tampered-state` | shipping, fixture | `input_requests` | Needs a tool that returns InputRequiredResult with a signed requestState it can verify; the platform never asks the client for input. | dist/index.js scenario `input-required-result-tampered-state`: calls `test_input_required_result_tampered_state` and requires an InputRequiredResult |
 | `input-required-result-capability-check` | `sep-2322-respect-client-capabilities` | shipping, fixture | `input_requests` | Needs a tool that returns InputRequiredResult with an input request gated on client capabilities; the platform never asks the client for input. | dist/index.js scenario `input-required-result-capability-check`: calls `test_input_required_result_capabilities` and requires an InputRequiredResult |
-| `tools-call-with-progress` | `tools-call-with-progress` | shipping, fixture | `response_stream` | Requires notifications/progress on the tools/call response stream; the JSON-response transport has no request-scoped notification wire (the fixture tool reports progress and the SDK drops it). | dist/index.js scenario `tools-call-with-progress`: requires at least three `notifications/progress` for `test_tool_with_progress` |
+| `tools-call-with-progress` | `tools-call-with-progress` | shipping, fixture | `response_stream` | Requires notifications/progress on the tools/call response stream. The stateless JSON-response transport has no request-scoped notification wire by design (the fixture tool reports progress and the SDK drops it); the specification allows both the JSON answer and sending no progress. | dist/index.js scenario `tools-call-with-progress`: requires at least three `notifications/progress` for `test_tool_with_progress`; spec 2026-07-28 (modelcontextprotocol/modelcontextprotocol docs/specification/2026-07-28/basic/transports/streamable-http.mdx): the server MUST return either `Content-Type: application/json` (a single JSON object) or `Content-Type: text/event-stream`; docs/specification/2026-07-28/basic/patterns/progress.mdx: servers receiving a progress token MAY choose not to send any progress notifications |
 
 Fixture coverage (shipping profile; each check passes on the fixture profile):
 
