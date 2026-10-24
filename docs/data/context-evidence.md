@@ -25,8 +25,11 @@ A reference is built only from a stored event that:
   `failure_history`, occurred before `valid_to`;
 - for revision-scoped tools, if it is an execution event (`quality.*`: CI and test runs,
   findings), names no workspace snapshot in its payload other than the requested one (for a
-  commit: none), and if it is a failure observation, was not made in such a dirty run. CI or test
-  output of a dirty workspace never backs a commit answer. Code events are exempt: a code claim
+  commit: none), and if it is a failure observation made in a CI or test run, names only runs the
+  answer KEPT: runs visible in the revision's window that ran on the requested state (an
+  allow-list: a dirty run that completes after the window, or never reports completion, is not
+  seen at the cut, and its observations are not cited either). CI or test output of a dirty
+  workspace never backs a commit answer. Code events are exempt: a code claim
   names the run that first observed it, so a commit that adopts code first indexed in a dirty
   snapshot cites that replayed claim; whether a code fact belongs to the revision is decided by
   the revision's membership (`retrieval/revision.py`).

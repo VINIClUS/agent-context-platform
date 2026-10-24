@@ -13,13 +13,14 @@ the current pointers, so a commit query cannot see a later or dirty snapshot's c
 snapshot query sees its uncommitted revisions. The revision's window `[run start, next run)`
 bounds everything else: decisions and failures are read at `valid_at` just before the end of the
 window (an open window: the snapshot's `valid_instant`, never the wall clock) and at a record time
-that never passes the snapshot (`Freshness.known_until`: a supersession, fix or decision delivered
-beyond `as_of_event_id` is not known yet), and every cited event, session content included, must
+that never passes the snapshot (`Freshness.valid_instant` and `known_until`: a supersession, fix
+or decision delivered beyond `as_of_event_id` is not known yet), and every cited event, session content included, must
 have occurred AND been observed inside the window. CI and test output of a workspace snapshot
 other than the requested one (dirty state, for a commit: any snapshot) is never evidence: such
-execution events are not citable, such runs are dropped from failures together with the
-observations made in them, and a resolution that rested on them becomes
-`unknown (dirty_runs_excluded)`. Code facts are not filtered this way: a commit that adopts code
+execution events are not citable, such runs are dropped from failures, a failure observation
+made in a run is cited only when the answer kept that run (an allow-list: a dirty run completing
+after the window, or never, is not seen at the cut), and a resolution that rested on dropped runs
+becomes `unknown (dirty_runs_excluded)`. Code facts are not filtered this way: a commit that adopts code
 first indexed in a dirty snapshot cites that replayed claim; revision membership decides.
 
 Candidates. Graph proximity comes from PLATFORM-040 (`neighborhood`, depth 2, around the code the
@@ -73,7 +74,10 @@ cites an event delivered after its `as_of_event_id` (outbox order).
 Freshness. `as_of_event_id`, `projection_checkpoint` and `staleness_ms` come from
 `freshness.py`, over the projectors each tool depends on. An outdated temporal projection
 (`TemporalProjectionOutdated`) fails `decision_history` and `failure_history`, and is a warning
-(`temporal_projection_outdated`) where temporal facts are only one source.
+(`temporal_projection_outdated`) where temporal facts are only one source. Temporal record time
+never passes the snapshot's own time (`valid_instant`) nor its scope's projection backlog
+(`known_until`); when the backlog hides facts the snapshot's time would show, the package carries
+`projection_backlog_hides_recent_facts`.
 
 Bounds and safety. Inputs are data: no SQL, Cypher, path or URL is ever taken from them (all
 statements are static and parameterized, all graph reads go through the read-only facades). The
@@ -223,7 +227,8 @@ _STOPWORD_TEXT: Final = (
 _STOPWORDS: Final = frozenset(_STOPWORD_TEXT.split())
 _ONE_MICROSECOND: Final = timedelta(microseconds=1)
 QUERY_CANCELED: Final = "57014"  # PostgreSQL SQLSTATE of a statement cancelled by its timeout
-FAR_FUTURE: Final = datetime(9999, 12, 31, tzinfo=UTC)  # "every recorded fact" for temporal reads
+# Temporal facts recorded after an earlier, still-undelivered event of the scope are hidden.
+BACKLOG_WARNING: Final = "projection_backlog_hides_recent_facts"
 
 
 class ContextRequestError(RetrievalError, ValueError):
@@ -436,7 +441,10 @@ class ContextComposer:
         cursor: CursorCodec,
         clock: Callable[[], datetime] = lambda: datetime.now(UTC),
         default_deadline_seconds: float = DEFAULT_DEADLINE_SECONDS,
+        vector_search: bool = True,
     ) -> None:
+        """`vector_search=False` for a lexical-only deployment (no embedding provider): the
+        vector leg is skipped, not attempted and reported as a failed search."""
         if not (math.isfinite(default_deadline_seconds) and default_deadline_seconds > 0):
             raise ContextRequestError("deadline must be positive")
         self._graph = graph
@@ -448,6 +456,7 @@ class ContextComposer:
         self._cursor = cursor
         self._clock = clock
         self._deadline = default_deadline_seconds
+        self._vector = vector_search
 
     # --- the five tools ---
 
@@ -562,7 +571,12 @@ class ContextComposer:
         now = self._clock()
         try:
             async with asyncio.timeout(deadline):
-                freshness = await self._freshness.read(DEPENDENCIES[tool], now)
+                freshness = await self._freshness.read(
+                    DEPENDENCIES[tool],
+                    now,
+                    project_id=getattr(scope, "project_id", None),
+                    repository_id=getattr(scope, "repository_id", None),
+                )
                 digest = query_digest(tool, request, context.principal_id)
                 start = 0
                 if cursor is not None:
@@ -665,14 +679,14 @@ class ContextComposer:
             raise ScopeNotFound("the repository is unknown")
         return await self._revisions.view(repository_id, revision)
 
-    def _window(self, view: RevisionView, freshness: Freshness) -> _Window:
+    def _window(self, view: RevisionView, freshness: Freshness, gathered: _Gathered) -> _Window:
         """The revision's window: a closed one is read just before its end; an open one at the
         snapshot's `valid_instant`. Record time is never beyond the snapshot (`_known`)."""
         start = window_bound(view.run.occurred_at)
         end = window_bound(view.window_end)
         assert start is not None
         at = max(start, freshness.valid_instant if end is None else end - _ONE_MICROSECOND)
-        return _Window(start, end, at, _known(freshness, at))
+        return _Window(start, end, at, _known(freshness, gathered, at))
 
     @staticmethod
     def _revision_scope(
@@ -698,9 +712,10 @@ class ContextComposer:
     ) -> _Gathered:
         repository_id = request.repository_id
         view = await self._view(repository_id, request.revision)
-        window = self._window(view, freshness)
+        gathered = _Gathered()
+        window = self._window(view, freshness, gathered)
         scope = self._revision_scope(repository_id, request.revision, window, freshness)
-        gathered = _Gathered(evidence=scope)
+        gathered.evidence = scope
         _view_warnings(view, gathered)
         tokens = _tokens(request.task)
         snapshot = None if isinstance(request.revision, CommitRevisionV1) else scope.snapshot_id
@@ -728,7 +743,7 @@ class ContextComposer:
         temporal = TemporalScope(repository_id=repository_id)
         decisions = await self._decisions(temporal, window.at, window.known, False, gathered)
         failures = await self._failures(temporal, window.at, window.known, gathered)
-        scope = replace(scope, excluded_runs=_dirty_runs(failures, snapshot))
+        scope = replace(scope, kept_runs=_kept_runs(failures, snapshot))
         gathered.evidence = scope
         failures = [clean for f in failures if (clean := _without_dirty(f, snapshot)) is not None]
         hits = await self._search_hits(repository_id, request.task, tokens, scope, gathered)
@@ -813,6 +828,8 @@ class ContextComposer:
                 query = " or ".join(tokens)
                 with _search_span():
                     lexical += await self._search.lexical(query, search_scope, MAX_SEARCH_HITS)
+            if not self._vector:
+                continue
             try:
                 with _search_span():
                     vector += await self._search.vector(task, search_scope, MAX_SEARCH_HITS)
@@ -853,10 +870,9 @@ class ContextComposer:
         self, repository_id: str, revision: CommitRevisionV1, freshness: Freshness
     ) -> _Gathered:
         view = await self._view(repository_id, revision)
-        window = self._window(view, freshness)
-        gathered = _Gathered(
-            evidence=self._revision_scope(repository_id, revision, window, freshness)
-        )
+        gathered = _Gathered()
+        window = self._window(view, freshness, gathered)
+        gathered.evidence = self._revision_scope(repository_id, revision, window, freshness)
         _view_warnings(view, gathered)
         code = _CodeIndex(view)
         gathered.add(code.summary(revision.commit_id))
@@ -873,9 +889,7 @@ class ContextComposer:
             gathered.add(_decision_candidate(record, window.at, priority=3))
         failures = await self._failures(temporal, window.at, window.known, gathered)
         if gathered.evidence is not None:
-            gathered.evidence = replace(
-                gathered.evidence, excluded_runs=_dirty_runs(failures, None)
-            )
+            gathered.evidence = replace(gathered.evidence, kept_runs=_kept_runs(failures, None))
         for failure in failures:
             clean = _without_dirty(failure, None)
             if clean is None or clean.resolution.status is FixStatus.RESOLVED:
@@ -890,10 +904,9 @@ class ContextComposer:
         self, request: SymbolContextInputV1, revision: CommitRevisionV1, freshness: Freshness
     ) -> _Gathered:
         view = await self._view(request.repository_id, revision)
-        window = self._window(view, freshness)
-        gathered = _Gathered(
-            evidence=self._revision_scope(request.repository_id, revision, window, freshness)
-        )
+        gathered = _Gathered()
+        window = self._window(view, freshness, gathered)
+        gathered.evidence = self._revision_scope(request.repository_id, revision, window, freshness)
         _view_warnings(view, gathered)
         code = _CodeIndex(view)
         symbol = code.resolve_symbol(request.symbol_id, request.symbol_name)
@@ -936,7 +949,7 @@ class ContextComposer:
             raise ScopeNotFound("the project or repository is unknown")
         gathered = _Gathered()
         # Known as of the projection snapshot, not the wall clock: the same snapshot, the same answer.
-        known = _known(freshness)
+        known = _known(freshness, gathered)
         with _temporal_span():
             result = await self._temporal.decisions(temporal, request.valid_at, known, True)
         if result.truncated:
@@ -990,7 +1003,7 @@ class ContextComposer:
         temporal = TemporalScope(repository_id=request.repository_id)
         at = request.valid_to - _ONE_MICROSECOND
         with _temporal_span():
-            result = await self._temporal.failures(temporal, at, _known(freshness), True)
+            result = await self._temporal.failures(temporal, at, _known(freshness, gathered), True)
         if result.truncated:
             gathered.warnings.add("failures_capped")
         failures = [f for f in result.failures if _in_window(f, request.valid_from, at)]
@@ -1633,13 +1646,15 @@ def _ran_on(hit: SearchHit, events: Mapping[str, LedgerEvent]) -> str:
     return ""
 
 
-def _dirty_runs(failures: Iterable[FailureRecord], snapshot: str | None) -> frozenset[str]:
-    """The CI and test runs a revision answer drops: those of another workspace snapshot."""
+def _kept_runs(failures: Iterable[FailureRecord], snapshot: str | None) -> frozenset[str]:
+    """The CI and test runs a revision answer keeps: those visible in its window (the temporal
+    read returned them) that ran on the revision's own state, never another workspace snapshot.
+    An observation made in any other run (dirty, or not visible at the cut) is not evidence."""
     return frozenset(
         run.run_id
         for failure in failures
         for run in failure.observed_in
-        if run.kind is not RunKind.SESSION and run.snapshot_id not in (None, snapshot)
+        if run.kind is not RunKind.SESSION and run.snapshot_id in (None, snapshot)
     )
 
 
@@ -1728,11 +1743,17 @@ def _temporal_span() -> AbstractContextManager[object]:
     )
 
 
-def _known(freshness: Freshness, ceiling: datetime | None = None) -> datetime:
-    """The record time temporal facts are read at: everything the snapshot knows and nothing
-    beyond it (`Freshness.known_until`), at most `ceiling` (a closed revision window)."""
-    bounds = [b for b in (freshness.known_until, ceiling) if b is not None]
-    return min(bounds) if bounds else FAR_FUTURE
+def _known(freshness: Freshness, gathered: _Gathered, ceiling: datetime | None = None) -> datetime:
+    """The record time temporal facts are read at: never past the snapshot's own time
+    (`valid_instant`: a fact projected after the freshness read is not known yet), nor past the
+    projection backlog (`known_until`), at most `ceiling` (a revision window's instant). When
+    the backlog is the binding bound, facts the snapshot's time would otherwise show are hidden,
+    and the answer says so (`BACKLOG_WARNING`)."""
+    limit = freshness.valid_instant if ceiling is None else min(ceiling, freshness.valid_instant)
+    if freshness.known_until is None or freshness.known_until >= limit:
+        return limit
+    gathered.warnings.add(BACKLOG_WARNING)
+    return freshness.known_until
 
 
 def _snapshot_token(freshness: Freshness) -> str:
