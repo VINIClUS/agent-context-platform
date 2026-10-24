@@ -50,6 +50,7 @@ def test_every_secret_field_has_a_file_name_and_nothing_else_does() -> None:
         "AGENT_CONTEXT_S3__SECRET_ACCESS_KEY",
         "AGENT_CONTEXT_MCP__TOKEN_HMAC_KEY",
         "AGENT_CONTEXT_MCP__CURSOR_HMAC_KEY",
+        "AGENT_CONTEXT_OTEL_RECEIVER__IDEMPOTENCY_HMAC_KEY",
     }
 
 

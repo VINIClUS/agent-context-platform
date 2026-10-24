@@ -283,6 +283,60 @@ class ObservabilitySettings(BaseModel):
 # --- end observability ---------------------------------------------------------------------------
 
 
+# --- Codex OTLP trace receiver (PLATFORM-053) ----------------------------------------------------
+class OtelReceiverSettings(BaseModel):
+    """Limits of ``POST /v1/otel/traces`` (docs/data/codex-otel-mapping.md, "Receiver").
+
+    ``idempotency_hmac_key`` keys the mapper's idempotency digest; it must stay stable across
+    restarts and replicas or re-exported records stop deduplicating, so the receiver answers 503
+    until it is set (there is no per-process fallback).
+    """
+
+    model_config = _SECTION_CONFIG
+
+    idempotency_hmac_key: SecretStr | None = Field(default=None, repr=False)
+    # Counted while streaming, before decompression.
+    max_request_body_bytes: int = Field(default=4_194_304, gt=0)
+    # Bound on gzip output: a decompression bomb fails as 413 without being inflated. 6 MiB is the
+    # collector's largest batch (3.73 MiB, docs/data/codex-otel-mapping.md) plus about 60%.
+    max_decompressed_bytes: int = Field(default=6_291_456, gt=0)
+    # Spans per request (the collector's send_batch_max_size must not exceed it).
+    max_spans: int = Field(default=500, gt=0, le=500)
+    # Spans plus span events per request, span events per span and attributes per resource,
+    # scope, span or event: checked before any record is converted.
+    max_records: int = Field(default=1_000, gt=0, le=5_000)
+    max_events_per_span: int = Field(default=64, gt=0, le=1_000)
+    max_attributes: int = Field(default=128, gt=0, le=1_000)
+    # Request-level container and total limits, enforced on the wire bytes before parsing.
+    max_resources: int = Field(default=16, gt=0, le=1_000)
+    max_scopes: int = Field(default=64, gt=0, le=1_000)
+    max_links: int = Field(default=1_000, gt=0, le=100_000)
+    max_total_attributes: int = Field(default=65_536, gt=0, le=1_048_576)
+    # Every field occurrence the scan visits (bounds its cost by limits, not bytes) and every
+    # repeated element (bounds what parsing allocates).
+    max_fields: int = Field(default=300_000, gt=0, le=4_194_304)
+    max_objects: int = Field(default=200_000, gt=0, le=4_194_304)
+    # How far in the future (by Codex's clock) a record's times may be.
+    max_clock_skew_seconds: float = Field(default=300.0, ge=0, le=86_400, allow_inf_nan=False)
+    # Per-producer, per-replica token bucket.
+    rate_limit_per_second: float = Field(default=5.0, gt=0, allow_inf_nan=False)
+    rate_limit_burst: int = Field(default=20, gt=0)
+
+    @field_validator("idempotency_hmac_key")
+    @classmethod
+    def require_long_hmac_key(cls, key: SecretStr | None) -> SecretStr | None:
+        value = None if key is None else key.get_secret_value().strip()
+        # Length and a cheap entropy floor: a repeated or near-constant string is no key.
+        if value is not None and (len(value) < 32 or len(set(value)) < 8):
+            raise ValueError(
+                "OTel receiver HMAC key must be at least 32 characters with 8 distinct ones"
+            )
+        return key
+
+
+# --- end Codex OTLP trace receiver ---------------------------------------------------------------
+
+
 class Settings(BaseSettings):
     """Single process boundary for the Agent Context environment namespace."""
 
@@ -305,6 +359,7 @@ class Settings(BaseSettings):
     search: SearchSettings = Field(default_factory=SearchSettings)
     fault_injection: FaultInjectionSettings = Field(default_factory=FaultInjectionSettings)
     observability: ObservabilitySettings = Field(default_factory=ObservabilitySettings)
+    otel_receiver: OtelReceiverSettings = Field(default_factory=OtelReceiverSettings)
     # Structural indexer (PLATFORM-032b). Adapters are confined with Landlock and the runner
     # refuses to run them when the kernel cannot enforce it; this is the dev-only escape hatch
     # (AGENT_CONTEXT_INDEXER_ALLOW_UNCONFINED_ADAPTERS). Never enable it in production.

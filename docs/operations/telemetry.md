@@ -71,6 +71,8 @@ counters).
 | `agent_context.mcp.requests` | counter | `{request}` | `method` = server/discover / tools/list / tools/call / other; `tool` = context_for_task / repository_overview / symbol_context / decision_history / failure_history / none; `outcome` = ok / client_error / auth_error / rate_limited / server_error | `agent_context_mcp_requests_total` |
 | `agent_context.mcp.duration` | histogram | `s` | `method`, `tool` | `agent_context_mcp_duration_seconds_*` |
 | `http.server.request.duration` | histogram | `s` | `http.request.method` (standard methods or `_OTHER`), `http.route` (the matched route template under `/v1/`, `/health/`, `/mcp`, `/openapi.json`, `/docs` or `/redoc`, else `other`), `http.response.status_code` | `http_server_request_duration_seconds_*` |
+| `agent_context.otel.requests` | counter | `{request}` | `outcome` = accepted / rejected / error; `reason` = none / auth / rate_limited / unsupported_media_type / too_large / malformed / unsupported / abandoned / internal | `agent_context_otel_requests_total` |
+| `agent_context.otel.spans` | counter | `{span}` | `result` = mapped / unmapped / rejected | `agent_context_otel_spans_total` |
 
 Duration histograms use the explicit bucket boundaries
 `0.005, 0.01, 0.025, 0.05, 0.1, 0.25, 0.5, 1, 2, 5, 10, 30, 60, 120, 300` seconds.
@@ -116,6 +118,17 @@ Duration histograms use the explicit bucket boundaries
 - **Index.** One sample per `index_checkout`: `success`, `failed` (indexing or ingestion error, or
   an unsuccessful completion) or `refused` (repository mismatch, refused scan, structural sandbox
   unavailable).
+- **Codex OTLP receiver** (`POST /v1/otel/traces`, PLATFORM-053). One `requests` sample per export:
+  `accepted` for every 200 (rejected spans included), `rejected` for a 4xx (`auth` 401/403,
+  `rate_limited` 429, `unsupported_media_type` 415, `too_large` 413 for any request-level limit,
+  `malformed` 400 for undecodable or malformed wire data, `unsupported` 400 for well-formed data the
+  receiver refuses structurally (a singular message field sent twice), `abandoned` when the client
+  went away while queued), `error` with `internal` for
+  5xx (including a full admission gate). `spans` counts each span once: `mapped` (it produced a
+  stored or already-stored event), `unmapped` (no Codex event the mapper models) or `rejected`
+  (refused by the mapper, its resource or scope, the platform-origin marker, its times, or the
+  ingestion batch). These are the receiver's only signals: its batches bypass the ingestion route,
+  so `agent_context.ingestion.*` and its span never count them.
 - **Retrieval.** One sample per retrieval operation, recorded with
   `observability.retrieval_span(operation, client_errors=..., deadline_errors=...)` (or the
   `traced_retrieval` decorator); the composer and MCP tools adopt it. `client_error` is a typed

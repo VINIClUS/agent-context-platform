@@ -131,6 +131,12 @@ class Telemetry:
             contract.MCP_REQUESTS, unit="{request}", description="MCP requests."
         )
         self.mcp_duration = histogram(contract.MCP_DURATION, "Duration of MCP requests.")
+        self.otel_requests = meter.create_counter(
+            contract.OTEL_REQUESTS, unit="{request}", description="Codex OTLP trace exports."
+        )
+        self.otel_spans = meter.create_counter(
+            contract.OTEL_SPANS, unit="{span}", description="Codex OTLP spans by mapping result."
+        )
         self.http_duration = histogram(
             contract.HTTP_SERVER_DURATION, "Duration of HTTP server requests."
         )
@@ -493,6 +499,25 @@ def record_mcp_request(method: str, tool: str, outcome: str, seconds: float) -> 
         },
     )
     telemetry.mcp_duration.record(seconds, {"method": method_label, "tool": tool_label})
+
+
+@_fail_open
+def record_otel_request(outcome: str, reason: str) -> None:
+    current().otel_requests.add(
+        1,
+        {
+            "outcome": contract.closed(outcome, contract.OTEL_OUTCOMES),
+            "reason": contract.closed(reason, contract.OTEL_REASONS),
+        },
+    )
+
+
+@_fail_open
+def record_otel_spans(result: str, count: int) -> None:
+    if count > 0:
+        current().otel_spans.add(
+            count, {"result": contract.closed(result, contract.OTEL_SPAN_RESULTS)}
+        )
 
 
 def http_method_label(method: str) -> str:

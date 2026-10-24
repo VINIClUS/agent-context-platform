@@ -151,8 +151,9 @@ file named after its variable, holding only the value (one trailing newline is d
 ```
 
 The secret settings are `AGENT_CONTEXT_POSTGRESQL__{DSN,API_DSN,PROJECTOR_DSN,ADMIN_DSN,MIGRATION_DSN}`,
-`AGENT_CONTEXT_NEO4J__PASSWORD`, `AGENT_CONTEXT_S3__{ACCESS_KEY_ID,SECRET_ACCESS_KEY}` and
-`AGENT_CONTEXT_MCP__TOKEN_HMAC_KEY` (`settings.SECRET_FILE_NAMES`). **A variable set both in the
+`AGENT_CONTEXT_NEO4J__PASSWORD`, `AGENT_CONTEXT_S3__{ACCESS_KEY_ID,SECRET_ACCESS_KEY}`,
+`AGENT_CONTEXT_MCP__{TOKEN_HMAC_KEY,CURSOR_HMAC_KEY}` and
+`AGENT_CONTEXT_OTEL_RECEIVER__IDEMPOTENCY_HMAC_KEY` (`settings.SECRET_FILE_NAMES`). **A variable set both in the
 environment (even to an empty value, in any letter case) and as a file refuses to start**, naming
 the variable: a stale variable left after a rotation would otherwise keep the old value in use
 and visible in `/proc/<pid>/environ`. Export a secret OR mount it, never both. Everything else
