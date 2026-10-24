@@ -44,6 +44,7 @@ requests carry a valid `memory:read` token, so they pass authentication; without
 | `GET /sse` (HTTP+SSE endpoint) | `404` | The `2024-11-05` transport is not hosted. |
 | `POST /messages` (HTTP+SSE endpoint) | `404` | As above. |
 
-A client that supports both eras and probes with a modern request first sees a recognized modern
-JSON-RPC error (`-32022` carries `data.supported`), so it should retry with `2026-07-28` rather
-than fall back to `initialize`, as the specification's backward-compatibility rules ask.
+A client that supports both eras and tries a `2026-07-28` request first simply succeeds: this
+server speaks that version. A client that sends a legacy `initialize` instead gets `-32022` with
+`data.supported = ["2026-07-28"]`, a recognized modern JSON-RPC error, so per the specification's
+backward-compatibility rules it should retry with `2026-07-28` rather than keep the handshake.

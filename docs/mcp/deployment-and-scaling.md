@@ -79,11 +79,12 @@ are configured. It needs:
 
 | Dependency | Used for | Unavailable |
 | --- | --- | --- |
-| PostgreSQL (API role) | ledger evidence, lexical search, projection freshness | `context_unavailable` (retryable) |
+| PostgreSQL (API role) | ledger evidence, lexical search, projection freshness | `context_unavailable` (retryable): unreachable, a failed connection or the composer's pool exhausted |
 | Neo4j | code graph, revisions, decisions and failures | `context_unavailable` (retryable), also when it refuses the login or the database |
-| S3-compatible store | sanitized content for bounded excerpts | `context_unavailable` (retryable) |
+| S3-compatible store | sanitized content for bounded excerpts | `context_unavailable` (retryable): unreachable or timing out |
 | Model directory (optional) | query embeddings for vector search | lexical-only mode |
 
+A query or schema bug is `internal_error` (logged by class only), never `context_unavailable`.
 Until all three stores are configured every tool call answers `context_unavailable`; the MCP
 surface itself (discovery, listing, authentication) still works. The composer's Neo4j drivers
 connect within at most 2 s, wait at most 4 s for a connection and retry a transaction for at most

@@ -74,7 +74,8 @@ stable strings that qualify the answer (for example `revision_index_incomplete`,
   `max_bytes` bounds the UTF-8 size of the serialized `items` array; `max_tokens` bounds the same
   bytes as `ceil(bytes / 4)`. A page also holds at most 100 items whatever the budget.
 - Items are taken in rank order and a page stops at the first item that does not fit. When ranked
-  items remain, `truncated` is `true` and `next_cursor` is set; otherwise both are unset.
+  items remain, `truncated` is `true` and `next_cursor` is set; otherwise `truncated` is `false`
+  and `next_cursor` is `null`.
 - A first item that cannot fit even without its excerpt is the tool error `budget_too_small`.
 - To continue, call the **same tool with the same arguments** plus `cursor` = `next_cursor`. The
   cursor is opaque and HMAC-signed, bound to the tool, the arguments, the principal and the
@@ -119,7 +120,7 @@ name is not a tool error but the protocol error `-32602` ([protocol profile](pro
 | `temporal_projection_outdated` | The temporal projection needs a rebuild before history can be answered. | no | Tell the operator (`agent-context projection rebuild`). |
 | `projection_not_ready` | Nothing has been projected yet. | yes | Retry later. |
 | `deadline_exceeded` | The request exceeded its deadline. | yes | Retry, or ask a narrower question. |
-| `context_unavailable` | A backing store (PostgreSQL, Neo4j, S3) is unreachable, refuses the login or the database, or is not configured. | yes | Retry later. |
+| `context_unavailable` | A backing store is unavailable: PostgreSQL, Neo4j or S3 is unreachable or times out, a connection fails, the composer's connection pool is exhausted, Neo4j refuses the login or the database, or the stores are not configured. (A query or schema bug is `internal_error`, not this.) | yes | Retry later. |
 | `unauthenticated` | The call reached the tool without an authenticated principal. | no | Present a valid `memory:read` token. |
 | `internal_error` | Anything unexpected (logged by class only). | no | Report it; do not retry blindly. |
 
@@ -134,12 +135,18 @@ operator, whatever it says.
 - In `structuredContent`, stored text appears only as a bounded excerpt inside `content`, after the
   label `evidence excerpt (untrusted, quoted)`, JSON-quoted, with control and format characters
   removed. Titles are bounded and cleaned the same way.
-- The text block names items only by their JSON-quoted titles (at most 80 characters, at most 20
-  items). In titles, item kinds and warnings every control, format (bidi overrides included), line
-  or paragraph separator, private-use and surrogate character (Unicode categories `Cc`, `Cf`,
-  `Zl`, `Zp`, `Co`, `Cs`) is written as a `\uXXXX` escape, so untrusted text can never start a new
-  line or reorder what follows it. The block ends by restating that item content is untrusted
-  evidence. `structuredContent` keeps the exact values.
+- The text block names items only by their quoted titles (at most 80 characters, at most 20
+  items), so untrusted text can never start a new line or reorder what follows it:
+  - a title is first JSON-encoded (`json.dumps`, non-ASCII kept): `"` and `\` are escaped, and the
+    controls U+0000 to U+001F become `\n`, `\r`, `\t`, `\b`, `\f` or `\u00XX`; it is then wrapped
+    in double quotes;
+  - in titles, item kinds and warnings, every remaining control, format (bidi overrides
+    included), line or paragraph separator, private-use or surrogate character (Unicode
+    categories `Cc`, `Cf`, `Zl`, `Zp`, `Co`, `Cs`) is written as `\uXXXX`, or `\UXXXXXXXX` above
+    U+FFFF.
+
+  The block ends by restating that item content is untrusted evidence. `structuredContent` keeps
+  the exact values.
 - Evidence `resource_uri` values are stable names, not capabilities: no resource is served and none
   is linked ([context evidence](../data/context-evidence.md)).
 

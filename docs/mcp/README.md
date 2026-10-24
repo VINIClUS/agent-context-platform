@@ -83,10 +83,17 @@ Verified on 2026-10-24 against the code on this branch.
 | --- | --- | --- |
 | MCP protocol | `2026-07-28` (the only supported version) | `mcp_types.version.MODERN_PROTOCOL_VERSIONS`; [specification](https://modelcontextprotocol.io/specification/2026-07-28) |
 | Codex CLI, minimum | `0.147.0` | `agent-context-codex`: `src/agent_context_codex/install/capabilities.py` (`MIN_VERSION`) |
-| Codex CLI, last tested | `0.147.0` | `agent-context-infra`: `integration/fixtures/versions-under-test.lock` (component `codex-cli`) |
+| Codex CLI, last tested | `0.147.0` | `agent-context-codex` CODEX-041 real Codex smoke (`scripts/smoke-codex-mcp.sh`, `tests/e2e/test_codex_mcp.py`) against this server on 2026-10-24: `codex-cli 0.147.0` release binary, linux x86_64 musl, SHA-256 `cb0a15567e9a60a5820d54b0f6ae86d504dc3805c1eab21a47f70e3eb7b73a40`; recorded in `docs/codex-compatibility.md` "Last end-to-end smoke" (branch `claude/keen-shannon-danae0-codex-041`) |
 | MCP Python SDK | `mcp` `2.2.0` (and `mcp-types` `2.2.0`) | `uv.lock`; [PyPI](https://pypi.org/project/mcp/2.2.0/), [source](https://github.com/modelcontextprotocol/python-sdk) tag `v2.2.0` |
 | Agent Context SDK | `0.6.0`, wheel SHA-256 `11639c35114c8206ee5922adb3072f1ff31c07b39aaabe681e594d81e67ea079` | `pyproject.toml` `[tool.agent-context.sdk]` |
 | Conformance suite | `@modelcontextprotocol/conformance@0.2.0-alpha.11`, requirements `2026-07-28` | [conformance](conformance.md); [npm](https://www.npmjs.com/package/@modelcontextprotocol/conformance) |
+
+The MCP smoke ran on Codex `0.147.0` only. The adapter's own documentation records source-level
+verification of later Codex releases (`rust-v0.157.1`, and `rust-v0.163.0` for its plugin; on the
+same branch the installer requires releases up to `0.157.1` to list the `mcp_2026_07_28` feature,
+`LAST_VERSION_LISTING_FLAG` in `src/agent_context_codex/install/capabilities.py`), but no MCP
+smoke against them. The infra lock (`integration/fixtures/versions-under-test.lock`, component
+`codex-cli`) records `0.147.0` as a floor constraint, not a tested version.
 
 ## Sources
 

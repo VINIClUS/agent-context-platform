@@ -38,11 +38,34 @@ Rejections carry fixed bodies and never echo request data.
 5. **Size limit**: `413`.
 6. **Protocol version header**: `MCP-Protocol-Version` must be `2026-07-28`; absent or anything
    else is `400` with `-32022` and `data.supported = ["2026-07-28"]`.
-7. **SDK ladder** (`mcp.shared.inbound.classify_inbound_request`): `params._meta` must carry the
-   protocol version and the client capabilities (`-32602`); the version header, `Mcp-Method` and,
-   for `tools/call`, `Mcp-Name` must equal the body (`-32020`).
-8. **Served methods**: anything other than `server/discover`, `tools/list` and `tools/call` is
-   `404` with `-32601`.
+
+The MCP SDK's stateless transport (`mcp.server._streamable_http_modern`) then checks, in order:
+
+7. **Content-Type** must start with `application/json`; missing or anything else is `400` with
+   the plain-text body `Invalid Content-Type header` (not JSON-RPC).
+8. **Accept** must admit JSON: `application/json`, `application/*` or `*/*`. Without one of
+   them (no `Accept` at all, or only `text/event-stream`) the answer is `406` with an empty body.
+9. **Body**: not JSON is `-32700`; not one request or notification object is `-32600`. A
+   notification is acknowledged here with `202` and no body.
+10. **Routing headers**: a repeated `MCP-Protocol-Version`, `Mcp-Method` or `Mcp-Name` is `-32020`.
+11. **Envelope ladder** (`mcp.shared.inbound.classify_inbound_request`): `params._meta` must carry
+    the protocol version and the client capabilities (`-32602`); the version header, `Mcp-Method`
+    and, for `tools/call`, `Mcp-Name` must be present and equal the body (`-32020`).
+12. **Served methods**: anything other than `server/discover`, `tools/list` and `tools/call` is
+    `404` with `-32601`.
+
+The checks the transport answers before any JSON-RPC parsing, replayed as raw ASGI requests (no
+client-supplied defaults) by `tests/docs/test_mcp_docs.py`:
+
+<!-- docs-check: transport-rejections -->
+| Request | Observed |
+| --- | --- |
+| no `Accept` header | `406`, empty body |
+| `Accept: text/event-stream` only | `406`, empty body |
+| `Accept: application/json` | `200` |
+| `Accept: */*` | `200` |
+| no `Content-Type` header | `400`, plain text `Invalid Content-Type header` |
+| `Content-Type: text/plain` | `400`, plain text `Invalid Content-Type header` |
 
 ## Headers
 
@@ -56,16 +79,19 @@ Rejections carry fixed bodies and never echo request data.
 | `Host` | request | Exactly one, on the allowlist. |
 | `Origin` | request | Optional; checked when present; at most one. |
 | `Content-Length` | request | Optional; a declared length over the limit is refused before reading. |
-| `Content-Type` | request | `application/json`. |
+| `Content-Type` | request | Required; must start with `application/json` (else `400`, plain text). |
+| `Accept` | request | Required; must admit `application/json` (`application/json`, `application/*` or `*/*`), else `406` with an empty body. |
 | `traceparent` | request | Optional W3C trace context; parents the request span. |
 | `baggage` | request | Ignored: no client baggage is ever imported. |
 | `WWW-Authenticate` | response | `Bearer` on every `401`, with no realm or error detail. |
 | `Retry-After` | response | Whole seconds on `429` and `503`. |
 | `Allow` | response | `POST` on `405`. |
 
-`Accept` should list `application/json` and `text/event-stream`, as the transport asks of clients;
-the server does not reject a request for omitting it. `Mcp-Session-Id` and `Last-Event-ID` are
-ignored if a client sends them (see [legacy compatibility](legacy-compatibility.md)).
+Clients should send `Accept: application/json, text/event-stream`, as the transport asks; the
+server only requires the JSON part, because it answers with JSON only. `Mcp-Session-Id` and
+`Last-Event-ID` are ignored if a client sends them (see
+[legacy compatibility](legacy-compatibility.md)). The `tracestate` header is read with
+`traceparent` but stripped from every exported span (`observability/redaction.py`).
 
 ## Per-request `_meta`
 
@@ -150,11 +176,20 @@ Two layers, never mixed:
 | `-32600` | `INVALID_REQUEST` | 400 | Not one request or notification object; also the bodies of the Host (`421`), Origin (`403`) and size (`413`) rejections. |
 | `-32602` | `INVALID_PARAMS` | 400 | `params._meta` lacks a required key, or `tools/call` names an unknown tool. |
 | `-32601` | `METHOD_NOT_FOUND` | 404 | The method is not served. |
-| `-32020` | `HEADER_MISMATCH` | 400 | `MCP-Protocol-Version`, `Mcp-Method` or `Mcp-Name` disagrees with the body, or is missing. |
+| `-32020` | `HEADER_MISMATCH` | 400 | `Mcp-Method` or, for `tools/call`, `Mcp-Name` is missing or disagrees with the body; the version header disagrees with `_meta`; or a routing header is repeated. A missing or unsupported `MCP-Protocol-Version` is `-32022` instead. |
 | `-32022` | `UNSUPPORTED_PROTOCOL_VERSION` | 400 | The version header is absent or not `2026-07-28`; `data.supported` lists `2026-07-28`. |
 
-Authentication failures are not JSON-RPC: `401`/`403`/`503` carry `{"error": <code>,
-"message": <fixed text>}` and `429` has an empty body.
+Not every rejection is JSON-RPC:
+
+<!-- docs-check: non-jsonrpc -->
+| HTTP | Body | When |
+| --- | --- | --- |
+| `401`, `403`, `503` | JSON `{"error": <code>, "message": <fixed text>}` | Authentication, scope, verifier overload or PostgreSQL unavailable ([security](security.md)). |
+| `429` | empty | Rate limit; `Retry-After`. |
+| `405` | empty | Not POST; `Allow: POST`. |
+| `406` | empty | `Accept` does not admit `application/json`. |
+| `400` | plain text `Invalid Content-Type header` | `Content-Type` missing or not `application/json`. |
+| `202` | empty | A notification was accepted. |
 
 ## Limits
 
@@ -196,7 +231,9 @@ discovery advertises none of it.
 
 A `traceparent` header parents the platform's request span; a valid `_meta` `traceparent` parents
 the spans recorded while serving the request (without one, the request span stays their parent).
-`tracestate` and client `baggage` are never imported, and the caller's sampled flag is ignored.
+The `tracestate` header is extracted with `traceparent` but removed from every span before export
+(`observability/redaction.py`); `_meta` `tracestate` and all client `baggage` are never imported,
+and the caller's sampled flag is ignored.
 The MCP SDK's own OpenTelemetry middleware, which would import the whole `_meta` carrier, is
 replaced by one that keeps only `traceparent` (`mcp/telemetry.py`). Metrics and spans are
 in [the telemetry contract](../operations/telemetry.md).

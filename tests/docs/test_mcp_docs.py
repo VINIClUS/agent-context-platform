@@ -12,6 +12,7 @@ methods, which is replayed against an in-process application.
 
 from __future__ import annotations
 
+import asyncio
 import hashlib
 import inspect
 import json
@@ -38,11 +39,19 @@ from opentelemetry.trace.propagation.tracecontext import TraceContextTextMapProp
 from pydantic import BaseModel
 from typer.main import get_command
 
+from agent_context_platform import app as app_module
 from agent_context_platform import cli
 from agent_context_platform.app import create_app
 from agent_context_platform.mcp import auth, tools
-from agent_context_platform.mcp.server import MCP_PATH
-from agent_context_platform.settings import SECRETS_DIR_ENV, Settings
+from agent_context_platform.mcp.auth import MEMORY_READ_SCOPE, McpAuthHolder, require_scope
+from agent_context_platform.mcp.server import (
+    LIST_CACHE_HINT,
+    MCP_PATH,
+    build_mcp_mount,
+    create_mcp_server,
+)
+from agent_context_platform.retrieval import composer, cursor
+from agent_context_platform.settings import SECRETS_DIR_ENV, MCPSettings, Settings
 
 pytestmark = pytest.mark.unit
 
@@ -62,6 +71,9 @@ CONFORMANCE = MCP_DOCS / "conformance.md"
 
 # Documentation placeholders (RFC 2606 example domains), never sources.
 PLACEHOLDER_HOSTS = ("example.com",)
+# Package registries: version and distribution references only, never a protocol source, so
+# they may appear only in the README's verified-versions table.
+REGISTRY_PREFIXES = ("https://pypi.org/", "https://www.npmjs.com/")
 # Official sources only (PLATFORM-048): the MCP site, the MCP Python SDK and conformance repos,
 # the Codex repo and guide, and the package registries of the pinned versions.
 OFFICIAL_URL_PREFIXES = (
@@ -353,15 +365,134 @@ def test_recorded_versions_match_the_locks() -> None:
     assert mcp_cells[1] == locked["mcp"] and mcp_cells[3] == locked["mcp-types"]
 
 
-def test_the_codex_config_block_names_the_served_tools() -> None:
+def test_the_codex_config_block_is_what_the_installer_writes() -> None:
+    """Value by value against the installer's owned values, vendored with their source commit
+    (`agent-context-codex` is not importable here)."""
+    fixture = json.loads(
+        (Path(__file__).parent / "fixtures/codex_mcp_owned_values.json").read_text()
+    )
     text = _text(MCP_DOCS / "README.md")
     block = re.search(r"```toml\n(.*?)```", text, re.DOTALL)
     assert block is not None
     table = tomllib.loads(block.group(1))["mcp_servers"]["agent-context"]
-    assert sorted(table["enabled_tools"]) == sorted(tools.memory_tools())
-    assert table["url"].endswith(MCP_PATH)
-    assert table["bearer_token_env_var"] in CLIENT_VARIABLES
-    assert set(table["env_http_headers"].values()) <= CLIENT_VARIABLES
+    assert list(table) == ["url", *fixture["values"]]
+    assert {k: v for k, v in table.items() if k != "url"} == fixture["values"]
+    assert table["url"].endswith(MCP_PATH) and fixture["url"].endswith(MCP_PATH)
+    assert sorted(fixture["values"]["enabled_tools"]) == sorted(tools.memory_tools())
+    assert fixture["values"]["bearer_token_env_var"] in CLIENT_VARIABLES
+    assert set(fixture["values"]["env_http_headers"].values()) <= CLIENT_VARIABLES
+
+
+def test_registries_are_cited_only_as_version_references() -> None:
+    versions = _text(MCP_DOCS / "README.md").split(_MARKER.format(name="versions"), 1)[1]
+    versions_rows = versions.lstrip("\n").split("\n\n", 1)[0]
+    for page in PAGES:
+        for line in _text(page).splitlines():
+            if any(prefix in line for prefix in REGISTRY_PREFIXES):
+                assert line in versions_rows, f"{page.name}: a registry cited outside versions"
+
+
+def test_the_replica_shared_key_is_the_cursor_key() -> None:
+    wired = re.search(
+        r"CursorCodec\.from_key\(settings\.mcp\.(\w+)\)", inspect.getsource(app_module)
+    )
+    assert wired is not None
+    expected = f"AGENT_CONTEXT_MCP__{wired.group(1).upper()}"
+    shared = [
+        name
+        for page in PAGES
+        for name in re.findall(r"must share `(AGENT_CONTEXT_[A-Z_]+)`", _flat(page))
+    ]
+    assert shared and set(shared) == {expected}
+
+
+def _flat(page: Path) -> str:
+    return " ".join(_text(page).split())
+
+
+def _hmac_minimum() -> int:
+    found = re.search(r"< (\d+)", inspect.getsource(MCPSettings.require_long_hmac_key))
+    assert found is not None
+    return int(found.group(1))
+
+
+def _ttl_maximum() -> int:
+    field = MCPSettings.model_fields["principal_cache_ttl_seconds"]
+    return int(next(meta.le for meta in field.metadata if hasattr(meta, "le")))
+
+
+def _defaults() -> MCPSettings:
+    return MCPSettings()
+
+
+# Every documented number, as a pattern over the pages (whitespace folded) and the source values
+# its groups must equal; each pattern must match at least once.
+FACTS: tuple[tuple[str, Callable[[], tuple[int, ...]]], ...] = (
+    (
+        r"(\d+) per second, burst (\d+)",
+        lambda: (int(_defaults().rate_limit_per_second), _defaults().rate_limit_burst),
+    ),
+    (r"(\d+) MiB", lambda: (_defaults().max_request_body_bytes // 1_048_576,)),
+    (r"(\d+) minutes", lambda: (int(cursor.DEFAULT_TTL.total_seconds() // 60),)),
+    (
+        r"(\d+) connections plus (\d+) overflow, (\d+) s",
+        lambda: (
+            app_module.COMPOSER_POOL_SIZE,
+            app_module.COMPOSER_POOL_OVERFLOW,
+            int(app_module.COMPOSER_POOL_TIMEOUT_SECONDS),
+        ),
+    ),
+    (
+        r"connect within at most (\d+) s, wait at most (\d+) s for a connection and retry a "
+        r"transaction for at most (\d+) s",
+        lambda: (
+            int(app_module.COMPOSER_NEO4J_CONNECT_SECONDS),
+            int(app_module.COMPOSER_NEO4J_ACQUIRE_SECONDS),
+            int(app_module.COMPOSER_NEO4J_RETRY_SECONDS),
+        ),
+    ),
+    (r"(\d+) s deadline", lambda: (int(composer.DEFAULT_DEADLINE_SECONDS),)),
+    (r"Tool request deadline \| (\d+) s", lambda: (int(composer.DEFAULT_DEADLINE_SECONDS),)),
+    (r"at most (\d+) items whatever the budget", lambda: (composer.MAX_PAGE_ITEMS,)),
+    (
+        r"at most (\d+) characters, at most (\d+) items",
+        lambda: (tools.MAX_TEXT_TITLE_CHARS, tools.MAX_TEXT_ITEMS),
+    ),
+    (r"(\d+) s by default", lambda: (int(_defaults().principal_cache_ttl_seconds),)),
+    (
+        r"(\d+) s by default, at most (\d+)",
+        lambda: (int(_defaults().principal_cache_ttl_seconds), _ttl_maximum()),
+    ),
+    (
+        r"(\d+) s \(max (\d+)\)",
+        lambda: (int(_defaults().principal_cache_ttl_seconds), _ttl_maximum()),
+    ),
+    (
+        r"default (\d+), max (\d+)",
+        lambda: (int(_defaults().principal_cache_ttl_seconds), _ttl_maximum()),
+    ),
+    (r"[Dd]efault (\d+) s\b", lambda: (int(_defaults().principal_cache_ttl_seconds),)),
+    (r"[Aa]t least (\d+) characters", lambda: (_hmac_minimum(),)),
+)
+
+
+@pytest.mark.parametrize(("pattern", "source"), FACTS, ids=[fact[0] for fact in FACTS])
+def test_documented_numbers_are_the_source_constants(
+    pattern: str, source: Callable[[], tuple[int, ...]]
+) -> None:
+    found = [
+        tuple(int(group) for group in match.groups())
+        for page in PAGES
+        for match in re.finditer(pattern, _flat(page))
+    ]
+    assert found, f"no documented value matches {pattern!r}"
+    assert set(found) == {source()}, f"{pattern!r}: documented {sorted(set(found))}"
+
+
+def test_documented_cache_lifetimes_are_the_served_ones() -> None:
+    found = {int(v) for page in PAGES for v in re.findall(r"ttlMs: (\d+)", _flat(page))}
+    assert LIST_CACHE_HINT.ttl_ms in found
+    assert found <= {LIST_CACHE_HINT.ttl_ms, 0}  # 0: `server/discover`, checked live below
 
 
 def test_the_deploy_table_lists_every_production_mcp_key() -> None:
@@ -498,3 +629,176 @@ def test_documented_input_limits_are_the_enforced_ones() -> None:
     assert free_text["At most"] == f"{tools.MAX_TEXT_CHARS} characters"
     assert other["At most"] == f"{tools.MAX_ID_CHARS} characters"
     assert set(_code(other["Arguments"])) >= set(tools._UNBOUNDED_FIELDS) - {"kind"}
+
+
+# --- raw ASGI requests: no client-supplied default header (an HTTP client adds `Accept: */*`) ----
+
+
+@dataclass(frozen=True)
+class _Raw:
+    status: int
+    headers: dict[str, str]
+    body: bytes
+
+
+def _raw(
+    headers: dict[str, str],
+    body: bytes,
+    *,
+    method: str = "POST",
+    holder: McpAuthHolder | None = None,
+    repeat: int = 1,
+) -> _Raw:
+    """Send `repeat` identical raw requests to the `/mcp` stack the application mounts; the
+    last answer is returned."""
+
+    async def run() -> _Raw:
+        if holder is None:
+            harness = AuthHarness()
+            harness.add()
+            gate_holder = McpAuthHolder(harness.runtime())
+        else:
+            gate_holder = holder
+        mount = build_mcp_mount(
+            create_mcp_server(composer=tools.ComposerHolder()),
+            MCPSettings(),
+            access_gate=require_scope(MEMORY_READ_SCOPE, gate_holder),
+        )
+        sent: list[dict[str, Any]] = []
+        async with mount.lifespan():
+            for _ in range(repeat):
+                sent = await _exchange(mount.asgi_app, method, headers, body)
+        start = next(m for m in sent if m["type"] == "http.response.start")
+        return _Raw(
+            int(start["status"]),
+            {k.decode().lower(): v.decode() for k, v in start["headers"]},
+            b"".join(m.get("body", b"") for m in sent if m["type"] == "http.response.body"),
+        )
+
+    return asyncio.run(run())
+
+
+async def _exchange(
+    app: Any, method: str, headers: dict[str, str], body: bytes
+) -> list[dict[str, Any]]:
+    """One raw ASGI request; every message the application sent."""
+    sent: list[dict[str, Any]] = []
+    messages = [{"type": "http.request", "body": body, "more_body": False}]
+
+    async def receive() -> dict[str, Any]:
+        return messages.pop(0) if messages else {"type": "http.disconnect"}
+
+    async def send(message: dict[str, Any]) -> None:
+        sent.append(message)
+
+    scope = {
+        "type": "http",
+        "asgi": {"version": "3.0"},
+        "http_version": "1.1",
+        "method": method,
+        "scheme": "http",
+        "path": MCP_PATH,
+        "raw_path": MCP_PATH.encode(),
+        "root_path": "",
+        "query_string": b"",
+        "headers": [(k.encode(), v.encode()) for k, v in headers.items()],
+        "client": ("127.0.0.1", 50000),
+        "server": ("127.0.0.1", 8000),
+    }
+    await app(scope, receive, send)
+    return sent
+
+
+def _raw_headers(method: str = "server/discover", **changes: str | None) -> dict[str, str]:
+    headers: dict[str, str] = {
+        "host": "127.0.0.1:8000",
+        "authorization": f"Bearer {TOKEN}",
+        "content-type": "application/json",
+        "accept": "application/json, text/event-stream",
+        "mcp-protocol-version": MODERN_PROTOCOL_VERSIONS[0],
+        "mcp-method": method,
+    }
+    for name, value in changes.items():
+        key = name.replace("_", "-")
+        if value is None:
+            headers.pop(key, None)
+        else:
+            headers[key] = value
+    return headers
+
+
+_DISCOVER = json.dumps(rpc_body("server/discover")).encode()
+TRANSPORT: dict[str, dict[str, str]] = {
+    "no `Accept` header": _raw_headers(accept=None),
+    "`Accept: text/event-stream` only": _raw_headers(accept="text/event-stream"),
+    "`Accept: application/json`": _raw_headers(accept="application/json"),
+    "`Accept: */*`": _raw_headers(accept="*/*"),
+    "no `Content-Type` header": _raw_headers(content_type=None),
+    "`Content-Type: text/plain`": _raw_headers(content_type="text/plain"),
+}
+
+
+def _expect(observed: str) -> tuple[int, bytes | None]:
+    """The status and, when the cell states one, the exact body of an Observed cell."""
+    status = int(_code(observed)[0])
+    if "empty body" in observed or observed.endswith("empty"):
+        return status, b""
+    if "plain text" in observed:
+        return status, _code(observed)[1].encode()
+    return status, None
+
+
+def test_transport_rejections_answer_as_documented() -> None:
+    rows = _table(MCP_DOCS / "protocol-profile.md", "transport-rejections")
+    assert [row["Request"] for row in rows] == list(TRANSPORT)
+    for row in rows:
+        status, body = _expect(row["Observed"])
+        answer = _raw(TRANSPORT[row["Request"]], _DISCOVER)
+        assert answer.status == status, row["Request"]
+        if body is not None:
+            assert answer.body == body, row["Request"]
+
+
+def _notification() -> bytes:
+    body = rpc_body("notifications/initialized")
+    del body["id"]
+    return json.dumps(body).encode()
+
+
+def _scopeless_holder() -> McpAuthHolder:
+    harness = AuthHarness()
+    harness.add(scopes=("events:ingest",))
+    return McpAuthHolder(harness.runtime())
+
+
+def _limited_holder() -> McpAuthHolder:
+    harness = AuthHarness()
+    harness.add()
+    return McpAuthHolder(harness.runtime(rate_per_second=0.001, burst=1))
+
+
+def test_non_jsonrpc_rejections_answer_as_documented() -> None:
+    probes: dict[int, _Raw] = {
+        401: _raw(_raw_headers(authorization=None), _DISCOVER),
+        403: _raw(_raw_headers(), _DISCOVER, holder=_scopeless_holder()),
+        503: _raw(_raw_headers(), _DISCOVER, holder=McpAuthHolder(None)),
+        429: _raw(_raw_headers(), _DISCOVER, holder=_limited_holder(), repeat=2),
+        405: _raw(_raw_headers(), b"", method="GET"),
+        406: _raw(_raw_headers(accept=None), _DISCOVER),
+        400: _raw(_raw_headers(content_type=None), _DISCOVER),
+        202: _raw(_raw_headers("notifications/initialized"), _notification()),
+    }
+    rows = _table(MCP_DOCS / "protocol-profile.md", "non-jsonrpc")
+    documented = {int(code) for row in rows for code in _code(row["HTTP"])}
+    assert documented == set(probes)
+    for row in rows:
+        for code in (int(c) for c in _code(row["HTTP"])):
+            answer = probes[code]
+            assert answer.status == code, row
+            if row["Body"] == "empty":
+                assert answer.body == b"", code
+            elif row["Body"].startswith("JSON"):
+                assert set(json.loads(answer.body)) == {"error", "message"}, code
+            else:
+                assert answer.body == _code(row["Body"])[0].encode(), code
+    assert "retry-after" in probes[429].headers and probes[405].headers["allow"] == "POST"
