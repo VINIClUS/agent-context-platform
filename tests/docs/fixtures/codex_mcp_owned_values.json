@@ -1,0 +1,28 @@
+{
+  "source": {
+    "repository": "VINIClUS/agent-context-codex",
+    "commit": "0a9073dc559393b328f8c0dd2c0cda36db51ebb0",
+    "path": "src/agent_context_codex/install/mcp.py",
+    "blob": "52c15849b812b855be4faf16fe10ee7082d71bbd",
+    "function": "owned_values"
+  },
+  "url": "<platform_url>/mcp",
+  "values": {
+    "bearer_token_env_var": "AGENT_CONTEXT_MCP_TOKEN",
+    "env_http_headers": {
+      "CF-Access-Client-Id": "AGENT_CONTEXT_CF_ACCESS_CLIENT_ID",
+      "CF-Access-Client-Secret": "AGENT_CONTEXT_CF_ACCESS_CLIENT_SECRET"
+    },
+    "enabled": true,
+    "required": false,
+    "enabled_tools": [
+      "context_for_task",
+      "repository_overview",
+      "symbol_context",
+      "decision_history",
+      "failure_history"
+    ],
+    "startup_timeout_sec": 10,
+    "tool_timeout_sec": 30
+  }
+}

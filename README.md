@@ -370,7 +370,7 @@ does). Unset, they read `unknown`/`dev` (local builds).
 | Role | Command | Environment |
 | --- | --- | --- |
 | `platform-migrate` (one-shot, before the API) | `agent-context db upgrade --expect-head <io.agent-context.alembic.head>` | `AGENT_CONTEXT_POSTGRESQL__MIGRATION_DSN` |
-| `platform-api` (2 replicas) | default: `uvicorn agent_context_platform.app:create_app --factory --host 0.0.0.0 --port 8000 --no-access-log --no-server-header` | `AGENT_CONTEXT_ENVIRONMENT=production`, `__POSTGRESQL__DSN` (API login), `__NEO4J__*`, `__S3__*`, `__MCP__TOKEN_HMAC_KEY`, `__MCP__ALLOWED_HOSTS`/`__ALLOWED_ORIGINS` |
+| `platform-api` (2 replicas) | default: `uvicorn agent_context_platform.app:create_app --factory --host 0.0.0.0 --port 8000 --no-access-log --no-server-header` | `AGENT_CONTEXT_ENVIRONMENT=production`, `__POSTGRESQL__DSN` (API login), `__NEO4J__*`, `__S3__*`, `__MCP__TOKEN_HMAC_KEY`, `__MCP__CURSOR_HMAC_KEY` (the same on every replica), `__MCP__ALLOWED_HOSTS`/`__ALLOWED_ORIGINS` |
 | `platform-projector` | `agent-context projection run` | `__POSTGRESQL__PROJECTOR_DSN`, `__NEO4J__*`, `__S3__*`, and `__SEARCH__MODEL_DIR` (model volume) or `AGENT_CONTEXT_PROJECTION_LEXICAL_ONLY=1` (see Search and embeddings) |
 | `platform-indexer` | `agent-context index --repository-id <id> --checkout /work` | `__POSTGRESQL__API_DSN`; run with `user: "10001:10001"` |
 
@@ -549,6 +549,10 @@ uv run pytest -q tests/evaluation
 ```
 
 ## MCP memory tools
+
+The MCP documentation set is [docs/mcp/README.md](docs/mcp/README.md): connecting Codex, the
+protocol profile, the tool contracts, security, deployment and scaling, conformance and legacy
+compatibility.
 
 `POST /mcp` (MCP `2026-07-28`, stateless: no `initialize`, no `Mcp-Session-Id`, no cookie; a
 direct `tools/call` needs no prior `server/discover`) serves exactly five read-only tools, each
