@@ -232,3 +232,42 @@ def test_an_unreachable_graph_is_unavailable_quickly_not_a_deadline(
     error = json.loads(result["content"][0]["text"])["error"]
     assert (error["code"], error["retryable"]) == ("context_unavailable", True)
     assert elapsed < 8.0  # well inside the 10 s tool deadline
+
+
+def test_an_exhausted_composer_pool_is_unavailable_not_a_crash(
+    api_login: str, token: str, delivered: None, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    from agent_context_platform import app as app_module
+
+    monkeypatch.setattr(app_module, "COMPOSER_POOL_SIZE", 1)
+    monkeypatch.setattr(app_module, "COMPOSER_POOL_OVERFLOW", 0)
+    monkeypatch.setattr(app_module, "COMPOSER_POOL_TIMEOUT_SECONDS", 0.5)
+    engines: list[AsyncEngine] = []
+    build = app_module._composer_engine
+
+    def capture(settings: Settings) -> AsyncEngine:
+        engines.append(build(settings))
+        return engines[-1]
+
+    monkeypatch.setattr(app_module, "_composer_engine", capture)
+    services = _service_settings()
+    settings = Settings(
+        environment="test",
+        postgresql={"dsn": api_login},
+        neo4j=services["neo4j"],
+        s3=services["s3"],
+    )
+    with TestClient(create_app(settings), base_url="http://127.0.0.1:8000") as http:
+        assert http.portal is not None
+        (engine,) = engines
+        held = http.portal.call(engine.connect().start)  # the pool's only connection, on its loop
+        try:
+            started = time.monotonic()
+            result = call(http, "repository_overview", CALLS["repository_overview"])
+            elapsed = time.monotonic() - started
+        finally:
+            http.portal.call(held.close)
+
+    error = json.loads(result["content"][0]["text"])["error"]
+    assert (error["code"], error["retryable"]) == ("context_unavailable", True)
+    assert elapsed < 5.0
