@@ -80,6 +80,9 @@ FIXTURE_TOOLS: Final = frozenset(
     }
 )
 MISSING_REQUIRED_CLIENT_CAPABILITY: Final = -32021
+# The SDK release whose private tool registry `create_fixture_server` was reviewed against; a
+# test fails as soon as the lock moves to another one.
+REVIEWED_SDK_VERSION: Final = "2.2.0"
 
 
 def _text(text: str) -> TextContent:
@@ -206,6 +209,7 @@ def create_fixture_server() -> MCPServer[Any]:
     ):
         server.add_tool(function, structured_output=False)
     # The listing must carry the scenario's schema verbatim, not the one derived from the
-    # signature: the SDK keeps the derived schema on the registered tool, so replace it there.
+    # signature. The SDK has no public API for a hand-written input schema: it keeps the derived
+    # one on the registered tool, so replace it there (reviewed for REVIEWED_SDK_VERSION only).
     server._tool_manager.get_tool(JSON_SCHEMA_TOOL).parameters = JSON_SCHEMA_2020_12  # type: ignore[union-attr]
     return server

@@ -255,6 +255,19 @@ def test_the_fixture_profile_lists_every_fixture_tool_the_manifest_relies_on(
     assert header["x-mcp-header"] == "Region"
 
 
+def test_the_private_sdk_registry_use_is_pinned_to_the_reviewed_sdk() -> None:
+    """`create_fixture_server` replaces one schema through the SDK's private tool registry."""
+    from importlib.metadata import version
+
+    lock = (ROOT / "uv.lock").read_text(encoding="utf-8")
+    locked = re.search(r'\n\[\[package\]\]\nname = "mcp"\nversion = "([^"]+)"', lock)
+    assert locked is not None
+    assert version("mcp") == locked.group(1) == fixture_server.REVIEWED_SDK_VERSION, (
+        "the mcp SDK moved: re-review fixture_server's private _tool_manager use, then update "
+        "REVIEWED_SDK_VERSION"
+    )
+
+
 def _call(client: TestClient, name: str, **options: Any) -> Any:
     return rpc(client, "tools/call", {"name": name, "arguments": {}}, **options)
 
