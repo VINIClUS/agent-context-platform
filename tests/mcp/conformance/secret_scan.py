@@ -7,11 +7,17 @@ credential shapes: bearer tokens (`<prefix>.<secret>`, `security/bearer.py`), an
 ``Authorization: Bearer`` value, URLs or DSNs with a password, private keys, cloud and GitHub
 tokens, and the repository's test canaries (``AGENT_CONTEXT_CANARY``). A hit prints the file,
 line and pattern name, never the match, and exits 1.
+
+The runner's own scan is the only one that knows the token. ``--verdict FILE`` records its
+outcome (pass or fail and counts, never a value) in the output directory, and
+``--check-verdict FILE`` exits 0 only for a passing token-aware verdict: CI uploads artifacts only
+when that check and its own token-less rescan both pass.
 """
 
 from __future__ import annotations
 
 import argparse
+import json
 import os
 import re
 import sys
@@ -66,19 +72,45 @@ def scan_paths(paths: Iterable[Path], token: str | None = None) -> list[str]:
     return findings
 
 
+def verdict_passed(path: Path) -> bool:
+    """A recorded verdict passes only if it is token-aware and found nothing."""
+    try:
+        verdict = json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return False
+    return (
+        isinstance(verdict, dict)
+        and verdict.get("passed") is True
+        and verdict.get("token_aware") is True
+        and verdict.get("findings") == 0
+    )
+
+
 def main(argv: Iterable[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description=__doc__)
-    parser.add_argument("paths", nargs="+", type=Path)
+    parser.add_argument("paths", nargs="*", type=Path)
+    parser.add_argument("--verdict", type=Path, help="record the outcome here (counts only)")
+    parser.add_argument("--check-verdict", type=Path, help="exit 0 only for a passing verdict")
     arguments = parser.parse_args(None if argv is None else list(argv))
+    if arguments.check_verdict is not None:
+        passed = verdict_passed(arguments.check_verdict)
+        print(f"secret scan: recorded token-aware verdict {'passed' if passed else 'FAILED'}")
+        return 0 if passed else 1
+    if not arguments.paths:
+        parser.error("paths are required unless --check-verdict is given")
+    token = os.environ.get(TOKEN_ENV) or None
     missing = [str(path) for path in arguments.paths if not path.exists()]
+    findings = [] if missing else scan_paths(arguments.paths, token)
     if missing:
         print(f"secret scan: missing {missing}", file=sys.stderr)
-        return 1
-    findings = scan_paths(arguments.paths, os.environ.get(TOKEN_ENV) or None)
     for finding in findings:
         print(f"secret scan: {finding}", file=sys.stderr)
     print(f"secret scan: {len(findings)} finding(s)")
-    return 1 if findings else 0
+    passed = not missing and not findings
+    if arguments.verdict is not None:
+        verdict = {"passed": passed, "findings": len(findings), "token_aware": token is not None}
+        arguments.verdict.write_text(json.dumps(verdict) + "\n", encoding="utf-8")
+    return 0 if passed else 1
 
 
 if __name__ == "__main__":

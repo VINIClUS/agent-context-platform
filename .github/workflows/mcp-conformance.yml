@@ -123,8 +123,13 @@ jobs:
         if: always()
         run: uv run --frozen python tests/mcp/conformance/secret_scan.py "$OUTPUT_DIR"
 
+      - name: Check the run's token-aware scan verdict
+        id: verdict
+        if: always()
+        run: uv run --frozen python tests/mcp/conformance/secret_scan.py --check-verdict "$OUTPUT_DIR/secret-scan.json"
+
       - name: Upload checks and application logs
-        if: always() && steps.scan.outcome == 'success'
+        if: always() && steps.scan.outcome == 'success' && steps.verdict.outcome == 'success'
         uses: actions/upload-artifact@043fb46d1a93c77aae656e7c1c64a875d1fc6a0a # v7.0.1
         with:
           name: mcp-conformance
