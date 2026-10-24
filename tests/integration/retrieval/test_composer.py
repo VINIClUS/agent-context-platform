@@ -494,11 +494,19 @@ def test_retrieval_reads_run_as_a_login_member_of_the_api_role_only(
     assert page.items and page.as_of_event_id
 
 
-# Freshness reads the projection progress tables of the API role's read grants (PLATFORM-055).
+# Freshness reads the projection progress tables of the API role's read grants (PLATFORM-055);
+# evidence alone reads content references and search alone the lexical documents, so revoking
+# those proves the evidence and search reads run as the API login too (the projector role can
+# read all of them).
 @pytest.mark.parametrize(
-    "table", [table for table in API_READ_TABLES if table.startswith("projection.")]
+    "table",
+    [
+        *(table for table in API_READ_TABLES if table.startswith("projection.")),
+        "ledger.event_content_refs",
+        "retrieval.search_documents",
+    ],
 )
-def test_a_missing_projection_read_grant_fails_closed(
+def test_a_missing_api_read_grant_fails_closed(
     seeded: Seeded, postgres_dsn: str, projection_engine: AsyncEngine, table: str
 ) -> None:
     async def grant(statement: str) -> None:
@@ -509,7 +517,9 @@ def test_a_missing_projection_read_grant_fails_closed(
         await grant(f"REVOKE SELECT ON {table} FROM agent_context_api")
         try:
             with pytest.raises(ContextUnavailable):
-                await world.composer().repository_overview(overview(seeded.revisions.c2), PRINCIPAL)
+                await world.composer().context_for_task(
+                    task(commit(seeded.revisions.c2), "rounding drift in add"), PRINCIPAL
+                )
         finally:
             await grant(f"GRANT SELECT ON {table} TO agent_context_api")
 
@@ -648,8 +658,10 @@ def test_a_delivery_past_a_still_pending_row_stales_the_cursor_and_is_never_cite
 def test_answers_follow_the_snapshot_not_the_wall_clock_nor_a_producer_clock(
     seeded: Seeded, postgres_dsn: str, projection_engine: AsyncEngine
 ) -> None:
-    """A decision whose producer clock runs ahead is known as soon as it is delivered; one that
-    starts in two hours is not active in the open snapshot window, whatever the reader's clock."""
+    """A decision whose producer clock runs ahead is known once a later delivery's time (clamped
+    by the server's clock) passes its `observed_at`, never before (review round 6: a fast clock
+    must not move the snapshot); one that starts in two hours is not active in the open snapshot
+    window, whatever the reader's clock."""
 
     async def body(world: EvalWorld) -> None:
         real = datetime.now(UTC)
@@ -689,6 +701,13 @@ def test_answers_follow_the_snapshot_not_the_wall_clock_nor_a_producer_clock(
                 "budget": WIDE,
             }
         )
+        early = await now.decision_history(ask, PRINCIPAL)
+        assert "decision:dec_skewed" not in {item.item_id for item in early.items}
+        await asyncio.sleep(
+            max(0.0, (real + timedelta(seconds=3.5) - datetime.now(UTC)).total_seconds())
+        )
+        await decision(94, "dec_honest", datetime.now(UTC), real)  # a later, honest delivery
+        assert (await world.project()).delivered == 1
         found = await now.decision_history(ask, PRINCIPAL)
         assert "decision:dec_skewed" in {item.item_id for item in found.items}
         snapshot = task(
@@ -710,7 +729,7 @@ def test_a_task_answer_needs_a_bounded_number_of_statements(
     statements: list[str] = []
 
     async def body(world: EvalWorld) -> ContextPackageV1:
-        engine = world._engines[0].sync_engine  # the API role
+        engine = world._engines[2].sync_engine  # the API login every composer read uses
 
         def count(*_: Any) -> None:
             statements.append("x")
@@ -726,5 +745,25 @@ def test_a_task_answer_needs_a_bounded_number_of_statements(
 
     page = run_in_world(seeded, postgres_dsn, projection_engine, body)
     assert page.items
-    print("api statements", len(statements))
-    assert len(statements) <= STATEMENT_CEILING
+    assert 0 < len(statements) <= STATEMENT_CEILING
+
+
+def test_a_lexical_only_deployment_skips_the_vector_leg_without_an_error_outcome(
+    seeded: Seeded, postgres_dsn: str, projection_engine: AsyncEngine
+) -> None:
+    from unit.observability._capture import capture_telemetry
+
+    from agent_context_platform.observability import contract
+
+    async def body(world: EvalWorld) -> ContextPackageV1:
+        return await world.composer(lexical_only=True).context_for_task(
+            task(commit(seeded.revisions.c2), "rounding drift in add"), PRINCIPAL
+        )
+
+    with capture_telemetry() as telemetry:
+        page = run_in_world(seeded, postgres_dsn, projection_engine, body)
+        name = contract.RETRIEVAL_DURATION
+        assert telemetry.value(name, operation="search", outcome="client_error") == 0
+        assert telemetry.value(name, operation="search", outcome="ok") > 0
+    assert page.items
+    assert "vector_search_unavailable" not in page.warnings

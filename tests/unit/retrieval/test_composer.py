@@ -579,7 +579,7 @@ def test_a_request_can_shorten_the_deadline_but_never_extend_it() -> None:
     from agent_context_platform.retrieval.graph import RetrievalDeadlineExceeded
 
     class SlowFreshness:
-        async def read(self, *_: object) -> Any:
+        async def read(self, *_: object, **__: object) -> Any:
             await asyncio.sleep(1)
             raise AssertionError("the deadline should have fired first")
 
@@ -606,7 +606,7 @@ def test_a_request_can_shorten_the_deadline_but_never_extend_it() -> None:
         asyncio.run(slow.decision_history(request, RequestContext("p", deadline_seconds=60)))
 
 
-def test_only_execution_events_of_another_snapshot_are_dirty_and_dropped_runs_take_their_observations() -> (
+def test_only_execution_events_of_another_snapshot_are_dirty_and_only_kept_runs_back_observations() -> (
     None
 ):
     def event_of(event_type: str, payload: dict[str, Any]) -> Any:
@@ -618,15 +618,26 @@ def test_only_execution_events_of_another_snapshot_are_dirty_and_dropped_runs_ta
     assert commit_scope.admits(replayed)
     dirty_run = event_of("quality.ci_run.completed", {"snapshot_id": "snap-1"})
     assert not commit_scope.admits(dirty_run)
-    observation = event_of("knowledge.failure.observed", {"ci_run_id": "ci-dirty"})
-    assert commit_scope.admits(observation)
-    assert not replace(commit_scope, excluded_runs=frozenset({"ci-dirty"})).admits(observation)
+    # An allow-list: an observation of a run the answer never saw (completed after the window,
+    # or never) is not evidence; one of a kept run is; one naming a kept and an unseen run is not.
+    unseen = event_of("knowledge.failure.observed", {"ci_run_id": "ci-unseen"})
     clean = event_of("knowledge.failure.observed", {"ci_run_id": "ci-clean"})
-    assert replace(commit_scope, excluded_runs=frozenset({"ci-dirty"})).admits(clean)
+    both = event_of(
+        "knowledge.failure.observed", {"ci_run_id": "ci-clean", "test_run_id": "test-unseen"}
+    )
+    in_session = event_of("knowledge.failure.observed", {"session_id": "sess-1"})
+    kept = replace(commit_scope, kept_runs=frozenset({"ci-clean"}))
+    assert not commit_scope.admits(clean)
+    assert kept.admits(clean)
+    assert not kept.admits(unseen)
+    assert not kept.admits(both)
+    assert commit_scope.admits(in_session)
+    # Outside a revision (failure_history) every run of the scope is evidence.
+    assert EvidenceScope(repository_id="repo-1").admits(unseen)
 
 
-def test_dirty_runs_are_the_runs_of_another_snapshot() -> None:
-    from agent_context_platform.retrieval.composer import _dirty_runs
+def test_kept_runs_are_the_visible_runs_of_the_revision_state() -> None:
+    from agent_context_platform.retrieval.composer import _kept_runs
 
     mixed = replace(
         _failure(True),
@@ -636,21 +647,36 @@ def test_dirty_runs_are_the_runs_of_another_snapshot() -> None:
             _run("ci-other", status="failure", snapshot="snap-2"),
         ),
     )
-    assert _dirty_runs([mixed], None) == {"ci-own", "ci-other"}
-    assert _dirty_runs([mixed], "snap-1") == {"ci-other"}
+    assert _kept_runs([mixed], None) == {"ci-clean"}
+    assert _kept_runs([mixed], "snap-1") == {"ci-clean", "ci-own"}
 
 
-def test_record_time_never_passes_the_snapshot() -> None:
-    from agent_context_platform.retrieval.composer import FAR_FUTURE, _known
+def _fresh(known: datetime | None) -> Any:
     from agent_context_platform.retrieval.freshness import Freshness
 
-    def fresh(known: datetime | None) -> Freshness:
-        return Freshness("e", 1, T, known, "pc1-x", 0, ())
+    return Freshness("e", 1, T, known, "pc1-x", 0, ())
 
-    assert _known(fresh(None)) == FAR_FUTURE
-    assert _known(fresh(T)) == T
-    assert _known(fresh(T), T - timedelta(hours=1)) == T - timedelta(hours=1)
-    assert _known(fresh(None), T) == T
+
+def test_record_time_never_passes_the_snapshot_time_nor_its_backlog() -> None:
+    from agent_context_platform.retrieval.composer import BACKLOG_WARNING, _Gathered, _known
+
+    hour = timedelta(hours=1)
+    quiet = _Gathered()
+    # No backlog: the snapshot's own time, never "every recorded fact".
+    assert _known(_fresh(None), quiet) == T
+    assert _known(_fresh(None), quiet, T - hour) == T - hour
+    # A backlog past the snapshot's time hides nothing.
+    assert _known(_fresh(T + hour), quiet) == T
+    assert _known(_fresh(T), quiet) == T
+    assert not quiet.warnings
+    # A backlog before it hides facts, and the package says so.
+    lagging = _Gathered()
+    assert _known(_fresh(T - hour), lagging) == T - hour
+    assert lagging.warnings == {BACKLOG_WARNING}
+    # ... unless the window's own instant is earlier still.
+    closed = _Gathered()
+    assert _known(_fresh(T - hour), closed, T - 2 * hour) == T - 2 * hour
+    assert not closed.warnings
 
 
 def test_executed_output_names_the_revision_it_ran_on() -> None:
@@ -720,7 +746,7 @@ def test_driver_errors_become_typed_errors_without_the_statement_or_its_paramete
             self.sqlstate = sqlstate
 
     class FailingFreshness:
-        async def read(self, *_: object) -> Any:
+        async def read(self, *_: object, **__: object) -> Any:
             raise OperationalError(
                 "SELECT secret_column FROM ledger.events WHERE q = %(query)s",
                 {"query": "private task words"},
@@ -761,7 +787,7 @@ def test_each_tool_call_is_one_retrieval_sample_with_a_closed_outcome(telemetry:
     from agent_context_platform.retrieval.freshness import Freshness
 
     class StaticFreshness:
-        async def read(self, *_: object) -> Freshness:
+        async def read(self, *_: object, **__: object) -> Freshness:
             return Freshness(str(EVENT), 1, T, None, "pc1-x", 0, ())
 
     fake: Any = object()
