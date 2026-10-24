@@ -32,7 +32,7 @@ are the contract.
 3. **Install the server table** with the Codex adapter
    (`agent-context-codex`, `src/agent_context_codex/install/mcp.py`), which also enables the Codex
    feature `mcp_2026_07_28` when the installed release still lists it, reads the result back with
-   `codex mcp list` and smoke-tests `server/discover`:
+   `codex mcp list` and, when the release needs it, smoke-tests `server/discover`:
 
    ```bash
    agent-context-codex install mcp --codex-home ~/.codex --dry-run   # show the plan and the table
