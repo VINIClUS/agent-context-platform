@@ -13,6 +13,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import time
 import uuid
 from collections.abc import Iterator
 from datetime import UTC, datetime, timedelta
@@ -203,7 +204,6 @@ def test_each_tool_reads_through_the_api_role_and_reports_a_typed_error(
 
     assert result["isError"] is True
     error = json.loads(result["content"][0]["text"])["error"]
-    # Never a permission failure (`context_unavailable`) or a crash (`internal_error`).
     # Past the freshness read (one event is delivered) to the scope check, which needs the graph:
     # never a permission failure (`context_unavailable`) or a crash (`internal_error`).
     assert error == {
@@ -211,3 +211,24 @@ def test_each_tool_reads_through_the_api_role_and_reports_a_typed_error(
         "message": "the scope is unknown",
         "retryable": False,
     }
+
+
+def test_an_unreachable_graph_is_unavailable_quickly_not_a_deadline(
+    api_login: str, token: str, delivered: None
+) -> None:
+    services = _service_settings()
+    unreachable = {**services["neo4j"], "uri": "bolt://127.0.0.1:1"}
+    settings = Settings(
+        environment="test",
+        postgresql={"dsn": api_login},
+        neo4j=unreachable,
+        s3=services["s3"],
+    )
+    with TestClient(create_app(settings), base_url="http://127.0.0.1:8000") as http:
+        started = time.monotonic()
+        result = call(http, "repository_overview", CALLS["repository_overview"])
+        elapsed = time.monotonic() - started
+
+    error = json.loads(result["content"][0]["text"])["error"]
+    assert (error["code"], error["retryable"]) == ("context_unavailable", True)
+    assert elapsed < 8.0  # well inside the 10 s tool deadline
