@@ -802,3 +802,53 @@ def test_non_jsonrpc_rejections_answer_as_documented() -> None:
             else:
                 assert answer.body == _code(row["Body"])[0].encode(), code
     assert "retry-after" in probes[429].headers and probes[405].headers["allow"] == "POST"
+
+
+def _library_class(library: str, name: str) -> type[BaseException]:
+    import builtins
+
+    import botocore.exceptions
+    import neo4j.exceptions
+    import sqlalchemy.exc
+
+    module = {
+        "botocore": botocore.exceptions,
+        "SQLAlchemy": sqlalchemy.exc,
+        "Neo4j": neo4j.exceptions,
+        "": builtins,
+    }[library]
+    found = getattr(module, name)
+    assert isinstance(found, type) and issubclass(found, BaseException), name
+    return found
+
+
+def _kind_of(error_type: type[BaseException]) -> Any:
+    """What `_classify` answers for an exception of `error_type` (its order, without an instance)."""
+    for handled, kind in tools._ERRORS:
+        if issubclass(error_type, handled):
+            return kind
+    if issubclass(error_type, OSError):
+        return tools._UNAVAILABLE
+    return tools._INTERNAL
+
+
+def test_documented_store_failures_are_classified_as_documented() -> None:
+    rows = _table(MCP_DOCS / "tool-contracts.md", "store-failures")
+    for row in rows:
+        exceptions = row["Exceptions"]
+        library = next(
+            (name for name in ("botocore", "SQLAlchemy", "Neo4j") if exceptions.startswith(name)),
+            "",
+        )
+        code, retryable, logged = _first(row["Code"]), row["Retryable"], row["Logged"]
+        if "DatabaseNotFound" in exceptions:
+            assert _code(exceptions)[1] == tools._DATABASE_NOT_FOUND
+            kinds = [tools._MISCONFIGURED_KIND]
+        else:
+            names = [name for name in _code(exceptions) if name.isidentifier()]
+            kinds = [_kind_of(_library_class(library, name)) for name in names]
+        for kind in kinds:
+            assert kind.code == code, row
+            assert ("yes" if kind.retryable else "no") == retryable, row
+            is_logged = kind is tools._INTERNAL or kind.misconfigured
+            assert ("yes" if is_logged else "no") == logged, row

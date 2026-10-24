@@ -81,10 +81,16 @@ are configured. It needs:
 | --- | --- | --- |
 | PostgreSQL (API role) | ledger evidence, lexical search, projection freshness | `context_unavailable` (retryable): unreachable, a failed connection or the composer's pool exhausted |
 | Neo4j | code graph, revisions, decisions and failures | `context_unavailable` (retryable), also when it refuses the login or the database |
-| S3-compatible store | sanitized content for bounded excerpts | `context_unavailable` (retryable): unreachable or timing out |
+| S3-compatible store | sanitized content for bounded excerpts | `context_unavailable` (retryable): unreachable or timing out, or missing credentials or region |
 | Model directory (optional) | query embeddings for vector search | lexical-only mode |
 
 A query or schema bug is `internal_error` (logged by class only), never `context_unavailable`.
+Misconfiguration (missing or partial S3 credentials or region, a Neo4j login or token the server
+refuses, a Neo4j database that does not exist) also answers `context_unavailable`, because the
+caller cannot fix it, but unlike an outage it writes one `ERROR` line on
+`agent_context_platform.mcp.tools` naming the tool and the exception class (never its message):
+alert on it. The full mapping is in
+[the tool contracts](tool-contracts.md#backing-store-failures).
 Until all three stores are configured every tool call answers `context_unavailable`; the MCP
 surface itself (discovery, listing, authentication) still works. The composer's Neo4j drivers
 connect within at most 2 s, wait at most 4 s for a connection and retry a transaction for at most

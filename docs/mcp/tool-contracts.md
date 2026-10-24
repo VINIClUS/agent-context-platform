@@ -120,9 +120,36 @@ name is not a tool error but the protocol error `-32602` ([protocol profile](pro
 | `temporal_projection_outdated` | The temporal projection needs a rebuild before history can be answered. | no | Tell the operator (`agent-context projection rebuild`). |
 | `projection_not_ready` | Nothing has been projected yet. | yes | Retry later. |
 | `deadline_exceeded` | The request exceeded its deadline. | yes | Retry, or ask a narrower question. |
-| `context_unavailable` | A backing store is unavailable: PostgreSQL, Neo4j or S3 is unreachable or times out, a connection fails, the composer's connection pool is exhausted, Neo4j refuses the login or the database, or the stores are not configured. (A query or schema bug is `internal_error`, not this.) | yes | Retry later. |
+| `context_unavailable` | A backing store is unavailable or misconfigured: PostgreSQL, Neo4j or S3 is unreachable or times out, a connection fails, the composer's pool is exhausted, a store refuses the configured credentials or database, or the stores are not configured ([backing-store failures](#backing-store-failures)). A query or schema bug is `internal_error`, not this. | yes | Retry later; misconfiguration also needs the operator (it is logged). |
 | `unauthenticated` | The call reached the tool without an authenticated principal. | no | Present a valid `memory:read` token. |
-| `internal_error` | Anything unexpected (logged by class only). | no | Report it; do not retry blindly. |
+| `internal_error` | Anything unexpected, including a query or schema bug (logged by class only). | no | Report it; do not retry blindly. |
+
+### Backing-store failures
+
+How failures of PostgreSQL, Neo4j and S3 become tool errors (`_classify` in `mcp/tools.py`).
+Inside a request the composer already turns any PostgreSQL driver error into
+`context_unavailable`; the table covers what reaches the tool layer. Every row answers with the
+fixed message only; "logged" means one `ERROR` line on `agent_context_platform.mcp.tools` naming
+the tool and the exception class, never its message.
+
+<!-- docs-check: store-failures -->
+| Exceptions | Code | Retryable | Logged | Meaning and action |
+| --- | --- | --- | --- | --- |
+| botocore `EndpointConnectionError`, `ConnectTimeoutError`, `ProxyConnectionError` | `context_unavailable` | yes | no | S3 unreachable or timing out. Retry later. |
+| botocore `ReadTimeoutError`, `ConnectionClosedError` | `context_unavailable` | yes | no | S3 stopped answering mid-request. Retry later. |
+| SQLAlchemy `TimeoutError` | `context_unavailable` | yes | no | The composer's PostgreSQL pool stayed exhausted for 5 s. Retry later. |
+| SQLAlchemy `DisconnectionError`, `OperationalError`, `InterfaceError` | `context_unavailable` | yes | no | PostgreSQL connection lost or refused. Retry later. |
+| Neo4j `ServiceUnavailable`, `SessionExpired`, `ConnectionAcquisitionTimeoutError`, `DatabaseUnavailable`, `TransientError` | `context_unavailable` | yes | no | Neo4j unreachable or busy. Retry later. |
+| `OSError` | `context_unavailable` | yes | no | A connection refused or reset below the drivers. Retry later. |
+| botocore `NoCredentialsError`, `PartialCredentialsError`, `CredentialRetrievalError`, `NoRegionError` | `context_unavailable` | yes | yes | S3 is misconfigured. Retry later; the operator must fix the settings (see the log line). |
+| Neo4j `AuthError`, `TokenExpired`, `Forbidden` | `context_unavailable` | yes | yes | Neo4j refuses the configured login. As above. |
+| Neo4j `ClientError` with code `Neo.ClientError.Database.DatabaseNotFound` | `context_unavailable` | yes | yes | The configured Neo4j database does not exist. As above. |
+| botocore `ParamValidationError` | `internal_error` | no | yes | A request bug in the platform. Report it. |
+| SQLAlchemy `ProgrammingError`, `DataError` | `internal_error` | no | yes | A query or schema bug in the platform. Report it. |
+
+Misconfiguration is answered as `context_unavailable` (retryable) because the caller cannot tell it
+from an outage and nothing about the request is wrong; the operator learns of it from the log
+line, which outages do not produce.
 
 ## Content trust
 
