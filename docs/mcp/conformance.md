@@ -58,12 +58,14 @@ It needs Python (`uvx uv@0.11.28 run --frozen python`, or `PYTHON=...`), Node wi
 network access for `npx` only; no database, graph or object store. For each profile it starts the
 server, runs the suite into `OUTPUT_DIR/<profile>/results/`, and stops the server; then it writes
 `OUTPUT_DIR/<profile>/checks.json` (all checks, by scenario), `OUTPUT_DIR/summary.json` (counts)
-and scans the whole directory for credentials (`secret_scan.py`: the run's own token plus
-credential shapes). The servers are always torn down. It exits non-zero on any unexpected failure,
+and scans the whole directory for credentials. `secret_scan.py` looks for the run's own token
+(whole, and its secret segment on its own) and for credential shapes. The run token is passed only
+to the loopback servers and the scanner; `npx` and the suite never see it. In GitHub Actions it is
+masked in the logs. The servers are always torn down. It exits non-zero on any unexpected failure,
 stale or missing manifest entry, unknown scenario, bad citation or scan finding.
 
 CI (`.github/workflows/mcp-conformance.yml`) runs it on pull requests and pushes to `main` with
-pinned actions and a checksum-verified Node `22.22.0`. It scans the output again and uploads
+pinned actions, a checksum-verified Node `22.22.0` and a checksum-verified ShellCheck `0.11.0`. It scans the output again and uploads
 `summary.json`, `checks.json`, the suite output and the application logs as the `mcp-conformance`
 artifact only after that scan passes.
 
@@ -73,30 +75,61 @@ No expected-failure baseline may mask a required check. `tests/mcp/conformance/a
 lists only scored checks, and `evaluate.py` enforces:
 
 1. **A failed scored check must be listed** for that profile, else the run fails. Checks reported
-   as `FAILURE` or `ERROR` count as failed; `WARNING`, `SKIPPED` and `INFO` do not.
+   as `FAILURE` or `ERROR` count as failed; `WARNING`, `SKIPPED` and `INFO` do not. A check id the
+   suite reports more than once (once per probed variant) failed if any report failed.
 2. **Capability exclusions** (`[[exclusion]]`). The check exercises only a capability the platform
-   does not advertise. Each capability names the methods that would serve it. Tests verify the
-   exclusion and never assume it (`test_conformance_profiles.py`):
+   does not advertise. Only allowlisted scenarios can be excluded at all, each for its own
+   capability (`evaluate.EXCLUDABLE`):
+   - `resources`: `resources-list`, `resources-read-text`, `resources-read-binary`,
+     `resources-templates-read`, and in `caching` only the two resources caching-hint checks;
+   - `prompts`: the five `prompts-*` scenarios, and in `caching` only the prompts hint check;
+   - `completions`: `completion-complete`;
+   - `input_requests`: the ten `input-required-result-*` scenarios. This includes
+     `tampered-state`: it tampers with the `requestState` of the server's own
+     `InputRequiredResult`, which a server that never asks for input never issues;
+   - `response_stream`: `tools-call-with-progress`.
+
+   Anything else, including any scenario about stateless or session behaviour, transport
+   security, headers, authorization or integrity, can never be listed, and must pass. Each
+   capability names the methods that would serve it. Tests verify the exclusion and never assume
+   it (`test_conformance_profiles.py`):
    - the shipping `server/discover` advertises only `tools`;
    - every listed method answers `-32601` with HTTP 404;
    - for `input_requests`, no memory tool returns `InputRequiredResult`;
    - for `response_stream`, every shipping method and the fixture progress tool answer one
      `application/json` body with no notification, even when the client accepts
      `text/event-stream` and sends a progress token (see below).
-
-   A protected scenario (stateless/session behaviour, transport security, headers, authorization;
-   `evaluate.PROTECTED`) can never be excluded.
 3. **Fixture coverage** (`[[fixture]]`, shipping profile only). The check needs one of the suite's
-   fixture tools, which the shipping server must never list (tested). It is not a waiver: the same
-   check must **pass** on the fixture profile, or the run fails.
-4. **The manifest stays current.** These all fail the run:
+   fixture tools, which the shipping server must never list (tested). Only the six `tools-call-*`
+   content and error scenarios, and in `server-stateless` only its four diagnostic-tool checks,
+   can be listed (`evaluate.FIXTURE_COVERABLE`). Every other `server-stateless` check must pass on
+   shipping. It is not a waiver: the same check must **pass** on the fixture profile, or the run
+   fails.
+4. **Every listed failure needs the suite's not-applicable evidence.** The failed report (its
+   message or details) must say, in the suite's own words, that the entry's reason applies
+   (`evaluate.EVIDENCE`):
+   - `Method not found` / `-32601` for an unserved method;
+   - `Unknown tool` or `Not testable` for a missing fixture tool;
+   - for input requests, `Unknown tool`, `Method not found`, `Prerequisite failed`, or that no
+     `InputRequiredResult` came back;
+   - for the response stream, `Unknown tool` or `No progress notifications received`.
+
+   If the report names a tool, it must be the entry's tool. A listed check that failed for any
+   other reason is an unexpected failure, so an entry can never mask a regression it does not
+   describe.
+5. **The manifest stays current.** These all fail the run:
    - a listed check that passes (stale);
    - a listed check that did not run (missing);
    - an unknown scenario, in the results or the manifest;
-   - a scored scenario that did not run.
-5. **Citations are checked.** Every entry cites the pinned package's bundle (`dist/index.js`). The
-   runner checks that the cited scenario class and literal occur in it.
-6. **Unscored scenarios** (the requirement set's `not_scored`: the tasks extension and pending
+   - a scored scenario that did not run or reported no check.
+
+   The exact sets of excluded and fixture-covered (scenario, check) pairs are also pinned in
+   `test_conformance_evaluate.py`, so growing either one is a reviewed change.
+6. **Citations are checked inside the scenario.** Every entry cites the pinned package's bundle
+   (`dist/index.js`). The runner locates the cited scenario's own class there (from its class
+   keyword to the next scenario's), and requires the cited literal and every listed check id to
+   occur inside it. A literal found elsewhere in the bundle does not count.
+7. **Unscored scenarios** (the requirement set's `not_scored`: the tasks extension and pending
    scenarios) are reported and never gate. Listing one is an error.
 
 "Conditional on a capability" means that the check's only interaction is a method gated by that
