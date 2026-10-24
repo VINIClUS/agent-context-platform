@@ -97,9 +97,18 @@ jobs:
           tar -xJf "$RUNNER_TEMP/$archive" -C "$RUNNER_TEMP/node" --strip-components=1
           echo "$RUNNER_TEMP/node/bin" >> "$GITHUB_PATH"
 
+      - name: Install ShellCheck (pinned, checksum-verified)
+        run: |
+          curl --fail --location --output "$RUNNER_TEMP/shellcheck.tar.xz" https://github.com/koalaman/shellcheck/releases/download/v0.11.0/shellcheck-v0.11.0.linux.x86_64.tar.xz
+          echo "8c3be12b05d5c177a04c29e3c78ce89ac86f1595681cab149b65b97c4e227198  $RUNNER_TEMP/shellcheck.tar.xz" | sha256sum --check --strict
+          mkdir -p "$RUNNER_TEMP/shellcheck"
+          tar --extract --file "$RUNNER_TEMP/shellcheck.tar.xz" --xz --strip-components=1 --directory "$RUNNER_TEMP/shellcheck" shellcheck-v0.11.0/shellcheck
+          echo "$RUNNER_TEMP/shellcheck" >> "$GITHUB_PATH"
+
       - name: Check Node and the runner script
         run: |
           test "$(node --version)" = "v${NODE_VERSION}"
+          test "$(shellcheck --version | sed -n 's/^version: //p')" = "0.11.0"
           shellcheck scripts/run-mcp-conformance.sh
 
       - name: Run the pinned conformance suite
