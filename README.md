@@ -75,6 +75,14 @@ roll back to an image whose head matches the database, or restore. And the API r
 although only MCP retrieval reads it, because the MCP tools query the graph (PLATFORM-046); an
 API without Neo4j would answer MCP calls it cannot serve.
 
+## Codex OTLP receiver
+
+`POST /v1/otel/traces` accepts Codex trace-safe OTLP/HTTP exports (protobuf) from the collector,
+authenticated with an `events:ingest` producer token, and appends the mapped events to the ledger.
+It answers 503 until `AGENT_CONTEXT_OTEL_RECEIVER__IDEMPOTENCY_HMAC_KEY` is set. Limits, records and
+the collector configuration are in
+[docs/data/codex-otel-mapping.md](docs/data/codex-otel-mapping.md#receiver).
+
 ## Telemetry
 
 The platform exports its own OpenTelemetry traces and metrics over OTLP/HTTP when
@@ -553,13 +561,17 @@ tool is annotated `readOnlyHint: true`, `destructiveHint: false`, `idempotentHin
 URL, and paging is the explicit, signed `cursor` (see Context packages).
 
 * **Auth.** A bearer `mcp_...` token with the `memory:read` scope (401 without, 403 with another
-  scope, 429 over the per-principal rate). The composer is called with the token's principal only.
+  scope, 429 over the per-principal rate). In this MVP that single scope reads every project and
+  repository of the installation (design spec §14.5); per-project authorization is future work.
+  The token's principal is used only to bind cursors to their caller, never to narrow a query,
+  and no argument can name a principal.
 * **Results.** `structuredContent` is the `ContextPackageV1`, valid against the output schema, and
   `resultType` is `complete`. The text block is a short summary that names items only by a
   bounded, JSON-quoted title; item titles and content are untrusted evidence.
 * **Errors.** An unknown tool is a JSON-RPC `-32602`. Everything else is a tool error
   (`isError: true`) whose text is `{"error": {"code", "message", "retryable"}}`, with a fixed
-  message and one of these codes: `invalid_arguments` (field names only, never values),
+  message and one of these codes: `invalid_arguments` (field names only, never values; also
+  free text over 1000 characters and IDs over 512),
   `invalid_request`, `scope_not_found`, `revision_not_found`, `symbol_not_found`,
   `ambiguous_symbol`, `budget_too_small`, `cursor_invalid`, `cursor_expired`, `cursor_mismatch`,
   `cursor_stale` (start again from the first page), `temporal_projection_outdated`,
@@ -571,11 +583,14 @@ URL, and paging is the explicit, signed `cursor` (see Context packages).
   (`docs/data/context-evidence.md`): dereferencing it would need a reader that re-checks scope,
   delivery and purge and serves content beyond the bounded excerpts, which does not exist yet.
 * **Wiring.** At start-up the API builds the composer from `AGENT_CONTEXT_POSTGRESQL__API_DSN`
-  (falling back to `__DSN`; the API role, never the projector role), `__NEO4J__*`, `__S3__*`,
-  `__MCP__CURSOR_HMAC_KEY` (required in production) and, for vector search,
-  `__SEARCH__MODEL_DIR` (without it the tools search lexically and warn
-  `vector_search_unavailable`). Until all of PostgreSQL, Neo4j and S3 are configured every call
-  answers `context_unavailable`.
+  (falling back to `__DSN`; the API role, never the projector role) on its own bounded pool (5
+  connections plus 5 overflow, apart from the ingestion and token-lookup pool), `__NEO4J__*`
+  (connect and retry bounds shortened to 2 s, so an unreachable or misconfigured graph answers
+  `context_unavailable` quickly instead of waiting out the 10 s deadline), `__S3__*`,
+  `__MCP__CURSOR_HMAC_KEY` (required in production; blank means unset, and outside production a
+  random per-process key is used) and, for vector search, `__SEARCH__MODEL_DIR` (without it the
+  tools search lexically only, with no warning). Until all of PostgreSQL, Neo4j and S3 are
+  configured every call answers `context_unavailable`.
 
 ## Ingestion API contract
 

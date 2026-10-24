@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import json
 import re
-from collections.abc import Awaitable, Callable, Iterable, Mapping
+from collections.abc import Awaitable, Callable, Iterable, Mapping, Sequence
 from typing import Any, Final, Protocol
 
 from mcp.shared.inbound import (
@@ -31,7 +31,7 @@ class _ClientDisconnectedError(Exception):
 _PORT: Final = re.compile(r"[0-9]{1,5}", re.ASCII)
 
 
-def _matches(value: str, allowed: Iterable[str]) -> bool:
+def allowlisted(value: str, allowed: Iterable[str]) -> bool:
     """Exact match, or ``prefix:*`` for a 1-5 digit port after the prefix."""
     for pattern in allowed:
         if value == pattern:
@@ -43,6 +43,25 @@ def _matches(value: str, allowed: Iterable[str]) -> bool:
         ):
             return True
     return False
+
+
+def allowed_header(values: Sequence[str], allowed: Iterable[str], *, required: bool) -> bool:
+    """Whether a Host or Origin header passes: at most one value, and that one allowlisted.
+
+    A repeated header is ambiguous and refused, never resolved. A missing one passes only when it
+    is not ``required`` (a missing Origin is a non-browser client; a Host is always required).
+    The token probe (``ledger.whoami``) applies the same rule.
+    """
+    if len(values) > 1:
+        return False
+    if not values:
+        return not required
+    return allowlisted(values[0], allowed)
+
+
+def header_values(scope: Scope, name: bytes) -> list[str]:
+    """Every value of header ``name`` (lower-case) in an ASGI scope, in order."""
+    return [value.decode("latin-1") for key, value in scope["headers"] if key.lower() == name]
 
 
 async def _respond(
@@ -145,18 +164,12 @@ class ProtocolGuard:
             return
 
         headers = self._single_valued_headers(scope)
-        host = headers.get("host")
-        if (
-            self._is_duplicated(scope, b"host")
-            or host is None
-            or not _matches(host, self._allowed_hosts)
-        ):
+        if not allowed_header(header_values(scope, b"host"), self._allowed_hosts, required=True):
             await _respond(send, 421, _error_body(INVALID_REQUEST, "Invalid Host"))
             return
         # A missing Origin is a non-browser client; a present one must be listed.
-        origin = headers.get("origin")
-        if self._is_duplicated(scope, b"origin") or (
-            origin is not None and not _matches(origin, self._allowed_origins)
+        if not allowed_header(
+            header_values(scope, b"origin"), self._allowed_origins, required=False
         ):
             await _respond(send, 403, _error_body(INVALID_REQUEST, "Invalid Origin"))
             return
@@ -220,11 +233,6 @@ class ProtocolGuard:
         finally:
             otel_context.detach(token)
         return None
-
-    @staticmethod
-    def _is_duplicated(scope: Scope, name: bytes) -> bool:
-        """Ambiguous repeated Host/Origin headers are rejected, never resolved."""
-        return sum(1 for header_name, _ in scope["headers"] if header_name.lower() == name) > 1
 
     @staticmethod
     def _single_valued_headers(scope: Scope) -> dict[str, str]:

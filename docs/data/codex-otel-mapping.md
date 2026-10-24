@@ -1,10 +1,10 @@
 # Codex OTel mapping (PLATFORM-051)
 
-`agent_context_platform.ledger.codex_otel` is a pure mapping library: it turns one decoded
-Codex OTel record into an `EventDraftV1`, or into nothing. It does no I/O; the OTLP receiver is
-PLATFORM-050. The SDK is pinned at **v0.3.2**; no private contract exists. Anything without a
-v0.3.2 contract is listed in the gap table below and is the input to **SDK-019** (v0.4.0, then
-the PIN-P update).
+`agent_context_platform.ledger.codex_otel` is a pure mapping library: it turns one decoded Codex
+OTel record into an `EventDraftV1`, or into nothing. It does no I/O; the OTLP receiver
+(PLATFORM-053) is described under [Receiver](#receiver). The SDK is pinned at **v0.3.2**; no private
+contract exists. Anything without a v0.3.2 contract is listed in the gap table below and is the
+input to **SDK-019** (v0.4.0, then the PIN-P update).
 
 Sources (all paths under `codex-rs/`, cited at both tags `rust-v0.147.0` = supported floor and
 `rust-v0.157.1` = installed):
@@ -65,6 +65,133 @@ sandbox export.
   envelope context), the same input the P025 agent projector uses (`session_node_id`), so hook-
   and OTel-origin observations of a session land on one `Session` node. The telemetry source
   event is preserved as its own ledger event; coalescing happens in projection.
+
+## Receiver
+
+`POST /v1/otel/traces` (`ledger/otlp_api.py`) takes an OTLP/HTTP `ExportTraceServiceRequest` and
+feeds every Codex event record through this mapper. It is not part of the frozen
+`/v1/ingestion/*` OpenAPI document.
+
+- **Encoding.** `Content-Type: application/x-protobuf` only (OTLP/JSON is not accepted: 415), with
+  `Content-Encoding` identity or `gzip` (anything else: 415). A gzip body must be exactly one
+  member: truncated, trailing or multi-member data is 400.
+- **Auth.** Exactly the ingestion producers' credentials: `Authorization: Bearer <prefix>.<secret>`
+  of a registered producer with scope `events:ingest` (a `memory:read` token is 403), verified on the
+  same bounded Argon2 path, before any byte of the body is read. Every mapped draft names that
+  producer (`name` `codex-otel-receiver`, version `1.0.0`).
+- **Limits** (`AGENT_CONTEXT_OTEL_RECEIVER__*`). Request-level limits answer 413 with a
+  `google.rpc.Status` whose message starts with a fixed code, so the collector's logs show which:
+  | Limit | Default | Code |
+  | --- | --- | --- |
+  | `MAX_REQUEST_BODY_BYTES`, counted while streaming | 4 MiB | `request_too_large` |
+  | `MAX_DECOMPRESSED_BYTES`, gzip output (a bomb is never inflated past it) | 6 MiB | `inflated_too_large` |
+  | `MAX_RESOURCES`, resource spans per request | 16 | `too_many_resources` |
+  | `MAX_SCOPES`, scope spans per request | 64 | `too_many_scopes` |
+  | `MAX_SPANS` per request (at most 500) | 500 | `too_many_spans` |
+  | `MAX_RECORDS`, spans plus span events per request | 1000 | `too_many_records` |
+  | `MAX_LINKS`, span links per request (never mapped) | 1000 | `too_many_links` |
+  | `MAX_TOTAL_ATTRIBUTES`, every attribute at every level, nested values included | 65536 | `too_many_attributes` |
+  | `MAX_ATTRIBUTES` per resource or scope | 128 | `too_many_attributes` |
+  | nested attribute values deeper than 4 | | `too_many_attributes` |
+  | `MAX_FIELDS`, every field occurrence the scan visits | 300000 | `too_many_fields` |
+  | `MAX_OBJECTS`, every repeated element (message, string or bytes) at every level | 200000 | `too_many_objects` |
+  | distinct mapped events per request (one ingestion batch) | 500 | `too_many_drafts` |
+
+  These are checked on the **wire bytes before parsing** (`ledger/otlp_wire.py`). The scan uses the
+  generated descriptors as its only schema: it visits every field occurrence of every message
+  reachable from the request (counted against `MAX_FIELDS`, so its cost is bounded by the limits,
+  not the bytes), counts every repeated element against `MAX_OBJECTS` (so parsing never allocates
+  more than the limits allow), and stops at the first exceeded limit. **Unknown fields** (a newer
+  OTLP schema), at any level, are accepted: each occurrence counts against `MAX_FIELDS`, the scan
+  skips it by its wire type and never descends into it, and the parser keeps it as raw bytes,
+  bounded by `MAX_DECOMPRESSED_BYTES`; the mapper never reads them. `Resource.entity_refs` is
+  scanned like any field (each `EntityRef` and each of its repeated strings counts against
+  `MAX_OBJECTS`). The scan answers 400 with a fixed code only for what it cannot bound otherwise: a
+  singular message field that occurs twice (`repeated_singular_field`: the parser would merge both
+  into one container; telemetry reason `unsupported`), and malformed wire data
+  (`malformed_request`, reason `malformed`): a wire type that does not match a known field, groups
+  and reserved wire types 6 and 7 at any field (the parser itself would accept groups), truncated
+  data, or a varint over ten bytes. Per-span limits reject that span only (partial success):
+  `MAX_EVENTS_PER_SPAN` (64, `too_many_events`) and `MAX_ATTRIBUTES` per span or span event (128,
+  `too_many_attributes`); their events still count toward `MAX_RECORDS`, so a flood is a
+  request-level 413. A string value over 16 KiB rejects its record (`attribute_value_too_long`).
+  Record-level rejections (times, over-long values, the mapper) reject the span while sibling
+  records of the same span still land.
+
+  Inflation, the scan, parsing and mapping run on a worker thread behind an admission gate: two
+  decodes at once per process and four waiting; one producer holds at most two of those places and
+  runs at most one decode at a time (its second place waits for its own turn before it competes for
+  a worker), so one producer within its own rate limit never holds both workers and cannot starve
+  the others; beyond that the request is
+  refused at once with 503 and `Retry-After`. A queued request whose client has gone is not decoded.
+  A cancelled request keeps its place until its worker thread finishes, so at most two threads ever
+  decode per process; with N worker processes or replicas the bound is 2N. Measured on the
+  development container: the collector's largest batch (15 spans x 64 events x 44 attributes of 64
+  characters, 3.73 MiB, 25 KiB gzip) takes about 0.09 s and 11 MiB of extra peak memory; the densest
+  message the limits allow (65,536 attributes over 1000 records) about 0.13 s and 7 MiB; a flood of
+  the smallest fields stops at the field budget in about 0.17 s whatever its size. The worst case
+  the scan accepts is a body of about 300,000 fields that each carry a ten-byte (overlong) varint,
+  3.3 to 3.6 MiB: about 0.4 to 0.5 s here and about 0.6 s on the review machine, per accepted
+  request and running decode (unknown fields cost the same as known ones). `MAX_DECOMPRESSED_BYTES` stays 6 MiB (the largest
+  batch plus about 60%): with the field and object budgets the scan and parse costs no longer grow
+  with bytes, and the bytes themselves cost at most 6 MiB plus the 4 MiB body per running decode.
+  The ingestion append that follows is async database work on the event loop, one statement round
+  per event. A per-producer token bucket of 5/s, burst 20 (`RATE_LIMIT_PER_SECOND`,
+  `RATE_LIMIT_BURST`) answers 429 with `Retry-After`.
+- **Idempotency key.** `IDEMPOTENCY_HMAC_KEY` (at least 32 characters, at least 8 distinct) keys the
+  mapper's digest. Until it is set (and ingestion is configured) the route answers 503 with
+  `Retry-After`; the collector retries for at most an hour and then drops the batch.
+  **Rotation** (or a change of the producer name or version) changes the keys of re-exported
+  records, so queued re-exports would become duplicate events: drain the collector's sending queue
+  first (stop Codex export, wait until the queue is empty), then rotate and restart.
+- **Records.** A span whose attributes carry `event.name` is one record; so is each span event that
+  does (Codex's `trace_event!` inside a span). The resource is checked once per `ResourceSpans`
+  (`check_resource`): a platform-origin or unknown resource rejects all its spans. The
+  `agent_context.origin` marker rejects at every level: resource, scope (all its spans), span and
+  span event (the span). Records the mapper does not model are unmapped (counted, not errors);
+  records it refuses reject their span. Records with the same idempotency key in one export collapse
+  into one draft and the **first one wins**: a span and a span event describing the same Codex event
+  with different attributes would map to different keys, and so to two events (Codex emits each
+  trace-safe event once, so this is not expected).
+- **Times.** `event.timestamp` (`occurred_at`) and the OTLP time (span event time, else span end)
+  are **Codex's clock**, not the platform's. A record with no OTLP time is rejected
+  (`missing_timestamp`); one whose OTLP time or `occurred_at` is more than `MAX_CLOCK_SKEW_SECONDS`
+  (300) in the future is rejected (`future_timestamp`). `observed_at` is the later of `occurred_at`
+  and the OTLP time: deterministic, so a collector retry of the same export maps to identical drafts
+  and is answered `existing`.
+- **Streams and batches.** Drafts go to the stream `codex-otel:` plus 40 hex characters of a SHA-256
+  over the length-prefixed producer id and session id: one stream per producer and Codex session, of
+  a fixed length whatever the ids (the ledger's stream id is at most 512 characters) and
+  collision-safe; the readable ids stay in the event (producer, payload, context). A stream-level
+  failure (a quarantined stream after a failed integrity verification) stays within one session. All
+  drafts of one request are appended as one atomic batch. When the batch is refused, the events it
+  is attributable to (an `idempotency_conflict`, a `stream_quarantined` stream) are rejected and the
+  others resubmitted, until a batch is accepted, the ledger names no offender, or 8 batches were
+  tried (the ledger names one conflict per batch; what is left then is rejected as
+  `batch_rejected`). Worst case: 8 transactions of up to 500 events for one export. Events already
+  stored are `existing`, never rejected. One conflicting record therefore never discards the rest of
+  its export.
+- **Response.** 200 with an `ExportTraceServiceResponse`; when spans were rejected,
+  `partial_success.rejected_spans` and the fixed `error_message` `spans rejected: <reason codes>`
+  (sorted fixed codes such as `platform_origin`, `future_timestamp` or `idempotency_conflict`, never
+  a value). Partial success is final: the collector does not retry it. Errors answer a
+  `google.rpc.Status` with a fixed message: 400 malformed, 401/403 credentials, 413 (code above),
+  415, 429, and 503 (with `Retry-After`) when unconfigured, busy (the admission gate is full) or on
+  a retryable outage. Logs carry ids, counts and fixed codes only. Telemetry:
+  `agent_context.otel.requests` and `agent_context.otel.spans` are the receiver's only signals
+  (these batches do not go through the ingestion route, so `agent_context.ingestion.*` and its span
+  never count them; see `docs/operations/telemetry.md`).
+- **Threat note.** Any `events:ingest` producer can append `agent.session.started` for any
+  `conversation.id` it chooses, but only into its own streams (derived from its own producer id)
+  and under its own producer id: projections can tell the sources apart, and revoking the producer
+  stops it. Only the collector should hold the receiver's producer token.
+- **For the collector (INFRA-050).** The `otlphttp` exporter targets
+  `http://platform-api:8000/v1/otel/traces` (set `traces_endpoint`, since the path is not the OTLP
+  default) with `encoding: proto`, optionally `compression: gzip`, and the header
+  `Authorization: Bearer <producer token>` of a producer registered with scope `events:ingest`.
+  The batch processor must keep requests inside the limits above: `send_batch_max_size` at most
+  500, and batches well under 4 MiB (and 8 MiB inflated). A 413 is permanent for `otlphttp`, which
+  drops the batch. It forwards only the Codex trace-safe pipeline, never platform-origin signals.
 
 ## Mapped (SDK v0.3.2)
 

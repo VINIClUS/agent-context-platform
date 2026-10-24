@@ -50,6 +50,8 @@ CONTRACT = [
     (contract.MCP_REQUESTS, "counter", "{request}", "agent_context_mcp_requests_total"),
     (contract.MCP_DURATION, "histogram", "s", "agent_context_mcp_duration_seconds_*"),
     (contract.HTTP_SERVER_DURATION, "histogram", "s", "http_server_request_duration_seconds_*"),
+    (contract.OTEL_REQUESTS, "counter", "{request}", "agent_context_otel_requests_total"),
+    (contract.OTEL_SPANS, "counter", "{span}", "agent_context_otel_spans_total"),
 ]
 
 
@@ -66,6 +68,9 @@ def _record_one_of_each(capture: Capture) -> None:
         pass
     core.record_mcp_request("tools/list", "none", "ok", 0.01)
     core.record_http_request("GET", "/health/live", 200, 0.001)
+    core.record_otel_request("accepted", "none")
+    core.record_otel_spans("mapped", 1)
+    core.record_otel_spans("unmapped", 0)  # nothing recorded for an empty tally
     capture.handle.set_projection_snapshot(
         ProjectionSnapshot(outbox_pending=3, lag_seconds={"none": 1.5}, dead_letters={"none": 1})
     )
@@ -122,6 +127,8 @@ ATTRIBUTE_KEYS = {
         "http.route",
         "http.response.status_code",
     },
+    contract.OTEL_REQUESTS: {"outcome", "reason"},
+    contract.OTEL_SPANS: {"result"},
 }
 CLOSED_SETS = {
     (contract.INGESTION_BATCHES, "outcome"): contract.INGESTION_OUTCOMES,
@@ -137,6 +144,9 @@ CLOSED_SETS = {
     (contract.MCP_REQUESTS, "method"): contract.MCP_METHODS | {contract.OTHER},
     (contract.MCP_REQUESTS, "tool"): contract.MCP_TOOLS | {contract.MCP_NO_TOOL},
     (contract.MCP_REQUESTS, "outcome"): contract.MCP_OUTCOMES,
+    (contract.OTEL_REQUESTS, "outcome"): contract.OTEL_OUTCOMES,
+    (contract.OTEL_REQUESTS, "reason"): contract.OTEL_REASONS,
+    (contract.OTEL_SPANS, "result"): contract.OTEL_SPAN_RESULTS,
 }
 
 

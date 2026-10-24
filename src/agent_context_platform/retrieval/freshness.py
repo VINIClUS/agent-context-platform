@@ -12,15 +12,20 @@
   (which never writes checkpoints) leaves it unchanged.
 - `staleness_ms` is the age, at `now`, of the oldest outbox row still waiting; 0 when none waits,
   and never negative.
-- Two instants let the answer depend on the snapshot only, never on the wall clock, and compare
-  like with like (both are producer `observed_at` values, the clock temporal reads use):
-  `known_until` is just before the earliest `observed_at` of any knowledge or quality event
-  BEYOND the watermark (a later outbox row, delivered out of order or still waiting), or `None`
-  when there is none. Reading temporal facts recorded up to it hides every such event (a
-  supersession, a fix, a new decision is not known yet) while a producer whose clock runs ahead
-  is still seen as soon as its event is delivered. `valid_instant` is the latest `observed_at`
-  among the newest `RECENT_EVENTS` delivered events at or below the watermark: the "now" of an
-  open revision window.
+- Two instants let the answer depend on the snapshot only, never on the wall clock. Temporal
+  reads compare producer `observed_at` values, so a producer clock that runs ahead must never
+  move them. `valid_instant` is the latest `least(observed_at, recorded_at)` (the server's
+  `recorded_at` clamps a fast producer clock) among the newest `RECENT_EVENTS` delivered events at
+  or below the watermark. It is the "now" of an open revision window (one fast producer clock
+  cannot make a future decision current anywhere) AND the latest record time temporal reads use,
+  so a fact projected after this read (between it and the graph read) is not known yet. A fact
+  whose producer clock runs ahead is known once a later delivery's clamped time passes its
+  `observed_at`. `known_until` is just before the earliest `observed_at` of any knowledge or
+  quality event of the request's scope BEYOND the watermark that may already be in the graph
+  (delivered out of order, or claimed at least once: a row never claimed has never touched it),
+  or `None` when there is none. Reading temporal facts recorded up to it hides every such event
+  (a supersession, a fix, a new decision is not known yet); scoping it keeps another project's
+  backdated upload from hiding this project's facts.
 - Warnings, never silent: `projection_dead_letters:<projector>` for open dead letters of a
   projector the answer depends on, `projection_<state>:<projector>` for a paused or rebuilding one,
   and `projection_not_started:<projector>` when it has no checkpoint at all.
@@ -55,14 +60,20 @@ _WATERMARK: Final[str] = (
     "ORDER BY outbox_id DESC LIMIT 1"
 )
 # Bounded by the outbox rows after the watermark (the backlog), never the whole ledger.
+# A claim and a release both move `updated_at` past `created_at`; a failed attempt counts in
+# `retry_count`. A pending row with neither has never been handed to a projector.
 _BEYOND: Final[str] = (
     "SELECT min(e.observed_at) FROM projection.outbox o "
     "JOIN ledger.events e ON e.event_id = o.event_id "
     "WHERE o.outbox_id > :as_of AND (e.event_type LIKE 'knowledge.%' "
-    "OR e.event_type LIKE 'quality.%')"
+    "OR e.event_type LIKE 'quality.%') "
+    "AND NOT (o.status = 'pending' AND o.retry_count = 0 AND o.updated_at = o.created_at) "
+    "AND (CAST(:project_id AS text) IS NULL OR e.context ->> 'project_id' = :project_id) "
+    "AND (CAST(:repository_id AS text) IS NULL "
+    "OR e.context ->> 'repository_id' = :repository_id)"
 )
 _RECENT: Final[str] = (
-    "SELECT max(e.observed_at) FROM (SELECT event_id FROM projection.outbox "
+    "SELECT max(least(e.observed_at, e.recorded_at)) FROM (SELECT event_id FROM projection.outbox "
     "WHERE outbox_id <= :as_of AND status = 'delivered' ORDER BY outbox_id DESC "
     "LIMIT :recent) o JOIN ledger.events e ON e.event_id = o.event_id"
 )
@@ -105,16 +116,33 @@ class FreshnessReader:
         self._sessions = sessions
         self._timeout = str(max(1, int(statement_timeout_seconds * 1000)))
 
-    async def read(self, projectors: Sequence[tuple[str, str]], now: datetime) -> Freshness:
+    async def read(
+        self,
+        projectors: Sequence[tuple[str, str]],
+        now: datetime,
+        *,
+        project_id: str | None = None,
+        repository_id: str | None = None,
+    ) -> Freshness:
+        """The snapshot for an answer over `projectors`, its backlog bound scoped like the
+        temporal reads (`project_id` and/or `repository_id`; neither: every scope)."""
         async with self._sessions() as session, session.begin():
             await session.execute(text(_TIMEOUT), {"millis": self._timeout})
             waiting = (await session.execute(text(_WAITING))).one()
             mark = (await session.execute(text(_WATERMARK), {"low": waiting.low})).first()
             recent = beyond = None
             if mark is not None:
-                bound = {"as_of": mark.outbox_id, "recent": RECENT_EVENTS}
-                recent = (await session.execute(text(_RECENT), bound)).scalar_one()
-                beyond = (await session.execute(text(_BEYOND), bound)).scalar_one()
+                recent = (
+                    await session.execute(
+                        text(_RECENT), {"as_of": mark.outbox_id, "recent": RECENT_EVENTS}
+                    )
+                ).scalar_one()
+                scoped = {
+                    "as_of": mark.outbox_id,
+                    "project_id": project_id,
+                    "repository_id": repository_id,
+                }
+                beyond = (await session.execute(text(_BEYOND), scoped)).scalar_one()
             checkpoints = {
                 (str(row.projector_name), str(row.projector_version)): row
                 for row in await session.execute(text(_CHECKPOINTS))

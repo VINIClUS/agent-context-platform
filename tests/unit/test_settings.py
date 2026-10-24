@@ -437,3 +437,24 @@ def test_search_settings_load_from_environment(monkeypatch: pytest.MonkeyPatch) 
 def test_search_settings_reject_unbounded_values(field: str, value: int) -> None:
     with pytest.raises(ValidationError):
         Settings(search={field: value})
+
+
+def test_a_blank_mcp_hmac_key_means_unset_outside_and_missing_inside_production() -> None:
+    blank = Settings(environment="test", mcp={"cursor_hmac_key": "  ", "token_hmac_key": ""})
+
+    assert blank.mcp.cursor_hmac_key is None and blank.mcp.token_hmac_key is None
+    with pytest.raises(ValidationError, match=r"mcp\.cursor_hmac_key"):
+        Settings(
+            environment="production",
+            postgresql={"dsn": "postgresql+psycopg://u:p@db.example.test/a"},
+            neo4j={"uri": "bolt://db.example.test:7687", "username": "n", "password": "pw"},
+            s3={
+                "endpoint_url": "http://s3.example.test:3900",
+                "access_key_id": "id",
+                "secret_access_key": "secret",
+            },
+            mcp={
+                "token_hmac_key": "mcp-secret-hmac-key-0123456789abcdef",
+                "cursor_hmac_key": "   ",
+            },
+        )

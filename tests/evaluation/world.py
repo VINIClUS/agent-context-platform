@@ -236,6 +236,7 @@ class EvalWorld:
         clock: Callable[[], datetime] = lambda: NOW,
         content: ContentService | None = None,
         deadline_seconds: float = 60.0,
+        lexical_only: bool = False,
     ) -> ContextComposer:
         settings = neo4j_integration_settings()
         graph = GraphTraversalService.from_settings(settings)
@@ -245,12 +246,15 @@ class EvalWorld:
             graph=graph,
             graph_reader=self.store.read_only(),
             temporal=temporal,
-            search=SearchService(self.api_reads, self.store.read_only(), self.embeddings),
+            search=SearchService(
+                self.api_reads, self.store.read_only(), None if lexical_only else self.embeddings
+            ),
             ledger=EvidenceLedger(self.api_reads, content or self.content),
             freshness=FreshnessReader(self.api_reads),
             cursor=CursorCodec(CURSOR_KEY),
             clock=clock,
             default_deadline_seconds=deadline_seconds,
+            vector_search=not lexical_only,
         )
 
     def backend(self) -> SearchBackend:
