@@ -104,6 +104,7 @@ def test_every_cypher_statement_is_static_and_scoped() -> None:
     statements = [
         temporal._VERSIONS,
         temporal._OBSERVATIONS,
+        temporal._OBSERVATION_TOTALS,
         temporal._CI_RUNS,
         temporal._TEST_RUNS,
         temporal._NEXT_PASS,
@@ -124,6 +125,7 @@ def test_every_cypher_statement_is_static_and_scoped() -> None:
     ):
         assert "LIMIT $limit" in bulk
     assert "LIMIT $per_decision" in temporal._DECISION_VERSIONS
+    assert temporal._OBSERVATION_TOTALS.startswith("UNWIND $failure_ids AS failure_id ")
     for runs in (temporal._CI_RUNS, temporal._TEST_RUNS, temporal._NEXT_PASS):
         assert "r.completed_at <= $valid_at" in runs  # a run still to complete is hidden
     assert "p.completed_at <= $valid_at" in temporal._NEXT_PASS
@@ -601,11 +603,40 @@ def test_failures_classify_each_resolution_and_hide_resolved_by_default() -> Non
     assert [f.failure_id for f in default] == ["f_open", "f_test", "f_session", "f_bare"]
 
 
+def observed(
+    rows: list[dict[str, Any]], **more: list[dict[str, Any]]
+) -> Callable[[str, dict[str, Any]], list[dict[str, Any]]]:
+    """Answer the failure reads over `rows` (newest first) like the database: the totals count
+    every observation of the failures asked for, whatever the cap kept; `more` answers the run
+    reads by statement name."""
+
+    def script(query: str, params: dict[str, Any]) -> list[dict[str, Any]]:
+        if query is temporal._OBSERVATIONS:
+            return rows
+        if query is temporal._OBSERVATION_TOTALS:
+            return [
+                {
+                    "failure_id": failure_id,
+                    "observations": len(mine),
+                    "valid_from": min(row["valid_from"] for row in mine),
+                    "recorded_at": min(row["recorded_at"] for row in mine),
+                }
+                for failure_id in params["failure_ids"]
+                if (mine := [row for row in rows if row["failure_id"] == failure_id])
+            ]
+        for name, answer in more.items():
+            if query is getattr(temporal, name):
+                return answer
+        return []
+
+    return script
+
+
 def test_failures_flag_the_failure_and_observation_caps(monkeypatch: pytest.MonkeyPatch) -> None:
     # the database answers newest first: the caps keep the newest failures and observations
     assert "ORDER BY o.valid_from DESC" in temporal._OBSERVATIONS
     rows = [observation("f2", 3), observation("f2", 2), observation("f1", 1)]
-    service = _service(lambda _q, _p: rows)
+    service = _service(observed(rows))
     monkeypatch.setattr(temporal, "MAX_FAILURES", 1)
     result = asyncio.run(service.failures(TemporalScope("p")))
     assert result.truncated and [f.failure_id for f in result.failures] == ["f2"]
@@ -616,8 +647,40 @@ def test_failures_flag_the_failure_and_observation_caps(monkeypatch: pytest.Monk
     assert cut.truncated and [f.failure_id for f in cut.failures] == ["f2"]
     # a failure the cut goes through is partly read: it is left out, never returned partial
     split = [observation("f2", 3), observation("f1", 2), observation("f2", 1)]
-    partial = asyncio.run(_service(lambda _q, _p: split).failures(TemporalScope("p")))
+    partial = asyncio.run(_service(observed(split)).failures(TemporalScope("p")))
     assert partial.truncated and [f.failure_id for f in partial.failures] == ["f1"]
+    assert partial.failures[0].resolution.reason == "observed in no CI or test run in scope"
+
+
+def test_a_kept_failure_whose_older_observations_the_cap_cut_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Newest first: A seen last in a CI run that a later pass fixed, B twice (B is at the cut),
+    # then an older A the cap leaves out. Read alone, A's newest observation looks resolved.
+    rows = [
+        observation("f_a", 9, ci="ci_1"),
+        observation("f_b", 8, session="sess_1"),
+        observation("f_b", 7, session="sess_1"),
+        observation("f_a", 2, ci="ci_2"),
+    ]
+    runs = observed(
+        rows,
+        _CI_RUNS=[ci_row("ci_1", commit="a" * 40)],
+        _NEXT_PASS=[pass_row("ci_1", "ci_9", commit="b" * 40)],
+    )
+    monkeypatch.setattr(temporal, "MAX_OBSERVATIONS", 2)
+    result = asyncio.run(_service(runs).failures(TemporalScope("p"), include_resolved=True))
+    assert result.truncated and [f.failure_id for f in result.failures] == ["f_a"]
+    (failure,) = result.failures
+    assert failure.resolution.status is FixStatus.UNKNOWN and failure.resolution.path is None
+    assert "only the newest 2 observations" in (failure.resolution.reason or "")
+    assert (failure.valid_from, failure.recorded_at) == (at(2), at(3))  # the true first times
+    assert failure.source_event_ids == ("evo9",)  # only what was read is cited
+    # With its whole history inside the cap, the same failure is resolved by the pass.
+    monkeypatch.setattr(temporal, "MAX_OBSERVATIONS", 5000)
+    whole = asyncio.run(_service(runs).failures(TemporalScope("p"), include_resolved=True))
+    complete = {f.failure_id: f for f in whole.failures}["f_a"]
+    assert complete.valid_from == at(2) and complete.resolution.reason is None
 
 
 def test_from_settings_needs_complete_connection_settings() -> None:

@@ -1077,6 +1077,41 @@ def test_a_recurrence_after_a_fix_reopens_the_failure_until_it_is_fixed_again() 
     with_service(body)
 
 
+def test_a_failure_whose_older_observations_the_cap_cut_is_unknown(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    # Read whole, fail_a is unresolved: its older run (job "lint") never passed. Its newest run
+    # (job "test") did, so a history cut by the observation cap would wrongly call it resolved.
+    events = [
+        ci_run(1, "ci_lint", "failure", job="lint"),
+        failure(2, "fail_a", ci_run_id="ci_lint"),
+        failure(3, "fail_b", session_id="sess_1"),
+        failure(4, "fail_b", session_id="sess_1"),
+        ci_run(5, "ci_test", "failure"),
+        failure(6, "fail_a", ci_run_id="ci_test"),
+        ci_run(7, "ci_pass", "success", commit=OID_B),
+    ]
+
+    async def body(store: Neo4jStore, service: TemporalService) -> None:
+        await deliver(store, events)
+        whole = await service.failures(P1, day(FAR), day(FAR), include_resolved=True)
+        by_id = {f.failure_id: f for f in whole.failures}
+        assert by_id["fail_a"].resolution.status is FixStatus.UNRESOLVED
+        # The cap keeps fail_a 6 and fail_b 4; fail_b 3 is at the cut and fail_a 2 beyond it.
+        monkeypatch.setattr(temporal, "MAX_OBSERVATIONS", 2)
+        cut = await service.failures(P1, day(FAR), day(FAR), include_resolved=True)
+        assert cut.truncated and [f.failure_id for f in cut.failures] == ["fail_a"]
+        (found,) = cut.failures
+        assert found.resolution.status is FixStatus.UNKNOWN and found.resolution.path is None
+        assert (found.valid_from, found.recorded_at) == (
+            by_id["fail_a"].valid_from,
+            by_id["fail_a"].recorded_at,
+        )  # the first times of the whole history
+        assert found.source_event_ids == (str(event_uuid(6)),)
+
+    with_service(body)
+
+
 def test_a_batched_wipe_refuses_every_read_from_its_first_batch() -> None:
     # An in-place rebuild wipes in batches while the API keeps serving: no read may see a graph
     # that is partly gone, so the marker goes first, in its own transaction.

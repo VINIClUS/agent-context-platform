@@ -55,6 +55,9 @@ Gaps, reported rather than guessed:
   cannot be identified and a failure observed only in test runs is `unsupported`. `framework`
   is never used as a target.
 - A failure observed in no CI or test run in scope is `unknown`.
+- Only the newest `MAX_OBSERVATIONS` observations are read. When the cap cuts the history of a
+  failure it keeps, that failure is `unknown` (the older observations could change its
+  resolution) and its first times come from an aggregate over all its observations.
 - Run nodes keep the NEWEST observation of a run; a re-observation that changed its status is not
   versioned.
 
@@ -383,6 +386,16 @@ _OBSERVATIONS: Final[LiteralString] = (
     "o.recorded_at AS recorded_at, o.session_id AS session_id, o.test_run_id AS test_run_id, "
     "o.ci_run_id AS ci_run_id "
     "ORDER BY o.valid_from DESC, o.failure_id DESC, o.event_id DESC LIMIT $limit"
+)
+# Every observation of the failures kept, when the newest observations hit the cap: how many there
+# are and the earliest times, to tell a complete history from one the cap cut.
+_OBSERVATION_TOTALS: Final[LiteralString] = (
+    "UNWIND $failure_ids AS failure_id "
+    "MATCH (:Failure {failure_id: failure_id})-[:HAS_OBSERVATION]->(o:FailureObservation) "
+    "WHERE " + _in_scope("o") + " "
+    "AND o.valid_from <= $valid_at AND o.recorded_at <= $recorded_at "
+    "RETURN failure_id, count(o) AS observations, min(o.valid_from) AS valid_from, "
+    "min(o.recorded_at) AS recorded_at"
 )
 # A run is visible only in scope, once the platform had recorded it (a stub has no `recorded_at`
 # and never is) and once it had completed: a run still to complete at `valid_at` is omitted from
@@ -1003,7 +1016,7 @@ async def _failures(
     ).records
     # Newest first, so the caps keep the newest observations and failures: one seen late is
     # never hidden behind old ones. A failure the observation cut goes through is left out.
-    truncated = len(rows) > MAX_OBSERVATIONS
+    capped = truncated = len(rows) > MAX_OBSERVATIONS
     partial = str(rows[MAX_OBSERVATIONS]["failure_id"]) if truncated else None
     found: dict[str, _Seen] = {}
     for row in rows[:MAX_OBSERVATIONS]:
@@ -1013,6 +1026,20 @@ async def _failures(
     kept = list(found.items())[:MAX_FAILURES]
     for _, seen in kept:
         seen.rows.reverse()  # oldest first, as each record describes them
+    # The cut can also fall among the older observations of a failure that is kept: count them all.
+    totals: dict[str, Record] = {}
+    if capped and kept:
+        total_rows = (
+            await tx.run(
+                _OBSERVATION_TOTALS,
+                parameters={**parameters, "failure_ids": [failure_id for failure_id, _ in kept]},
+            )
+        ).records
+        totals = {
+            str(record["failure_id"]): record
+            for record in total_rows
+            if record["observations"] > len(found[str(record["failure_id"])].rows)
+        }
     wanted = {
         key: sorted({str(row[key]) for _, seen in kept for row in seen.rows if row[key]})
         for key in ("ci_run_id", "test_run_id")
@@ -1036,7 +1063,8 @@ async def _failures(
         ).records
         passes = {str(record["failing_id"]): record for record in records}
     result = [
-        _failure_record(failure_id, seen.rows, ci, tests, passes) for failure_id, seen in kept
+        _failure_record(failure_id, seen.rows, ci, tests, passes, totals.get(failure_id))
+        for failure_id, seen in kept
     ]
     result.sort(key=lambda record: (record.valid_from, record.failure_id))
     return tuple(result), truncated
@@ -1048,7 +1076,9 @@ def _failure_record(
     ci: dict[str, Record],
     tests: dict[str, Record],
     passes: dict[str, Record],
+    capped: Record | None = None,
 ) -> FailureRecord:
+    """`capped` is the aggregate over all observations when the cap cut this failure's history."""
     runs: dict[tuple[RunKind, str], ObservedRun] = {}
     for row in observations:
         if row["session_id"]:
@@ -1093,7 +1123,13 @@ def _failure_record(
             for row in observations
             if _occurrence(row, ci) > path.passing_completed_at
         )
-    if path is not None and not late:
+    if capped is not None:
+        resolution = FixResolution(
+            FixStatus.UNKNOWN,
+            f"only the newest {MAX_OBSERVATIONS} observations are read and older ones of this "
+            "failure could change its resolution",
+        )
+    elif path is not None and not late:
         resolution = FixResolution(FixStatus.RESOLVED, path=path)
     elif path is not None:
         resolution = FixResolution(
@@ -1122,8 +1158,12 @@ def _failure_record(
         operation=_text(first["operation"]),
         error_class=_text(first["error_class"]),
         fingerprint_sha256=_text(first["fingerprint_sha256"]),
-        valid_from=min(_parse(row["valid_from"]) for row in observations),
-        recorded_at=min(_parse(row["recorded_at"]) for row in observations),
+        valid_from=_parse(capped["valid_from"])
+        if capped is not None
+        else min(_parse(row["valid_from"]) for row in observations),
+        recorded_at=_parse(capped["recorded_at"])
+        if capped is not None
+        else min(_parse(row["recorded_at"]) for row in observations),
         observed_in=tuple(ordered),
         resolution=resolution,
         source_event_ids=tuple(sorted(str(row["event_id"]) for row in observations)),
