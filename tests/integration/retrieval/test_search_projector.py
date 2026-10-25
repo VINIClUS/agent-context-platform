@@ -787,6 +787,29 @@ def test_a_lexical_only_worker_writes_searchable_rows_and_applies_purges(
     with_world(body, dsn=postgres_dsn, owner=projection_engine)
 
 
+def test_content_holding_nul_is_indexed_instead_of_dead_lettered(
+    postgres_dsn: str, projection_engine: AsyncEngine
+) -> None:
+    # A PostgreSQL text value cannot hold NUL: raw in text, or escaped in JSON, it is indexed as
+    # a space and the stored bytes stay as they were.
+    async def body(world: SearchWorld) -> None:
+        await world.ingest("raw\x00separated words", "c-raw")
+        await world.ingest(
+            '{"out": "escaped\\u0000separated"}',
+            "c-json",
+            turn="turn-2",
+            media_type="application/json",
+        )
+        report = await world.project(projectors=world.lexical_projectors())
+
+        assert (report.delivered, report.dead_lettered) == (2, 0)
+        assert sorted(await world.documents()) == ["c-json", "c-raw"]
+        hits = await _service(world).lexical("separated", SCOPE, 5)
+        assert sorted(_ids(hits)) == ["c-json", "c-raw"]
+
+    with_world(body, dsn=postgres_dsn, owner=projection_engine)
+
+
 async def _rebuild_in_place(world: SearchWorld, projectors: Sequence[Any]) -> Any:
     """What `projection rebuild --in-place` does with search bound: check, then rebuild."""
     from agent_context_platform import cli

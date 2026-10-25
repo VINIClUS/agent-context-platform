@@ -265,17 +265,21 @@ def _flatten_json(value: object, out: list[str]) -> None:
 
 
 def extract_text(media_type: str, data: bytes) -> str:
-    """The searchable text of sanitized content: the string values of JSON, or the text itself."""
+    """The searchable text of sanitized content: the string values of JSON, or the text itself.
+
+    NUL (raw, or `\\u0000` in JSON) becomes a space: a PostgreSQL text value cannot hold it, and
+    one would fail the event's indexing on every retry. The stored content is not changed.
+    """
     decoded = data.decode("utf-8", errors="replace")
     if media_type.split(";", 1)[0].strip().lower() == "application/json":
         try:
             parsed = json.loads(decoded)
         except ValueError:
-            return decoded[:MAX_INDEXED_CHARS]
+            return decoded[:MAX_INDEXED_CHARS].replace("\x00", " ")
         parts: list[str] = []
         _flatten_json(parsed, parts)
         decoded = "\n".join(parts)
-    return decoded[:MAX_INDEXED_CHARS]
+    return decoded[:MAX_INDEXED_CHARS].replace("\x00", " ")
 
 
 async def _read_document(

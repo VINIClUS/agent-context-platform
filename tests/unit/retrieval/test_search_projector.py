@@ -451,6 +451,10 @@ def test_text_extraction_flattens_json_strings_and_bounds_the_result() -> None:
     assert extract_text("application/json", b"not json") == "not json"
     assert extract_text("text/plain", "ação".encode()) == "ação"
     assert extract_text("text/plain", b"bad \xff byte") == "bad � byte"
+    # PostgreSQL text cannot hold NUL: raw or JSON-escaped, it is indexed as a space.
+    assert extract_text("text/plain", b"a\x00b") == "a b"
+    assert extract_text("application/json", b'{"out": "x\\u0000y"}') == "x y"
+    assert extract_text("application/json", b"not\x00json") == "not json"
     assert len(extract_text("text/plain", b"x" * (search.MAX_INDEXED_CHARS + 5))) == (
         search.MAX_INDEXED_CHARS
     )
