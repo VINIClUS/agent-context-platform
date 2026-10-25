@@ -62,6 +62,7 @@ from .composer_world import (
     decision,
     decision_input,
     failure_input,
+    hit,
     items_by_id,
     neighborhood,
     overview_input,
@@ -294,6 +295,39 @@ def test_a_commit_task_cites_only_content_of_its_window_and_never_dirty_output()
     for key in ("turn:late", "ci:dirty-output", "dec:hidden", "turn:noise"):
         assert world.id(key) not in cited(page)
     assert "DIRTYMARK" not in text_of(page) and "HIDDEN" not in text_of(page)
+
+
+def test_shared_content_is_described_by_its_admitted_event_never_a_dropped_one() -> None:
+    world = seeded()
+    # The same content was first the dirty snapshot's test output, then part of a turn in C2's
+    # window: the search row describes it by that first (dirty) reference.
+    dirty = world.ledger.add(
+        "ci:dirty-shared",
+        "quality.test_run.completed",
+        at(1.4),
+        {"test_run_id": "t-dirty", "snapshot_id": SNAP},
+        content_id="c-shared",
+        text="shared rounding note",
+    )
+    turn = world.ledger.add(
+        "turn:shared",
+        "agent.turn.completed",
+        at(1.55),
+        content_id="c-shared",
+        text="shared rounding note",
+    )
+    row = hit(world.ledger, "ci:dirty-shared", "c-shared", 9.0)
+    world.search.lexical_hits.append(replace(row, source_event_ids=(dirty, turn)))
+
+    page = answer(world.composer().context_for_task(task_input(TASK), PRINCIPAL))
+    item = items_by_id(page)[content_item("c-shared")]
+
+    assert (item.kind, item.title) == ("assistant_message", "assistant message in the repository")
+    assert "(agent.turn.completed)" in item.content and "test_run" not in item.content
+    assert [(ref.evidence_kind, str(ref.source_event_id)) for ref in item.evidence] == [
+        ("agent", turn)
+    ]
+    assert dirty not in cited(page)
 
 
 def test_a_commit_answer_drops_dirty_runs_that_a_snapshot_answer_keeps() -> None:

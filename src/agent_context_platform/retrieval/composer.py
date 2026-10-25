@@ -845,7 +845,25 @@ class ContextComposer:
 
         def admitted(hit: SearchHit) -> SearchHit | None:
             events = tuple(sorted(e for e in {hit.event_id, *hit.source_event_ids} if e in citable))
-            return replace(hit, source_event_ids=events) if events else None
+            if not events:
+                return None
+            if hit.event_id in citable:
+                return replace(hit, source_event_ids=events)
+            # The row describes the content by its earliest reference, which the revision does
+            # not admit (another workspace's output, say): describe it by the earliest admitted
+            # event, so its kind, tier, evidence kind, session and time are that event's.
+            first = min(
+                (citable[e].event for e in events),
+                key=lambda event: (event.occurred_at, str(event.event_id)),
+            )
+            return replace(
+                hit,
+                event_id=str(first.event_id),
+                event_type=first.event_type,
+                occurred_at=first.occurred_at,
+                session_id=first.context.session_id,
+                source_event_ids=events,
+            )
 
         found: dict[str, tuple[SearchHit, float]] = {}
 
