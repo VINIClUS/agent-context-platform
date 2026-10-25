@@ -14,6 +14,7 @@ from agent_context_platform.db import Base, create_engine
 from agent_context_platform.ledger import models as ledger_models  # noqa: F401
 from agent_context_platform.operations import models as operations_models  # noqa: F401
 from agent_context_platform.projection import models as projection_models  # noqa: F401
+from agent_context_platform.retrieval import models as retrieval_models  # noqa: F401
 from agent_context_platform.settings import Settings
 from alembic import context
 
@@ -38,6 +39,8 @@ MANAGED_TABLES = {
     "operations.mcp_tokens",
     "operations.schema_versions",
     "operations.retention_policies",
+    "retrieval.search_documents",
+    "retrieval.content_tombstones",
 }
 MANAGED_SCHEMAS = {table.partition(".")[0] for table in MANAGED_TABLES}
 TYPE_BOUND_CHECK_CONSTRAINTS = {

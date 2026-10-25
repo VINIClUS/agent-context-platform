@@ -50,7 +50,11 @@ from sqlalchemy.exc import InterfaceError, OperationalError, SQLAlchemyError
 from sqlalchemy.exc import TimeoutError as PoolTimeoutError
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
-from agent_context_platform.content.blob_store import BlobStoreError
+from agent_context_platform.content.blob_store import (
+    BlobInputLimitError,
+    BlobIntegrityError,
+    BlobStoreError,
+)
 from agent_context_platform.content.service import (
     ContentService,
     ContentServiceError,
@@ -62,6 +66,12 @@ from agent_context_platform.ledger.repository import (
     ResolvedEvent,
     StreamQuarantinedError,
 )
+from agent_context_platform.observability import (
+    SPAN_LEDGER_APPEND,
+    record_content_object,
+    traced,
+)
+from agent_context_platform.operations.faults import fault_point
 
 IDEMPOTENCY_CONFLICT: Final = "idempotency_conflict"
 STREAM_QUARANTINED: Final = "stream_quarantined"
@@ -72,6 +82,12 @@ SERVICE_UNAVAILABLE: Final = "service_unavailable"
 _TRANSIENT_ERRORS: Final = (BlobStoreError, OperationalError, InterfaceError, PoolTimeoutError)
 
 _TRANSIENT_RETRY_AFTER_SECONDS: Final = 5
+# A stored object failed verification: it needs an operator, not a quick retry. The frozen
+# ingestion contract has no non-retryable code for "the platform's stored copy is corrupt", and the
+# batch itself is valid (it succeeds once the object is repaired), so it stays a retryable
+# `service_unavailable`, only paced slower; the alarm is raised where the check failed
+# (`content_integrity_failure`, `agent_context.ledger.integrity_failures`).
+_INTEGRITY_RETRY_AFTER_SECONDS: Final = 60
 
 
 @dataclass(frozen=True, slots=True)
@@ -114,6 +130,17 @@ class IngestionService:
                 event.event_id for event in batch.events if event.stream_id == error.stream_id
             }
             return await self._reject(batch, 409, STREAM_QUARANTINED, offenders)
+        except BlobIntegrityError as error:
+            limited = isinstance(error, BlobInputLimitError)
+            return await self._reject(
+                batch,
+                503,
+                SERVICE_UNAVAILABLE,
+                retryable=True,
+                retry_after=(
+                    _TRANSIENT_RETRY_AFTER_SECONDS if limited else _INTEGRITY_RETRY_AFTER_SECONDS
+                ),
+            )
         except _TRANSIENT_ERRORS:
             return await self._reject(
                 batch,
@@ -126,10 +153,20 @@ class IngestionService:
     async def _commit(
         self, batch: IngestBatchRequestV1, prepared: PreparedContent
     ) -> IngestOutcome:
+        fault_point("ledger.before_db_transaction")
         async with self._session_factory() as session, session.begin():
             await self._content.attach(session, prepared)
             resolved = [_resolve(event, prepared) for event in batch.events]
-            outcomes = await LedgerRepository.append_with_outcome(session, resolved)
+            with traced(SPAN_LEDGER_APPEND, {"agent_context.event_count": len(resolved)}) as span:
+                outcomes = await LedgerRepository.append_with_outcome(session, resolved)
+                span.set_attribute(
+                    "agent_context.events.created", sum(1 for item in outcomes if item.created)
+                )
+            fault_point("ledger.before_commit")
+        fault_point("ledger.after_commit_before_response")
+        # Telemetry (PLATFORM-050): content counts as stored only once the batch committed.
+        for storage, result in prepared.storage_outcomes():
+            record_content_object(storage, result)
         accepted = tuple(
             AcceptedEventV1(
                 event_id=outcome.stored.event_id,

@@ -1,0 +1,7 @@
+# The MCP conformance suite this repository is held to (PLATFORM-047). The single source of the
+# pin: scripts/run-mcp-conformance.sh reads it, and a test asserts that it equals the
+# `mcp-conformance` entry of agent-context-infra's integration/fixtures/versions-under-test.lock,
+# quoted in docs/mcp/conformance.md.
+package = "@modelcontextprotocol/conformance"
+version = "0.2.0-alpha.11"
+requirements = "2026-07-28"

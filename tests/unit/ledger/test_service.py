@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 from collections.abc import Sequence
 from datetime import UTC, datetime
+from typing import Any
 from uuid import UUID
 
 import pytest
@@ -19,7 +20,12 @@ from agent_context_sdk import (
 from agent_context_sdk.ids import new_uuid7
 from sqlalchemy.exc import OperationalError
 
-from agent_context_platform.content.blob_store import BlobNotFoundError, BlobStoreError
+from agent_context_platform.content.blob_store import (
+    BlobInputLimitError,
+    BlobIntegrityError,
+    BlobNotFoundError,
+    BlobStoreError,
+)
 from agent_context_platform.content.service import (
     ContentRequiresRedactionError,
     ContentResolutionError,
@@ -108,6 +114,9 @@ class FakeContent:
 
 
 class FakePrepared:
+    def storage_outcomes(self) -> tuple[tuple[str, str], ...]:
+        return (("inline", "stored"),)
+
     def resolve(self, claims: Sequence[ContentClaimV1]) -> tuple[()]:
         assert not claims
         return ()
@@ -280,6 +289,44 @@ def test_transient_storage_and_database_failures_are_retryable_503s(
     assert not outcome.response.accepted
 
 
+@pytest.mark.parametrize("stage", ["prepare", "attach"])
+def test_a_stored_object_failing_verification_is_a_slow_retry_never_a_new_upload(
+    monkeypatch: pytest.MonkeyPatch, stage: str
+) -> None:
+    # The frozen contract has no non-retryable code for "the platform's stored copy is corrupt":
+    # the batch itself is valid and succeeds once an operator repairs the object, so it stays a
+    # retryable 503 (`service_unavailable`), only with a longer Retry-After; the alarm is the
+    # `content_integrity_failure` log line and metric raised where the check fails.
+    error = BlobIntegrityError("object metadata SHA-256 does not match")
+    if stage == "prepare":
+        harness = _install(Harness(prepare_error=error), monkeypatch)
+    else:
+        harness = _install(Harness(), monkeypatch)
+        harness.content.attach_error = error
+
+    outcome = _run(harness, _batch(_draft("k1")))
+
+    assert outcome.http_status == 503
+    assert outcome.retry_after_seconds == 60
+    assert [(r.error_code, r.retryable) for r in outcome.response.rejected] == [
+        ("service_unavailable", True)
+    ]
+    assert not outcome.response.accepted
+
+
+def test_content_over_the_storage_limit_is_not_an_integrity_failure(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    harness = _install(
+        Harness(prepare_error=BlobInputLimitError("uncompressed payload exceeds configured limit")),
+        monkeypatch,
+    )
+
+    outcome = _run(harness, _batch(_draft("k1")))
+
+    assert (outcome.http_status, outcome.retry_after_seconds) == (503, 5)
+
+
 def test_existing_lookup_failure_degrades_to_no_existing_entries(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -328,3 +375,18 @@ def test_blob_store_outage_on_partial_replay_keeps_existing_and_retries_only_new
         True,
     )
     assert "begin" not in harness.log
+
+
+def test_content_is_counted_only_once_the_batch_commits(harness: Harness, telemetry: Any) -> None:
+    from agent_context_platform.observability import contract
+
+    draft = _draft("k1")
+    harness.append_result = ContentResolutionError("x")
+    assert _run(harness, _batch(draft)).http_status == 422
+    assert telemetry.points(contract.CONTENT_OBJECTS) == {}
+
+    harness.append_result = [_stored(draft, 1)]
+    assert _run(harness, _batch(draft)).http_status == 200
+    assert telemetry.points(contract.CONTENT_OBJECTS) == {
+        (("result", "stored"), ("storage", "inline")): 1
+    }

@@ -269,3 +269,33 @@ def test_constructor_rejects_a_negative_min_age() -> None:
 
 def test_constructor_allows_a_zero_min_age() -> None:
     OrphanSweeper(FakeS3Client([]), "bucket", FakeSessionFactory(set(), []), min_age=timedelta(0))
+
+
+def test_a_dry_run_checks_references_under_the_lock_but_deletes_nothing() -> None:
+    async def exercise() -> None:
+        orphan, kept = _digest(0x66), _digest(0x77)
+        now = datetime.now(UTC)
+        page = {
+            "Contents": [
+                {"Key": _key(orphan), "LastModified": now - timedelta(seconds=1)},
+                {"Key": _key(kept), "LastModified": now - timedelta(seconds=1)},
+                {"Key": _key(_digest(0x88)), "LastModified": now + timedelta(hours=1)},
+            ],
+            "IsTruncated": False,
+        }
+        client = FakeS3Client([page])
+        call_log: list[str] = []
+        sweeper = OrphanSweeper(
+            client, "bucket", FakeSessionFactory({kept}, call_log), min_age=timedelta(0)
+        )
+
+        report = await sweeper.run(now, dry_run=True)
+
+        assert report == SweepReport(
+            examined=3, deleted=0, retained=1, skipped_recent=1, would_delete=1, dry_run=True
+        )
+        assert client.deleted == []
+        _, orphan_key = content_digest_lock_key(orphan)
+        assert f"lock:{orphan_key}" in call_log  # the same race-free check as a real sweep
+
+    _run(exercise())

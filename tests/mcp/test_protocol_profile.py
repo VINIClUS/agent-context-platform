@@ -688,7 +688,21 @@ async def test_duplicate_host_or_origin_is_rejected(name: str, status: int) -> N
 
 
 def test_port_wildcard_rejects_non_ascii_digits() -> None:
-    from agent_context_platform.mcp.protocol_guard import _matches
+    from agent_context_platform.mcp.protocol_guard import allowlisted
 
-    assert not _matches("localhost:\u0663\u0663", ("localhost:*",))
-    assert _matches("localhost:33", ("localhost:*",))
+    assert not allowlisted("localhost:\u0663\u0663", ("localhost:*",))
+    assert allowlisted("localhost:33", ("localhost:*",))
+
+
+def test_allowed_header_is_the_one_host_and_origin_rule() -> None:
+    from agent_context_platform.mcp.protocol_guard import allowed_header
+
+    hosts = ("127.0.0.1:*", "mcp.example")
+    assert allowed_header(["127.0.0.1:8000"], hosts, required=True)
+    assert allowed_header(["mcp.example"], hosts, required=True)
+    assert not allowed_header([], hosts, required=True)
+    assert allowed_header([], hosts, required=False)  # no Origin: a non-browser client
+    assert not allowed_header(["mcp.example", "mcp.example"], hosts, required=False)
+    assert not allowed_header(["127.0.0.1"], hosts, required=True)  # ":*" needs a port
+    assert not allowed_header(["127.0.0.1:123456"], hosts, required=True)
+    assert not allowed_header(["evil.example"], hosts, required=False)

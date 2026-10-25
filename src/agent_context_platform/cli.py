@@ -3,7 +3,8 @@
 It exposes `agent-context projection rebuild|verify|status` (PLATFORM-039) and the credential
 provisioning commands `agent-context producer register|revoke|list` and
 `agent-context mcp-token create|revoke|list` (PLATFORM-039B), plus `agent-context index` (PLATFORM-039C,
-which indexes one git checkout into the ledger as the indexer producer). Every command reads the process environment through `Settings` (`AGENT_CONTEXT_*`), runs in one `asyncio.run`,
+which indexes one git checkout into the ledger as the indexer producer) and
+`agent-context db upgrade|current` (PLATFORM-049, the platform-migrate role). Every command reads the process environment through `Settings` (`AGENT_CONTEXT_*`), runs in one `asyncio.run`,
 and never prints a DSN, a password or an exception message: failures are reported by class name.
 
 Exit codes: 0 success, 1 verification mismatch or a failed operation, 2 usage error (bad or
@@ -20,6 +21,7 @@ from __future__ import annotations
 import asyncio
 import contextlib
 import json
+import math
 import os
 import signal
 import stat
@@ -28,7 +30,7 @@ import time
 from collections.abc import AsyncIterator, Callable, Coroutine, Sequence
 from contextlib import AbstractAsyncContextManager, asynccontextmanager
 from dataclasses import asdict, dataclass
-from datetime import UTC, datetime
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from typing import Annotated, Any, Protocol
 from uuid import uuid4
@@ -37,6 +39,7 @@ import typer
 from agent_context_sdk import RedactionPolicyV1
 from pydantic import PostgresDsn, Secret, ValidationError
 from sqlalchemy import text
+from sqlalchemy.exc import DBAPIError, SQLAlchemyError
 from sqlalchemy.ext.asyncio import (
     AsyncEngine,
     AsyncSession,
@@ -44,26 +47,50 @@ from sqlalchemy.ext.asyncio import (
     create_async_engine,
 )
 
+from agent_context_platform.content.blob_store import S3BlobStore, build_s3_client
+from agent_context_platform.content.orphans import OrphanSweeper, SweepReport
 from agent_context_platform.content.service import ContentService
 from agent_context_platform.db import session_factory
 from agent_context_platform.indexing.emitter import IndexingConfig, IndexingService
 from agent_context_platform.indexing.identity import repository_namespace
 from agent_context_platform.indexing.pipeline import IndexReport, IndexRequest, index_checkout
 from agent_context_platform.ledger.service import IngestionService
-from agent_context_platform.operations import provisioning
-from agent_context_platform.projection.neo4j import Neo4jStore
-from agent_context_platform.projection.registry import registered_projectors
+from agent_context_platform.ledger.verify import DEFAULT_BATCH_SIZE as LEDGER_BATCH_SIZE
+from agent_context_platform.ledger.verify import LedgerVerification, verify_ledger
+from agent_context_platform.observability import setup as telemetry_setup
+from agent_context_platform.observability.projection import ProjectionSampler
+from agent_context_platform.operations import faults, migrate, provisioning
+from agent_context_platform.projection.neo4j import Neo4jStore, Neo4jTransaction
+from agent_context_platform.projection.projectors.search import (
+    SearchBackend,
+    SearchProjector,
+    SearchReplayIntegrityError,
+    reset_search_tables,
+)
+from agent_context_platform.projection.registry import (
+    projectors_with_search,
+    registered_projectors,
+)
 from agent_context_platform.projection.runtime import (
     OutboxBacklog,
     ProjectionRunner,
     ProjectionRunReport,
     Projector,
 )
+from agent_context_platform.projection.schema import (
+    REQUIRED_HISTORY,
+    HistoryState,
+    history_projectors,
+    history_state,
+    narrow_projection_history,
+    projection_history,
+)
 from agent_context_platform.projection.verify import (
     CLI_APPLICATION_NAME,
     DEFAULT_BATCH_SIZE,
     DEFAULT_RUNNER_QUIET_SECONDS,
     REBUILD_LOCK_KEY,
+    GrantRequirement,
     MissingGrantError,
     NoContentBlobStore,
     ProjectionEventRecorder,
@@ -72,13 +99,21 @@ from agent_context_platform.projection.verify import (
     RunnerActiveError,
     TargetNotEmptyError,
     VerificationReport,
+    check_grants,
     preflight,
     projection_status,
     public_error_class,
     rebuild_projections,
+    record_history_if_fresh,
     verify_projections,
 )
-from agent_context_platform.settings import Neo4jSettings, Settings
+from agent_context_platform.retrieval.embeddings import (
+    LocalMiniLMProvider,
+    fetch_model,
+    load_manifest,
+    verify_model_dir,
+)
+from agent_context_platform.settings import Neo4jSettings, SecretFileError, Settings
 
 EXIT_OK = 0
 EXIT_FAILED = 1
@@ -140,6 +175,16 @@ _WIPE_TARGET = Annotated[
     bool,
     typer.Option("--wipe-target", help="Delete the target's graph data first (needs --confirm)."),
 ]
+_WITHOUT_SEARCH = Annotated[
+    bool,
+    typer.Option(
+        "--without-search",
+        envvar="AGENT_CONTEXT_PROJECTION_WITHOUT_SEARCH",
+        help="Skip the search projector: no ContentEmbedding nodes are rebuilt or compared, and "
+        "an in-place rebuild leaves the search tables and the search checkpoint untouched. "
+        "Without this flag a replay needs AGENT_CONTEXT_SEARCH__MODEL_DIR.",
+    ),
+]
 _CONFIRM = Annotated[
     str | None,
     typer.Option("--confirm", help="Repeat the database name to confirm a destructive step."),
@@ -170,9 +215,13 @@ class Runtime:
 
 def _load_settings() -> Settings:
     try:
-        return Settings()
+        settings = Settings()
     except ValidationError:
         raise CliUsageError("invalid AGENT_CONTEXT_* configuration") from None
+    except SecretFileError as error:  # names the file, never its content
+        raise CliUsageError(str(error)) from None
+    faults.configure(settings.fault_injection)
+    return settings
 
 
 def _engine(dsn: Secret[PostgresDsn] | None, name: str) -> AsyncEngine:
@@ -333,6 +382,9 @@ def _run(main: Callable[[], Coroutine[Any, Any, int]]) -> None:
     except provisioning.CommitAfterDeliveryError as error:
         typer.echo(f"error: {_recovery_message(error)}", err=True)
         code = EXIT_FAILED
+    except migrate.MigrationError as error:
+        typer.echo(f"error: {error.code}: {error}", err=True)
+        code = EXIT_USAGE if error.usage_error else EXIT_FAILED
     except provisioning.ProvisioningError as error:
         typer.echo(f"error: {error.code}{_PROVISIONING_HINTS.get(error.code, '')}", err=True)
         code = EXIT_USAGE
@@ -341,6 +393,9 @@ def _run(main: Callable[[], Coroutine[Any, Any, int]]) -> None:
         code = EXIT_FAILED
     except RunnerActiveError as error:
         typer.echo(f"error: {error}", err=True)
+        code = EXIT_FAILED
+    except SearchReplayIntegrityError as error:  # counts only, never content or IDs
+        typer.echo(f"error: {public_error_class(error)}: {error}", err=True)
         code = EXIT_FAILED
     except Exception as error:
         typer.echo(f"error: {public_error_class(error)}", err=True)
@@ -405,11 +460,14 @@ def verify_command(
     confirm: _CONFIRM = None,
     json_output: _JSON = False,
     batch_size: _BATCH = DEFAULT_BATCH_SIZE,
+    without_search: _WITHOUT_SEARCH = False,
 ) -> None:
     """Check checkpoints, coverage, source IDs and stream heads against the ledger."""
 
     async def main() -> int:
         settings = _load_settings()
+        if replay_check:
+            _require_search_model(settings, without_search=without_search)
         scratch: Neo4jStore | None = None
         if replay_check:
             target = _target_settings(settings.neo4j, target_uri, target_database, target_username)
@@ -421,26 +479,40 @@ def verify_command(
             _forbid_target_options(target_uri, target_database, wipe_target, confirm)
         try:
             async with _runtime(settings, record=record) as runtime:
+                if replay_check and without_search:
+                    await _require_no_embeddings(runtime.store, what="a replay check with")
                 await preflight(
-                    runtime.sessions, runtime.recording_sessions, write_checkpoints=False
+                    runtime.sessions,
+                    runtime.recording_sessions,
+                    write_checkpoints=False,
+                    extra_grants=_search_grants(settings, write_documents=False)
+                    if replay_check and not without_search
+                    else (),
                 )
                 report = await verify_projections(
                     runtime.sessions,
                     runtime.store,
-                    registered_projectors(),
+                    # Only a replay projects; plain verify must not load or hash the model.
+                    await _search_projectors(
+                        settings, runtime, write_documents=False, without_search=without_search
+                    )
+                    if replay_check
+                    else registered_projectors(),
                     require_caught_up=require_caught_up,
                     replay_target=scratch,
                     wipe_replay_target=wipe_target,
                     recorder=_recorder(runtime),
                     batch_size=batch_size,
                 )
+                history = await _history(runtime.store, registered_projectors())
         finally:
             if scratch is not None:
                 await scratch.close()
+        lines = _verification_lines(report, require_caught_up=require_caught_up)
         _emit(
-            report.to_dict(require_caught_up=require_caught_up),
+            {**report.to_dict(require_caught_up=require_caught_up), "history": history},
             as_json=json_output,
-            lines=_verification_lines(report, require_caught_up=require_caught_up),
+            lines=[*lines[:-1], _history_line(history), lines[-1]],
         )
         if report.record_error:
             typer.echo(f"error: {report.record_error}", err=True)
@@ -448,6 +520,31 @@ def verify_command(
         return EXIT_OK if report.ok(require_caught_up=require_caught_up) else EXIT_FAILED
 
     _run(main)
+
+
+async def _history(store: Neo4jStore, projectors: Sequence[Projector]) -> dict[str, Any]:
+    """Whether the live graph has the complete history the temporal reads need (the same
+    `REQUIRED_HISTORY` they check), and, for information, which other registered projector
+    versions did not project it from the ledger's start."""
+    history = await projection_history(store)
+    state, missing = history_state(history, REQUIRED_HISTORY)
+    _, others = history_state(history, history_projectors(projectors))
+    return {
+        "state": state.value,
+        "missing": list(missing),
+        "others_missing": [item for item in others if item not in missing],
+    }
+
+
+def _history_line(history: dict[str, Any]) -> str:
+    others = history["others_missing"]
+    tail = f"; other projectors not replayed from the start: {', '.join(others)}" if others else ""
+    if history["state"] == HistoryState.COMPLETE:
+        return f"history: complete for temporal reads{tail}"
+    return (
+        f"history: {history['state']}, rebuild required before temporal reads "
+        f"(not replayed from the start: {', '.join(history['missing'])}){tail}"
+    )
 
 
 def _rebuild_lines(report: RebuildReport) -> list[str]:
@@ -500,11 +597,13 @@ def rebuild_command(
     ] = DEFAULT_RUNNER_QUIET_SECONDS,
     json_output: _JSON = False,
     batch_size: _BATCH = DEFAULT_BATCH_SIZE,
+    without_search: _WITHOUT_SEARCH = False,
 ) -> None:
     """Replay the ledger into a standby target (default) or the live graph (--in-place)."""
 
     async def main() -> int:
         settings = _load_settings()
+        _require_search_model(settings, without_search=without_search)
         if in_place:
             _forbid_target_options(target_uri, target_database, wipe_target)
             _confirmed(confirm, settings.neo4j.database, "--in-place")
@@ -517,22 +616,41 @@ def rebuild_command(
             if wipe_target:
                 _confirmed(confirm, target_settings.database, "--wipe-target")
         async with _runtime(settings, record=record) as runtime:
+            if in_place and without_search:
+                await _require_no_embeddings(runtime.store, what="an in-place rebuild with")
             # Before anything is mutated: a missing grant must not surface after a target is wiped.
             await preflight(
-                runtime.sessions, runtime.recording_sessions, write_checkpoints=in_place
+                runtime.sessions,
+                runtime.recording_sessions,
+                write_checkpoints=in_place,
+                extra_grants=()
+                if without_search
+                else _search_grants(settings, write_documents=in_place),
             )
             target = runtime.store if in_place else Neo4jStore(target_settings)
             try:
+                projectors = await _search_projectors(
+                    settings, runtime, write_documents=in_place, without_search=without_search
+                )
+                if in_place:
+                    # Read-only, before the rebuild lock, the checkpoints, the reset and the wipe:
+                    # a replay that would fail on content must never start on the live graph.
+                    await _check_search_replay(projectors, runtime.sessions)
                 report = await rebuild_projections(
                     runtime.sessions,
                     target,
-                    registered_projectors(),
+                    projectors,
                     target_description=_describe(target_settings),
                     in_place=in_place,
                     wipe_target=wipe_target,
                     recorder=_recorder(runtime),
                     batch_size=batch_size,
                     runner_quiet_seconds=runner_quiet_seconds,
+                    before_replay=(
+                        (lambda: _prepare_search_replay(projectors, runtime.sessions))
+                        if in_place and not without_search
+                        else None
+                    ),
                 )
             finally:
                 if not in_place:
@@ -555,6 +673,8 @@ def status_command(json_output: _JSON = False) -> None:
         settings = _load_settings()
         async with _runtime(settings) as runtime:
             statuses = await projection_status(runtime.sessions, registered_projectors())
+            search = await _search_status(runtime)
+            history = await _history(runtime.store, registered_projectors())
         lines = [
             f"{item.name} {item.version}: state {item.state or 'none'}, "
             f"checkpoint {item.checkpoint_outbox_id}/{item.ledger_head_outbox_id}, "
@@ -562,12 +682,55 @@ def status_command(json_output: _JSON = False) -> None:
             f"last run {item.last_run_at.isoformat() if item.last_run_at else 'never'}"
             for item in statuses
         ]
+        lines.append(_search_status_line(search))
         _emit(
-            {"projectors": [item.to_dict() for item in statuses]}, as_json=json_output, lines=lines
+            {
+                "projectors": [item.to_dict() for item in statuses],
+                "history": history,
+                "search": search,
+            },
+            as_json=json_output,
+            lines=[*lines, _history_line(history)],
         )
         return EXIT_OK
 
     _run(main)
+
+
+async def _search_status(runtime: Runtime) -> dict[str, int]:
+    """Search rows versus embedding nodes: the durable trace of a lexical-only worker.
+
+    The search checkpoint advances over events a lexical-only worker indexed without embeddings,
+    so lag alone cannot show them; more rows than nodes means a rebuild with the model is due.
+    `documents_without_embeddings` is rows minus nodes, an approximation (hidden rows of
+    undelivered events and stale nodes count too): exact would need every ID from both stores.
+    Counts only.
+    """
+    async with runtime.sessions() as session:
+        documents = int(
+            await session.scalar(text("SELECT count(*) FROM retrieval.search_documents")) or 0
+        )
+
+    async def count(tx: Neo4jTransaction) -> int:
+        result = await tx.run("MATCH (n:ContentEmbedding) RETURN count(n) AS n", parameters={})
+        return int(result.records[0]["n"])
+
+    embeddings = await runtime.store.execute_read(count)
+    return {
+        "documents": documents,
+        "embeddings": embeddings,
+        "documents_without_embeddings": max(documents - embeddings, 0),
+    }
+
+
+def _search_status_line(search: dict[str, int]) -> str:
+    line = f"search: {search['documents']} documents, {search['embeddings']} embeddings"
+    if search["documents_without_embeddings"]:
+        line += (
+            f" (about {search['documents_without_embeddings']} without embeddings: run "
+            "`projection rebuild` with AGENT_CONTEXT_SEARCH__MODEL_DIR to add them)"
+        )
+    return line
 
 
 # --- projection worker (PLATFORM-039D) ---------------------------------------------------------
@@ -595,6 +758,7 @@ class WorkerTotals:
     lost_leases: int = 0
     iterations: int = 0
     paused_for_rebuild: int = 0
+    search_unembedded: int = 0  # lexical-only mode: content events indexed without embeddings
     outcome: str = "stopped"  # drained | timeout | stopped | interrupted
 
     def add(self, report: ProjectionRunReport) -> None:
@@ -605,16 +769,48 @@ class WorkerTotals:
         self.lost_leases += report.lost_leases
 
 
-def build_projectors(settings: Settings) -> tuple[Projector, ...]:
+LEXICAL_ONLY_ENV = "AGENT_CONTEXT_PROJECTION_LEXICAL_ONLY"
+
+
+async def build_projectors(
+    settings: Settings, runtime: Runtime, *, lexical_only: bool = False
+) -> tuple[Projector, ...]:
     """The projector set the worker runs: the ONE place a projector needing configuration binds.
 
-    Today that is the registry as is. A projector that needs a backend built from `settings` (the
-    search projector's embedding provider and PostgreSQL writer, PLATFORM-042) is added here, so
-    the worker never assembles projectors anywhere else. It must fail closed with a clear error
-    when its configuration is missing.
+    The search projector is bound exactly as `projection rebuild --in-place` binds it, in a writing
+    mode (`_search_projectors`, `write_documents=True`); with `AGENT_CONTEXT_SEARCH__MODEL_DIR` it
+    indexes (loading verifies every model digest and fails closed). `lexical_only` is the explicit
+    mode for a worker with no model: it reads content and writes the PostgreSQL rows with every
+    check a full index runs, so conflicts and unreadable content dead-letter live exactly as with a
+    model (a later replay skips them), and leaves only the `ContentEmbedding` nodes to a rebuild
+    with the model. Without a model and without that mode the worker refuses to start.
     """
-    del settings  # no registered projector needs configuration yet
-    return registered_projectors()
+    _check_worker_search_mode(settings, lexical_only=lexical_only)
+    if lexical_only:
+        content = ContentService(S3BlobStore.from_settings(settings.s3), RedactionPolicyV1())
+        return projectors_with_search(SearchBackend(runtime.sessions, content, None))
+    return await _search_projectors(settings, runtime, write_documents=True)
+
+
+def _check_worker_search_mode(settings: Settings, *, lexical_only: bool) -> None:
+    if lexical_only and settings.search.model_dir is not None:
+        raise CliUsageError(
+            "--lexical-only is refused while AGENT_CONTEXT_SEARCH__MODEL_DIR is set: a worker with "
+            "a model indexes embeddings too; unset one of them"
+        )
+    if not lexical_only and settings.search.model_dir is None:
+        raise CliUsageError(
+            "the projection worker needs AGENT_CONTEXT_SEARCH__MODEL_DIR (see `models fetch`); "
+            "pass --lexical-only to index search rows without embeddings"
+        )
+
+
+def _search_unembedded(projectors: Sequence[Projector]) -> int:
+    return sum(
+        projector.unembedded_events
+        for projector in projectors
+        if isinstance(projector, SearchProjector)
+    )
 
 
 def _worker_exit_code(totals: WorkerTotals, *, once: bool) -> int:
@@ -759,6 +955,11 @@ def _worker_lines(totals: WorkerTotals, statuses: Sequence[ProjectorStatus]) -> 
         f"retried {totals.retried}, dead-lettered {totals.dead_lettered}, "
         f"lost leases {totals.lost_leases}"
     ]
+    if totals.search_unembedded:
+        lines.append(
+            f"search: {totals.search_unembedded} content events indexed without embeddings "
+            "(lexical-only; a rebuild with the model adds them)"
+        )
     lines.extend(
         f"{item.name} {item.version}: checkpoint {item.checkpoint_outbox_id}/"
         f"{item.ledger_head_outbox_id}, lag {item.lag}"
@@ -799,6 +1000,16 @@ def run_command(
         typer.Option("--log-seconds", min=0.1, help="At most one progress line per N seconds."),
     ] = 30.0,
     json_output: _JSON = False,
+    lexical_only: Annotated[
+        bool,
+        typer.Option(
+            "--lexical-only",
+            envvar=LEXICAL_ONLY_ENV,
+            help="No embedding model: write the search rows (lexical search, purges, every "
+            "conflict check) without embeddings. Refused while AGENT_CONTEXT_SEARCH__MODEL_DIR is "
+            "set; without it the worker needs that model.",
+        ),
+    ] = False,
 ) -> None:
     """Run the projection worker: claim outbox rows and project them into the graph.
 
@@ -807,13 +1018,15 @@ def run_command(
     drains the outbox and exits 0, or 1 when an event was dead-lettered during the run, or on
     `--max-seconds` expiring (`timeout`), or when SIGTERM/SIGINT cuts it short (`interrupted`). Pauses (`paused_for_rebuild`) while a rebuild holds the
     rebuild lock. Uses the projector role. Progress and the summary are counts only; never a DSN
-    or event content.
+    or event content. Needs AGENT_CONTEXT_SEARCH__MODEL_DIR unless `--lexical-only` indexes the
+    search rows without embeddings.
     """
 
     async def main() -> int:
         if health_file is not None and not health_file.parent.is_dir():
             raise CliUsageError("--health-file must be in an existing directory")
         settings = _load_settings()
+        _check_worker_search_mode(settings, lexical_only=lexical_only)  # before any connection
         stop = asyncio.Event()
         loop = asyncio.get_running_loop()
         handled: list[signal.Signals] = []
@@ -831,12 +1044,33 @@ def run_command(
 
         worker_id = f"projection-worker-{os.getpid()}-{uuid4().hex[:8]}"
         runner: ProjectionRunner | None = None
+        telemetry = telemetry_setup.start(settings)  # PLATFORM-050: no-op without an endpoint
+        sampler: asyncio.Task[None] | None = None
         try:
             async with _runtime(settings) as runtime:
-                projectors = build_projectors(settings)
+                projectors = await build_projectors(settings, runtime, lexical_only=lexical_only)
                 runner = ProjectionRunner(
                     runtime.sessions, runtime.store, projectors, worker_id=worker_id
                 )
+                # The history marker: narrowed to the versions this worker runs, and recorded
+                # when it starts on an empty graph with nothing delivered (it then projects the
+                # whole ledger); never while a rebuild holds the lock.
+                async with _shared_rebuild_lock(runtime.sessions) as blocked:
+                    if not blocked:
+                        await narrow_projection_history(
+                            runtime.store, history_projectors(projectors)
+                        )
+                        if await record_history_if_fresh(
+                            runtime.sessions, runtime.store, projectors
+                        ):
+                            log("history_marker_recorded")
+                # Gauges are metrics: sample them only when metrics are exported.
+                if telemetry is not None and telemetry.exports_metrics:
+                    sampler = asyncio.create_task(
+                        ProjectionSampler(
+                            runtime.sessions, [projector.name for projector in projectors]
+                        ).run(stop, settings.observability.projection_sample_seconds)
+                    )
                 touch()
                 log("started")
                 try:
@@ -856,8 +1090,17 @@ def run_command(
                     # Never leave a lease behind, even when the loop died on an error.
                     with contextlib.suppress(Exception):
                         await asyncio.shield(runner.release_leases())
+                    if sampler is not None:
+                        sampler.cancel()
+                        await asyncio.gather(sampler, return_exceptions=True)
+                totals.search_unembedded = _search_unembedded(projectors)
+                if totals.search_unembedded:
+                    log(f"search_unembedded {totals.search_unembedded}")
                 statuses = await projection_status(runtime.sessions, projectors)
         finally:
+            if sampler is not None and not sampler.done():
+                sampler.cancel()
+            await telemetry_setup.stop(telemetry, settings)
             for sig in handled:
                 loop.remove_signal_handler(sig)
             if health_file is not None:
@@ -922,6 +1165,7 @@ def index_command(
             raise CliUsageError("--scip must be an existing file")
         settings = _load_settings()
         engine = _engine(settings.postgresql.effective_api_dsn, "API_DSN")
+        telemetry = telemetry_setup.start(settings)  # PLATFORM-050: no-op without an endpoint
         try:
             sessions = session_factory(engine)
             ingestion = IngestionService(
@@ -933,6 +1177,7 @@ def index_command(
             )
         finally:
             await engine.dispose()
+            await telemetry_setup.stop(telemetry, settings)
         _emit(report.to_dict(), as_json=json_output, lines=_index_lines(report))
         return EXIT_OK if report.success else EXIT_FAILED
 
@@ -1323,6 +1568,543 @@ def mcp_token_list_command(json_output: _JSON = False) -> None:
         return EXIT_OK
 
     _run(main)
+
+
+# --- `agent-context content` (PLATFORM-054): maintenance of stored content. ---------------------
+# `sweep-orphans` drives the existing `OrphanSweeper` (an INFRA timer runs it). It connects with
+# AGENT_CONTEXT_POSTGRESQL__API_DSN (falling back to __DSN; the sweeper only reads
+# catalog.content_objects under the per-digest advisory lock `attach` takes) and the AGENT_CONTEXT_S3__*
+# settings. It prints counts only, never keys or digests.
+
+content_app = typer.Typer(
+    help="Maintain stored content.",
+    no_args_is_help=True,
+    add_completion=False,
+    pretty_exceptions_enable=False,
+)
+app.add_typer(content_app, name="content")
+
+#: The sweeper's own grace window: an upload whose batch has not attached yet must never be
+#: deleted. A shorter min-age needs --allow-short-min-age, which production refuses.
+SWEEP_MIN_AGE_FLOOR_SECONDS = 86_400
+_SWEEP_MAX_MIN_AGE_SECONDS = 10 * 365 * 86_400
+
+
+def _sweep_lines(report: SweepReport, min_age: int) -> list[str]:
+    if report.dry_run:
+        counts = f"examined {report.examined}, would delete {report.would_delete}"
+    else:
+        counts = f"examined {report.examined}, deleted {report.deleted}"
+    return [
+        f"orphan sweep{' (dry run)' if report.dry_run else ''}: {counts}, retained "
+        f"{report.retained}, skipped recent {report.skipped_recent} (min age {min_age} s)"
+    ]
+
+
+@content_app.command("sweep-orphans")
+def sweep_orphans_command(
+    min_age: Annotated[
+        int,
+        typer.Option(
+            "--min-age",
+            help=f"Only objects older than this many seconds (default and floor "
+            f"{SWEEP_MIN_AGE_FLOOR_SECONDS}).",
+        ),
+    ] = SWEEP_MIN_AGE_FLOOR_SECONDS,
+    dry_run: Annotated[
+        bool, typer.Option("--dry-run", help="Count what would be deleted; delete nothing.")
+    ] = False,
+    allow_short_min_age: Annotated[
+        bool,
+        typer.Option(
+            "--allow-short-min-age",
+            help="Tests and development only: accept a min-age below the floor. "
+            "Refused in production.",
+        ),
+    ] = False,
+    json_output: _JSON = False,
+) -> None:
+    """Delete content objects no catalog row references, once older than the min-age."""
+
+    async def main() -> int:
+        if not 0 <= min_age <= _SWEEP_MAX_MIN_AGE_SECONDS:
+            raise CliUsageError(f"--min-age must be in [0, {_SWEEP_MAX_MIN_AGE_SECONDS}] seconds")
+        settings = _load_settings()
+        if allow_short_min_age and settings.environment == "production":
+            raise CliUsageError("--allow-short-min-age is refused in production")
+        if min_age < SWEEP_MIN_AGE_FLOOR_SECONDS and not allow_short_min_age:
+            raise CliUsageError(
+                f"--min-age below {SWEEP_MIN_AGE_FLOOR_SECONDS} s could delete an upload whose "
+                "batch has not attached yet; tests may pass --allow-short-min-age"
+            )
+        s3 = settings.s3
+        if s3.endpoint_url is None:
+            raise CliUsageError("AGENT_CONTEXT_S3__ENDPOINT_URL is required")
+        engine = _engine(settings.postgresql.effective_api_dsn, "API_DSN")
+        try:
+            sweeper = OrphanSweeper(
+                build_s3_client(s3),
+                s3.bucket_name,
+                session_factory(engine),
+                min_age=timedelta(seconds=min_age),
+            )
+            report = await sweeper.run(datetime.now(UTC), dry_run=dry_run)
+        finally:
+            await engine.dispose()
+        _emit(
+            {
+                "examined": report.examined,
+                "deleted": report.deleted,
+                "retained": report.retained,
+                "skipped_recent": report.skipped_recent,
+                "would_delete": report.would_delete,
+                "dry_run": report.dry_run,
+                "min_age_seconds": min_age,
+            },
+            as_json=json_output,
+            lines=_sweep_lines(report, min_age),
+        )
+        return EXIT_OK
+
+    _run(main)
+
+
+# --- end of `agent-context content` -------------------------------------------------------------
+
+
+# --- `agent-context ledger verify` (PLATFORM-056): read-only ledger integrity. ------------------
+# Connects with AGENT_CONTEXT_POSTGRESQL__PROJECTOR_DSN (falling back to __DSN): the projector role
+# holds SELECT and nothing else on the three ledger tables, and the walk runs in one READ ONLY
+# transaction (`ledger/verify.py`). Exit 0: every stream verifies; 1: an integrity check failed;
+# 2: a usage, grant, connection or database error (so 1 always means the ledger itself).
+
+ledger_app = typer.Typer(
+    help="Verify the event ledger.",
+    no_args_is_help=True,
+    add_completion=False,
+    pretty_exceptions_enable=False,
+)
+app.add_typer(ledger_app, name="ledger")
+
+LEDGER_READ_GRANTS = tuple(
+    GrantRequirement("table", table, "SELECT")
+    for table in ("ledger.events", "ledger.event_streams", "ledger.event_content_refs")
+)
+_INSUFFICIENT_PRIVILEGE = "42501"  # SQLSTATE insufficient_privilege
+
+
+def _ledger_lines(report: LedgerVerification) -> list[str]:
+    summary = report.to_dict()
+    totals, scope = summary["totals"], summary["scope"]
+    partial = ""
+    if not scope["full"]:
+        named = f", {len(scope['streams'])} named streams" if scope["streams"] else ""
+        partial = f" (partial: from sequence {scope['since_sequence']}{named})"
+    lines = [
+        f"ledger: {totals['streams']} streams, {totals['events']} events verified, "
+        f"{totals['streams_failed']} failed{partial}"
+    ]
+    if report.failure is not None:
+        lines.append(
+            f"ledger: {report.failure.check} failed "
+            f"(expected {report.failure.expected}, actual {report.failure.actual})"
+        )
+    for stream in report.streams:
+        failure = stream.failure
+        if failure is None:
+            continue
+        where = "" if failure.stream_sequence is None else f" at sequence {failure.stream_sequence}"
+        lines.append(
+            f"stream {stream.stream_id}: {failure.check} failed{where} "
+            f"(expected {failure.expected or '-'}, actual {failure.actual or '-'})"
+        )
+    lines.append("ok" if report.ok else "INTEGRITY FAILURE")
+    return lines
+
+
+@ledger_app.command("verify")
+def ledger_verify_command(
+    stream: Annotated[
+        list[str] | None,
+        typer.Option("--stream", help="Verify only this stream (repeatable); default: all."),
+    ] = None,
+    since_sequence: Annotated[
+        int,
+        typer.Option(
+            "--since-sequence",
+            min=1,
+            help="Start each stream at this sequence (its link to the one before is checked).",
+        ),
+    ] = 1,
+    batch_size: Annotated[
+        int, typer.Option("--batch-size", min=1, max=10_000, help="Events read per batch.")
+    ] = LEDGER_BATCH_SIZE,
+    json_output: _JSON = False,
+) -> None:
+    """Check sequences, payload and envelope digests, the hash chain and the stream heads."""
+
+    async def main() -> int:
+        settings = _load_settings()
+        engine = _engine(settings.postgresql.effective_projector_dsn, "PROJECTOR_DSN")
+        sessions = session_factory(engine)
+        try:
+            await check_grants(sessions, LEDGER_READ_GRANTS, role="projector")
+            report = await verify_ledger(
+                sessions,
+                streams=tuple(stream or ()),
+                since_sequence=since_sequence,
+                batch_size=batch_size,
+            )
+        except MissingGrantError as error:
+            raise CliUsageError(str(error)) from None
+        except DBAPIError as error:
+            # Never the driver's message: it can carry the statement and its parameters.
+            if getattr(error.orig, "sqlstate", None) == _INSUFFICIENT_PRIVILEGE:
+                # Without USAGE on the schema, even the grant preflight is refused.
+                raise CliUsageError(
+                    "the projector role may not read the ledger (permission denied); it needs "
+                    "USAGE on schema ledger and SELECT on ledger.events, ledger.event_streams "
+                    "and ledger.event_content_refs"
+                ) from None
+            raise CliUsageError(
+                "the ledger could not be read (connection or database error)"
+            ) from None
+        except (SQLAlchemyError, OSError):
+            raise CliUsageError(
+                "the ledger could not be read (connection or database error)"
+            ) from None
+        except Exception as error:
+            # Exit 1 means an integrity failure and nothing else: no verdict is exit 2.
+            raise CliUsageError(
+                f"the ledger could not be verified ({public_error_class(error)}); no verdict"
+            ) from None
+        finally:
+            await engine.dispose()
+        _emit(report.to_dict(), as_json=json_output, lines=_ledger_lines(report))
+        return EXIT_OK if report.ok else EXIT_FAILED
+
+    _run(main)
+
+
+# --- end of `agent-context ledger` --------------------------------------------------------------
+
+
+# --- `agent-context db` (PLATFORM-049): schema migrations for the platform-migrate role. ---------
+# It connects with AGENT_CONTEXT_POSTGRESQL__MIGRATION_DSN (falling back to __DSN) and runs only
+# the Alembic scripts shipped next to it (see operations/migrate.py).
+
+db_app = typer.Typer(
+    help="Upgrade and inspect the database schema.",
+    no_args_is_help=True,
+    add_completion=False,
+    pretty_exceptions_enable=False,
+)
+app.add_typer(db_app, name="db")
+
+_ALEMBIC_CONFIG = Annotated[
+    Path | None,
+    typer.Option(
+        "--alembic-config",
+        envvar=migrate.ALEMBIC_CONFIG_ENV,
+        help=f"The shipped alembic.ini (or ${migrate.ALEMBIC_CONFIG_ENV}; default ./alembic.ini).",
+    ),
+]
+
+
+@db_app.command("upgrade")
+def db_upgrade_command(
+    expect_head: Annotated[
+        str | None,
+        typer.Option("--expect-head", help="Fail unless the image's head is this revision."),
+    ] = None,
+    lock_timeout: Annotated[
+        float,
+        typer.Option(
+            "--lock-timeout",
+            help="Seconds to wait for a concurrent migration "
+            f"(at most {migrate.MAX_LOCK_TIMEOUT_SECONDS:.0f}).",
+        ),
+    ] = migrate.DEFAULT_LOCK_TIMEOUT_SECONDS,
+    alembic_config: _ALEMBIC_CONFIG = None,
+    json_output: _JSON = False,
+) -> None:
+    """Upgrade to the image's Alembic head under the migration lock; never downgrades."""
+
+    async def main() -> int:
+        if not (
+            math.isfinite(lock_timeout) and 0 < lock_timeout <= migrate.MAX_LOCK_TIMEOUT_SECONDS
+        ):
+            raise CliUsageError(
+                f"--lock-timeout must be in (0, {migrate.MAX_LOCK_TIMEOUT_SECONDS:.0f}] seconds"
+            )
+        settings = _load_settings()
+        config = migrate.alembic_config(alembic_config)
+        engine = _engine(settings.postgresql.effective_migration_dsn, "MIGRATION_DSN")
+        # As PID 1 of the migrate container, `docker stop` sends SIGTERM: cancel the run so the
+        # lock wait (or the migration transaction) is abandoned and the connection closed,
+        # instead of being SIGKILLed while the server backend keeps waiting.
+        loop = asyncio.get_running_loop()
+        task = asyncio.current_task()
+        interrupted = asyncio.Event()
+
+        def stop() -> None:
+            interrupted.set()
+            if task is not None:
+                task.cancel()
+
+        handled: list[signal.Signals] = []
+        for sig in (signal.SIGTERM, signal.SIGINT):
+            with contextlib.suppress(NotImplementedError, RuntimeError, ValueError):
+                loop.add_signal_handler(sig, stop)
+                handled.append(sig)
+        try:
+            report = await migrate.upgrade(
+                engine, config, expect_head=expect_head, lock_timeout_seconds=lock_timeout
+            )
+        except BaseException:
+            if not interrupted.is_set():
+                raise
+            if task is not None:
+                task.uncancel()
+            raise migrate.MigrationError(
+                "interrupted", "stopped by a signal; run `db current` to see the revision"
+            ) from None
+        finally:
+            # A second signal during clean-up gets the default action.
+            for sig in handled:
+                loop.remove_signal_handler(sig)
+            await engine.dispose()
+        line = (
+            f"schema upgraded from {report.before or 'an empty database'} to {report.after}"
+            if report.applied
+            else f"schema already at head {report.after}"
+        )
+        _emit(
+            {
+                "before": report.before,
+                "after": report.after,
+                "head": report.head,
+                "applied": report.applied,
+            },
+            as_json=json_output,
+            lines=[line],
+        )
+        return EXIT_OK
+
+    _run(main)
+
+
+@db_app.command("current")
+def db_current_command(alembic_config: _ALEMBIC_CONFIG = None, json_output: _JSON = False) -> None:
+    """Show the database's revision against the image's head (exit 1 unless at head)."""
+
+    async def main() -> int:
+        settings = _load_settings()
+        config = migrate.alembic_config(alembic_config)
+        engine = _engine(settings.postgresql.effective_migration_dsn, "MIGRATION_DSN")
+        try:
+            report = await migrate.current(engine, config)
+        finally:
+            await engine.dispose()
+        _emit(
+            {"revision": report.revision, "head": report.head, "state": report.state},
+            as_json=json_output,
+            lines=[f"revision {report.revision or 'none'} head {report.head}: {report.state}"],
+        )
+        return EXIT_OK if report.state == "at_head" else EXIT_FAILED
+
+    _run(main)
+
+
+# --- end of `agent-context db` ------------------------------------------------------------------
+
+
+# --- PLATFORM-042: `models fetch` and the search projector's configured backend ----------------
+# Kept in one block, apart from the other commands, to ease rebases.
+models_app = typer.Typer(
+    help="Fetch and check the pinned local embedding model.",
+    no_args_is_help=True,
+    add_completion=False,
+    pretty_exceptions_enable=False,
+)
+app.add_typer(models_app, name="models")
+
+
+@models_app.command("fetch")
+def models_fetch_command(
+    dest: Annotated[
+        Path,
+        typer.Option(
+            "--dest",
+            file_okay=False,
+            help="Directory to download the model into (set AGENT_CONTEXT_SEARCH__MODEL_DIR to it).",
+        ),
+    ],
+    json_output: _JSON = False,
+) -> None:
+    """Download the pinned embedding model by revision and verify every sha256.
+
+    This is the only command that downloads the model; the service and the tests never do.
+    """
+
+    async def main() -> int:
+        manifest = load_manifest()
+        downloaded = await asyncio.to_thread(fetch_model, manifest, dest)
+        await asyncio.to_thread(verify_model_dir, manifest, dest)
+        _emit(
+            {
+                "model_id": manifest.model_id,
+                "revision": manifest.revision,
+                "dest": str(dest),
+                "downloaded": downloaded,
+                "verified": [item.path for item in manifest.files],
+            },
+            as_json=json_output,
+            lines=[
+                f"{manifest.model_id}@{manifest.revision}: {len(downloaded)} file(s) downloaded, "
+                f"{len(manifest.files)} verified in {dest}"
+            ],
+        )
+        return EXIT_OK
+
+    _run(main)
+
+
+_SEARCH_UPDATE_COLUMNS = (
+    "event_id",
+    "source_event_ids",
+    "event_type",
+    "session_id",
+    "occurred_at",
+    "redaction",
+    "tsv",
+    "indexed_at",
+)
+
+
+def _search_grants(settings: Settings, *, write_documents: bool) -> tuple[GrantRequirement, ...]:
+    """Projector-role privileges the bound search projector needs; none when it is unbound.
+
+    Content and tombstones are read whenever search is bound; the search rows and tombstones are
+    written only in a writing mode (`write_documents`). Checked by `preflight`, before any wipe.
+    """
+    if settings.search.model_dir is None:
+        return ()
+    needed = [
+        GrantRequirement("table", "catalog.inline_contents", "SELECT"),
+        GrantRequirement("table", "retrieval.content_tombstones", "SELECT"),
+    ]
+    if write_documents:
+        needed += [
+            GrantRequirement("table", "retrieval.content_tombstones", "INSERT"),
+            *(
+                GrantRequirement("table", "retrieval.search_documents", privilege)
+                for privilege in ("SELECT", "INSERT", "DELETE")
+            ),
+            GrantRequirement("function", "retrieval.reset_search_projection()", "EXECUTE"),
+            *(
+                GrantRequirement("column", "retrieval.search_documents", "UPDATE", column)
+                for column in _SEARCH_UPDATE_COLUMNS
+            ),
+        ]
+    return tuple(needed)
+
+
+def _require_search_model(settings: Settings, *, without_search: bool) -> None:
+    """Refuse a replay that would bind the search projector without a model, before any mutation.
+
+    A destructive rebuild without the model would wipe the graph and then fail (or silently drop)
+    every `ContentEmbedding`; `--without-search` is the explicit way to skip the projector.
+    """
+    if not without_search and settings.search.model_dir is None:
+        raise CliUsageError(
+            "the search projector needs AGENT_CONTEXT_SEARCH__MODEL_DIR (see `models fetch`); "
+            "pass --without-search to skip it"
+        )
+
+
+async def _require_no_embeddings(store: Neo4jStore, *, what: str) -> None:
+    """Refuse `--without-search` against a live graph that holds `ContentEmbedding` nodes.
+
+    The replay would wipe (in place) or fail to reproduce (replay-check) the embeddings the search
+    projector owns, and nothing would bring them back. Raised before any mutation.
+    """
+
+    async def count(tx: Neo4jTransaction) -> int:
+        result = await tx.run("MATCH (n:ContentEmbedding) RETURN count(n) AS n", parameters={})
+        return int(result.records[0]["n"])
+
+    if await store.execute_read(count):
+        raise CliUsageError(
+            f"{what} --without-search is refused: the live graph holds ContentEmbedding nodes "
+            "that would be lost or reported as a mismatch; configure "
+            "AGENT_CONTEXT_SEARCH__MODEL_DIR and drop --without-search"
+        )
+
+
+async def _prepare_search_replay(
+    projectors: Sequence[Projector], sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    """Before an in-place replay: empty the search documents and reseed the tombstones.
+
+    `reset_search_tables` tombstones every purge the ledger records, so purge knowledge survives
+    the rebuild even for a dead-lettered `content.purged` the delivered-only replay skips, and the
+    replayed originals of purged content find their tombstone instead of reading gone bytes.
+    """
+    if any(isinstance(projector, SearchProjector) for projector in projectors):
+        async with sessions() as session, session.begin():
+            await reset_search_tables(session)
+
+
+async def _check_search_replay(
+    projectors: Sequence[Projector], sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    for projector in projectors:
+        if isinstance(projector, SearchProjector):
+            await projector.check_replay(sessions)
+
+
+async def _seed_search_purges(
+    projectors: Sequence[Projector], sessions: async_sessionmaker[AsyncSession]
+) -> None:
+    for projector in projectors:
+        if isinstance(projector, SearchProjector):
+            await projector.seed_purges(sessions)
+
+
+async def _search_projectors(
+    settings: Settings, runtime: Runtime, *, write_documents: bool, without_search: bool = False
+) -> tuple[Projector, ...]:
+    """The registered projectors; with a model directory the search projector can embed.
+
+    Without `AGENT_CONTEXT_SEARCH__MODEL_DIR` the default (unconfigured) search projector is used:
+    it fails closed on any event it would have to index. Loading verifies every model digest.
+    `write_documents` is False for a replay into a scratch or standby graph: the search rows and
+    tombstones live in the live PostgreSQL, which such a replay must never write.
+    """
+    if without_search:
+        return tuple(item for item in registered_projectors() if item.name != "search")
+    model_dir = settings.search.model_dir
+    if model_dir is None:  # every caller refuses this first (`_require_search_model`)
+        raise CliUsageError("the search projector needs AGENT_CONTEXT_SEARCH__MODEL_DIR")
+    provider = await asyncio.to_thread(
+        LocalMiniLMProvider.load,
+        model_dir,
+        batch_size=settings.search.embedding_batch_size,
+        threads=settings.search.embedding_threads,
+    )
+    content = ContentService(S3BlobStore.from_settings(settings.s3), RedactionPolicyV1())
+    projectors = projectors_with_search(
+        SearchBackend(runtime.sessions, content, provider, write_documents)
+    )
+    if not write_documents:
+        # A scratch or standby replay never writes tombstones, and its originals precede their
+        # purges: remember every purge the ledger records so purged bytes are never read.
+        await _seed_search_purges(projectors, runtime.sessions)
+    return projectors
+
+
+# --- end PLATFORM-042 ---------------------------------------------------------------------------
 
 
 if __name__ == "__main__":

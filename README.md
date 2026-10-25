@@ -50,6 +50,46 @@ uv run --frozen uvicorn agent_context_platform.app:create_app \
 The process-only liveness endpoint is `GET http://127.0.0.1:8000/health/live`. It does not
 represent readiness of PostgreSQL, object storage, Neo4j, or any other external service.
 
+`GET /health/ready` does: it checks, concurrently and each within two seconds, that PostgreSQL
+answers and `public.alembic_version` holds exactly the Alembic head this code ships, that Neo4j
+accepts a connectivity check and that the S3 bucket answers `HeadBucket`. It answers `200
+{"status":"ready"}` or `503 {"status":"not_ready","components":{...}}` with only the component
+names (`postgresql`, `schema`, `neo4j`, `s3`) and coarse states (`ok`, `unconfigured`,
+`unavailable`, `timeout`, `forbidden`, `mismatch`, `unknown`), never a host, DSN or error text,
+and always with `Cache-Control: no-store`. It only reads (one `SELECT` in a read-only
+transaction) and concurrent requests share a probe while it is younger than the timeout. The
+bound holds even when a dependency vanishes mid-request: a timed-out check is cancelled but never
+awaited (at most four are kept per check), and PostgreSQL is reached over readiness's own unpooled
+engine with libpq connect, keepalive and TCP user timeouts plus a statement timeout, so a dead
+socket left by a failover is never reused. The API's login role, a member of
+`agent_context_api`, needs `SELECT` on `public.alembic_version`, `projection.projection_checkpoints`
+and `projection.dead_letters` (the schema head, and projection progress for freshness); migration
+`20261022_0001` grants exactly these to `agent_context_api`, so a migrated database needs no extra
+grant. Readiness checks all three: if one is missing the schema is reported `forbidden` (not ready),
+never assumed current.
+
+Two consequences of these rules are deliberate. Readiness requires the *exact* head, so a
+replica running an older image leaves rotation as soon as a newer image's migration commits
+(even a purely additive one), and an image-only rollback after a migration never becomes ready:
+roll back to an image whose head matches the database, or restore. And the API requires Neo4j
+although only MCP retrieval reads it, because the MCP tools query the graph (PLATFORM-046); an
+API without Neo4j would answer MCP calls it cannot serve.
+
+## Codex OTLP receiver
+
+`POST /v1/otel/traces` accepts Codex trace-safe OTLP/HTTP exports (protobuf) from the collector,
+authenticated with an `events:ingest` producer token, and appends the mapped events to the ledger.
+It answers 503 until `AGENT_CONTEXT_OTEL_RECEIVER__IDEMPOTENCY_HMAC_KEY` is set. Limits, records and
+the collector configuration are in
+[docs/data/codex-otel-mapping.md](docs/data/codex-otel-mapping.md#receiver).
+
+## Telemetry
+
+The platform exports its own OpenTelemetry traces and metrics over OTLP/HTTP when
+`AGENT_CONTEXT_OBSERVABILITY__OTLP_ENDPOINT` (or a standard `OTEL_EXPORTER_OTLP_*ENDPOINT`) is set,
+and nothing otherwise. The instruments, attributes and privacy rules are the contract in
+[docs/operations/telemetry.md](docs/operations/telemetry.md).
+
 ## Quality gates
 
 Run the same gates as CI:
@@ -107,6 +147,34 @@ agent-context projection rebuild --target-uri bolt://standby:7687 --target-datab
 agent-context projection rebuild --in-place --confirm neo4j   # stop the projection runner first
 ```
 
+* **Rebuild required on upgrade.** Checkpoints are per `(projector, version)` and a delivered
+  outbox row is never claimed again, so a projector version deployed over a populated graph only
+  sees the events delivered after it. The `knowledge` and `quality` projectors are version `2`:
+  they add the `DecisionVersion` and `FailureObservation` history nodes and the
+  `project_id`/`repository_id`/`recorded_at` run properties the temporal reads
+  (`retrieval/temporal.py`) need, and after an upgrade every older entity lacks some or all of
+  that history. The graph therefore carries a projection history marker
+  (`(:ProjectionHistory {marker_id: "ledger"})`, `projection/schema.py`) naming the projector
+  versions that projected it from the START of the ledger. Only two things record it: a rebuild
+  (in place or into a standby) once its full replay has verified, and `projection run` when it
+  starts on an empty graph before any outbox row was delivered. A wipe deletes the marker in its
+  own transaction BEFORE any other node, and the graph digest leaves it out. At every start the
+  worker also narrows the marker to the projector versions it runs, so rolling a projector back
+  and forward again drops the old claim. `TemporalService` checks the marker in every read
+  transaction, before and again after reading the data (reads are read-committed, so a wipe that
+  starts meanwhile is seen), and raises `TemporalProjectionOutdated` unless it names the current
+  `knowledge` and `quality` versions (`projection.schema.REQUIRED_HISTORY`); it never serves
+  partial history. `projection status` and `projection verify` print
+  `history: complete|outdated|missing` against that same set (JSON `history.state`, with the
+  versions not replayed from the start in `history.missing`, and other registered projectors in
+  `history.others_missing`, for information only); it is reported, not a verification failure
+  (an upgrade without a rebuild already fails `verify` with `processed_count_mismatch`).
+  **Operator procedure on upgrade:** stop the projection runner, deploy, run
+  `projection rebuild --in-place --confirm <database>` (or a standby rebuild and cutover), check
+  that `projection status` prints `history: complete for temporal reads`, then start the runner.
+  **Also rebuild after restoring a Neo4j dump** (the restored marker is only true if the dump and
+  the ledger agree) **and after rolling a projector version back.** The temporal reads use
+  `CALL (...) { ... }` subqueries and need Neo4j 5.23 or later (tests pin 5.26).
 * **Running the projector.** `agent-context projection run` is the worker process: it drives the
   existing `ProjectionRunner` over the registered projectors with the projector-role connection
   (`AGENT_CONTEXT_POSTGRESQL__PROJECTOR_DSN`, falling back to `__DSN`) and the live Neo4j settings.
@@ -244,6 +312,367 @@ agent-context mcp-token revoke mcp_AbCd1234xyz            # prefix from `mcp-tok
   connection must be the schema owner or a role granted `SELECT, INSERT, UPDATE` on them. The
   grants are checked before any write; a missing one exits `1` naming it. The DSN is never printed.
 
+### Content maintenance, token probe and secret files
+
+`agent-context content sweep-orphans [--min-age SECONDS] [--dry-run] [--json]` deletes stored
+objects no catalog row references once older than the 24-hour floor (counts only).
+`GET /v1/auth/whoami` answers `204` and `X-Agent-Context-Token-Kind: producer|mcp` for a valid
+token and writes nothing. `AGENT_CONTEXT_SECRETS_DIR` reads secret settings from `0400` files named
+after their variables (a variable both exported and mounted refuses to start). A stored object
+that fails verification raises the `content_integrity_failure` log line and the
+`integrity_failures` metric and answers a retryable `503` (`Retry-After: 60`); it is never repaired
+automatically. See
+[docs/operations/content-integrity.md](docs/operations/content-integrity.md).
+
+### Verifying ledger integrity
+
+`agent-context ledger verify [--stream <id>]... [--since-sequence N] [--batch-size N] [--json]`
+re-checks every stream (or the named ones) in `stream_sequence` order, without writing anything:
+
+* `sequence`: contiguous from 1 (or from `N`), no gap, no duplicate;
+* `previous_event_sha256`: null for the first event, otherwise the previous event's stored
+  `event_sha256` (from `N`, the link to event `N-1` is checked);
+* `event_decode`: the rows rebuild a valid `StoredEventV1`, and every stored JSONB column is
+  exactly the canonical form of what it decodes to;
+* `producer_id`: the denormalized `producer_id` column (read by the idempotency lookups) equals
+  the envelope's producer; every other column is itself part of the sealed envelope;
+* `payload_sha256` and `event_sha256`: recomputed from the stored payload and the canonical
+  envelope with the SDK's own sealing functions (never a second canonicalization; a frozen
+  golden event pins the exact digests), so an `event_sha256` replaced mid-chain is caught even
+  when the next link was repaired to match;
+* `stream_head`: `ledger.event_streams` names the stream's last event (sequence, ID, digest),
+  also when `N` lies past the stream's end; `stream_head_missing`: a stream has events but no
+  head row (a partial restore: streams are enumerated from the events too, so deleting heads
+  never hides events); `stream_exists`: a named stream has neither;
+* `event_count` (ledger-wide, once every stream verified): the events walked equal `count(*)` of
+  the events in scope in the same snapshot.
+
+Purge is not implemented as an operation yet. It is specified to append `content.purged` and
+delete stored bytes, and must never rewrite an event or touch `ledger.event_content_refs` (their
+digest metadata is sealed into the event). The verifier never reads content bytes, so purged
+content will verify like any other. Each stream reports its event count, sequence range and only
+its FIRST failure: stream ID, sequence, event ID, check name and the expected and actual digests
+(or sequences), never payload or content. The JSON report is stable (fields are only ever added);
+`scope.full` is false for a `--since-sequence` or `--stream` run, so a tail run's `ok` is never
+mistaken for a full one:
+
+```json
+{"ok": false,
+ "checks": ["stream_exists", "sequence", "previous_event_sha256", "event_decode", "producer_id",
+            "payload_sha256", "event_sha256", "stream_head", "stream_head_missing",
+            "event_count"],
+ "scope": {"full": true, "since_sequence": 1, "streams": null},
+ "totals": {"streams": 2, "streams_failed": 1, "events": 5},
+ "failure": null,
+ "streams": [
+   {"stream_id": "s-a", "ok": false, "events": 1, "first_sequence": 1, "last_sequence": 1,
+    "failure": {"check": "event_sha256", "stream_sequence": 2, "event_id": "0190...",
+                "expected": "<recomputed sha256>", "actual": "<stored sha256>"}},
+   {"stream_id": "s-b", "ok": true, "events": 4, "first_sequence": 1, "last_sequence": 4,
+    "failure": null}]}
+```
+
+The top-level `failure` carries a ledger-wide check (`event_count`), with the same fields.
+
+* **Role.** It connects with `AGENT_CONTEXT_POSTGRESQL__PROJECTOR_DSN` (falls back to `__DSN`):
+  the projector role, which the migrations grant only `USAGE` on schema `ledger` and `SELECT` on
+  `ledger.events`, `ledger.event_streams` and `ledger.event_content_refs`. The grants are checked
+  first; the whole walk is one `REPEATABLE READ, READ ONLY` transaction (a consistent snapshot in
+  which PostgreSQL refuses any write). The DSN and driver errors are never printed.
+* **Bounded.** Streams are paged by key and each stream's events stream through a server-side
+  cursor `--batch-size` rows at a time (default 500, at most 10000) with their content refs read
+  per batch, so memory holds one batch, not the ledger. Run it on a quiet replica or off-peak for
+  very large ledgers: it reads every event once.
+* **Exit codes.** `0` every stream verified; `1` an integrity failure, and only that; `2` no
+  verdict: a usage error, a missing grant, a connection or database error, or any unexpected
+  error.
+
+Runbook. Run it after every restore drill and before trusting a restored database, and on a
+schedule against production. On exit `1`, stop the projection workers and ingestion for the
+affected streams, keep the database as found (do not "repair" rows: the chain is the evidence),
+and compare the failing event with the same `stream_id`/`stream_sequence` in the last good backup;
+restore from it if the backup verifies. `--since-sequence` re-checks only a recent tail (it trusts
+the stored digest of event `N-1`), so a scheduled tail check never replaces a periodic full run.
+
+### Migrating the schema
+
+`agent-context db upgrade [--expect-head <rev>] [--lock-timeout <seconds>] [--json]` upgrades the
+database to the single Alembic head shipped with the code, through
+`AGENT_CONTEXT_POSTGRESQL__MIGRATION_DSN` (the schema owner; falls back to `__DSN`). It runs
+Alembic in-process on one connection holding a session-level advisory lock for the whole run, so
+two migrate jobs serialize: the second waits (at most `--lock-timeout`, default 600 s) and then
+finds the schema at head and changes nothing. It asserts the resulting revision is exactly the
+head, and `--expect-head` fails before connecting unless it names that head. A database at a
+revision the code does not ship (migrated by a newer image) is refused, never downgraded.
+`agent-context db current [--json]` prints the revision against the head (`at_head`, `behind`,
+`empty` or `unknown`) and takes no lock. Both find `alembic.ini` through `--alembic-config` or
+`AGENT_CONTEXT_ALEMBIC_CONFIG` (default `./alembic.ini`) and never print the DSN.
+`--lock-timeout` must be finite, positive and at most 2147483 s (PostgreSQL's `lock_timeout`).
+SIGTERM or SIGINT (`docker stop` on the migrate container) cancels the run: the lock wait or the
+single migration transaction is abandoned and the connection closed, and the command exits
+`1` with `interrupted` (`db current` shows where the schema is). Exit codes: `0` on success
+(`current`: at head); `1` on a failed or mismatched migration, a lock timeout, an interruption
+or a schema not at head; `2` on a usage error (bad option, missing DSN or Alembic
+configuration) or the downgrade refusal.
+
+## Container image
+
+`containers/platform/Dockerfile` builds the one immutable image every platform role runs (the
+INFRA-040 services): a pinned `python:3.12-slim` digest, the locked environment from
+`uv sync --frozen --no-dev --no-editable` with the verified private SDK wheel, `alembic.ini` and
+`alembic/`, and a stdlib health probe. It adds no compiler, curl, git or shell tooling, runs as
+the dedicated numeric user `10002:10002` (distinct from the indexer image's `10001`), and its
+default command is exec-form.
+
+```bash
+docker build -f containers/platform/Dockerfile \
+  --build-arg REVISION="$(git rev-parse HEAD)" --build-arg VERSION=0.1.0 \
+  --build-arg SDK_VERSION=0.6.0 --build-arg ALEMBIC_HEAD=20261022_0001 \
+  -t agent-context-platform:dev .
+```
+
+The build arguments fill the labels `org.opencontainers.image.revision`,
+`org.opencontainers.image.version`, `io.agent-context.sdk.version` and
+`io.agent-context.alembic.head`; each one that is set is checked against what the image actually
+contains, and the build fails on a mismatch (only `VERSION` may carry a leading `v`, as a tag
+does). Unset, they read `unknown`/`dev` (local builds).
+
+| Role | Command | Environment |
+| --- | --- | --- |
+| `platform-migrate` (one-shot, before the API) | `agent-context db upgrade --expect-head <io.agent-context.alembic.head>` | `AGENT_CONTEXT_POSTGRESQL__MIGRATION_DSN` |
+| `platform-api` (2 replicas) | default: `uvicorn agent_context_platform.app:create_app --factory --host 0.0.0.0 --port 8000 --no-access-log --no-server-header` | `AGENT_CONTEXT_ENVIRONMENT=production`, `__POSTGRESQL__DSN` (API login), `__NEO4J__*`, `__S3__*`, `__MCP__TOKEN_HMAC_KEY`, `__MCP__CURSOR_HMAC_KEY` (the same on every replica), `__MCP__ALLOWED_HOSTS`/`__ALLOWED_ORIGINS` |
+| `platform-projector` | `agent-context projection run` | `__POSTGRESQL__PROJECTOR_DSN`, `__NEO4J__*`, `__S3__*`, and `__SEARCH__MODEL_DIR` (model volume) or `AGENT_CONTEXT_PROJECTION_LEXICAL_ONLY=1` (see Search and embeddings) |
+| `platform-indexer` | `agent-context index --repository-id <id> --checkout /work` | `__POSTGRESQL__API_DSN`; run with `user: "10001:10001"` |
+
+Every serving role logs in as a LOGIN member (`INHERIT`) of the migrations' group role and needs
+no grant of its own: the API login of `agent_context_api` (whose reads include
+`public.alembic_version`, `projection.projection_checkpoints` and `projection.dead_letters`, see
+`/health/ready`), the projector login of `agent_context_projector`. The migrate role needs only its
+DSN, as the schema owner: it does not set `AGENT_CONTEXT_ENVIRONMENT=production`,
+whose completeness check covers the serving roles. Only the API serves HTTP, so the image declares
+no `HEALTHCHECK`; the API's compose service uses the stdlib probe (no curl, no shell):
+`test: ["CMD", "python", "/app/healthcheck.py", "/health/ready"]` (`/health/live` is the
+default path, port `8000` the default port). Gate the API on `service_completed_successfully` of
+`platform-migrate`. The structural indexer's adapter sandbox relies on `RLIMIT_NPROC`, which is
+per UID, so the indexer role runs as the indexer image's dedicated `10001`, which no other role
+uses (or runs `containers/indexer/Dockerfile` itself, with its documented flags and a read-only
+`/work` mount).
+
+Every role runs with a read-only root filesystem and a scratch tmpfs; the image needs no
+writable path besides `/tmp` and no capability:
+
+```bash
+docker run --read-only --tmpfs /tmp:rw,noexec,nosuid,size=64m --cap-drop ALL \
+  --security-opt no-new-privileges --pids-limit 256 --memory 1g agent-context-platform:dev
+```
+
+Semantic-search model files (`AGENT_CONTEXT_SEARCH__MODEL_DIR`, PLATFORM-042) are not baked into
+the image: provision them into a read-only volume and point the variable at its mount.
+
+`tests/container/test_platform_image.py` (the `Platform image` CI job) checks the user, the
+read-only boot, dropped capabilities, the labels, the exec-form command, the absence of compilers
+and network tools, `agent-context --help`, the shipped head and `/health/live` inside the
+container. Run it with `AGENT_CONTEXT_TEST_CONTAINER=1` (and `AGENT_CONTEXT_TEST_PLATFORM_IMAGE`
+to test an already built tag). A `v*` tag runs `.github/workflows/release-image.yml`, which checks
+that the tag is `v<project version>` and the lockfile, runs the unit and contract tests, builds
+with the labels, runs the same container tests, pushes `ghcr.io/viniclus/agent-context-platform:<tag>` and
+prints the digest; infra pins that digest (`image: ghcr.io/viniclus/agent-context-platform@sha256:...`)
+in its `versions.lock`, never the tag, and passes the `io.agent-context.alembic.head` label to
+`--expect-head`.
+
+## Search and embeddings
+
+Retrieval over sanitized content has two projections, both rebuildable from the ledger and never a
+source of truth: PostgreSQL full-text rows (`retrieval.search_documents`, a `simple`-configuration
+`tsvector` with a GIN index; the text itself is not stored twice) and 384-dimension vectors on
+Neo4j `ContentEmbedding` nodes behind a cosine vector index. The `search` projector writes both for
+every event that references sanitized content and removes both on `content.purged`. Search is
+always scoped to a project and a repository, bounded to 100 results and runs under a deadline
+(`retrieval/search.py`).
+
+Embeddings come from the multilingual MiniLM model run on `onnxruntime` (no torch). The model is
+pinned by revision and file digests in `src/agent_context_platform/retrieval/models.lock.json`.
+The service and the tests never download it; fetch it once and point the service at it:
+
+```bash
+agent-context models fetch --dest /var/lib/agent-context/models/minilm   # about 470 MB, sha256-checked
+export AGENT_CONTEXT_SEARCH__MODEL_DIR=/var/lib/agent-context/models/minilm
+```
+
+Loading re-checks every digest and fails closed on a mismatch. `AGENT_CONTEXT_SEARCH__EMBEDDING_BATCH_SIZE`
+and `..._EMBEDDING_THREADS` bound the inference work.
+
+What needs the model:
+
+* `projection run` (the worker) refuses to start without `MODEL_DIR` (exit `2`, before any
+  connection) unless it runs **lexical-only**: `--lexical-only` or
+  `AGENT_CONTEXT_PROJECTION_LEXICAL_ONLY=1` (refused while `MODEL_DIR` is set). Lexical-only reads
+  the content (S3 settings needed) and writes the search rows with every check a full index runs:
+  tombstones, scope and content identity, readable bytes. A conflict or unreadable content is
+  therefore dead-lettered live exactly as with a model, and lexical search and purges work at
+  once. Only the `ContentEmbedding` nodes are missing; the worker counts them (`search_unembedded`
+  in the summary, a `projection_worker search_unembedded N` log line), and `projection status`
+  reports them durably (`search: N documents, M embeddings (K without embeddings ...)`; the search
+  checkpoint itself shows no lag, since those events were delivered).
+* Backfilling embeddings after lexical-only: run a rebuild with `MODEL_DIR` set. Either
+  `projection rebuild --in-place` (stop the worker first: it resets the search tables and the live
+  graph and replays the delivered events), or a standby rebuild into another Neo4j instance and
+  cutover (the rows already exist in PostgreSQL; the standby graph gets the embeddings). Then run
+  the worker with the model.
+* `projection rebuild` and `projection verify --replay-check` refuse to run without `MODEL_DIR`
+  unless `--without-search` (or `AGENT_CONTEXT_PROJECTION_WITHOUT_SEARCH=1`, which the worker
+  ignores) skips the search projector. `--without-search` is itself refused (in place, or for a
+  replay check) while the live graph holds `ContentEmbedding` nodes: they would be wiped, or
+  reported as drift. Plain `projection verify` never loads the model; `status` never does either.
+* `projection rebuild --in-place` first reads every document the replay will index, read-only and
+  before it takes the rebuild lock, touches a checkpoint, resets a table or wipes the graph. It
+  skips content the ledger records as purged and fails with `SearchReplayIntegrityError` (counts
+  only) if any other content cannot be read or one content ID names different content. This costs
+  one extra read of all indexed content. Then `retrieval.reset_search_projection()` (a SECURITY
+  DEFINER function; the projector role holds no TRUNCATE and cannot delete tombstones) empties
+  the documents and reseeds the tombstones from every purge in the ledger, whatever its outbox
+  status. Purged content therefore stays purged across rebuilds, even when its purge event was
+  dead-lettered. The reset locks in the worker's order under a 10 s lock timeout.
+* Recovery: if an in-place rebuild still fails after the wipe (a transient Neo4j, PostgreSQL or
+  S3 error), the checkpoints stay `rebuilding` and the worker must stay stopped; fix the cause
+  and run the same `projection rebuild --in-place` again. It starts from zero. Not transient:
+  content bytes that vanish without a `content.purged` between the check and the replay (storage
+  loss during the rebuild) fail the replay after the wipe, and the rerun is then refused by its
+  check. Restore the bytes, or purge the content through the ledger, then rerun; until then live
+  search (and the graph) stays partial. The check holds one PostgreSQL transaction per page of
+  500 delivered events while it reads their content serially.
+* `projection status` reports `documents_without_embeddings` as rows minus nodes: an
+  approximation (hidden rows of undelivered events and stale nodes left by a purge race count
+  too), enough to show that a backfill is due, not an exact list.
+* Ownership: `retrieval.reset_search_projection()` runs with its owner's rights, the role that
+  ran the migrations. It is safe as written (fixed statements, pinned `search_path`, EXECUTE for
+  the projector role only), but infra should still run migrations as a dedicated non-superuser
+  schema owner (`AGENT_CONTEXT_POSTGRESQL__MIGRATION_DSN`), never a superuser.
+
+Consistency: a search row is returned only once one of its source events is `delivered`, and a
+hit's provenance (event, session, time, source event IDs) comes from delivered events only: the
+earliest one, as a rebuild records it. A row left behind by a dead-lettered or not-yet-delivered
+event stays hidden. Indexing and purging of one content ID serialize on a PostgreSQL advisory
+lock. A producer-chosen `content_id` reused for different sanitized bytes (or in another scope) is
+refused (`SearchContentConflictError`, `SearchScopeConflictError`: retried, then dead-lettered),
+never merged.
+
+Retention contract (design section 16): every removal of stored content must go through the
+ledger as a `content.purged` event; replays treat content that is gone without one as an integrity
+failure. Retention expiry (180 days for session content) is not implemented yet. When it is, it
+must emit `content.purged` for what it deletes, or the next in-place rebuild stops at its check
+(follow-up).
+
+Containers (service image): the worker container sets `AGENT_CONTEXT_SEARCH__MODEL_DIR` to a
+read-only volume the model was provisioned into once with `agent-context models fetch --dest`
+(about 470 MB; never at image build or start-up). Without a provisioned model it runs
+lexical-only with `AGENT_CONTEXT_PROJECTION_LEXICAL_ONLY=1` (and no `MODEL_DIR`). Either way it
+needs the S3 settings, because indexing reads the content. The image needs the `onnxruntime`,
+`tokenizers` and `numpy` wheels (no torch). A process serving vector search
+(`SearchService.vector`, wired by PLATFORM-043) embeds the query, so it needs the same volume;
+lexical search needs only PostgreSQL. Rebuild and replay-check jobs need the volume too, or
+`--without-search` as above. `tests/unit/retrieval/test_model_parity.py`
+compares the ONNX output with sentence-transformers and runs only when
+`AGENT_CONTEXT_TEST_MODEL_PARITY=1`.
+
+## Context packages
+
+`retrieval/composer.py` (`ContextComposer`) answers the five memory tools (`context_for_task`,
+`repository_overview`, `symbol_context`, `decision_history`, `failure_history`) with an SDK
+`ContextPackageV1`. It resolves the explicit scope first (unknown repository, project, revision
+or symbol: a typed error, never a wider answer), reads code as indexed at the requested commit or
+workspace snapshot, fuses graph, temporal and lexical/vector candidates deterministically, and
+enforces the item, byte and token budget (`ceil(bytes / 4)`). Every item cites at least one stored
+event; the evidence form, including the metadata-only form of events that carry no content, is
+documented in `docs/data/context-evidence.md`.
+
+Pagination cursors are opaque and HMAC-signed, so any replica can continue a page another one
+issued. Set the shared key (at least 32 characters, required in production):
+
+```bash
+export AGENT_CONTEXT_MCP__CURSOR_HMAC_KEY=...   # from the secret store, the same on every replica
+```
+
+A cursor is valid for the same tool, input, principal and projection snapshot until it expires
+(15 minutes); once the projection moves (a new event delivered to a projector the answer depends
+on) the client starts again from the first page.
+
+The composer runs as the API role (never the projector role, which can write projection state).
+`FreshnessReader` also reads projection checkpoints and dead letters (for `projection_checkpoint`,
+`staleness_ms` and the warnings) through the SELECT grants of migration `20261022_0001`
+(`API_READ_TABLES` in `operations/readiness.py`); without one of them a request fails closed with
+`ContextUnavailable`. The integration and evaluation suites run every composer read as a LOGIN
+member of `agent_context_api` with no grant of its own.
+
+`query_id`, `generated_at`, `staleness_ms` and `next_cursor` (it carries an expiry) are the only
+fields that depend on the wall clock: everything else is a function of the request and the
+projection snapshot.
+
+`tests/evaluation/` holds the context-quality evaluation: 30 golden questions (6 per tool,
+`questions.json`) over a world seeded through the real ingestion service and projection runner.
+It needs the integration services and asserts provenance, budgets, zero unsupported claims, zero
+temporal leaks, required-evidence recall (90% overall, 80% per tool) and byte-identical answers
+after an empty-graph replay:
+
+```bash
+uv run pytest -q tests/evaluation
+```
+
+## MCP memory tools
+
+The MCP documentation set is [docs/mcp/README.md](docs/mcp/README.md): connecting Codex, the
+protocol profile, the tool contracts, security, deployment and scaling, conformance and legacy
+compatibility.
+
+`POST /mcp` (MCP `2026-07-28`, stateless: no `initialize`, no `Mcp-Session-Id`, no cookie; a
+direct `tools/call` needs no prior `server/discover`) serves exactly five read-only tools, each
+bound to the `ContextComposer` method of the same name (`mcp/tools.py`): `context_for_task`,
+`repository_overview`, `symbol_context`, `decision_history` and `failure_history`. Their
+`inputSchema`/`outputSchema` are the SDK's published `mcp.<tool>.{input,output}.v1.json` schemas;
+`tools/list` is the same on every replica (sorted, `ttlMs` 60000, `cacheScope: private`). Every
+tool is annotated `readOnlyHint: true`, `destructiveHint: false`, `idempotentHint: true`,
+`openWorldHint: false`, and says why in its description. No input takes SQL, Cypher, a path or a
+URL, and paging is the explicit, signed `cursor` (see Context packages).
+
+* **Auth.** A bearer `mcp_...` token with the `memory:read` scope (401 without, 403 with another
+  scope, 429 over the per-principal rate). In this MVP that single scope reads every project and
+  repository of the installation (design spec §14.5); per-project authorization is future work.
+  The token's principal is used only to bind cursors to their caller, never to narrow a query,
+  and no argument can name a principal.
+* **Results.** `structuredContent` is the `ContextPackageV1`, valid against the output schema, and
+  `resultType` is `complete`. The text block is a short summary that names items only by a
+  bounded, JSON-quoted title; item titles and content are untrusted evidence.
+* **Errors.** An unknown tool is a JSON-RPC `-32602`. Everything else is a tool error
+  (`isError: true`) whose text is `{"error": {"code", "message", "retryable"}}`, with a fixed
+  message and one of these codes: `invalid_arguments` (field names only, never values; also
+  free text over 1000 characters and IDs over 512),
+  `invalid_request`, `scope_not_found`, `revision_not_found`, `symbol_not_found`,
+  `ambiguous_symbol`, `budget_too_small`, `cursor_invalid`, `cursor_expired`, `cursor_mismatch`,
+  `cursor_stale` (start again from the first page), `temporal_projection_outdated`,
+  `projection_not_ready`, `deadline_exceeded`, `context_unavailable`, `unauthenticated` and
+  `internal_error`. `retryable` is true only for `projection_not_ready`, `deadline_exceeded` and
+  `context_unavailable`. `context_unavailable` covers every store outage: PostgreSQL (a failed
+  connection or the composer's pool exhausted after 5 s), Neo4j (unreachable, refused login,
+  unknown database) and S3 (connection refused, DNS failure, connect or read timeout, connection
+  closed). Misconfiguration (Neo4j or S3 credentials, a missing database or region) answers the
+  same and is also logged at ERROR with the exception class only. `internal_error` is left for
+  bugs (an invalid request to S3, a graph query error, a package failing its schema); inside a
+  request the composer reports every PostgreSQL driver error, a query bug included, as
+  `context_unavailable` (PLATFORM-043).
+* **No resources.** `resources/*` and prompts are not served and no resource links are emitted.
+  The `resource_uri` of an evidence reference is a stable name, not a capability
+  (`docs/data/context-evidence.md`): dereferencing it would need a reader that re-checks scope,
+  delivery and purge and serves content beyond the bounded excerpts, which does not exist yet.
+* **Wiring.** At start-up the API builds the composer from `AGENT_CONTEXT_POSTGRESQL__API_DSN`
+  (falling back to `__DSN`; the API role, never the projector role) on its own bounded pool (5
+  connections plus 5 overflow, apart from the ingestion and token-lookup pool), `__NEO4J__*`
+  (connect and retry bounds shortened to 2 s, so an unreachable or misconfigured graph answers
+  `context_unavailable` quickly instead of waiting out the 10 s deadline), `__S3__*`,
+  `__MCP__CURSOR_HMAC_KEY` (required in production; blank means unset, and outside production a
+  random per-process key is used) and, for vector search, `__SEARCH__MODEL_DIR` (without it the
+  tools search lexically only, with no warning). Until all of PostgreSQL, Neo4j and S3 are
+  configured every call answers `context_unavailable`.
+
 ## Ingestion API contract
 
 `openapi/agent-context-v1.json` freezes the ingestion v1 HTTP surface (`/v1/ingestion/*` and the
@@ -256,6 +685,12 @@ fixtures (see its README).
 uv run python scripts/export-openapi.py --check   # exit 1 on drift
 uv run python scripts/export-openapi.py           # rewrite the snapshot (new API versions only)
 ```
+
+## Crash-test fault points
+
+Test images can arm documented crash points (`AGENT_CONTEXT_FAULT_INJECTION__*`) that kill the API or
+the projection worker with exit code 137 at fixed boundaries; settings refuse them in production.
+See `docs/operations/fault-injection.md` for the labels, the variables and the recovery contract.
 
 ## Development workflow
 

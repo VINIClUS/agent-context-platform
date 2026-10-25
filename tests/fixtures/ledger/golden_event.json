@@ -1,0 +1,76 @@
+{
+  "content_refs": [
+    {
+      "content_id": "c-alpha",
+      "content_sha256": "89a17ed624e1586515338bb4f8481788424c93f9836d1e1e382aeb7da5334b0f",
+      "disposition": "sanitized",
+      "encoding": null,
+      "inline_id": "89a17ed624e1586515338bb4f8481788424c93f9836d1e1e382aeb7da5334b0f",
+      "media_type": "text/plain",
+      "object_key": null,
+      "storage": "inline",
+      "uncompressed_bytes": 10
+    },
+    {
+      "content_id": "c-beta",
+      "content_sha256": "97181288664d8e5959e7d7cc6e874d0eda4ad0d8a361ab08aa880246aef2203d",
+      "disposition": "sanitized",
+      "encoding": null,
+      "inline_id": "97181288664d8e5959e7d7cc6e874d0eda4ad0d8a361ab08aa880246aef2203d",
+      "media_type": "text/plain",
+      "object_key": null,
+      "storage": "inline",
+      "uncompressed_bytes": 9
+    },
+    {
+      "content_id": "c-gamma",
+      "content_sha256": "9e4bfb1ef206a8f5d1e688de9d848003aa365b806f4962658dc70cc85e0cbf77",
+      "disposition": "sanitized",
+      "encoding": null,
+      "inline_id": "9e4bfb1ef206a8f5d1e688de9d848003aa365b806f4962658dc70cc85e0cbf77",
+      "media_type": "text/plain",
+      "object_key": null,
+      "storage": "inline",
+      "uncompressed_bytes": 10
+    }
+  ],
+  "context": {
+    "checkout_id": null,
+    "project_id": null,
+    "repository_id": null,
+    "session_id": "s-golden",
+    "tool_call_id": null,
+    "turn_id": "t-7",
+    "workspace_id": null
+  },
+  "event_id": "01a17291-cc71-7361-9465-f9fbf61ae54c",
+  "event_type": "agent.turn.started",
+  "idempotency_key": "golden-7",
+  "integrity": {
+    "event_sha256": "815689d06ac447d0ade1304eb990c29cdb3463eb3fe20b7f625815343f743853",
+    "payload_sha256": "88d1f4e11e0985082dc8fa64df0cdb8d66ede4d099e50c8df47b020ac5707259",
+    "previous_event_sha256": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  },
+  "observed_at": "2026-09-01T12:30:15.123456Z",
+  "occurred_at": "2026-09-01T12:30:15.123456Z",
+  "payload": {
+    "session_id": "s-golden",
+    "source": "codex",
+    "turn_id": "t-7",
+    "user_message_content_id": "c-gamma"
+  },
+  "producer": {
+    "name": "Codex",
+    "producer_id": "golden-producer",
+    "version": "1.2.3"
+  },
+  "redaction": {
+    "disposition": "sanitized",
+    "finding_counts": {},
+    "policy_version": "1.0.0"
+  },
+  "schema_version": "1.0.0",
+  "stream_id": "golden-stream",
+  "stream_sequence": 7,
+  "trace": null
+}

@@ -68,6 +68,7 @@ import base64
 import binascii
 import hashlib
 import json
+import logging
 from collections.abc import Mapping, Sequence
 from dataclasses import dataclass
 from typing import Any, ClassVar, Final, cast
@@ -84,13 +85,29 @@ from agent_context_sdk import (
     canonical_json_bytes,
     redact_json,
 )
-from sqlalchemy import text
+from sqlalchemy import select, text
 from sqlalchemy.dialects.postgresql import insert as pg_insert
 from sqlalchemy.ext.asyncio import AsyncSession
 
 from agent_context_platform.catalog.models import ContentObjectRow
-from agent_context_platform.content.blob_store import BlobStore, StoredBlob
+from agent_context_platform.content.blob_store import (
+    BlobInputLimitError,
+    BlobIntegrityError,
+    BlobNotFoundError,
+    BlobStore,
+    BlobStoreError,
+    StoredBlob,
+)
 from agent_context_platform.content.models import INLINE_MAX_BYTES, InlineContentRow
+from agent_context_platform.observability import (
+    SPAN_CONTENT_PREPARE,
+    record_content_object,
+    record_integrity_failure,
+    traced,
+)
+from agent_context_platform.operations.faults import fault_point
+
+logger = logging.getLogger("agent_context_platform.content.service")
 
 #: Fixed namespace for every advisory lock this module (and the orphan
 #: sweeper) takes on a content digest. Arbitrary but stable: changing it
@@ -112,6 +129,31 @@ _MAX_JSON_DEPTH: Final[int] = 256
 #: regardless of the claimed media type. See "Object-storage media type is
 #: a fixed constant" in the module docstring.
 _OBJECT_STORAGE_MEDIA_TYPE: Final[str] = "application/octet-stream"
+
+
+def _integrity_failure(check: str, stage: str, content_sha256: str) -> None:
+    """Raise the operator alarm for a stored object that failed verification.
+
+    One content-free WARNING line (`content_integrity_failure`: the check, the stage, the digest
+    and its canonical object key, never bytes or the exception text) and the contract counter
+    `agent_context.ledger.integrity_failures{check}` (PLATFORM-050), which INFRA alerts on. The
+    ingestion response stays a retryable 503 (`ledger.service`): the batch is valid and succeeds
+    once the object is repaired.
+    """
+    object_key = f"sha256/{content_sha256[:2]}/{content_sha256[2:4]}/{content_sha256}.zst"
+    logger.warning(
+        "content_integrity_failure check=%s stage=%s content_sha256=%s",
+        check,
+        stage,
+        content_sha256,
+        extra={
+            "check": check,
+            "stage": stage,
+            "content_sha256": content_sha256,
+            "object_key": object_key,
+        },
+    )
+    record_integrity_failure(check)
 
 
 class ContentServiceError(ValueError):
@@ -154,6 +196,12 @@ class ContentResolutionError(ContentServiceError):
     """``PreparedContent.resolve()`` claims do not match the prepared batch."""
 
     error_code: ClassVar[str] = "content_resolution_mismatch"
+
+
+class ContentUnavailableError(ContentServiceError):
+    """Stored content a ref points at could not be read back (missing, purged or corrupt)."""
+
+    error_code: ClassVar[str] = "content_unavailable"
 
 
 def content_digest_lock_key(content_sha256: str) -> tuple[int, int]:
@@ -276,6 +324,8 @@ class _PreparedItem:
     redaction_report: RedactionReportV1
     data: bytes | None
     stored_blob: StoredBlob | None
+    # Telemetry (PLATFORM-050): an object digest already uploaded earlier in this batch.
+    reused: bool = False
 
 
 class PreparedContent:
@@ -343,6 +393,15 @@ class PreparedContent:
         except KeyError:
             raise ContentResolutionError("no prepared content for that content_id") from None
 
+    def storage_outcomes(self) -> tuple[tuple[str, str], ...]:
+        """``(storage, result)`` telemetry labels per item, recorded once the batch commits."""
+        return tuple(
+            ("object", "reused" if item.reused else "stored")
+            if item.stored_blob is not None
+            else ("inline", "stored")
+            for item in self._items
+        )
+
     @property
     def redaction_reports(self) -> Mapping[str, RedactionReportV1]:
         """Every prepared item's report, keyed by ``content_id``."""
@@ -377,6 +436,14 @@ class ContentService:
     async def prepare(self, items: Sequence[SanitizedContentItemV1]) -> PreparedContent:
         """Validate, re-check, and store every item; fail the whole batch atomically.
 
+        Traced as ``agent_context.content.prepare`` (PLATFORM-050); see ``_prepare``.
+        """
+        with traced(SPAN_CONTENT_PREPARE, {"agent_context.item_count": len(items)}):
+            return await self._prepare(items)
+
+    async def _prepare(self, items: Sequence[SanitizedContentItemV1]) -> PreparedContent:
+        """Validate, re-check, and store every item; fail the whole batch atomically.
+
         Every item is validated (unique ``content_id``, supported media
         type, valid encoding, and a defense-in-depth redaction re-check)
         *before* any bytes are uploaded to object storage, so a batch that
@@ -394,28 +461,35 @@ class ContentService:
         """
         validated: list[tuple[SanitizedContentItemV1, bytes]] = []
         seen_content_ids: set[str] = set()
-        for item in items:
-            content_id = item.claim.content_id
-            if content_id in seen_content_ids:
-                raise DuplicateContentIdError("duplicate content_id in prepare() batch")
-            seen_content_ids.add(content_id)
+        try:
+            for item in items:
+                content_id = item.claim.content_id
+                if content_id in seen_content_ids:
+                    raise DuplicateContentIdError("duplicate content_id in prepare() batch")
+                seen_content_ids.add(content_id)
 
-            try:
-                data = base64.b64decode(item.sanitized_bytes_base64, validate=True)
-            except (binascii.Error, ValueError):
-                raise InvalidContentEncodingError("content base64 could not be decoded") from None
+                try:
+                    data = base64.b64decode(item.sanitized_bytes_base64, validate=True)
+                except (binascii.Error, ValueError):
+                    raise InvalidContentEncodingError(
+                        "content base64 could not be decoded"
+                    ) from None
 
-            # Pydantic validates the claim's shape, not its relation to the
-            # bytes, and model_construct() skips even that: recompute both
-            # so bytes can never be stored under a digest they do not have.
-            if (
-                hashlib.sha256(data).hexdigest() != item.claim.content_sha256
-                or len(data) != item.claim.uncompressed_bytes
-            ):
-                raise ContentResolutionError("content bytes do not match their claim")
+                # Pydantic validates the claim's shape, not its relation to the
+                # bytes, and model_construct() skips even that: recompute both
+                # so bytes can never be stored under a digest they do not have.
+                if (
+                    hashlib.sha256(data).hexdigest() != item.claim.content_sha256
+                    or len(data) != item.claim.uncompressed_bytes
+                ):
+                    raise ContentResolutionError("content bytes do not match their claim")
 
-            self._recheck_redaction(item.claim.media_type, data)
-            validated.append((item, data))
+                self._recheck_redaction(item.claim.media_type, data)
+                validated.append((item, data))
+        except ContentServiceError:
+            # Telemetry (PLATFORM-050): the item being validated is the one rejected.
+            record_content_object(self._storage_for(item.claim.uncompressed_bytes), "rejected")
+            raise
 
         object_blob_cache: dict[str, StoredBlob] = {}
         prepared_items = [
@@ -478,13 +552,27 @@ class ContentService:
             )
 
         stored_blob = object_blob_cache.get(claim.content_sha256)
+        reused = stored_blob is not None
         if stored_blob is None:
             # Fixed media type (see module docstring); also cached per
             # digest for this batch so a repeated digest reuses the first
             # upload's verified result instead of paying a redundant
             # get_verified() round-trip inside put_verified()'s own reuse
             # check.
-            stored_blob = await self._blob_store.put_verified(data, _OBJECT_STORAGE_MEDIA_TYPE)
+            fault_point("content.before_s3_put")
+            try:
+                stored_blob = await self._blob_store.put_verified(data, _OBJECT_STORAGE_MEDIA_TYPE)
+            except BlobInputLimitError:
+                raise  # the content is too large; nothing stored was checked
+            except BlobNotFoundError:
+                _integrity_failure("missing_object", "prepare", claim.content_sha256)
+                raise
+            except BlobIntegrityError:
+                # An object already stored under this digest failed re-verification. It is
+                # reported and left as is: never repaired, overwritten or deleted here.
+                _integrity_failure("digest_mismatch", "prepare", claim.content_sha256)
+                raise
+            fault_point("content.after_head_verification")
             object_blob_cache[claim.content_sha256] = stored_blob
         ref = ContentRefV1(
             content_id=claim.content_id,
@@ -502,7 +590,12 @@ class ContentService:
             redaction_report=item.redaction_report,
             data=None,
             stored_blob=stored_blob,
+            reused=reused,
         )
+
+    def _storage_for(self, size: int) -> str:
+        """The telemetry ``storage`` label an item of ``size`` bytes gets (PLATFORM-050)."""
+        return "inline" if size <= self._inline_threshold else "object"
 
     async def attach(self, session: AsyncSession, prepared: PreparedContent) -> None:
         """Durably record prepared content in the caller's transaction.
@@ -542,7 +635,29 @@ class ContentService:
         for digest in sorted(object_items):
             stored_blob = object_items[digest]
             await self._lock_digest(session, digest)
-            await self._blob_store.get_verified(stored_blob.object_key, digest)
+            try:
+                await self._blob_store.get_verified(stored_blob.object_key, digest)
+            except BlobNotFoundError:
+                # Under the digest lock: a catalog row means a referenced object is gone (the
+                # sweep never deletes those), and an object this request wrote seconds ago is
+                # no old orphan either: both are integrity failures. Otherwise the orphan sweep
+                # deleted an old unreferenced object this batch was reusing: nothing is lost and
+                # the retried batch uploads it again, so it raises no alarm.
+                referenced = await session.scalar(
+                    select(ContentObjectRow.id).where(ContentObjectRow.content_sha256 == digest)
+                )
+                if referenced is not None or stored_blob.created:
+                    _integrity_failure("missing_object", "attach", digest)
+                else:
+                    logger.info(
+                        "content_object_swept_before_attach content_sha256=%s",
+                        digest,
+                        extra={"content_sha256": digest},
+                    )
+                raise
+            except BlobIntegrityError:
+                _integrity_failure("digest_mismatch", "attach", digest)
+                raise
             insert_object = (
                 pg_insert(ContentObjectRow)
                 .values(
@@ -573,6 +688,49 @@ class ContentService:
                 .on_conflict_do_nothing(index_elements=["inline_id"])
             )
             await session.execute(insert_inline)
+
+    async def read(self, session: AsyncSession, ref: ContentRefV1) -> bytes:
+        """Return the sanitized bytes `ref` addresses, verified against the ref's digest.
+
+        This is the read path for consumers of stored content (the search projector). Inline
+        content is read from ``catalog.inline_contents`` through the caller's session (the
+        projector role holds ``SELECT``); object content is fetched and verified through the
+        :class:`BlobStore`. Raises :class:`ContentUnavailableError`, content-free, when the bytes
+        are gone (purged) or no longer match the ref.
+
+        INTERNAL projector read path: it performs NO scope or authorization check and must never
+        be exposed to callers as is. Any caller-facing read (PLATFORM-043) must gate it first.
+        """
+        if ref.storage is ContentStorage.INLINE:
+            row = await session.get(InlineContentRow, ref.inline_id)
+            if row is None:
+                # Nothing deletes inline rows and callers skip purged content first: a loss.
+                _integrity_failure("missing_object", "read", ref.content_sha256)
+                raise ContentUnavailableError("inline content is not stored")
+            data = row.data
+        else:
+            if ref.object_key is None:
+                raise ContentUnavailableError("content ref has no object key")
+            try:
+                data = await self._blob_store.get_verified(ref.object_key, ref.content_sha256)
+            except BlobIntegrityError:
+                _integrity_failure("digest_mismatch", "read", ref.content_sha256)
+                raise ContentUnavailableError("object content could not be read") from None
+            except BlobNotFoundError:
+                # No platform code deletes referenced bytes (the sweep takes only unreferenced
+                # objects) and callers skip purged content before reading: a loss.
+                _integrity_failure("missing_object", "read", ref.content_sha256)
+                raise ContentUnavailableError("object content could not be read") from None
+            except BlobStoreError:
+                # Unreachable, not wrong: an outage, no integrity alarm.
+                raise ContentUnavailableError("object content could not be read") from None
+        if (
+            len(data) != ref.uncompressed_bytes
+            or hashlib.sha256(data).hexdigest() != ref.content_sha256
+        ):
+            _integrity_failure("digest_mismatch", "read", ref.content_sha256)
+            raise ContentUnavailableError("stored content does not match its ref")
+        return data
 
     @staticmethod
     async def _lock_digest(session: AsyncSession, content_sha256: str) -> None:

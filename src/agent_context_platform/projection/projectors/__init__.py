@@ -34,7 +34,13 @@ _LOCK_STATEMENTS: dict[str, LiteralString] = {
         "MERGE (n:Constraint {constraint_id: $node_id}) SET n._lock = true REMOVE n._lock"
     ),
     "Decision": "MERGE (n:Decision {decision_id: $node_id}) SET n._lock = true REMOVE n._lock",
+    "DecisionVersion": (
+        "MERGE (n:DecisionVersion {event_id: $node_id}) SET n._lock = true REMOVE n._lock"
+    ),
     "Failure": "MERGE (n:Failure {failure_id: $node_id}) SET n._lock = true REMOVE n._lock",
+    "FailureObservation": (
+        "MERGE (n:FailureObservation {event_id: $node_id}) SET n._lock = true REMOVE n._lock"
+    ),
     "Finding": "MERGE (n:Finding {finding_id: $node_id}) SET n._lock = true REMOVE n._lock",
     "Project": "MERGE (n:Project {project_id: $node_id}) SET n._lock = true REMOVE n._lock",
     "Repository": "MERGE (n:Repository {repository_id: $node_id}) SET n._lock = true REMOVE n._lock",
@@ -178,6 +184,18 @@ def relationship_statement(
         f"MERGE (a:{source_label} {{{source_key}: $source_id}}) MERGE (b:{target_label} {{{target_key}: $target_id}}) "
         f"MERGE (a)-[r:{rel_type}]->(b) "
     ) + (_ASSERT_RELATIONSHIP)
+
+
+def scope_parameters(event: StoredEventV1) -> dict[str, object]:
+    """The envelope `context` scope (`project_id`, `repository_id`) a scoped node is written with.
+
+    Written with `min_non_null`: the smallest non-null value wins, so a later event that disagrees
+    cannot move it and any delivery order converges on the same value.
+    """
+    return {
+        "project_id": event.context.project_id,
+        "repository_id": event.context.repository_id,
+    }
 
 
 def event_order(event: StoredEventV1) -> str:

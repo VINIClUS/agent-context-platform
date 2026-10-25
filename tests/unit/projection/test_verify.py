@@ -22,9 +22,10 @@ from agent_context_sdk.events.system import ProjectionMode, ProjectionOutcome, P
 from sqlalchemy.dialects import postgresql
 
 from agent_context_platform.ledger.service import IngestOutcome
-from agent_context_platform.projection import verify
+from agent_context_platform.projection import schema, verify
 from agent_context_platform.projection.models import ProjectionState
 from agent_context_platform.projection.runtime import EventIntegrityError, OrphanedOutboxRowError
+from agent_context_platform.projection.schema import HISTORY_LABEL, ProjectionHistory
 from agent_context_platform.projection.verify import (
     NODE_KEYS,
     CheckpointView,
@@ -116,20 +117,43 @@ class FakeTx:
         graph = self.graph
         if "count(n) AS nodes" in query:
             return Rows([Rec(nodes=len(graph.nodes))])
-        if "DETACH DELETE" in query:
+        if "DETACH DELETE" in query and query != schema._DELETE_HISTORY:
             doomed = list(graph.nodes)[: parameters["limit"]]
             for node_id in doomed:
                 del graph.nodes[node_id]
             graph.rels = [r for r in graph.rels if r[0] in graph.nodes and r[2] in graph.nodes]
             return Rows([Rec(deleted=len(doomed))])
-        if query.startswith("MATCH (n) WHERE NOT any"):
+        if query == schema._RECORD_HISTORY:
+            for i in [i for i, (labels, _) in graph.nodes.items() if HISTORY_LABEL in labels]:
+                del graph.nodes[i]
+            graph.node(
+                HISTORY_LABEL,
+                marker_id=parameters["marker_id"],
+                projectors=parameters["projectors"],
+            )
+            return Rows([])
+        if query == schema._DELETE_HISTORY:
+            doomed = [i for i, (labels, _) in graph.nodes.items() if HISTORY_LABEL in labels]
+            for i in doomed:
+                del graph.nodes[i]
+            return Rows([Rec(deleted=len(doomed))])
+        if query == schema._READ_HISTORY:
+            return Rows(
+                [
+                    Rec(marker_id=props.get("marker_id"), projectors=props.get("projectors"))
+                    for labels, props in graph.nodes.values()
+                    if HISTORY_LABEL in labels
+                ][: parameters["limit"]]
+            )
+        if query.startswith(f"MATCH (n) WHERE NOT n:{HISTORY_LABEL} AND NOT any"):
             keyed = set(parameters["keyed"])
             keys = parameters["keys"]
             after = parameters["after"]
             ids = sorted(
                 i
                 for i, (labels, props) in graph.nodes.items()
-                if not any(
+                if HISTORY_LABEL not in labels
+                and not any(
                     label in keyed and props.get(keys[label]) is not None for label in labels
                 )
             )
@@ -1146,7 +1170,7 @@ async def test_count_and_wipe_work_in_bounded_batches() -> None:
     assert await verify.count_nodes(store) == 5  # type: ignore[arg-type]
     assert await verify.wipe_graph(store, batch=2) == 5  # type: ignore[arg-type]
     assert await verify.count_nodes(store) == 0  # type: ignore[arg-type]
-    assert store.writes == 4  # 2 + 2 + 1, then an empty batch
+    assert store.writes == 5  # the history marker, 2 + 2 + 1, then an empty batch
 
 
 async def test_a_scratch_replay_needs_an_empty_or_confirmed_target(
@@ -1398,6 +1422,71 @@ async def test_a_standby_rebuild_never_touches_checkpoints_and_replays_everythin
     assert steps.calls == ["schema", "replay delivered_only=False", "verify target"]
     assert result.ok and result.mode == "standby" and result.wiped_nodes == 0
     assert result.recorded is None
+
+
+async def test_only_a_verified_rebuild_records_the_projection_history_marker(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    for in_place in (True, False):
+        steps = Steps(monkeypatch)
+        target = FakeStore()
+        result = await rebuild(steps, in_place=in_place, target=target)
+        assert result.ok and result.history_recorded and result.to_dict()["history_recorded"]
+        assert await schema.projection_history(target) == ProjectionHistory(  # type: ignore[arg-type]
+            frozenset({"p:1", "q:1"})
+        )
+        # the marker is metadata, not projected data: the digest does not see it
+        assert (await compute_graph_digest(target)).node_count == 0  # type: ignore[arg-type]
+    failed = Steps(monkeypatch, ok=False)
+    target = FakeStore()
+    result = await rebuild(failed, in_place=True, target=target)
+    assert not result.ok and not result.history_recorded
+    assert await schema.projection_history(target) is None  # type: ignore[arg-type]
+    broken = Steps(monkeypatch)
+    broken.fail_replay = True
+    with pytest.raises(RuntimeError):
+        await rebuild(broken, in_place=False, target=target)
+    assert await schema.projection_history(target) is None  # type: ignore[arg-type]
+
+
+async def test_a_wipe_deletes_the_history_marker_before_any_other_node() -> None:
+    graph = sample_graph()
+    store = FakeStore(graph)
+    await schema.record_projection_history(store, [("p", "1")])  # type: ignore[arg-type]
+    seen: list[bool] = []
+    commit = store.execute_write
+
+    async def write(callback: Any) -> Any:
+        result = await commit(callback)
+        seen.append(await schema.projection_history(store) is None)  # type: ignore[arg-type]
+        return result
+
+    store.execute_write = write  # type: ignore[method-assign]
+    assert await verify.wipe_graph(store, batch=2) == 6  # type: ignore[arg-type]
+    assert seen and all(seen) and graph.nodes == {}
+
+
+async def test_a_worker_records_the_history_marker_only_on_a_fresh_graph() -> None:
+    projectors = [FakeProjector("p", "t.a", version="3")]
+
+    def outbox(delivered: int | None) -> Any:
+        def answer(kind: str, sql: str) -> Any:
+            assert kind == "scalar" and "outbox" in sql and "status" in sql
+            return delivered
+
+        return factory(answer)
+
+    empty = FakeStore()
+    assert await verify.record_history_if_fresh(outbox(None), empty, projectors)  # type: ignore[arg-type]
+    assert await schema.projection_history(empty) == ProjectionHistory(frozenset({"p:3"}))  # type: ignore[arg-type]
+    # the marker itself makes the graph non-empty: a restart neither rewrites nor drops it
+    assert not await verify.record_history_if_fresh(outbox(None), empty, projectors)  # type: ignore[arg-type]
+    delivered = FakeStore()
+    assert not await verify.record_history_if_fresh(outbox(5), delivered, projectors)  # type: ignore[arg-type]
+    assert await schema.projection_history(delivered) is None  # type: ignore[arg-type]
+    populated = FakeStore(sample_graph())
+    assert not await verify.record_history_if_fresh(outbox(None), populated, projectors)  # type: ignore[arg-type]
+    assert await schema.projection_history(populated) is None  # type: ignore[arg-type]
 
 
 async def test_a_standby_rebuild_refuses_a_non_empty_target_unless_wiping(

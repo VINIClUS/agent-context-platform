@@ -4,7 +4,9 @@ Everything the `agent-context projection` CLI does lives here, so it can be test
 
 * `compute_graph_digest` is the production digest: a canonical SHA-256 over every node (labels and
   non-volatile properties) and relationship (type, endpoint identities, properties) of ONE Neo4j
-  database. It streams in keyset-ordered batches and holds only 32 bytes per graph item.
+  database. It streams in keyset-ordered batches and holds only 32 bytes per graph item. The
+  projection history marker (`schema.HISTORY_LABEL`) is metadata about the graph, not projected
+  data, and is left out, so a replay without it still matches the live graph.
 * `verify_projections` checks, read-only, checkpoint continuity, event coverage, orphan source IDs
   and stream heads against the ledger, and can compare the live graph with a scratch replay.
 * `replay_ledger` projects the ledger, in ledger (outbox) order, through the registered projectors
@@ -77,7 +79,14 @@ from agent_context_platform.projection.runtime import (
     OrphanedOutboxRowError,
     Projector,
 )
-from agent_context_platform.projection.schema import CONSTRAINT_STATEMENTS, ensure_schema
+from agent_context_platform.projection.schema import (
+    CONSTRAINT_STATEMENTS,
+    HISTORY_LABEL,
+    delete_projection_history,
+    ensure_schema,
+    history_projectors,
+    record_projection_history,
+)
 
 Clock = Callable[[], datetime]
 
@@ -86,10 +95,13 @@ Clock = Callable[[], datetime]
 # --------------------------------------------------------------------------------------------
 
 # Properties a projector may write transiently and that must never reach the digest. The projectors
-# write no wall clock or run identity, so the only entry is the lock marker `lock_nodes` sets and
-# removes inside one statement. Extend this list, never the hashing code, when a projector gains a
-# volatile property.
-VOLATILE_PROPERTIES: Final[frozenset[str]] = frozenset({"_lock"})
+# write no wall clock or run identity, so the entries are the lock marker `lock_nodes` sets and
+# removes inside one statement, and `ContentEmbedding.embedding` (PLATFORM-042): ONNX floats can
+# differ in their last bits across CPUs and runtimes, and rounding only moves the boundary a few
+# values can flip across. The node's `content_id`, `model_id`, `model_revision`, scope and
+# `source_event_ids` stay digested, so what was embedded and with which model is still verified.
+# Extend this list, never the hashing code, when a projector gains a volatile property.
+VOLATILE_PROPERTIES: Final[frozenset[str]] = frozenset({"_lock", "embedding"})
 
 # Graph properties that point back at the ledger; every value must be an existing event ID.
 SOURCE_ID_PROPERTIES: Final[tuple[str, ...]] = ("source_event_id", "source_event_ids")
@@ -224,8 +236,8 @@ class _Pass:
         """(page query, relationship query), each taking `$cursors`/`$after`/`$limit`."""
         if self.label is None:
             return (
-                "MATCH (n) WHERE NOT any(l IN labels(n) WHERE l IN $keyed "
-                "AND n[$keys[l]] IS NOT NULL) "
+                "MATCH (n) WHERE NOT n:" + HISTORY_LABEL + " AND NOT any(l IN labels(n) "
+                "WHERE l IN $keyed AND n[$keys[l]] IS NOT NULL) "
                 "AND ($after IS NULL OR elementId(n) > $after) "
                 "WITH n ORDER BY elementId(n) LIMIT $limit "
                 "RETURN elementId(n) AS cursor, labels(n) AS labels, properties(n) AS props",
@@ -1167,8 +1179,12 @@ async def count_nodes(store: Neo4jStore) -> int:
 
 
 async def wipe_graph(store: Neo4jStore, *, batch: int = _WIPE_BATCH) -> int:
-    """Delete every node and relationship in bounded transactions; return the nodes deleted."""
-    deleted = 0
+    """Delete every node and relationship in bounded transactions; return the nodes deleted.
+
+    The projection history marker goes first, in its own committed transaction: the batches that
+    follow leave a partial graph behind them, and no reader that trusts the marker may see one.
+    """
+    deleted = await store.execute_write(delete_projection_history)
 
     async def delete_batch(tx: Neo4jTransaction) -> int:
         result = await tx.run(
@@ -1519,6 +1535,7 @@ class RebuildReport:
     recorded: RecordResult | None
     record_error: str | None = None
     skipped_dead_lettered: tuple[UUID, ...] = ()
+    history_recorded: bool = False
 
     @property
     def ok(self) -> bool:
@@ -1537,6 +1554,7 @@ class RebuildReport:
             "verification": self.verification.to_dict(),
             "recorded": None if self.recorded is None else self.recorded.to_dict(),
             "record_error": self.record_error,
+            "history_recorded": self.history_recorded,
             "skipped_dead_lettered": {
                 "count": len(self.skipped_dead_lettered),
                 "event_ids": [str(item) for item in self.skipped_dead_lettered[:_SKIPPED_LISTED]],
@@ -1583,8 +1601,12 @@ async def rebuild_projections(
     clock: Clock = lambda: datetime.now(UTC),
     batch_size: int = DEFAULT_BATCH_SIZE,
     runner_quiet_seconds: int = DEFAULT_RUNNER_QUIET_SECONDS,
+    before_replay: Callable[[], Awaitable[None]] | None = None,
 ) -> RebuildReport:
     """Rebuild the projection (see `_rebuild_projections`), serialized with other rebuilds.
+
+    `before_replay` runs for an in-place rebuild after every guard and before the graph is wiped
+    (the search tables, projections held outside Neo4j, are reset there).
 
     An in-place rebuild, or a standby rebuild with `wipe_target`, first takes the session-level
     rebuild advisory lock on a dedicated projector connection and holds it for the whole
@@ -1610,6 +1632,7 @@ async def rebuild_projections(
             batch_size=batch_size,
             runner_quiet_seconds=runner_quiet_seconds,
             own_pids=own_pids,
+            before_replay=before_replay,
         )
 
 
@@ -1626,6 +1649,7 @@ async def _rebuild_projections(
     batch_size: int,
     runner_quiet_seconds: int,
     own_pids: Collection[int],
+    before_replay: Callable[[], Awaitable[None]] | None = None,
 ) -> RebuildReport:
     """Rebuild the graph projection from the ledger into `target`, then verify it.
 
@@ -1649,6 +1673,10 @@ async def _rebuild_projections(
     row lock: catch up on events delivered meanwhile, never move a checkpoint backwards, recompute
     the processed counts), and verify the live projection like `verify_projections`. Pending
     events stay pending for the runner.
+
+    Only once that verification passes is the projection history marker recorded on the target
+    (`schema.record_projection_history`, `history_recorded`): every registered projector has then
+    seen the ledger from its start. A failed or interrupted rebuild leaves the target without one.
     """
     started = clock()
     wiped = 0
@@ -1669,6 +1697,8 @@ async def _rebuild_projections(
     verification: VerificationReport | None = None
     try:
         if in_place:
+            if before_replay is not None:
+                await before_replay()
             wiped = await wipe_graph(target)
         await ensure_schema(target)
         replay = await replay_ledger(session_factory, target, projectors, delivered_only=in_place)
@@ -1686,6 +1716,8 @@ async def _rebuild_projections(
             verification = await _verify_replayed_target(
                 session_factory, target, projectors, replay, batch_size
             )
+        if verification.ok():
+            await record_projection_history(target, history_projectors(projectors))
     except Exception as error:
         if recorder is not None:
             with contextlib.suppress(Exception):  # the original failure is the one to surface
@@ -1732,7 +1764,33 @@ async def _rebuild_projections(
         recorded=recorded,
         record_error=record_error,
         skipped_dead_lettered=skipped,
+        history_recorded=ok,
     )
+
+
+async def record_history_if_fresh(
+    session_factory: async_sessionmaker[AsyncSession],
+    store: Neo4jStore,
+    projectors: Sequence[Projector],
+) -> bool:
+    """Record the projection history marker when `store` starts empty with nothing delivered.
+
+    The projection worker calls this at start-up, holding the rebuild lock shared. An empty graph
+    while no outbox row has ever been delivered means every ledger event is still to be projected,
+    by these projectors, from the start: the marker is then true. Anything else (a graph with data,
+    or a delivered row, whatever version delivered it) records nothing; only a verified rebuild
+    can establish complete history there. Returns whether the marker was recorded.
+    """
+    if await count_nodes(store):
+        return False
+    async with session_factory() as session:
+        delivered = await session.scalar(
+            select(OutboxRow.outbox_id).where(OutboxRow.status == OutboxStatus.DELIVERED).limit(1)
+        )
+    if delivered is not None:
+        return False
+    await record_projection_history(store, history_projectors(projectors))
+    return True
 
 
 # --------------------------------------------------------------------------------------------
@@ -1744,7 +1802,7 @@ async def _rebuild_projections(
 class GrantRequirement:
     """One privilege a connection must hold, checked with `has_*_privilege` (inherited roles count)."""
 
-    kind: str  # "table", "column" or "sequence"
+    kind: str  # "table", "column", "sequence" or "function" (`obj` is its signature)
     obj: str
     privilege: str
     column: str | None = None
@@ -1830,6 +1888,9 @@ async def check_grants(
             elif item.kind == "column":
                 query = text("SELECT has_column_privilege(:obj, :col, :priv)")
                 params = {"obj": item.obj, "col": item.column, "priv": item.privilege}
+            elif item.kind == "function":
+                query = text("SELECT has_function_privilege(:obj, :priv)")
+                params = {"obj": item.obj, "priv": item.privilege}
             else:
                 query = text("SELECT has_sequence_privilege(:obj, :priv)")
                 params = {"obj": item.obj, "priv": item.privilege}
@@ -1844,13 +1905,20 @@ async def preflight(
     recorder_sessions: async_sessionmaker[AsyncSession] | None,
     *,
     write_checkpoints: bool,
+    extra_grants: Sequence[GrantRequirement] = (),
 ) -> None:
     """Check both connections' grants; call before any target or checkpoint is mutated.
+
+    `extra_grants` are further projector-role privileges a bound projector needs (search).
 
     `recorder_sessions` is None when the report is not recorded. `write_checkpoints` is the
     in-place rebuild, which rewrites the live checkpoints.
     """
-    needed = PROJECTOR_READ_GRANTS + (PROJECTOR_CHECKPOINT_GRANTS if write_checkpoints else ())
+    needed = (
+        PROJECTOR_READ_GRANTS
+        + (PROJECTOR_CHECKPOINT_GRANTS if write_checkpoints else ())
+        + tuple(extra_grants)
+    )
     await check_grants(projector_sessions, needed, role="projector")
     if recorder_sessions is not None:
         await check_grants(recorder_sessions, RECORDER_GRANTS, role="api")
@@ -1969,6 +2037,7 @@ __all__ = [
     "projection_status",
     "rebuild_lock",
     "rebuild_projections",
+    "record_history_if_fresh",
     "replay_ledger",
     "source_ids",
     "system_event_key",

@@ -54,6 +54,9 @@ MIN_KEY_BYTES: Final = 32
 ALLOWED_SERVICE_NAMES: Final = frozenset({"codex_cli_rs", "codex_exec"})
 _PLATFORM_SERVICE_PREFIXES: Final = ("agent-context-", "agent_context_", "agent-context.")
 _PLATFORM_SERVICE_NAMES: Final = frozenset({"agent-context", "agent_context"})
+# The loop-prevention resource attribute every platform signal carries (PLATFORM-050,
+# `docs/operations/telemetry.md`). Its presence, whatever the value, marks platform telemetry.
+PLATFORM_ORIGIN_ATTRIBUTE: Final = "agent_context.origin"
 
 MAX_ATTRIBUTES: Final = 128
 MAX_RESOURCE_ATTRIBUTES: Final = 64
@@ -169,6 +172,8 @@ def _check_service(resource: Mapping[str, object]) -> None:
     if len(resource) > MAX_RESOURCE_ATTRIBUTES:
         raise CodexOtelError(RejectionReason.TOO_MANY_ATTRIBUTES)
     _check_scalars(resource)
+    if PLATFORM_ORIGIN_ATTRIBUTE in resource:
+        raise CodexOtelError(RejectionReason.PLATFORM_ORIGIN)
     service = resource.get("service.name")
     if not isinstance(service, str) or not service:
         raise CodexOtelError(RejectionReason.MISSING_SERVICE)
@@ -178,6 +183,16 @@ def _check_service(resource: Mapping[str, object]) -> None:
         raise CodexOtelError(RejectionReason.PLATFORM_ORIGIN)
     if service not in ALLOWED_SERVICE_NAMES:
         raise CodexOtelError(RejectionReason.UNKNOWN_SERVICE)
+
+
+def check_resource(resource: Mapping[str, object]) -> None:
+    """Reject a resource that is not an allowlisted Codex service (loop prevention, bounds).
+
+    The batch entry point for the OTLP receiver: it checks each resource once, so every span of
+    a platform-origin or unknown resource is rejected even when it carries no Codex event.
+    Raises `CodexOtelError` with a fixed reason code.
+    """
+    _check_service(resource)
 
 
 def _check_scalars(attributes: Mapping[str, object]) -> None:
@@ -315,6 +330,9 @@ def map_record(
     if record.signal is not config.accepted_signal:
         raise CodexOtelError(RejectionReason.UNSUPPORTED_SIGNAL)
     _check_service(record.resource)
+    if PLATFORM_ORIGIN_ATTRIBUTE in record.attributes:
+        # The loop-prevention marker at record level too, not only on the resource.
+        raise CodexOtelError(RejectionReason.PLATFORM_ORIGIN)
     if len(record.attributes) > MAX_ATTRIBUTES:
         raise CodexOtelError(RejectionReason.TOO_MANY_ATTRIBUTES)
     _check_scalars(record.attributes)

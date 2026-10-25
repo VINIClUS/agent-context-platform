@@ -86,21 +86,21 @@ Until PostgreSQL is configured the endpoint fails closed: 401 without a token, 5
 
 ## Provisioning
 
-Use an operator DSN (a role that may `INSERT` into `operations.mcp_tokens`; the API role cannot):
+Tokens are minted with the operator CLI, through an operator connection
+(`AGENT_CONTEXT_POSTGRESQL__ADMIN_DSN`, falling back to `AGENT_CONTEXT_POSTGRESQL__DSN`: a role that
+may `INSERT` into `operations.mcp_tokens`; the API role cannot):
 
 ```sh
-export AGENT_CONTEXT_POSTGRESQL__DSN='postgresql+psycopg://<operator>@<host>/<database>'
-python -m agent_context_platform.mcp.auth mint --principal codex-reader --expires 2027-01-01T00:00:00+00:00
+agent-context mcp-token create --principal codex-reader --scope memory:read --expires-in 90
+agent-context mcp-token list
+agent-context mcp-token revoke mcp_AbCd1234xyz            # prefix from `mcp-token list`
 ```
 
-The command inserts the Argon2id verifier and prints the token to stdout exactly once (the token id goes
-to stderr). Store the token in the client's secret store; it cannot be recovered. `--dsn-env` names a
-different environment variable.
+`create` stores the Argon2id verifier and prints the token once (stdout, or a new `0600` file with
+`--output`); store it in the client's secret store, it cannot be recovered. `revoke` sets
+`revoked_at`; it takes effect within the cache TTL. The README's "Provisioning credentials"
+section has the delivery and failure rules.
 
-To provision by hand, generate `mcp_<random>` and a random secret, hash `"<prefix>.<secret>"` with
-Argon2id (`argon2.PasswordHasher().hash(token)`), and insert `token_id`, `token_prefix`, `token_verifier`,
-`principal`, `scopes = '{memory:read}'`, `created_at` and `expires_at`.
-
-To revoke, set `revoked_at = now()` on the row; it takes effect within the cache TTL.
-
-The planned CLI (PLATFORM-050) will wrap this command.
+`python -m agent_context_platform.mcp.auth mint --principal <name> --expires <ISO 8601>` is the
+older single-purpose equivalent (it reads an operator DSN from `AGENT_CONTEXT_POSTGRESQL__DSN`, or
+the variable `--dsn-env` names).

@@ -2,6 +2,9 @@ from __future__ import annotations
 
 import pytest
 
+# Telemetry capture fixtures (PLATFORM-050), shared by every unit test package.
+from observability._capture import canaries, telemetry  # noqa: F401
+
 PRODUCTION_ENV = {
     "AGENT_CONTEXT_ENVIRONMENT": "production",
     "AGENT_CONTEXT_POSTGRESQL__DSN": (
@@ -14,6 +17,7 @@ PRODUCTION_ENV = {
     "AGENT_CONTEXT_S3__ACCESS_KEY_ID": "garage-access-key",
     "AGENT_CONTEXT_S3__SECRET_ACCESS_KEY": "garage-secret-key",
     "AGENT_CONTEXT_MCP__TOKEN_HMAC_KEY": "mcp-secret-hmac-key-0123456789abcdef",
+    "AGENT_CONTEXT_MCP__CURSOR_HMAC_KEY": "mcp-cursor-hmac-key-0123456789abcdef",
 }
 
 

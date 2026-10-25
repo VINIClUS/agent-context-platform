@@ -374,7 +374,35 @@ def test_role_dsns_fall_back_to_the_shared_dsn_and_never_print() -> None:
     assert "projector-secret" not in repr(split) and "shared-secret" not in repr(split)
 
 
-@pytest.mark.parametrize("field", ["projector_dsn", "api_dsn", "admin_dsn"])
+def test_the_migration_dsn_falls_back_to_the_shared_dsn_and_never_prints() -> None:
+    shared = "postgresql+psycopg://platform:shared-secret@postgres/agent_context"
+    migration = "postgresql+psycopg://migrator:migration-secret@postgres/agent_context"
+
+    only_shared = Settings(postgresql={"dsn": shared})
+    split = Settings(postgresql={"dsn": shared, "migration_dsn": migration})
+
+    assert only_shared.postgresql.effective_migration_dsn is only_shared.postgresql.dsn
+    assert Settings().postgresql.effective_migration_dsn is None
+    assert split.postgresql.effective_migration_dsn is not None
+    assert split.postgresql.effective_migration_dsn.get_secret_value().unicode_string() == migration
+    assert split.postgresql.effective_api_dsn is split.postgresql.dsn
+    assert "migration-secret" not in repr(split) and "migration-secret" not in str(split)
+
+
+def test_the_migration_dsn_is_read_from_its_own_variable(monkeypatch: pytest.MonkeyPatch) -> None:
+    migration = "postgresql+psycopg://migrator:migration-secret@postgres/agent_context"
+    monkeypatch.setenv("AGENT_CONTEXT_POSTGRESQL__MIGRATION_DSN", migration)
+
+    settings = Settings()
+
+    assert settings.postgresql.dsn is None
+    assert settings.postgresql.effective_migration_dsn is not None
+    assert settings.postgresql.effective_migration_dsn.get_secret_value().unicode_string() == (
+        migration
+    )
+
+
+@pytest.mark.parametrize("field", ["projector_dsn", "api_dsn", "admin_dsn", "migration_dsn"])
 @pytest.mark.parametrize(
     "dsn",
     ["postgresql://u:p@postgres/agent", "postgresql+psycopg://u:p@postgres", "mysql://u:p@h/d"],
@@ -382,3 +410,51 @@ def test_role_dsns_fall_back_to_the_shared_dsn_and_never_print() -> None:
 def test_role_dsns_share_the_scheme_and_database_rules(field: str, dsn: str) -> None:
     with pytest.raises(ValidationError):
         Settings(postgresql={field: dsn})
+
+
+def test_search_settings_default_to_no_model_and_a_small_batch() -> None:
+    search = Settings().search
+
+    assert search.model_dir is None
+    assert (search.embedding_batch_size, search.embedding_threads) == (16, 1)
+
+
+def test_search_settings_load_from_environment(monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setenv("AGENT_CONTEXT_SEARCH__MODEL_DIR", "/models/minilm")
+    monkeypatch.setenv("AGENT_CONTEXT_SEARCH__EMBEDDING_BATCH_SIZE", "8")
+    monkeypatch.setenv("AGENT_CONTEXT_SEARCH__EMBEDDING_THREADS", "2")
+
+    search = Settings().search
+
+    assert str(search.model_dir) == "/models/minilm"
+    assert (search.embedding_batch_size, search.embedding_threads) == (8, 2)
+
+
+@pytest.mark.parametrize(
+    ("field", "value"),
+    [("embedding_batch_size", 0), ("embedding_batch_size", 257), ("embedding_threads", 0)],
+)
+def test_search_settings_reject_unbounded_values(field: str, value: int) -> None:
+    with pytest.raises(ValidationError):
+        Settings(search={field: value})
+
+
+def test_a_blank_mcp_hmac_key_means_unset_outside_and_missing_inside_production() -> None:
+    blank = Settings(environment="test", mcp={"cursor_hmac_key": "  ", "token_hmac_key": ""})
+
+    assert blank.mcp.cursor_hmac_key is None and blank.mcp.token_hmac_key is None
+    with pytest.raises(ValidationError, match=r"mcp\.cursor_hmac_key"):
+        Settings(
+            environment="production",
+            postgresql={"dsn": "postgresql+psycopg://u:p@db.example.test/a"},
+            neo4j={"uri": "bolt://db.example.test:7687", "username": "n", "password": "pw"},
+            s3={
+                "endpoint_url": "http://s3.example.test:3900",
+                "access_key_id": "id",
+                "secret_access_key": "secret",
+            },
+            mcp={
+                "token_hmac_key": "mcp-secret-hmac-key-0123456789abcdef",
+                "cursor_hmac_key": "   ",
+            },
+        )

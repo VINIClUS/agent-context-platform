@@ -101,7 +101,9 @@ jobs:
   integration:
     name: Integration
     runs-on: ubuntu-latest
-    timeout-minutes: 15
+    # The full suite against the services (retrieval, MCP, ledger verify, rebuilds) outgrew
+    # 15 minutes on a hosted runner.
+    timeout-minutes: 30
 
     steps:
       - name: Check out repository
@@ -247,4 +249,90 @@ jobs:
       - name: Build the indexer image and run container security tests
         env:
           AGENT_CONTEXT_TEST_CONTAINER: "1"
-        run: uv run --frozen pytest -q tests/container -m container --no-cov
+        run: uv run --frozen pytest -q tests/container/test_indexer_image.py -m container --no-cov
+
+  platform-image:
+    name: Platform image
+    runs-on: ubuntu-latest
+    timeout-minutes: 20
+
+    steps:
+      - name: Check out repository
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@c771a70e6277c0a99b617c7a806ffedaca235ff9 # v9.0.0
+        with:
+          version: "0.11.28"
+          enable-cache: true
+          cache-dependency-glob: uv.lock
+
+      - name: Install Python
+        run: uv python install "3.12"
+
+      - name: Require private SDK token
+        env:
+          SDK_READ_TOKEN: ${{ secrets.AGENT_CONTEXT_SDK_READ_TOKEN }}
+        run: |
+          if [ -z "$SDK_READ_TOKEN" ]; then
+            echo "::error::AGENT_CONTEXT_SDK_READ_TOKEN is required to download the private SDK release"
+            exit 1
+          fi
+
+      - name: Read SDK release metadata
+        run: |
+          uv run --no-project --python "3.12" python <<'PY'
+          import os
+          import tomllib
+          from pathlib import Path
+
+          metadata = tomllib.loads(Path("pyproject.toml").read_text())["tool"]["agent-context"]["sdk"]
+          variables = {
+              "SDK_REPOSITORY": metadata["repository"],
+              "SDK_VERSION": metadata["version"],
+              "SDK_TAG": metadata["tag"],
+              "SDK_COMMIT": metadata["commit"],
+              "SDK_WHEEL_SHA256": metadata["wheel-sha256"],
+              "SDK_WHEEL": f"agent_context_sdk-{metadata['version']}-py3-none-any.whl",
+          }
+          with Path(os.environ["GITHUB_ENV"]).open("a") as github_env:
+              for name, value in variables.items():
+                  print(f"{name}={value}", file=github_env)
+          PY
+
+      - name: Download private SDK wheel
+        env:
+          GH_TOKEN: ${{ secrets.AGENT_CONTEXT_SDK_READ_TOKEN }}
+        run: |
+          mkdir -p build/sdk
+          gh release download "$SDK_TAG" \
+            --repo "$SDK_REPOSITORY" \
+            --pattern "$SDK_WHEEL" \
+            --dir build/sdk
+
+      - name: Verify private SDK wheel
+        run: echo "$SDK_WHEEL_SHA256  build/sdk/$SDK_WHEEL" | sha256sum --check --strict -
+
+      - name: Verify lockfile
+        run: uv lock --check --python "3.12"
+
+      - name: Sync project
+        run: uv sync --frozen --python "3.12"
+
+      - name: Build the platform image
+        run: |
+          ALEMBIC_HEAD="$(uv run --frozen python -c 'from agent_context_platform.operations.migrate import alembic_config, image_head; print(image_head(alembic_config()))')"
+          VERSION="$(uv run --no-project python -c 'import tomllib; print(tomllib.load(open("pyproject.toml", "rb"))["project"]["version"])')"
+          docker build -f containers/platform/Dockerfile \
+            --build-arg REVISION="$(git rev-parse HEAD)" \
+            --build-arg VERSION="$VERSION" \
+            --build-arg SDK_VERSION="$SDK_VERSION" \
+            --build-arg ALEMBIC_HEAD="$ALEMBIC_HEAD" \
+            -t agent-context-platform:ci .
+          docker image ls agent-context-platform:ci
+
+      - name: Run platform container tests
+        env:
+          AGENT_CONTEXT_TEST_CONTAINER: "1"
+          AGENT_CONTEXT_TEST_PLATFORM_IMAGE: agent-context-platform:ci
+        run: uv run --frozen pytest -q tests/container/test_platform_image.py -m container --no-cov
