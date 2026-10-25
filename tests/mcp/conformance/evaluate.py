@@ -111,25 +111,97 @@ FIXTURE_COVERABLE: Final[Mapping[str, frozenset[str] | None]] = {
         }
     ),
 }
-# The suite's own words for "this does not apply here", per capability and for fixture coverage.
-# A listed failure whose report carries none of them failed for another reason.
-_UNSERVED: Final = ("Method not found", "-32601")
-EVIDENCE: Final[Mapping[str, tuple[str, ...]]] = {
-    "resources": _UNSERVED,
-    "prompts": _UNSERVED,
-    "completions": _UNSERVED,
-    "input_requests": (
-        "Unknown tool",
-        "Method not found",
-        "Prerequisite failed",
-        "InputRequiredResult",
-        'resultType "input_required"',
+# The suite's own words for "this does not apply here", per reason and profile: the check's
+# `errorMessage` must match one of them in full. Only the message counts, never `details`, which
+# echoes what the server sent. A listed failure whose message matches none failed for another
+# reason, and so does one that matches the phrasing of another profile (the fixture profile serves
+# the progress tool, so "Unknown tool" there is a regression, not evidence).
+_UNSERVED: Final = (
+    r"Failed: Method not found",
+    r"(?:prompts|resources|resources/templates)/list returned JSON-RPC error -32601: "
+    r"Method not found",
+)
+_NO_INPUT_REQUESTS: Final = (
+    r"JSON-RPC error: Method not found",  # the non-tool scenario's prompts/get
+    r"Prerequisite failed: could not get initial InputRequiredResult with requestState",
+)
+_EVIDENCE_TEXT: Final[Mapping[tuple[str, str], tuple[str, ...]]] = {
+    **{
+        (capability, profile): _UNSERVED
+        for capability in ("resources", "prompts", "completions")
+        for profile in PROFILES
+    },
+    ("input_requests", "shipping"): (
+        *_NO_INPUT_REQUESTS,
+        r"JSON-RPC error: Unknown tool",
+        # Only with no result at all (`_evidence_holds`): the tool call was refused.
+        r"Expected InputRequiredResult with inputRequests and requestState",
     ),
-    "response_stream": ("Unknown tool", "No progress notifications received"),
-    "fixture": ("Unknown tool", "Not testable"),
+    # On the fixture profile an unknown tool is a complete tool-error result; the suite then says
+    # it got a complete result, and the result itself must be the SDK's unknown-tool error for the
+    # cited tool (`_evidence_holds`).
+    ("input_requests", "fixture"): (
+        *_NO_INPUT_REQUESTS,
+        r"Expected InputRequiredResult(?: .+)?",
+        r'Expected resultType "input_required", got "complete"',
+        r"Server returned complete result; expected InputRequiredResult.+",
+    ),
+    ("response_stream", "shipping"): (r"Failed: Unknown tool",),
+    ("response_stream", "fixture"): (r"No progress notifications received",),
+    ("fixture", "shipping"): (
+        r"Failed: Unknown tool",
+        r"Not testable: server does not list the diagnostic tool '(?P<tool>[A-Za-z0-9_]+)'.*",
+    ),
 }
-# A tool a report names: `Unknown tool: <name>` or a quoted `'<name>'`.
-_NAMED_TOOL: Final = re.compile(r"Unknown tool: ([A-Za-z0-9_]+)|'(test_[A-Za-z0-9_]+)'")
+EVIDENCE: Final[Mapping[tuple[str, str], tuple[re.Pattern[str], ...]]] = {
+    key: tuple(re.compile(pattern, re.DOTALL) for pattern in patterns)
+    for key, patterns in _EVIDENCE_TEXT.items()
+}
+# Checks that must be reported on both profiles whatever else changes.
+ALWAYS_REPORTED: Final[Mapping[str, frozenset[str]]] = {
+    "dns-rebinding-protection": frozenset(
+        {"localhost-host-rebinding-rejected", "localhost-host-valid-accepted"}
+    ),
+}
+# The only scored checks that may end neither passed nor failed, with the status they have now:
+# a success turning into a skip (or any other drift) fails the run, and so does a pinned check
+# that now passes (update the pin).
+OTHER_STATUSES: Final[Mapping[str, frozenset[tuple[str, str, str]]]] = {
+    profile: frozenset(
+        {
+            ("caching", "sep-2549-resources-read-caching-hints", "SKIPPED"),
+            (
+                "input-required-result-missing-input-response",
+                "sep-2322-missing-response-rerequests",
+                "WARNING",
+            ),
+            ("sep-2164-resource-not-found", "sep-2164-error-code", "WARNING"),
+            ("sep-2164-resource-not-found", "sep-2164-data-uri", "WARNING"),
+            ("server-sse-multiple-streams", "server-sse-streams-functional", "INFO"),
+            *(
+                ("server-stateless", f"sep-2575-server-{check}", "SKIPPED")
+                for check in (
+                    "sends-subscription-ack",
+                    "tags-subscription-id",
+                    "honors-notification-filter",
+                    "sends-prompts-list-changed-on-subscription",
+                    "sends-tools-list-changed-on-subscription",
+                )
+            ),
+            (
+                "input-required-result-ignore-extra-params"
+                if profile == "shipping"
+                else "input-required-result-validate-input",
+                "sep-2322-ignore-unexpected-params"
+                if profile == "shipping"
+                else "sep-2322-error-on-protocol-error",
+                "WARNING",
+            ),
+        }
+    )
+    for profile in PROFILES
+}
+MIN_LITERAL_CHARS: Final = 6
 
 
 class ManifestError(ValueError):
@@ -155,9 +227,8 @@ class Entry:
     source: str
     source_literal: str
 
-    @property
-    def evidence(self) -> tuple[str, ...]:
-        return EVIDENCE["fixture" if self.kind == "fixture" else self.reason]
+    def evidence(self, profile: str) -> tuple[re.Pattern[str], ...]:
+        return EVIDENCE[("fixture" if self.kind == "fixture" else self.reason, profile)]
 
     @property
     def tool(self) -> str | None:
@@ -312,6 +383,8 @@ def load_manifest(path: Path) -> Manifest:
                 source=_text(row, "source", where),
                 source_literal=_text(row, "source_literal", where),
             )
+            if len(entry.source_literal.strip("`")) < MIN_LITERAL_CHARS:
+                raise ManifestError(f"{where}: `source_literal` is too short to cite anything")
             _check_allowed(entry, where)
             entries.append(entry)
     manifest = Manifest(capabilities=capabilities, entries=tuple(entries))
@@ -447,13 +520,46 @@ def _grouped(
     return grouped
 
 
-def has_evidence(entry: Entry, report: Mapping[str, Any]) -> bool:
-    """The failed report says, in the suite's own words, that the entry's reason applies."""
-    text = str(report.get("errorMessage") or "") + "\n" + json.dumps(report.get("details"))
-    if not any(marker in text for marker in entry.evidence):
+def _unknown_tool_result(report: Mapping[str, Any], tool: str | None) -> bool:
+    """The report's result is the SDK's unknown-tool error for exactly ``tool``."""
+    details = report.get("details")
+    result = details.get("result") if isinstance(details, Mapping) else None
+    return (
+        tool is not None
+        and isinstance(result, Mapping)
+        and result.get("isError") is True
+        and result.get("content") == [{"text": f"Unknown tool: {tool}", "type": "text"}]
+    )
+
+
+def _evidence_holds(entry: Entry, profile: str, match: re.Match[str], report: Any) -> bool:
+    """What the message alone cannot show: which tool was missing, and that nothing answered."""
+    named = match.groupdict().get("tool")
+    if named is not None:
+        return named == entry.tool
+    message = match.string
+    if (
+        entry.reason == "input_requests"
+        and profile == "fixture"
+        and message.startswith(("Expected", "Server returned"))
+    ):
+        return _unknown_tool_result(report, entry.tool)
+    if entry.reason == "input_requests" and message.startswith("Expected"):
+        details = report.get("details")
+        return not (isinstance(details, Mapping) and details.get("result"))
+    return True
+
+
+def has_evidence(entry: Entry, profile: str, report: Mapping[str, Any]) -> bool:
+    """The failed report's message says, in the suite's exact words, that the entry applies."""
+    message = report.get("errorMessage")
+    if not isinstance(message, str):
         return False
-    named = {name for match in _NAMED_TOOL.finditer(text) for name in match.groups() if name}
-    return not named or (entry.tool is not None and named == {entry.tool})
+    for pattern in entry.evidence(profile):
+        match = pattern.fullmatch(message)
+        if match is not None:
+            return _evidence_holds(entry, profile, match, report)
+    return False
 
 
 def evaluate_profile(
@@ -492,7 +598,7 @@ def evaluate_profile(
                 if entry is None:
                     report.failed += 1
                     report.errors.append(f"unexpected failure: {scenario}/{check_id}")
-                elif not all(has_evidence(entry, failure) for failure in group.failures):
+                elif not all(has_evidence(entry, profile, failure) for failure in group.failures):
                     report.failed += 1
                     report.errors.append(
                         f"unexpected failure: {scenario}/{check_id} (listed for "
@@ -504,10 +610,21 @@ def evaluate_profile(
                     report.excluded += 1
             elif entry is not None:
                 report.errors.append(f"stale entry: {scenario}/{check_id} now {group.status}")
+            elif (scenario, check_id, group.status) in OTHER_STATUSES[profile]:
+                report.other += 1
             elif group.status == "SUCCESS":
                 report.passed += 1
+                if any(key == (s, c) for s, c, _ in OTHER_STATUSES[profile]):
+                    report.errors.append(
+                        f"stale status pin: {scenario}/{check_id} now SUCCESS (update "
+                        "OTHER_STATUSES)"
+                    )
             else:
                 report.other += 1
+                report.errors.append(f"unexpected status: {scenario}/{check_id} is {group.status}")
+    for scenario, required in ALWAYS_REPORTED.items():
+        for check_id in sorted(required - {c for s, c in seen if s == scenario}):
+            report.errors.append(f"missing: required check {scenario}/{check_id} did not run")
     for scenario, check_id in sorted(set(listed) - seen):
         if scenario in requirements.known and scenario not in requirements.unscored:
             report.errors.append(f"missing: listed check {scenario}/{check_id} did not run")
@@ -533,6 +650,25 @@ def check_fixture_coverage(
     return errors
 
 
+def check_same_checks(
+    requirements: Requirements,
+    results: Mapping[str, Mapping[str, Sequence[Mapping[str, Any]]]],
+) -> list[str]:
+    """Both profiles report the same check ids for every scored scenario: none was dropped."""
+    errors = []
+    for scenario in sorted(requirements.scored):
+        ids = [
+            {check.get("id") for check in results[profile].get(scenario, ())}
+            for profile in PROFILES
+        ]
+        if ids[0] != ids[1]:
+            errors.append(
+                f"results: {scenario!r} reports other check ids on the shipping and fixture "
+                f"profiles: {sorted(map(str, ids[0] ^ ids[1]))}"
+            )
+    return errors
+
+
 def evaluate(
     manifest: Manifest,
     requirements: Requirements,
@@ -543,12 +679,13 @@ def evaluate(
         evaluate_profile(profile, results[profile], manifest, requirements) for profile in PROFILES
     ]
     errors = check_fixture_coverage(manifest, results["fixture"])
+    errors.extend(check_same_checks(requirements, results))
     if package_source is not None:
         errors.extend(check_sources(manifest, package_source))
     return reports, errors
 
 
-def _aggregate(results: Mapping[str, Sequence[Mapping[str, Any]]], path: Path) -> None:
+def _aggregate(results: Mapping[str, Any], path: Path) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(results, indent=2, sort_keys=True) + "\n", encoding="utf-8")
 
@@ -563,18 +700,26 @@ def main(argv: Iterable[str] | None = None) -> int:
     parser.add_argument("--out", type=Path, required=True, help="<out>/<profile>/checks.json")
     arguments = parser.parse_args(None if argv is None else list(argv))
 
+    # Results first, so the artifact has per-profile checks even when nothing else loads.
+    results: dict[str, dict[str, list[dict[str, Any]]]] = {}
+    problem: Exception | None = None
+    for profile, directory in (("shipping", arguments.shipping), ("fixture", arguments.fixture)):
+        try:
+            results[profile] = load_results(directory)
+            _aggregate(results[profile], arguments.out / profile / "checks.json")
+        except (ManifestError, OSError, ValueError) as error:
+            problem = problem or error
+            _aggregate({"error": type(error).__name__}, arguments.out / profile / "checks.json")
     try:
+        if problem is not None:
+            raise problem
         manifest = load_manifest(arguments.manifest)
         requirements = load_requirements(arguments.requirements)
-        results = {
-            "shipping": load_results(arguments.shipping),
-            "fixture": load_results(arguments.fixture),
-        }
     except (ManifestError, OSError, ValueError, KeyError) as error:
+        summary_stub = {"error": type(error).__name__, "errors": 1}
+        (arguments.out / "summary.json").write_text(json.dumps(summary_stub) + "\n", "utf-8")
         print(f"conformance: cannot evaluate: {error}", file=sys.stderr)
         return 1
-    for profile in PROFILES:
-        _aggregate(results[profile], arguments.out / profile / "checks.json")
     reports, errors = evaluate(
         manifest,
         requirements,

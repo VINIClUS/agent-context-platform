@@ -115,6 +115,8 @@ status=0
   --shipping "$out/shipping/results" \
   --fixture "$out/fixture/results" \
   --out "$out" || status=1
+# The token-aware verdict (counts only) lets CI refuse to upload what only this scan can see.
 AGENT_CONTEXT_CONFORMANCE_TOKEN="$run_token" \
-  "${python[@]}" "$conformance_dir/secret_scan.py" "$out" || status=1
+  "${python[@]}" "$conformance_dir/secret_scan.py" --verdict "$out/secret-scan.json" "$out" ||
+  status=1
 exit "$status"

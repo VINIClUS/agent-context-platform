@@ -33,6 +33,25 @@ PACKAGE = (
 CANARY = "detail never printed"
 
 
+# The shipped pins, before the synthetic tests replace them.
+SHIPPED_ALWAYS_REPORTED = evaluate.ALWAYS_REPORTED
+SHIPPED_OTHER_STATUSES = evaluate.OTHER_STATUSES
+
+
+@pytest.fixture(autouse=True)
+def synthetic_pins(monkeypatch: pytest.MonkeyPatch) -> None:
+    """The synthetic results' own pins (the shipped ones are tested against the real manifest)."""
+    monkeypatch.setattr(evaluate, "ALWAYS_REPORTED", {})
+    monkeypatch.setattr(
+        evaluate,
+        "OTHER_STATUSES",
+        {
+            "shipping": frozenset({("server-stateless", "sep-2575-b", "WARNING")}),
+            "fixture": frozenset(),
+        },
+    )
+
+
 def _manifest(tmp_path: Path, body: str) -> evaluate.Manifest:
     path = tmp_path / "manifest.toml"
     path.write_text(textwrap.dedent(body), encoding="utf-8")
@@ -120,13 +139,16 @@ def test_listed_failures_and_fixture_coverage_pass(tmp_path: Path) -> None:
 
 def test_an_unlisted_scored_failure_fails_the_run(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path, BASE)
-    results = _results(shipping__server_stateless=[_check("sep-2575-a", "FAILURE")])
+    failed = [_check("sep-2575-a", "FAILURE"), _check("sep-2575-b", "WARNING")]
+    results = _results(shipping__server_stateless=failed)
     assert _errors(manifest, results) == ["unexpected failure: server-stateless/sep-2575-a"]
 
 
 def test_an_error_status_is_a_failure_too(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path, BASE)
-    results = _results(fixture__server_stateless=[_check("sep-2575-a", "ERROR")])
+    results = _results(
+        fixture__server_stateless=[_check("sep-2575-a", "ERROR"), _check("sep-2575-b")]
+    )
     assert _errors(manifest, results) == ["unexpected failure: server-stateless/sep-2575-a"]
 
 
@@ -139,17 +161,21 @@ def test_a_listed_check_that_passes_is_stale(tmp_path: Path) -> None:
 def test_a_listed_check_that_did_not_run_is_missing(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path, BASE)
     results = _results(shipping__resources_list=[_check("other-check", "FAILURE")])
-    assert _errors(manifest, results) == [
+    errors = _errors(manifest, results)
+    assert errors[:2] == [
         "unexpected failure: resources-list/other-check",
         "missing: listed check resources-list/resources-list did not run",
     ]
+    assert "other check ids on the shipping and fixture profiles" in errors[2]
 
 
 def test_a_scored_scenario_that_did_not_run_fails_the_run(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path, BASE)
     results = _results()
     del results["fixture"]["server-stateless"]
-    assert _errors(manifest, results) == ["results: scored scenario 'server-stateless' did not run"]
+    errors = _errors(manifest, results)
+    assert errors[0] == "results: scored scenario 'server-stateless' did not run"
+    assert "other check ids" in errors[1]
 
 
 def test_unknown_scenarios_fail_the_run(tmp_path: Path) -> None:
@@ -196,7 +222,11 @@ def test_a_fixture_covered_check_must_pass_on_the_fixture_profile(tmp_path: Path
 
 def test_a_repeated_check_id_fails_if_any_report_failed(tmp_path: Path) -> None:
     manifest = _manifest(tmp_path, BASE)
-    repeated = [_check("sep-2575-a"), _check("sep-2575-a", "FAILURE"), _check("sep-2575-b")]
+    repeated = [
+        _check("sep-2575-a"),
+        _check("sep-2575-a", "FAILURE"),
+        _check("sep-2575-b", "WARNING"),
+    ]
     assert _errors(manifest, _results(shipping__server_stateless=repeated)) == [
         "unexpected failure: server-stateless/sep-2575-a"
     ]
@@ -397,15 +427,118 @@ def test_evidence_naming_another_tool_does_not_count(tmp_path: Path) -> None:
     assert _errors(manifest, results) == []
 
 
-def test_evidence_may_sit_in_the_details() -> None:
-    entry = evaluate.load_manifest(MANIFEST).entries[-1]
-    assert entry.kind == "fixture" and entry.tool == "test_logging_tool"
-    found = {
-        "status": "FAILURE",
-        "details": {"result": {"text": "Unknown tool: test_logging_tool"}},
-    }
-    assert evaluate.has_evidence(entry, found)
-    assert not evaluate.has_evidence(entry, {"status": "FAILURE", "errorMessage": "boom"})
+def test_evidence_must_be_the_message_not_the_echoed_details(tmp_path: Path) -> None:
+    """P5: `details` echo what the server sent; a server-sent "Method not found" is no evidence."""
+    manifest = _manifest(tmp_path, BASE)
+    echoed = _check("resources-list", "FAILURE", "Missing resources array")
+    echoed["details"] = {"result": {"error": "Method not found", "code": -32601}}
+    assert _errors(manifest, _results(shipping__resources_list=[echoed])) == [
+        "unexpected failure: resources-list/resources-list (listed for 'resources', but the "
+        "report shows no such reason)"
+    ]
+
+
+def test_evidence_is_the_suites_exact_phrasing() -> None:
+    """P10: the marker must be the whole message, not a word inside a 500's text."""
+    entries = {e.scenario: e for e in evaluate.load_manifest(MANIFEST).entries}
+    mrtr = entries["input-required-result-basic-elicitation"]
+    for message in (
+        "JSON-RPC error: Unknown tool",
+        "Prerequisite failed: could not get initial InputRequiredResult with requestState",
+    ):
+        assert evaluate.has_evidence(mrtr, "shipping", {"errorMessage": message})
+    for message in (
+        "HTTP 500: InputRequiredResult handler crashed",
+        "JSON-RPC error: Internal error (Unknown tool)",
+        "Failed: Unknown tool",
+    ):
+        assert not evaluate.has_evidence(mrtr, "shipping", {"errorMessage": message})
+    multi = entries["input-required-result-multi-round"]
+    no_result = {"errorMessage": "Expected InputRequiredResult with inputRequests and requestState"}
+    assert evaluate.has_evidence(multi, "shipping", {**no_result, "details": {}})
+    assert not evaluate.has_evidence(
+        multi, "shipping", {**no_result, "details": {"result": {"content": []}}}
+    )
+
+
+def test_fixture_profile_input_request_evidence_needs_the_unknown_tool_result() -> None:
+    entries = {e.scenario: e for e in evaluate.load_manifest(MANIFEST).entries}
+    entry = entries["input-required-result-basic-elicitation"]
+    message = {"errorMessage": "Expected InputRequiredResult but got a complete result."}
+
+    def result(text: str) -> dict[str, Any]:
+        return {"result": {"isError": True, "content": [{"text": text, "type": "text"}]}}
+
+    own = result("Unknown tool: test_input_required_result_elicitation")
+    assert evaluate.has_evidence(entry, "fixture", {**message, "details": own})
+    for details in (
+        result("Unknown tool: test_input_required_result_sampling"),  # another tool
+        result("Internal error"),
+        {"result": {"isError": False, "content": own["result"]["content"]}},
+        None,
+    ):
+        assert not evaluate.has_evidence(entry, "fixture", {**message, "details": details})
+
+
+def test_evidence_is_per_profile() -> None:
+    """P9: the fixture profile serves the progress tool, so "Unknown tool" there is a regression."""
+    entries = {e.scenario: e for e in evaluate.load_manifest(MANIFEST).entries}
+    progress = entries["tools-call-with-progress"]
+    unknown = {"errorMessage": "Failed: Unknown tool"}
+    silent = {"errorMessage": "No progress notifications received"}
+    assert evaluate.has_evidence(progress, "shipping", unknown)
+    assert not evaluate.has_evidence(progress, "fixture", unknown)
+    assert evaluate.has_evidence(progress, "fixture", silent)
+    assert not evaluate.has_evidence(progress, "shipping", silent)
+    assert not evaluate.has_evidence(progress, "shipping", {"errorMessage": None})
+
+
+def test_both_profiles_must_report_the_same_check_ids(tmp_path: Path) -> None:
+    """P1: a check dropped on one profile fails the run even when nothing is listed for it."""
+    manifest = _manifest(tmp_path, BASE)
+    results = _results(fixture__server_stateless=[_check("sep-2575-a")])
+    assert _errors(manifest, results) == [
+        "results: 'server-stateless' reports other check ids on the shipping and fixture "
+        "profiles: ['sep-2575-b']"
+    ]
+
+
+def test_a_status_drift_fails_the_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    """P1: a success turning into a skip, or a pinned status changing, fails the run."""
+    manifest = _manifest(tmp_path, BASE)
+    skipped = _results(
+        fixture__server_stateless=[_check("sep-2575-a", "SKIPPED"), _check("sep-2575-b")]
+    )
+    assert _errors(manifest, skipped) == [
+        "unexpected status: server-stateless/sep-2575-a is SKIPPED"
+    ]
+    now_passing = _results(shipping__server_stateless=[_check("sep-2575-a"), _check("sep-2575-b")])
+    assert _errors(manifest, now_passing) == [
+        "stale status pin: server-stateless/sep-2575-b now SUCCESS (update OTHER_STATUSES)"
+    ]
+
+
+def test_always_reported_checks_must_run(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    monkeypatch.setattr(
+        evaluate, "ALWAYS_REPORTED", {"server-stateless": frozenset({"sep-2575-a", "sep-2575-c"})}
+    )
+    errors = _errors(_manifest(tmp_path, BASE), _results())
+    assert errors == [
+        "missing: required check server-stateless/sep-2575-c did not run",
+        "missing: required check server-stateless/sep-2575-c did not run",
+    ]
+
+
+def test_the_shipped_pins_cover_the_dns_rebinding_pair_and_both_profiles() -> None:
+    pair = frozenset({"localhost-host-rebinding-rejected", "localhost-host-valid-accepted"})
+    assert {"dns-rebinding-protection": pair} == SHIPPED_ALWAYS_REPORTED
+    assert set(SHIPPED_OTHER_STATUSES) == set(evaluate.PROFILES)
+    assert all(len(pins) == 11 for pins in SHIPPED_OTHER_STATUSES.values())
+
+
+def test_a_citation_literal_must_be_long_enough_to_cite_anything(tmp_path: Path) -> None:
+    with pytest.raises(evaluate.ManifestError, match="too short"):
+        _manifest(tmp_path, BASE.replace("'`resources/list`'", "'`list`'"))
 
 
 @pytest.mark.parametrize(
@@ -587,6 +720,40 @@ def test_main_fails_on_an_unexpected_failure(
     results = _results(shipping__server_stateless=[_check("sep-2575-a", "FAILURE")])
     assert _run_main(tmp_path, results) == 1
     assert "unexpected failure: server-stateless/sep-2575-a" in capsys.readouterr().err
+
+
+def test_main_still_writes_diagnostics_when_the_manifest_is_refused(
+    tmp_path: Path, capsys: pytest.CaptureFixture[str]
+) -> None:
+    results = _results()
+    _suite_output(tmp_path, "shipping", results["shipping"])
+    _suite_output(tmp_path, "fixture", results["fixture"])
+    (tmp_path / "manifest.toml").write_text("[[waiver]]\n", encoding="utf-8")
+    code = evaluate.main(
+        [
+            "--manifest",
+            str(tmp_path / "manifest.toml"),
+            "--requirements",
+            str(_requirements_file(tmp_path)),
+            "--package-source",
+            str(tmp_path / "index.js"),
+            "--shipping",
+            str(tmp_path / "shipping" / "results"),
+            "--fixture",
+            str(tmp_path / "missing"),
+            "--out",
+            str(tmp_path / "out"),
+        ]
+    )
+
+    assert code == 1
+    shipping = json.loads((tmp_path / "out" / "shipping" / "checks.json").read_text("utf-8"))
+    assert "server-stateless" in shipping
+    fixture = json.loads((tmp_path / "out" / "fixture" / "checks.json").read_text("utf-8"))
+    assert fixture == {"error": "FileNotFoundError"}
+    summary = json.loads((tmp_path / "out" / "summary.json").read_text("utf-8"))
+    assert summary == {"error": "FileNotFoundError", "errors": 1}
+    assert "cannot evaluate" in capsys.readouterr().err
 
 
 def test_main_refuses_unreadable_inputs(tmp_path: Path, capsys: pytest.CaptureFixture[str]) -> None:

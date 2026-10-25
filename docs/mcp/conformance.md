@@ -59,15 +59,18 @@ network access for `npx` only; no database, graph or object store. For each prof
 server, runs the suite into `OUTPUT_DIR/<profile>/results/`, and stops the server; then it writes
 `OUTPUT_DIR/<profile>/checks.json` (all checks, by scenario), `OUTPUT_DIR/summary.json` (counts)
 and scans the whole directory for credentials. `secret_scan.py` looks for the run's own token
-(whole, and its secret segment on its own) and for credential shapes. The run token is passed only
-to the loopback servers and the scanner; `npx` and the suite never see it. In GitHub Actions it is
-masked in the logs. The servers are always torn down. It exits non-zero on any unexpected failure,
+(whole, and its secret segment on its own) and for credential shapes. It records its verdict,
+counts only, in `OUTPUT_DIR/secret-scan.json`. The run token is passed only to the loopback servers
+and the scanner; `npx` and the suite never see it. In GitHub Actions it is masked in the logs. If
+the manifest or a result set cannot be loaded, `checks.json` and `summary.json` still record the
+error class. The servers are always torn down. It exits non-zero on any unexpected failure,
 stale or missing manifest entry, unknown scenario, bad citation or scan finding.
 
 CI (`.github/workflows/mcp-conformance.yml`) runs it on pull requests and pushes to `main` with
 pinned actions, a checksum-verified Node `22.22.0` and a checksum-verified ShellCheck `0.11.0`. It scans the output again and uploads
 `summary.json`, `checks.json`, the suite output and the application logs as the `mcp-conformance`
-artifact only after that scan passes.
+artifact only when both that token-less rescan and the run's own token-aware verdict
+(`secret_scan.py --check-verdict`) pass.
 
 ## Applicability policy
 
@@ -105,30 +108,43 @@ lists only scored checks, and `evaluate.py` enforces:
    can be listed (`evaluate.FIXTURE_COVERABLE`). Every other `server-stateless` check must pass on
    shipping. It is not a waiver: the same check must **pass** on the fixture profile, or the run
    fails.
-4. **Every listed failure needs the suite's not-applicable evidence.** The failed report (its
-   message or details) must say, in the suite's own words, that the entry's reason applies
-   (`evaluate.EVIDENCE`):
-   - `Method not found` / `-32601` for an unserved method;
-   - `Unknown tool` or `Not testable` for a missing fixture tool;
-   - for input requests, `Unknown tool`, `Method not found`, `Prerequisite failed`, or that no
-     `InputRequiredResult` came back;
-   - for the response stream, `Unknown tool` or `No progress notifications received`.
+4. **Every listed failure needs the suite's not-applicable evidence.** The failed report's
+   `errorMessage` must match, in full, one of the suite's exact phrasings for the entry's reason
+   on that profile (`evaluate.EVIDENCE`):
+   - an unserved method: `Failed: Method not found`, or `<list method> returned JSON-RPC error
+     -32601: Method not found`;
+   - a fixture tool missing on shipping: `Failed: Unknown tool`, or the `Not testable: server does
+     not list the diagnostic tool '<tool>' …` text naming the entry's own tool;
+   - input requests:
+     - on shipping: `JSON-RPC error: Unknown tool`, `JSON-RPC error: Method not found`, the
+       tampered-state prerequisite text, or the multi-round "Expected InputRequiredResult …"
+       text, the last only when the server returned no result at all;
+     - on the fixture profile: the suite's "got a complete result" phrasings, only when the
+       result is the SDK's unknown-tool error for the entry's own cited tool;
+   - the response stream: `Failed: Unknown tool` on shipping, and on the fixture profile, which
+     serves the progress tool, only `No progress notifications received`.
 
-   If the report names a tool, it must be the entry's tool. A listed check that failed for any
-   other reason is an unexpected failure, so an entry can never mask a regression it does not
-   describe.
-5. **The manifest stays current.** These all fail the run:
+   `details`, which echo what the server sent, are never evidence by themselves. A listed check
+   whose message matches none of these is an unexpected failure, so an entry masks only the
+   specific not-applicable outcomes its reason names.
+5. **The manifest and the results stay current.** These all fail the run:
    - a listed check that passes (stale);
    - a listed check that did not run (missing);
    - an unknown scenario, in the results or the manifest;
-   - a scored scenario that did not run or reported no check.
+   - a scored scenario that did not run or reported no check;
+   - a scored scenario reporting different check ids on the two profiles (a dropped check), or
+     a missing `dns-rebinding-protection` check (`evaluate.ALWAYS_REPORTED`);
+   - a scored check that ends neither passed nor failed, unless it is pinned with that exact status
+     (`evaluate.OTHER_STATUSES`: the 11 current warnings, skips and infos per profile), and a
+     pinned one that now passes.
 
    The exact sets of excluded and fixture-covered (scenario, check) pairs are also pinned in
    `test_conformance_evaluate.py`, so growing either one is a reviewed change.
 6. **Citations are checked inside the scenario.** Every entry cites the pinned package's bundle
    (`dist/index.js`). The runner locates the cited scenario's own class there (from its class
    keyword to the next scenario's), and requires the cited literal and every listed check id to
-   occur inside it. A literal found elsewhere in the bundle does not count.
+   occur inside it. A literal found elsewhere in the bundle does not count, and a literal shorter
+   than six characters is refused.
 7. **Unscored scenarios** (the requirement set's `not_scored`: the tasks extension and pending
    scenarios) are reported and never gate. Listing one is an error.
 
