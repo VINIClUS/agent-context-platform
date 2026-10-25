@@ -990,6 +990,37 @@ def test_symbol_history_lists_each_revision_with_the_run_that_opened_it() -> Non
     assert g.statements(revision._SYMBOL_CLAIMS) == [{"ids": ["sr:avg:1", "sr:avg:s"], "at": ts(2)}]
 
 
+def test_a_commit_history_is_its_commit_lineage_never_a_dirty_snapshot() -> None:
+    g, c1, _, c2 = world()
+    view = g.view(commit(C2))
+
+    history = asyncio.run(g.reader.symbol_history(view, "sym:avg"))
+
+    # The snapshot's revision sr:avg:s was never committed: C1's revision is held until C2.
+    assert [(f.symbol_revision_id, f.first_seen, f.until, f.run_label) for f in history] == [
+        ("sr:avg:1", c1.at, c2.at, "Commit"),
+        ("sr:avg:2", c2.at, None, "Commit"),
+    ]
+    assert g.statements(revision._SYMBOL_CLAIMS) == [{"ids": ["sr:avg:1", "sr:avg:2"], "at": c2.at}]
+
+
+def test_a_commit_that_adopts_a_snapshot_revision_lists_it_from_that_commit() -> None:
+    g, c1, s, c2 = world()
+    # C2 commits exactly what the snapshot held: report.py and average() keep S's revisions.
+    g.members = [m for m in g.members if not (m.run is c2 and m.file_id == "file:report")]
+    g.defs = [d for d in g.defs if d.symbol_revision_id != "sr:avg:2"]
+    g.member(c2, "file:report", "fr:report:s", "src/pkg/report.py")
+
+    history = asyncio.run(g.reader.symbol_history(g.view(commit(C2)), "sym:avg"))
+
+    assert [(f.symbol_revision_id, f.first_seen, f.until, f.run_label) for f in history] == [
+        ("sr:avg:1", c1.at, c2.at, "Commit"),
+        ("sr:avg:s", c2.at, None, "Commit"),
+    ]
+    assert history[1].source_event_ids == ("ev-avg-s",)  # the replayed claim is cited
+    assert s.at < c2.at
+
+
 def test_an_unchanged_symbol_has_one_revision_with_the_claims_known_at_the_view() -> None:
     g, c1, _, c2 = world()
     # C2 changes add.py elsewhere: the same symbol revision is claimed again on the new file.

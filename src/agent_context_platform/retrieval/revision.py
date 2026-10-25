@@ -28,7 +28,7 @@ matched on `repository_id`, with a `LIMIT` (`truncated` says a cap was hit).
 from __future__ import annotations
 
 from collections.abc import Iterable, Mapping, Sequence
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from datetime import datetime
 from typing import Final, LiteralString
 
@@ -343,6 +343,11 @@ async def _history(
     tx: Neo4jTransaction, view: RevisionView, symbol_id: str, facts: code.Facts
 ) -> tuple[SymbolRevisionFact, ...]:
     runs = {run.key: run for run in view.history_runs}
+    if view.run.label == "Commit":
+        # A commit's history is its commit lineage: a dirty snapshot in between is not code the
+        # repository ever committed (a revision a commit adopts from one opens at that commit).
+        runs = {key: run for key, run in runs.items() if run.label == "Commit"}
+        facts = replace(facts, runs=[run for run in facts.runs if run.key in runs])
     intervals = [item for item in code.derive_symbol(facts, symbol_id) if item.start.key in runs]
     intervals = intervals[-MAX_HISTORY:]
     ids = sorted({item.key for item in intervals})
