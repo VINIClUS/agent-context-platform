@@ -332,24 +332,38 @@ re-checks every stream (or the named ones) in `stream_sequence` order, without w
 * `sequence`: contiguous from 1 (or from `N`), no gap, no duplicate;
 * `previous_event_sha256`: null for the first event, otherwise the previous event's stored
   `event_sha256` (from `N`, the link to event `N-1` is checked);
-* `event_decode`: the rows rebuild a valid `StoredEventV1`;
+* `event_decode`: the rows rebuild a valid `StoredEventV1`, and every stored JSONB column is
+  exactly the canonical form of what it decodes to;
+* `producer_id`: the denormalized `producer_id` column (read by the idempotency lookups) equals
+  the envelope's producer; every other column is itself part of the sealed envelope;
 * `payload_sha256` and `event_sha256`: recomputed from the stored payload and the canonical
-  envelope with the SDK's own sealing functions (never a second canonicalization), so an
-  `event_sha256` replaced mid-chain is caught even when the next link was repaired to match;
-* `stream_head`: `ledger.event_streams` names the last event (sequence, ID, digest);
-  `stream_exists`: a requested stream is missing.
+  envelope with the SDK's own sealing functions (never a second canonicalization; a frozen
+  golden event pins the exact digests), so an `event_sha256` replaced mid-chain is caught even
+  when the next link was repaired to match;
+* `stream_head`: `ledger.event_streams` names the stream's last event (sequence, ID, digest),
+  also when `N` lies past the stream's end; `stream_head_missing`: a stream has events but no
+  head row (a partial restore: streams are enumerated from the events too, so deleting heads
+  never hides events); `stream_exists`: a named stream has neither;
+* `event_count` (ledger-wide, once every stream verified): the events walked equal `count(*)` of
+  the events in scope in the same snapshot.
 
-Purged content still verifies: a purge appends `content.purged` and deletes bytes, but never
-rewrites an event or its content refs, and the verifier never reads content. Each stream reports
-its event count, sequence range and only its FIRST failure: stream ID, sequence, event ID, check
-name and the expected and actual digests (or sequences), never payload or content. The JSON
-report is stable:
+Purge is not implemented as an operation yet. It is specified to append `content.purged` and
+delete stored bytes, and must never rewrite an event or touch `ledger.event_content_refs` (their
+digest metadata is sealed into the event). The verifier never reads content bytes, so purged
+content will verify like any other. Each stream reports its event count, sequence range and only
+its FIRST failure: stream ID, sequence, event ID, check name and the expected and actual digests
+(or sequences), never payload or content. The JSON report is stable (fields are only ever added);
+`scope.full` is false for a `--since-sequence` or `--stream` run, so a tail run's `ok` is never
+mistaken for a full one:
 
 ```json
 {"ok": false,
- "checks": ["stream_exists", "sequence", "previous_event_sha256", "event_decode",
-            "payload_sha256", "event_sha256", "stream_head"],
+ "checks": ["stream_exists", "sequence", "previous_event_sha256", "event_decode", "producer_id",
+            "payload_sha256", "event_sha256", "stream_head", "stream_head_missing",
+            "event_count"],
+ "scope": {"full": true, "since_sequence": 1, "streams": null},
  "totals": {"streams": 2, "streams_failed": 1, "events": 5},
+ "failure": null,
  "streams": [
    {"stream_id": "s-a", "ok": false, "events": 1, "first_sequence": 1, "last_sequence": 1,
     "failure": {"check": "event_sha256", "stream_sequence": 2, "event_id": "0190...",
@@ -357,6 +371,8 @@ report is stable:
    {"stream_id": "s-b", "ok": true, "events": 4, "first_sequence": 1, "last_sequence": 4,
     "failure": null}]}
 ```
+
+The top-level `failure` carries a ledger-wide check (`event_count`), with the same fields.
 
 * **Role.** It connects with `AGENT_CONTEXT_POSTGRESQL__PROJECTOR_DSN` (falls back to `__DSN`):
   the projector role, which the migrations grant only `USAGE` on schema `ledger` and `SELECT` on
@@ -367,8 +383,9 @@ report is stable:
   cursor `--batch-size` rows at a time (default 500, at most 10000) with their content refs read
   per batch, so memory holds one batch, not the ledger. Run it on a quiet replica or off-peak for
   very large ledgers: it reads every event once.
-* **Exit codes.** `0` every stream verified; `1` an integrity failure (at least one stream);
-  `2` a usage error, a missing grant, or a connection or database error.
+* **Exit codes.** `0` every stream verified; `1` an integrity failure, and only that; `2` no
+  verdict: a usage error, a missing grant, a connection or database error, or any unexpected
+  error.
 
 Runbook. Run it after every restore drill and before trusting a restored database, and on a
 schedule against production. On exit `1`, stop the projection workers and ingestion for the

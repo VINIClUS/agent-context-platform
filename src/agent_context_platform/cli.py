@@ -1694,11 +1694,21 @@ _INSUFFICIENT_PRIVILEGE = "42501"  # SQLSTATE insufficient_privilege
 
 
 def _ledger_lines(report: LedgerVerification) -> list[str]:
-    totals = report.to_dict()["totals"]
+    summary = report.to_dict()
+    totals, scope = summary["totals"], summary["scope"]
+    partial = ""
+    if not scope["full"]:
+        named = f", {len(scope['streams'])} named streams" if scope["streams"] else ""
+        partial = f" (partial: from sequence {scope['since_sequence']}{named})"
     lines = [
         f"ledger: {totals['streams']} streams, {totals['events']} events verified, "
-        f"{totals['streams_failed']} failed"
+        f"{totals['streams_failed']} failed{partial}"
     ]
+    if report.failure is not None:
+        lines.append(
+            f"ledger: {report.failure.check} failed "
+            f"(expected {report.failure.expected}, actual {report.failure.actual})"
+        )
     for stream in report.streams:
         failure = stream.failure
         if failure is None:
@@ -1762,6 +1772,11 @@ def ledger_verify_command(
         except (SQLAlchemyError, OSError):
             raise CliUsageError(
                 "the ledger could not be read (connection or database error)"
+            ) from None
+        except Exception as error:
+            # Exit 1 means an integrity failure and nothing else: no verdict is exit 2.
+            raise CliUsageError(
+                f"the ledger could not be verified ({public_error_class(error)}); no verdict"
             ) from None
         finally:
             await engine.dispose()

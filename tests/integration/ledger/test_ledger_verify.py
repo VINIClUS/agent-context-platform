@@ -32,7 +32,7 @@ from agent_context_sdk import (
     SanitizedContentItemV1,
 )
 from agent_context_sdk.ids import new_uuid7
-from sqlalchemy import text
+from sqlalchemy import event, text
 from sqlalchemy.engine import make_url
 from sqlalchemy.exc import DBAPIError
 from sqlalchemy.ext.asyncio import AsyncEngine, create_async_engine
@@ -97,24 +97,27 @@ def _draft(stream: str, number: int, body: bytes | None) -> tuple[EventDraftV1, 
     claims: tuple[ContentClaimV1, ...] = ()
     items: list[Any] = []
     if body is not None:
-        content_id = f"{stream}-c-{number}"
-        claim = ContentClaimV1(
-            content_id=content_id,
-            content_sha256=hashlib.sha256(body).hexdigest(),
-            media_type="text/plain",
-            uncompressed_bytes=len(body),
-        )
-        claims = (claim,)
-        items.append(
-            SanitizedContentItemV1(
-                claim=claim,
-                sanitized_bytes_base64=base64.b64encode(body).decode(),
-                redaction_report=RedactionReportV1(
-                    policy_version="1.0.0", disposition=ContentDisposition.SANITIZED
-                ),
+        # The first event carries three refs, claimed out of order (the ledger sorts them).
+        suffixes = ("-z", "", "-a") if number == 1 else ("",)
+        for suffix in suffixes:
+            content = body + suffix.encode()
+            claim = ContentClaimV1(
+                content_id=f"{stream}-c-{number}{suffix}",
+                content_sha256=hashlib.sha256(content).hexdigest(),
+                media_type="text/plain",
+                uncompressed_bytes=len(content),
             )
-        )
-        payload["user_message_content_id"] = content_id
+            claims += (claim,)
+            items.append(
+                SanitizedContentItemV1(
+                    claim=claim,
+                    sanitized_bytes_base64=base64.b64encode(content).decode(),
+                    redaction_report=RedactionReportV1(
+                        policy_version="1.0.0", disposition=ContentDisposition.SANITIZED
+                    ),
+                )
+            )
+        payload["user_message_content_id"] = f"{stream}-c-{number}"
     moment = T0 + timedelta(seconds=number)
     draft = EventDraftV1(
         event_type="agent.turn.started",
@@ -243,6 +246,11 @@ CORRUPTIONS: dict[str, tuple[tuple[str, ...], str, int | None]] = {
         "event_sha256",
         1,
     ),
+    "content_ref_deleted": (
+        ("DELETE FROM ledger.event_content_refs WHERE content_id = 'stream-a-c-1-z'",),
+        "event_sha256",
+        1,
+    ),
     "stream_head": (
         (
             "UPDATE ledger.event_streams SET last_event_sha256 = repeat('c', 64) "
@@ -273,16 +281,113 @@ def test_each_corruption_is_detected_with_exit_1_and_its_check(
     assert "text 1" not in result.output  # never content
 
 
-def test_purged_content_still_verifies(
+def test_the_walk_never_reads_content_so_purged_bytes_cannot_matter(
+    ledger: AsyncEngine, projector_login: str
+) -> None:
+    # Purge is not implemented yet; it is specified to delete stored bytes and append a
+    # `content.purged` event, never to touch an event or its refs. Deleting bytes here would need
+    # the FKs disabled, so instead prove the verifier issues no statement against content storage.
+    statements: list[str] = []
+
+    async def run() -> ledger_verify.LedgerVerification:
+        engine = create_async_engine(projector_login, poolclass=NullPool)
+        event.listen(
+            engine.sync_engine,
+            "before_cursor_execute",
+            lambda _conn, _cursor, statement, *_rest: statements.append(statement),
+        )
+        try:
+            return await ledger_verify.verify_ledger(session_factory(engine))
+        finally:
+            await engine.dispose()
+
+    report = asyncio.run(run())
+
+    assert report.ok and report.to_dict()["totals"]["events"] == 6
+    assert statements and not [s for s in statements if "catalog." in s or "content_objects" in s]
+    assert any("ledger.event_content_refs" in s for s in statements)
+
+
+def test_events_without_a_head_row_are_never_skipped(
     ledger: AsyncEngine, projector_login: str, monkeypatch: pytest.MonkeyPatch
 ) -> None:
-    # What a purge does to storage: the bytes go, the event and its content ref stay.
-    digest = hashlib.sha256(b"text 1").hexdigest()
+    # A partial restore (pg_restore continues after errors): the head rows are gone, the events
+    # are not, and one of them was tampered with.
+    monkeypatch.setattr(ledger_verify, "STREAM_PAGE_SIZE", 1)  # page across both tables
     asyncio.run(
-        owner_sql(ledger, f"DELETE FROM catalog.inline_contents WHERE content_sha256 = '{digest}'")
+        owner_sql(
+            ledger,
+            "UPDATE ledger.events SET payload = jsonb_set(payload, '{turn_id}', '\"t-X\"') "
+            f"WHERE {_where(2)}",
+            "DELETE FROM ledger.event_streams WHERE stream_id = 'stream-a'",
+        )
     )
 
-    assert verify_cli(projector_login, monkeypatch).exit_code == 0
+    one = verify_cli(projector_login, monkeypatch)
+    assert one.exit_code == 1, one.output
+    streams = {s["stream_id"]: s for s in json.loads(one.stdout)["streams"]}
+    assert streams["stream-a"]["failure"]["check"] == "stream_head_missing"
+    assert streams["stream-b"]["ok"] is True
+    named = verify_cli(projector_login, monkeypatch, "--stream", "stream-a")
+    assert named.exit_code == 1
+    assert json.loads(named.stdout)["streams"][0]["failure"]["check"] == "stream_head_missing"
+
+    asyncio.run(owner_sql(ledger, "DELETE FROM ledger.event_streams"))
+    every = verify_cli(projector_login, monkeypatch)
+    assert every.exit_code == 1, every.output
+    report = json.loads(every.stdout)
+    assert report["totals"] == {"streams": 2, "streams_failed": 2, "events": 0}
+    assert {s["failure"]["check"] for s in report["streams"]} == {"stream_head_missing"}
+
+
+def test_events_outside_the_walk_fail_event_count(
+    ledger: AsyncEngine, projector_login: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    # Defence in depth: should the enumeration ever miss a stream, the snapshot's count catches it.
+    enumerate_page = ledger_verify._stream_ids
+
+    async def lossy(session: Any, after: str) -> list[str]:
+        return [stream for stream in await enumerate_page(session, after) if stream != "stream-b"]
+
+    monkeypatch.setattr(ledger_verify, "_stream_ids", lossy)
+
+    result = verify_cli(projector_login, monkeypatch)
+
+    assert result.exit_code == 1, result.output
+    report = json.loads(result.stdout)
+    assert report["failure"] == {
+        "check": "event_count",
+        "stream_sequence": None,
+        "event_id": None,
+        "expected": "6",
+        "actual": "4",
+    }
+    assert report["totals"]["streams_failed"] == 0
+
+
+def test_a_head_past_the_range_must_name_the_real_last_event(
+    ledger: AsyncEngine, projector_login: str, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    asyncio.run(
+        owner_sql(
+            ledger,
+            "UPDATE ledger.event_streams SET last_event_sha256 = repeat('c', 64) "
+            "WHERE stream_id = 'stream-b'",
+        )
+    )
+
+    # stream-b ends at sequence 2, before the range: no event is walked, its head still is.
+    result = verify_cli(projector_login, monkeypatch, "--since-sequence", "4")
+
+    assert result.exit_code == 1, result.output
+    streams = {s["stream_id"]: s for s in json.loads(result.stdout)["streams"]}
+    assert streams["stream-a"]["ok"] is True
+    failure = streams["stream-b"]["failure"]
+    assert (failure["check"], failure["stream_sequence"], failure["actual"]) == (
+        "stream_head",
+        2,
+        "c" * 64,
+    )
 
 
 def test_streams_and_since_sequence_narrow_the_walk(

@@ -8,22 +8,36 @@ for each stored event, exactly what sealing guaranteed (design spec section 6.2)
 2. `previous_event_sha256`: the stored link is null for the first event and otherwise equals the
    previous event's STORED `event_sha256` (the chain as it was sealed).
 3. `event_decode`: the rows rebuild into a valid `StoredEventV1` through the repository's own
-   reconstruction (`_row_to_stored_event`, content refs in canonical order).
-4. `payload_sha256`: recomputed from the stored payload with the SDK's seal-time functions.
-5. `event_sha256`: recomputed from the canonical envelope (RFC 8785 JCS, `integrity.event_sha256`
+   reconstruction (`_row_to_stored_event`, content refs in canonical order), and every stored
+   JSONB column is byte-for-byte the canonical form of what it decodes to (a stored form the
+   model would silently normalize, an upper-case UUID or a dropped null key, fails here).
+4. `producer_id`: the denormalized `producer_id` column (the idempotency lookups read it) equals
+   the envelope's `producer.producer_id`. Every other column is itself part of the envelope.
+5. `payload_sha256`: recomputed from the stored payload with the SDK's seal-time functions.
+6. `event_sha256`: recomputed from the canonical envelope (RFC 8785 JCS, `integrity.event_sha256`
    excluded) with the SDK's seal-time function.
 
-and, once a stream's events are read, `stream_head`: `ledger.event_streams` names the last event
-(its sequence, ID and digest). A requested stream that does not exist fails `stream_exists`.
+and, per stream: `stream_head`: `ledger.event_streams` names the stream's last event (its
+sequence, ID and digest; with `since_sequence` past the end, the last event before it);
+`stream_head_missing`: a stream has events but no head row (a partial restore); `stream_exists`:
+a requested stream has neither. Once every stream verified, `event_count`: the events walked
+equal `count(*)` of the events in scope, in the same snapshot, so no event can sit outside the
+walk.
+
+Streams are enumerated from BOTH `ledger.event_streams` and `ledger.events`, so deleting head
+rows never hides events from the walk.
 
 The canonicalization is never reimplemented: `_serialized_payload` and `_event_sha256` are the
-functions `seal_event` itself uses (the SDK is pinned), so a verifier and a sealer can never
-disagree about the bytes. A middle event whose `event_sha256` was replaced, with the next event's
-link repaired to match, is caught by check 5 on the edited event.
+functions `seal_event` itself uses (the SDK is pinned, and a golden-digest test fails loudly if
+an SDK release changes them), so a verifier and a sealer can never disagree about the bytes. A
+middle event whose `event_sha256` was replaced, with the next event's link repaired to match, is
+caught by check 6 on the edited event.
 
-Purge (design spec section 16) appends a `content.purged` tombstone and deletes stored bytes; it
-never rewrites an event or its content refs, which keep their digest metadata. The verifier reads
-only the sealed envelope, never content bytes, so purged content verifies like any other.
+Purge (design spec section 16) is not implemented as an operation yet. It is specified to append
+a `content.purged` tombstone and delete stored bytes, and must never rewrite an event or touch
+`ledger.event_content_refs`, whose digest metadata is sealed into the event. The verifier reads
+only the sealed envelope and its refs, never content bytes (its role cannot read them), so purged
+content will verify like any other.
 
 Bounded and read-only. The whole run is one `REPEATABLE READ, READ ONLY` transaction (a
 consistent snapshot; PostgreSQL refuses any write). Streams are paged by keyset, and each stream's
@@ -39,10 +53,11 @@ from collections.abc import Sequence
 from dataclasses import dataclass, field
 from typing import Any, Final
 
+from agent_context_sdk import StoredEventV1
 from agent_context_sdk.canonical import canonical_json_bytes, sha256_hex
 from agent_context_sdk.events.envelope import _event_sha256, _serialized_payload
 from pydantic import ValidationError
-from sqlalchemy import select, text
+from sqlalchemy import func, select, text, union
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker
 
 from agent_context_platform.ledger.models import EventContentRefRow, EventRow, EventStreamRow
@@ -55,9 +70,12 @@ CHECKS: Final = (
     "sequence",
     "previous_event_sha256",
     "event_decode",
+    "producer_id",
     "payload_sha256",
     "event_sha256",
     "stream_head",
+    "stream_head_missing",
+    "event_count",
 )
 _READ_ONLY: Final = "SET TRANSACTION ISOLATION LEVEL REPEATABLE READ, READ ONLY"
 
@@ -108,22 +126,31 @@ class StreamVerification:
 @dataclass(slots=True)
 class LedgerVerification:
     streams: list[StreamVerification] = field(default_factory=list)
+    since_sequence: int = 1
+    requested_streams: tuple[str, ...] = ()
+    failure: IntegrityFailure | None = None  # a ledger-wide check (`event_count`)
     batches: int = 0  # event batches fetched (bounded-memory evidence; not part of the output)
 
     @property
     def ok(self) -> bool:
-        return all(stream.ok for stream in self.streams)
+        return self.failure is None and all(stream.ok for stream in self.streams)
 
     def to_dict(self) -> dict[str, Any]:
-        """The stable machine-readable report (`ledger verify --json`)."""
+        """The stable machine-readable report (`ledger verify --json`); fields are only added."""
         return {
             "ok": self.ok,
             "checks": list(CHECKS),
+            "scope": {
+                "full": self.since_sequence == 1 and not self.requested_streams,
+                "since_sequence": self.since_sequence,
+                "streams": list(self.requested_streams) or None,
+            },
             "totals": {
                 "streams": len(self.streams),
                 "streams_failed": sum(1 for stream in self.streams if not stream.ok),
                 "events": sum(stream.events for stream in self.streams),
             },
+            "failure": None if self.failure is None else self.failure.to_dict(),
             "streams": [stream.to_dict() for stream in self.streams],
         }
 
@@ -140,50 +167,104 @@ async def verify_ledger(
         raise ValueError("since_sequence must be at least 1")
     if batch_size < 1:
         raise ValueError("batch_size must be at least 1")
-    report = LedgerVerification()
+    requested = tuple(sorted(set(streams)))
+    report = LedgerVerification(since_sequence=since_sequence, requested_streams=requested)
     async with sessions() as session, session.begin():
         await session.execute(text(_READ_ONLY))
-        if streams:
-            for stream_id in sorted(set(streams)):
-                head = await session.get(EventStreamRow, stream_id)
-                if head is None:
-                    report.streams.append(
-                        StreamVerification(stream_id, failure=IntegrityFailure("stream_exists"))
-                    )
-                    continue
+        if requested:
+            for stream_id in requested:
                 report.streams.append(
-                    await _verify_stream(session, head, since_sequence, batch_size, report)
+                    await _verify_stream(session, stream_id, since_sequence, batch_size, report)
                 )
         else:
             after = ""
-            while True:
-                page = (
-                    await session.scalars(
-                        select(EventStreamRow)
-                        .where(EventStreamRow.stream_id > after)
-                        .order_by(EventStreamRow.stream_id)
-                        .limit(STREAM_PAGE_SIZE)
-                    )
-                ).all()
-                if not page:
-                    break
-                for head in page:
+            while page := await _stream_ids(session, after):
+                for stream_id in page:
                     report.streams.append(
-                        await _verify_stream(session, head, since_sequence, batch_size, report)
+                        await _verify_stream(session, stream_id, since_sequence, batch_size, report)
                     )
-                    session.expunge(head)
-                after = page[-1].stream_id
+                after = page[-1]
+        if report.ok:
+            report.failure = await _check_count(session, report, requested, since_sequence)
     return report
 
 
+async def _stream_ids(session: AsyncSession, after: str) -> list[str]:
+    """One keyset page of every stream ID with a head row OR with events.
+
+    Each side is limited before the union, so a page reads at most one page of distinct IDs
+    from each table (the `(stream_id, stream_sequence)` index stops the scan early).
+    """
+    heads = (
+        select(EventStreamRow.stream_id.label("stream_id"))
+        .where(EventStreamRow.stream_id > after)
+        .order_by(EventStreamRow.stream_id)
+        .limit(STREAM_PAGE_SIZE)
+    )
+    events = (
+        select(EventRow.stream_id.label("stream_id"))
+        .distinct()
+        .where(EventRow.stream_id > after)
+        .order_by(EventRow.stream_id)
+        .limit(STREAM_PAGE_SIZE)
+    )
+    ids = union(heads, events).subquery()
+    page = await session.scalars(
+        select(ids.c.stream_id).order_by(ids.c.stream_id).limit(STREAM_PAGE_SIZE)
+    )
+    return list(page)
+
+
+async def _check_count(
+    session: AsyncSession,
+    report: LedgerVerification,
+    requested: Sequence[str],
+    since_sequence: int,
+) -> IntegrityFailure | None:
+    query = (
+        select(func.count()).select_from(EventRow).where(EventRow.stream_sequence >= since_sequence)
+    )
+    if requested:
+        query = query.where(EventRow.stream_id.in_(requested))
+    stored = int(await session.scalar(query) or 0)
+    walked = sum(stream.events for stream in report.streams)
+    if stored != walked:
+        return IntegrityFailure("event_count", expected=str(stored), actual=str(walked))
+    return None
+
+
 async def _verify_stream(
+    session: AsyncSession,
+    stream_id: str,
+    since_sequence: int,
+    batch_size: int,
+    report: LedgerVerification,
+) -> StreamVerification:
+    result = StreamVerification(stream_id)
+    head = await session.get(EventStreamRow, stream_id)
+    if head is None:
+        has_events = await session.scalar(
+            select(EventRow.event_id).where(EventRow.stream_id == stream_id).limit(1)
+        )
+        result.failure = IntegrityFailure(
+            "stream_exists" if has_events is None else "stream_head_missing"
+        )
+        return result
+    try:
+        result.failure = await _walk(session, head, since_sequence, batch_size, report, result)
+    finally:
+        session.expunge(head)
+    return result
+
+
+async def _walk(
     session: AsyncSession,
     head: EventStreamRow,
     since_sequence: int,
     batch_size: int,
     report: LedgerVerification,
-) -> StreamVerification:
-    result = StreamVerification(head.stream_id)
+    result: StreamVerification,
+) -> IntegrityFailure | None:
     expected_sequence = since_sequence
     previous_digest: str | None = None
     if since_sequence > 1:
@@ -203,16 +284,14 @@ async def _verify_stream(
                 .order_by(EventRow.stream_sequence)
                 .limit(1)
             )
-            if later is None:  # a stream that ends before the range: only its head to check
-                result.failure = _check_head(head, None, since_sequence)
-                return result
-            result.failure = IntegrityFailure(
-                "sequence",
-                stream_sequence=later,
-                expected=str(since_sequence - 1),
-                actual=str(later),
-            )
-            return result
+            if later is not None:
+                return IntegrityFailure(
+                    "sequence",
+                    stream_sequence=later,
+                    expected=str(since_sequence - 1),
+                    actual=str(later),
+                )
+            # The stream ends before the range: only its head is left to check.
     last: EventRow | None = None
     rows = await session.stream_scalars(
         select(EventRow)
@@ -227,8 +306,7 @@ async def _verify_stream(
             for row in batch:
                 failure = _check_event(row, expected_sequence, previous_digest, refs)
                 if failure is not None:
-                    result.failure = failure
-                    return result
+                    return failure
                 if result.first_sequence is None:
                     result.first_sequence = row.stream_sequence
                 result.last_sequence = row.stream_sequence
@@ -240,8 +318,15 @@ async def _verify_stream(
                 session.expunge(row)
     finally:
         await rows.close()
-    result.failure = _check_head(head, last, since_sequence)
-    return result
+    if last is None and since_sequence > 1:
+        # Nothing in range: the head must still name the stream's real last event.
+        last = await session.scalar(
+            select(EventRow)
+            .where(EventRow.stream_id == head.stream_id)
+            .order_by(EventRow.stream_sequence.desc())
+            .limit(1)
+        )
+    return _check_head(head, last)
 
 
 async def _content_refs(
@@ -279,8 +364,13 @@ def _check_event(
         return fail("previous_event_sha256", previous_digest, row.previous_event_sha256)
     try:
         event = _row_to_stored_event(row, refs.get(row.event_id, []))
+        canonical = _stored_columns_are_canonical(row, event)
     except (ValidationError, ValueError, TypeError):
+        canonical = False
+    if not canonical:
         return fail("event_decode", None, None)
+    if row.producer_id != event.producer.producer_id:
+        return fail("producer_id", event.producer.producer_id, row.producer_id)
     payload_digest = sha256_hex(canonical_json_bytes(_serialized_payload(event)))
     if payload_digest != row.payload_sha256:
         return fail("payload_sha256", payload_digest, row.payload_sha256)
@@ -290,20 +380,32 @@ def _check_event(
     return None
 
 
-def _check_head(
-    head: EventStreamRow, last: EventRow | None, since_sequence: int
-) -> IntegrityFailure | None:
-    """The stream head names the last event read (or none, for an empty stream)."""
+def _stored_columns_are_canonical(row: EventRow, event: StoredEventV1) -> bool:
+    """Each stored JSONB column is the canonical form of what the model decoded from it.
+
+    The digests are computed from the decoded model; this closes the gap between a stored form
+    and the model's normalization of it (exactly how `_event_row_from_sealed` dumps each field).
+    """
+    decoded: dict[str, Any] = event.model_dump(
+        mode="json", include={"producer", "context", "trace", "payload", "redaction"}
+    )
+    stored = {
+        "producer": row.producer,
+        "context": row.context,
+        "trace": row.trace,
+        "payload": row.payload,
+        "redaction": row.redaction,
+    }
+    return all(
+        canonical_json_bytes(stored[name]) == canonical_json_bytes(decoded[name]) for name in stored
+    )
+
+
+def _check_head(head: EventStreamRow, last: EventRow | None) -> IntegrityFailure | None:
+    """The stream head names the stream's last event (or none, for an empty stream)."""
     if last is None:
-        if since_sequence == 1 and head.last_sequence != 0:
+        if head.last_sequence != 0 or head.last_event_sha256 is not None:
             return IntegrityFailure("stream_head", expected="0", actual=str(head.last_sequence))
-        if since_sequence > 1 and head.last_sequence >= since_sequence:
-            return IntegrityFailure(
-                "stream_head",
-                stream_sequence=since_sequence,
-                expected=str(since_sequence - 1),
-                actual=str(head.last_sequence),
-            )
         return None
     if head.last_sequence != last.stream_sequence:
         return IntegrityFailure(

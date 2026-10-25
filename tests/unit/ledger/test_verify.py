@@ -5,6 +5,7 @@ from __future__ import annotations
 import hashlib
 import json
 from datetime import UTC, datetime, timedelta
+from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
@@ -21,6 +22,8 @@ from agent_context_sdk import (
     StoredEventV1,
     seal_event,
 )
+from agent_context_sdk.canonical import canonical_json_bytes, sha256_hex
+from agent_context_sdk.events.envelope import _event_sha256, _serialized_payload
 from sqlalchemy.exc import OperationalError, ProgrammingError
 from typer.testing import CliRunner
 
@@ -29,6 +32,7 @@ from agent_context_platform.ledger.models import EventContentRefRow, EventRow, E
 from agent_context_platform.ledger.repository import (
     _content_ref_rows_from_sealed,
     _event_row_from_sealed,
+    _row_to_stored_event,
 )
 from agent_context_platform.ledger.verify import (
     CHECKS,
@@ -215,17 +219,17 @@ def test_the_stream_head_must_name_the_last_event() -> None:
     rows = chain()
     last = rows[-1][0]
     good = _head(last_sequence=3, last_event_id=last.event_id, last_event_sha256=last.event_sha256)
-    assert _check_head(good, last, 1) is None
+    assert _check_head(good, last) is None
 
     behind = _head(last_sequence=2, last_event_id=last.event_id, last_event_sha256="0" * 64)
-    failure = _check_head(behind, last, 1)
+    failure = _check_head(behind, last)
     assert failure is not None and (failure.check, failure.expected, failure.actual) == (
         "stream_head",
         "3",
         "2",
     )
     wrong = _head(last_sequence=3, last_event_id=uuid4(), last_event_sha256=last.event_sha256)
-    assert _check_head(wrong, last, 1) == IntegrityFailure(
+    assert _check_head(wrong, last) == IntegrityFailure(
         "stream_head",
         stream_sequence=3,
         event_id=str(last.event_id),
@@ -234,13 +238,76 @@ def test_the_stream_head_must_name_the_last_event() -> None:
     )
 
 
-def test_an_empty_read_needs_an_empty_head() -> None:
-    assert _check_head(_head(last_sequence=0), None, 1) is None
-    failure = _check_head(_head(last_sequence=2), None, 1)
-    assert failure is not None and failure.check == "stream_head"
-    assert _check_head(_head(last_sequence=4), None, 5) is None  # nothing at or after 5
-    failure = _check_head(_head(last_sequence=6), None, 5)
-    assert failure is not None and failure.check == "stream_head"
+def test_an_empty_stream_needs_an_empty_head() -> None:
+    assert _check_head(_head(last_sequence=0), None) is None
+    for head in (_head(last_sequence=2), _head(last_sequence=0, last_event_sha256="0" * 64)):
+        failure = _check_head(head, None)
+        assert failure is not None and failure.check == "stream_head"
+
+
+def test_the_producer_id_column_must_match_the_envelope() -> None:
+    rows = chain()
+    rows[1][0].producer_id = "someone-else"  # what the idempotency lookups read
+
+    failure = walk(rows)
+
+    assert failure is not None
+    assert (failure.check, failure.stream_sequence) == ("producer_id", 2)
+    assert (failure.expected, failure.actual) == ("verify-test", "someone-else")
+
+
+def test_a_non_canonical_stored_column_fails_event_decode() -> None:
+    # The model decodes both forms identically; only the stored bytes differ.
+    rows = chain()
+    context = dict(rows[1][0].context)
+    dropped = next(key for key, value in context.items() if value is None)
+    del context[dropped]
+    rows[1][0].context = context
+
+    failure = walk(rows)
+
+    assert failure is not None and (failure.check, failure.stream_sequence) == ("event_decode", 2)
+
+
+GOLDEN = Path(__file__).parents[2] / "fixtures" / "ledger" / "golden_event.json"
+GOLDEN_PAYLOAD_SHA256 = "88d1f4e11e0985082dc8fa64df0cdb8d66ede4d099e50c8df47b020ac5707259"
+GOLDEN_EVENT_SHA256 = "815689d06ac447d0ade1304eb990c29cdb3463eb3fe20b7f625815343f743853"
+
+
+def test_a_frozen_event_keeps_its_exact_digests() -> None:
+    """An SDK release that changes the seal-time digests must fail here, loudly."""
+    sealed = StoredEventV1.model_validate(json.loads(GOLDEN.read_text(encoding="utf-8")))
+    row = _event_row_from_sealed(sealed, recorded_at=T0)
+    refs = list(reversed(_content_ref_rows_from_sealed(sealed)))  # storage order is arbitrary
+    assert len(refs) == 3
+
+    failure = _check_event(row, 7, "a" * 64, {row.event_id: refs})
+
+    assert failure is None
+    assert (row.payload_sha256, row.event_sha256) == (GOLDEN_PAYLOAD_SHA256, GOLDEN_EVENT_SHA256)
+    rebuilt = _row_to_stored_event(row, refs)
+    assert sha256_hex(canonical_json_bytes(_serialized_payload(rebuilt))) == GOLDEN_PAYLOAD_SHA256
+    assert _event_sha256(rebuilt) == GOLDEN_EVENT_SHA256
+    for dropped in range(3):  # every ref is sealed, not only the first
+        fewer = refs[:dropped] + refs[dropped + 1 :]
+        failure = _check_event(row, 7, "a" * 64, {row.event_id: fewer})
+        assert failure is not None and failure.check == "event_sha256"
+
+
+def test_the_scope_and_a_ledger_wide_failure_are_reported() -> None:
+    report = LedgerVerification(
+        [StreamVerification("s", 2, 3, 4)],
+        since_sequence=3,
+        requested_streams=("s",),
+        failure=IntegrityFailure("event_count", expected="5", actual="2"),
+    )
+
+    summary = report.to_dict()
+
+    assert report.ok is False
+    assert summary["scope"] == {"full": False, "since_sequence": 3, "streams": ["s"]}
+    assert summary["failure"]["check"] == "event_count"
+    assert summary["totals"]["streams_failed"] == 0
 
 
 def test_the_report_shape_is_stable() -> None:
@@ -256,7 +323,9 @@ def test_the_report_shape_is_stable() -> None:
     assert LedgerVerification([ok, bad]).to_dict() == {
         "ok": False,
         "checks": list(CHECKS),
+        "scope": {"full": True, "since_sequence": 1, "streams": None},
         "totals": {"streams": 2, "streams_failed": 1, "events": 4},
+        "failure": None,
         "streams": [
             {
                 "stream_id": "s-ok",
@@ -373,6 +442,33 @@ def test_permission_denied_names_the_grants_without_driver_detail(
     assert result.exit_code == 2
     assert "permission denied" in result.output and "USAGE on schema ledger" in result.output
     assert "hunter2" not in result.output and "has_table_privilege" not in result.output
+
+
+def test_a_partial_run_and_a_ledger_wide_failure_are_named_in_text(
+    ledger_cli: dict[str, Any],
+) -> None:
+    ledger_cli["report"] = LedgerVerification(
+        [StreamVerification("s", 1, 4, 4)],
+        since_sequence=4,
+        requested_streams=("s",),
+        failure=IntegrityFailure("event_count", expected="3", actual="1"),
+    )
+
+    result = CliRunner().invoke(cli.app, ["ledger", "verify", "--stream", "s"])
+
+    assert result.exit_code == 1
+    assert "(partial: from sequence 4, 1 named streams)" in result.stdout
+    assert "ledger: event_count failed (expected 3, actual 1)" in result.stdout
+
+
+def test_an_unexpected_error_is_no_verdict_and_exits_2(ledger_cli: dict[str, Any]) -> None:
+    ledger_cli["error"] = RuntimeError("hunter2 leaked in a message")
+
+    result = CliRunner().invoke(cli.app, ["ledger", "verify"])
+
+    assert result.exit_code == 2
+    assert "no verdict" in result.output and "RuntimeError" in result.output
+    assert "hunter2" not in result.output
 
 
 def test_bad_options_are_usage_errors(ledger_cli: dict[str, Any]) -> None:
