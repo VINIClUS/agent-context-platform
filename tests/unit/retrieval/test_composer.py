@@ -426,6 +426,26 @@ def test_failure_windows_count_the_first_observation_or_any_run_completion() -> 
     assert not _in_window(failure, T + timedelta(hours=2), T + timedelta(hours=3))
 
 
+def test_a_failure_first_seen_before_the_window_counts_when_it_recurs_inside_it() -> None:
+    session = ObservedRun(RunKind.SESSION, "sess-1", None, None, None, None, None, None, ())
+    recurring = replace(
+        _failure(None), observed_in=(session,), observed_at=(T, T + timedelta(hours=5))
+    )
+    assert _in_window(recurring, T + timedelta(hours=4), T + timedelta(hours=6))
+    once = replace(recurring, observed_at=(T,))
+    assert not _in_window(once, T + timedelta(hours=4), T + timedelta(hours=6))
+
+
+def test_a_decision_quotes_the_recording_its_status_comes_from() -> None:
+    record = replace(
+        _decision(DecisionStanding.ACTIVE, None),
+        source_event_ids=("e-current", "e-older"),
+        event_id="e-current",
+    )
+    assert _decision_candidate(record, T).excerpt == ("e-current", None)
+    assert len(_decision_candidate(record, T).citations) == 2  # both recordings stay cited
+
+
 def test_content_candidates_are_typed_by_event_and_quote_their_own_content() -> None:
     hit = SearchHit(
         "c-1",

@@ -181,6 +181,18 @@ def test_historical_reasons_name_the_superseder_or_the_expiry() -> None:
     assert [r.decision_id for r in records][:2] == ["b", "e"]  # active first, then by ID
 
 
+def test_a_decision_names_the_recording_its_status_comes_from() -> None:
+    # The newest recording by order wins even when an older one has the greater event ID (event
+    # IDs need not sort like occurred_at): the excerpt must quote the winner, not the older text.
+    older = temporal._VersionRow(version("a", 1, status="proposed").version, "event-z", ("mod_a",))
+    rows = [older, version("a", 2)]
+    records, _ = temporal._classify(rows, at(5), at(50), False)
+    assert [(r.decision_id, r.status, r.event_id) for r in records] == [
+        ("a", "accepted", "event-a-2")
+    ]
+    assert records[0].source_event_ids == ("event-a-2", "event-z")
+
+
 def test_the_decision_cap_truncates_and_keeps_active_first(monkeypatch: pytest.MonkeyPatch) -> None:
     monkeypatch.setattr(temporal, "MAX_DECISIONS", 2)
     rows = [version(name, n) for n, name in enumerate("abc", start=1)]
@@ -509,6 +521,21 @@ def pass_row(failing: str, passing: str | None, **more: Any) -> dict[str, Any]:
         "snapshot_id": more.get("snapshot"),
         "passing_order": "t|evp1",
     }
+
+
+def test_a_failure_keeps_every_observation_time_oldest_first() -> None:
+    # Newest first, as the query returns them; sessions carry no run completion of their own.
+    observations = [
+        observation("f_session", 9, session="sess_2"),
+        observation("f_session", 2, session="sess_1"),
+    ]
+    service = _service(lambda query, _p: observations if query is temporal._OBSERVATIONS else [])
+    (failure,) = asyncio.run(
+        service.failures(TemporalScope(repository_id="r"), include_resolved=True)
+    ).failures
+    assert failure.valid_from == at(2)
+    assert failure.observed_at == (at(2), at(9))
+    assert {run.completed_at for run in failure.observed_in} == {None}
 
 
 def test_failures_classify_each_resolution_and_hide_resolved_by_default() -> None:

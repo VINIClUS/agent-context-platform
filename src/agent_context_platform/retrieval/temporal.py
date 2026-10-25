@@ -218,6 +218,9 @@ class DecisionRecord:
     supersedes_id: str | None
     recorded_at: datetime
     source_event_ids: tuple[str, ...]
+    # The recording the status and subjects come from (the newest by `order`), not the
+    # greatest of `source_event_ids`: event IDs need not sort like `occurred_at`.
+    event_id: str | None = None
 
 
 @dataclass(frozen=True, slots=True)
@@ -314,6 +317,9 @@ class FailureRecord:
     observed_in: tuple[ObservedRun, ...]
     resolution: FixResolution
     source_event_ids: tuple[str, ...]
+    # Every observation's valid time, oldest first: `valid_from` is only the first, and a
+    # session observation has no run completion to place a recurrence by.
+    observed_at: tuple[datetime, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -679,9 +685,11 @@ def _classify(
     versions = [row.version for row in rows]
     events: dict[str, list[str]] = {}
     subjects: dict[tuple[str, str], tuple[str, ...]] = {}
+    recording: dict[tuple[str, str], str] = {}
     for row in rows:
         events.setdefault(row.version.decision_id, []).append(row.event_id)
         subjects[(row.version.decision_id, row.version.order)] = row.subjects
+        recording[(row.version.decision_id, row.version.order)] = row.event_id
     active = set(
         active_decisions(versions, scope=_SUBJECT, valid_at=valid_at, recorded_at=recorded_at)
     )
@@ -719,6 +727,7 @@ def _classify(
                 supersedes_id=version.supersedes_id,
                 recorded_at=version.recorded_at,
                 source_event_ids=tuple(sorted(events[decision_id])),
+                event_id=recording[(decision_id, version.order)],
             )
         )
     records.sort(key=lambda item: (item.standing is not DecisionStanding.ACTIVE, item.decision_id))
@@ -1118,4 +1127,5 @@ def _failure_record(
         observed_in=tuple(ordered),
         resolution=resolution,
         source_event_ids=tuple(sorted(str(row["event_id"]) for row in observations)),
+        observed_at=tuple(sorted(_parse(row["valid_from"]) for row in observations)),
     )

@@ -1493,7 +1493,7 @@ def _decision_candidate(
         match=match,
         recency=_iso(record.valid_from),
         priority=priority,
-        excerpt=(record.source_event_ids[-1], None) if record.source_event_ids else None,
+        excerpt=(record.event_id, None) if record.event_id else None,
     )
 
 
@@ -1699,7 +1699,9 @@ def _without_dirty(failure: FailureRecord, snapshot: str | None) -> FailureRecor
 
 
 def _in_window(failure: FailureRecord, start: datetime, end: datetime) -> bool:
-    if start <= failure.valid_from <= end:
+    """Whether the failure occurred in the window: first seen there, observed again there (in
+    any session, test run or CI run), or seen in a run that completed there."""
+    if any(start <= moment <= end for moment in (failure.valid_from, *failure.observed_at)):
         return True
     return any(
         run.completed_at is not None and start <= run.completed_at <= end
