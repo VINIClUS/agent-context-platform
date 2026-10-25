@@ -403,7 +403,10 @@ def decision(
     status: str = "accepted",
     valid_from: datetime | None = None,
     effective_valid_to: datetime | None = None,
+    winner: str | None = None,
 ) -> DecisionRecord:
+    """`winner` is the recording the status comes from (temporal's `event_id`): the newest of
+    `events` unless given."""
     start = valid_from or at(0.5)
     return DecisionRecord(
         decision_id=decision_id,
@@ -418,6 +421,7 @@ def decision(
         supersedes_id=supersedes,
         recorded_at=start,
         source_event_ids=tuple(events),
+        event_id=winner if winner is not None else (events[-1] if events else None),
     )
 
 
