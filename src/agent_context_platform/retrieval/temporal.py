@@ -306,6 +306,10 @@ class FixResolution:
     status: FixStatus
     reason: str | None = None
     path: FixPath | None = None
+    # When a recurrence after the pass made it `unresolved`: the CI or test run each such
+    # observation was made in (`None` for one made outside a run), so a reader that drops runs
+    # can tell whether the status rests on them.
+    late_runs: tuple[str | None, ...] = ()
 
 
 @dataclass(frozen=True, slots=True)
@@ -1111,6 +1115,7 @@ def _failure_record(
         if run.run_id in passes and passes[run.run_id]["passing_id"] is not None
     ]
     late: list[str] = []
+    late_runs: tuple[str | None, ...] = ()
     path: FixPath | None = None
     if latest and len(fixed) == len(latest):
         _, record = max(fixed, key=lambda item: _occurred(item[0]))
@@ -1118,10 +1123,15 @@ def _failure_record(
         # The pass fixes only what happened before it: an observation that occurred later (in a
         # session, a test run or a CI run not completed at the cut) is a recurrence it cannot
         # vouch for.
-        late = sorted(
-            str(row["event_id"])
-            for row in observations
-            if _occurrence(row, ci) > path.passing_completed_at
+        recurring = [
+            row for row in observations if _occurrence(row, ci) > path.passing_completed_at
+        ]
+        late = sorted(str(row["event_id"]) for row in recurring)
+        late_runs = tuple(
+            sorted(
+                {_text(row["ci_run_id"]) or _text(row["test_run_id"]) for row in recurring},
+                key=lambda run: (run is not None, run or ""),
+            )
         )
     if capped is not None:
         resolution = FixResolution(
@@ -1135,6 +1145,7 @@ def _failure_record(
         resolution = FixResolution(
             FixStatus.UNRESOLVED,
             f"observed again after the passing run {path.passing_run_id}: {', '.join(late)}",
+            late_runs=late_runs,
         )
     elif ci_runs:
         open_runs = sorted(

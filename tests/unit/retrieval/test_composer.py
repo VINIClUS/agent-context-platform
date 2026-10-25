@@ -420,6 +420,22 @@ def test_a_commit_query_drops_runs_and_fixes_of_dirty_snapshots() -> None:
     assert unknown is not None and unknown.resolution.status is FixStatus.UNKNOWN
 
 
+def test_a_recurrence_in_a_run_the_answer_dropped_never_decides_its_resolution() -> None:
+    def recurred(*late_runs: str | None) -> FailureRecord:
+        reason = "observed again after the passing run ci-2: ev-late"
+        resolution = FixResolution(FixStatus.UNRESOLVED, reason, late_runs=late_runs)
+        return replace(_failure(True), resolution=resolution)
+
+    # Seen again in a run the commit answer does not hold (dirty, or not completed at the cut):
+    # the status rests on that run, so it is unknown, and the reason never names its event.
+    dropped = _without_dirty(recurred("ci-late"), None)
+    assert dropped is not None
+    assert dropped.resolution == FixResolution(FixStatus.UNKNOWN, "dirty_runs_excluded")
+    # Seen again outside any run, or in a run the answer keeps: the status stands.
+    for kept in (recurred(None), recurred("ci-1")):
+        assert _without_dirty(kept, None) == kept
+
+
 def test_failure_windows_count_the_first_observation_or_any_run_completion() -> None:
     failure = _failure(True)
     assert _in_window(failure, T - timedelta(hours=1), T + timedelta(hours=1))

@@ -652,6 +652,26 @@ def test_failures_flag_the_failure_and_observation_caps(monkeypatch: pytest.Monk
     assert partial.failures[0].resolution.reason == "observed in no CI or test run in scope"
 
 
+def test_a_recurrence_after_the_pass_names_the_runs_it_was_made_in() -> None:
+    # Fixed by ci_9 (completed at 5); seen again at 7 in a run not completed at the cut, and at 8
+    # outside any run.
+    rows = [
+        observation("f", 8, session="sess_1"),
+        observation("f", 7, ci="ci_late"),
+        observation("f", 1, ci="ci_1"),
+    ]
+    script = observed(
+        rows, _CI_RUNS=[ci_row("ci_1", commit="a" * 40)], _NEXT_PASS=[pass_row("ci_1", "ci_9")]
+    )
+    (failure,) = asyncio.run(
+        _service(script).failures(TemporalScope("p"), include_resolved=True)
+    ).failures
+    assert failure.resolution.status is FixStatus.UNRESOLVED and failure.resolution.path is None
+    assert failure.resolution.reason == "observed again after the passing run ci_9: evo7, evo8"
+    assert failure.resolution.late_runs == (None, "ci_late")
+    assert [run.run_id for run in failure.observed_in] == ["ci_1", "sess_1"]
+
+
 def test_a_kept_failure_whose_older_observations_the_cap_cut_is_unknown(
     monkeypatch: pytest.MonkeyPatch,
 ) -> None:

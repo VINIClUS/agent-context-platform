@@ -1679,8 +1679,9 @@ def _without_dirty(failure: FailureRecord, snapshot: str | None) -> FailureRecor
 
     The resolution was derived over every run, dirty ones included, so it is kept only when it
     rests on the remaining runs alone: a fix path between two kept runs that validated an allowed
-    revision. Anything else is `unknown` with the reason `dirty_runs_excluded` (never a reason
-    text that names a dirty run).
+    revision, and no recurrence after it made in a run the answer did not keep (a dirty one, or
+    one not completed at the cut). Anything else is `unknown` with the reason
+    `dirty_runs_excluded` (never a reason text that names a dirty run).
     """
     kept = tuple(run for run in failure.observed_in if run.snapshot_id in (None, snapshot))
     if failure.observed_in and not kept:
@@ -1690,10 +1691,11 @@ def _without_dirty(failure: FailureRecord, snapshot: str | None) -> FailureRecor
     path_kept = path is None or (
         path.failing_run_id in ids and path.validated_snapshot_id in (None, snapshot)
     )
-    if len(kept) == len(failure.observed_in) and path_kept:
+    late_dropped = any(run is not None and run not in ids for run in failure.resolution.late_runs)
+    if len(kept) == len(failure.observed_in) and path_kept and not late_dropped:
         return failure
     resolution = failure.resolution
-    if path is None or not path_kept:
+    if path is None or not path_kept or late_dropped:
         resolution = FixResolution(FixStatus.UNKNOWN, "dirty_runs_excluded")
     return replace(failure, observed_in=kept, resolution=resolution)
 
